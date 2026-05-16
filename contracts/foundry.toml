@@ -11,3 +11,7 @@ remappings = [
     "solady/=lib/solady/src/",
     "forge-std/=lib/forge-std/src/",
 ]
+
+[rpc_endpoints]
+mantle         = "${MANTLE_RPC_URL}"
+mantle_sepolia = "${MANTLE_SEPOLIA_RPC_URL}"
