@@ -1,0 +1,9 @@
+{
+  "name": "@vault8004/contracts",
+  "private": true,
+  "scripts": {
+    "build": "forge build",
+    "test": "forge test",
+    "export-abi": "node scripts/export-abi.js"
+  }
+}

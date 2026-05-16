@@ -1,0 +1,10 @@
+{
+  "name": "vault8004",
+  "private": true,
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "build:contracts": "cd contracts && forge build && node scripts/export-abi.js",
+    "dev:web": "pnpm --filter web dev",
+    "dev:agent": "cd agent && uv run python -m agent.main"
+  }
+}

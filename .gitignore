@@ -1,0 +1,13 @@
+node_modules
+.env
+.env.local
+contracts/lib/
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+__pycache__/
+.venv/
+.next/
+dist/
+*.log
+.DS_Store
