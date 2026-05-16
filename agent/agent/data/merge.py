@@ -38,7 +38,8 @@ def build_daily_dataset() -> pd.DataFrame:
     tvl_mantle = _load_raw("tvl_mantle")
     tvl_moe = _load_raw("tvl_merchant-moe")
     tvl_lendle = _load_raw("tvl_lendle")
-    yields_meth = _load_raw("yields_cmeth")
+    meth_protocol = _load_raw("meth_protocol")
+    yields_cmeth = _load_raw("yields_cmeth")
     yields_aave_usdc = _load_raw("yields_aave_usdc")
     yields_susde = _load_raw("yields_susde")
     allora = _load_raw("allora_synthetic")
@@ -58,10 +59,14 @@ def build_daily_dataset() -> pd.DataFrame:
         meth_d = _daily(meth, "price_usd", "meth_price")
         parts.append((meth_d / eth_d).rename("meth_exchange_rate"))
 
-    if yields_meth is not None:
-        parts.append(_daily(yields_meth, "apy", "meth_apy"))
-    if yields_meth is not None:
-        parts.append(_daily(yields_meth, "apy", "cmeth_apy"))
+    # meth_apy: from mETH Protocol native API; synthetic 3.5% fallback when API unavailable.
+    # TODO Week 2: replace with DeFiLlama mantle-staked-ether pool or live mETH Protocol endpoint.
+    if meth_protocol is not None and not meth_protocol.empty and "apy" in meth_protocol.columns:
+        parts.append(_daily(meth_protocol, "apy", "meth_apy"))
+    # cmeth_apy: from DeFiLlama cmETH Lendle pool (Mantle). Note: this is lending yield,
+    # not pure staking yield — real cmETH yield accrues via exchange_rate (see TODO #2).
+    if yields_cmeth is not None:
+        parts.append(_daily(yields_cmeth, "apy", "cmeth_apy"))
     if yields_aave_usdc is not None:
         parts.append(_daily(yields_aave_usdc, "apy", "aave_usdc_apy"))
     if yields_susde is not None:
@@ -85,6 +90,11 @@ def build_daily_dataset() -> pd.DataFrame:
         parts.append(is_synth)
 
     df = pd.concat(parts, axis=1).sort_index()
+
+    # Synthetic meth_apy fallback: mETH Protocol API is unavailable (404), so we use 3.5%
+    # matching the hardcoded value in gather/market_data.py. Week 2: replace with live data.
+    if "meth_apy" not in df.columns or df["meth_apy"].isna().all():
+        df["meth_apy"] = 0.035
 
     # Snapshot which APY cells are NaN before any filling
     flag_cols = []

@@ -1,16 +1,16 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    rpc_url: str = "https://rpc.mantle.xyz"
-    private_key: str = ""
-    anthropic_api_key: str = ""
-    pinata_api_key: str = ""
-    pinata_secret_key: str = ""
-    vault_address: str = "0x0000000000000000000000000000000000000000"
-    decision_log_address: str = "0x0000000000000000000000000000000000000000"
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    model_config = {"env_file": "../.env", "env_file_encoding": "utf-8"}
+    MANTLE_RPC_URL: str = "https://rpc.mantle.xyz"
+    MANTLE_SEPOLIA_RPC_URL: str = "https://rpc.sepolia.mantle.xyz"
+    VAULT_ADDRESS: str = "0x0000000000000000000000000000000000000000"
+    AGENT_PRIVATE_KEY: str = ""
+    ANTHROPIC_API_KEY: str = ""
+    ALLORA_API_KEY: str = ""
+    PINATA_JWT: str = ""
 
 
 settings = Settings()

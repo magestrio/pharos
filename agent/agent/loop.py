@@ -16,7 +16,7 @@ async def _run_cycle_async() -> None:
     vault_state = await get_vault_state()
     market_data = await get_market_data()
     allora = await get_allora_signals()
-    risk = await get_risk_metrics()
+    risk = await get_risk_metrics(market_data, vault_state)
 
     state = {
         "vault": vault_state.model_dump(),

@@ -4,6 +4,9 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from agent.data.storage import save_parquet
 
+# All APY columns are stored in decimal form: 0.05 means 5% annualized.
+# DeFiLlama /chart/{pool_id} returns apy as percent (e.g. 6.62 → 6.62%).
+# We divide by 100 before saving so that parquet and live gather/ use the same convention.
 POOL_IDS = {
     "susde":     "66985a81-9c51-46ca-9977-42b4fe7bc6df",  # Ethena sUSDe, Ethereum
     "aave_usdc": "32cb38a5-b9b9-441a-bf07-8fab47b999d3",  # Aave V3 USDC Mantle
@@ -35,6 +38,10 @@ async def fetch_yields() -> None:
                     "apyReward": "apy_reward",
                     "tvlUsd": "tvl_usd",
                 })
+                # Convert percent → decimal (DeFiLlama returns e.g. 6.62 for 6.62%)
+                for col in ["apy", "apy_base", "apy_reward"]:
+                    if col in df.columns:
+                        df[col] = df[col] / 100
                 cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=90)
                 df = df[df["timestamp"] >= cutoff]
                 df = df[["timestamp", "apy", "apy_base", "apy_reward", "tvl_usd"]]
