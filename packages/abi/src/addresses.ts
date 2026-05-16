@@ -1,0 +1,16 @@
+export const ADDRESSES = {
+  mantleMainnet: {
+    chainId: 5000,
+    vault: "0x0000000000000000000000000000000000000000" as `0x${string}`,
+    decisionLog: "0x0000000000000000000000000000000000000000" as `0x${string}`,
+    reputationOracle: "0x0000000000000000000000000000000000000000" as `0x${string}`,
+    erc8004Registry: "0x8004BAa17C0000000000000000000000000000000" as `0x${string}`,
+  },
+  mantleSepolia: {
+    chainId: 5003,
+    vault: "0x0000000000000000000000000000000000000000" as `0x${string}`,
+    decisionLog: "0x0000000000000000000000000000000000000000" as `0x${string}`,
+    reputationOracle: "0x0000000000000000000000000000000000000000" as `0x${string}`,
+    erc8004Registry: "0x0000000000000000000000000000000000000000" as `0x${string}`,
+  },
+} as const;
