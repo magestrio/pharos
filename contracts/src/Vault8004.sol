@@ -1,56 +1,92 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {ERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IStrategyAdapter} from "./adapters/IStrategyAdapter.sol";
 
-contract Vault8004 is Ownable, Pausable {
+contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    struct AllocationCall {
-        address adapter;
-        bytes data;
+    // NOTE: ERC4626 already exposes asset() → address. We do NOT redeclare
+    // `IERC20 public immutable asset` here — that would generate a getter with a
+    // mismatched return type (IERC20 vs address) and fail to compile.
+    // Use IERC20(asset()) wherever the token reference is needed internally.
+
+    address public agent;
+    address public currentStrategy;
+    mapping(address => bool) public whitelistedStrategies;
+    uint256 public totalAllocated;
+
+    event AgentSet(address indexed agent);
+    event StrategyWhitelisted(address indexed strategy, bool status);
+    event StrategyChanged(address indexed oldStrategy, address indexed newStrategy);
+    event Allocated(address indexed strategy, uint256 amount, bytes32 decisionId);
+    event Deallocated(address indexed strategy, uint256 amount, bytes32 decisionId);
+
+    modifier onlyAgent() {
+        require(msg.sender == agent, "not agent");
+        _;
     }
 
-    IERC20 public immutable asset;
-    mapping(address => bool) public whitelistedAdapters;
+    constructor(
+        IERC20 _asset,
+        address _owner,
+        string memory _name,
+        string memory _symbol
+    ) ERC4626(_asset) ERC20(_name, _symbol) Ownable(_owner) {}
 
-    event Deposited(address indexed user, uint256 amount);
-    event Withdrawn(address indexed user, uint256 amount);
-    event AllocationExecuted(bytes32 indexed decisionId, uint256 callCount);
-    event AdapterWhitelisted(address indexed adapter, bool status);
+    // ─── ERC-4626 overrides ──────────────────────────────────────────────────
 
-    constructor(address _asset, address _owner) Ownable(_owner) {
-        asset = IERC20(_asset);
+    function totalAssets() public view override returns (uint256) {
+        uint256 strategyBal = currentStrategy != address(0)
+            ? IStrategyAdapter(currentStrategy).balance()
+            : 0;
+        return IERC20(asset()).balanceOf(address(this)) + strategyBal;
     }
 
-    function deposit(uint256 amount) external whenNotPaused {
-        asset.safeTransferFrom(msg.sender, address(this), amount);
-        emit Deposited(msg.sender, amount);
+    // Pause + reentrancy guard applied at the internal hook level so all four
+    // public entry points (deposit/mint/withdraw/redeem) inherit the protection.
+    function _deposit(address caller, address receiver, uint256 assets, uint256 shares)
+        internal
+        override
+        whenNotPaused
+        nonReentrant
+    {
+        super._deposit(caller, receiver, assets, shares);
     }
 
-    function withdraw(uint256 amount) external onlyOwner {
-        asset.safeTransfer(msg.sender, amount);
-        emit Withdrawn(msg.sender, amount);
+    function _withdraw(address caller, address receiver, address owner, uint256 assets, uint256 shares)
+        internal
+        override
+        whenNotPaused
+        nonReentrant
+    {
+        super._withdraw(caller, receiver, owner, assets, shares);
     }
 
-    function executeAllocation(
-        bytes32 decisionId,
-        AllocationCall[] calldata calls
-    ) external onlyOwner whenNotPaused {
-        for (uint256 i = 0; i < calls.length; i++) {
-            require(whitelistedAdapters[calls[i].adapter], "adapter not whitelisted");
-            IStrategyAdapter(calls[i].adapter).execute(calls[i].data);
-        }
-        emit AllocationExecuted(decisionId, calls.length);
+    // ─── Owner-only ──────────────────────────────────────────────────────────
+
+    function setAgent(address _agent) external onlyOwner {
+        agent = _agent;
+        emit AgentSet(_agent);
     }
 
-    function setAdapterWhitelist(address adapter, bool status) external onlyOwner {
-        whitelistedAdapters[adapter] = status;
-        emit AdapterWhitelisted(adapter, status);
+    function whitelistStrategy(address strategy, bool status) external onlyOwner {
+        whitelistedStrategies[strategy] = status;
+        emit StrategyWhitelisted(strategy, status);
+    }
+
+    function setCurrentStrategy(address strategy) external onlyOwner {
+        require(whitelistedStrategies[strategy], "not whitelisted");
+        address old = currentStrategy;
+        currentStrategy = strategy;
+        emit StrategyChanged(old, strategy);
     }
 
     function pause() external onlyOwner {
@@ -61,7 +97,34 @@ contract Vault8004 is Ownable, Pausable {
         _unpause();
     }
 
-    function totalAssets() external view returns (uint256) {
-        return asset.balanceOf(address(this));
+    function emergencyWithdraw(address strategy) external onlyOwner {
+        uint256 bal = IStrategyAdapter(strategy).balance();
+        if (bal > 0) {
+            IStrategyAdapter(strategy).withdraw(bal);
+        }
+        if (strategy == currentStrategy) {
+            totalAllocated = 0;
+        }
+        emit Deallocated(strategy, bal, bytes32(0));
+    }
+
+    // ─── Agent-only ──────────────────────────────────────────────────────────
+
+    function allocate(bytes32 decisionId, uint256 amount) external onlyAgent whenNotPaused nonReentrant {
+        require(currentStrategy != address(0), "no strategy");
+        uint256 free = IERC20(asset()).balanceOf(address(this)) - totalAllocated;
+        require(amount <= free, "insufficient free cash");
+        IERC20(asset()).forceApprove(currentStrategy, amount);
+        IStrategyAdapter(currentStrategy).deposit(amount);
+        totalAllocated += amount;
+        emit Allocated(currentStrategy, amount, decisionId);
+    }
+
+    function deallocate(bytes32 decisionId, uint256 amount) external onlyAgent whenNotPaused nonReentrant {
+        require(currentStrategy != address(0), "no strategy");
+        IStrategyAdapter(currentStrategy).withdraw(amount);
+        require(totalAllocated >= amount, "underflow");
+        totalAllocated -= amount;
+        emit Deallocated(currentStrategy, amount, decisionId);
     }
 }
