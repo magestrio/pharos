@@ -36,8 +36,12 @@ address constant LB_ROUTER = 0x013e138EF6008ae5FDFDE29700e3f2Bc61d21E3a;
 contract Deploy is Script {
     function run() external {
         address deployer = vm.envAddress("DEPLOYER_ADDRESS");
+        address safeOwner = vm.envAddress("SAFE_OWNER");
         address registry8004 = vm.envOr("REGISTRY_8004", address(0));
         uint256 agentId = vm.envOr("AGENT_ID", uint256(1));
+
+        console.log("DEPLOYER_ADDRESS:   ", deployer);
+        console.log("SAFE_OWNER:         ", safeOwner);
 
         vm.startBroadcast();
 
@@ -94,6 +98,13 @@ contract Deploy is Script {
 
         // Agent placeholder — update to AI agent address before mainnet
         vault.setAgent(deployer);
+
+        // Transfer ownership to Gnosis Safe (2-of-3) — must be LAST
+        // after whitelistStrategy / setCurrentStrategy / setAgent, otherwise
+        // those setup calls would require 2/3 Safe signatures.
+        vault.transferOwnership(safeOwner);
+        decisionLog.transferOwnership(safeOwner);
+        console.log("Ownership transferred to Safe:", safeOwner);
 
         vm.stopBroadcast();
     }
