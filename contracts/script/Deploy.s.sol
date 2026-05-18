@@ -10,6 +10,9 @@ import {MerchantMoeAdapter} from "../src/adapters/MerchantMoeAdapter.sol";
 import {LendleAdapter} from "../src/adapters/LendleAdapter.sol";
 import {MethProtocolAdapter} from "../src/adapters/MethProtocolAdapter.sol";
 import {EthenaAdapter} from "../src/adapters/EthenaAdapter.sol";
+import {AaveV3WethAdapter} from "../src/adapters/AaveV3WethAdapter.sol";
+import {AaveV3UsdcAdapter} from "../src/adapters/AaveV3UsdcAdapter.sol";
+import {MerchantMoeRouter} from "../src/adapters/MerchantMoeRouter.sol";
 
 // Mantle Mainnet addresses (verified via bgd-labs/aave-address-book)
 address constant WETH  = 0xdEAddEaDdeadDEadDEADDEAddEADDEAddead1111;
@@ -35,7 +38,6 @@ contract Deploy is Script {
         address deployer = vm.envAddress("DEPLOYER_ADDRESS");
         address registry8004 = vm.envOr("REGISTRY_8004", address(0));
         uint256 agentId = vm.envOr("AGENT_ID", uint256(1));
-        uint256 initialDeposit = vm.envOr("INITIAL_DEPOSIT", uint256(1e6));
 
         vm.startBroadcast();
 
@@ -47,7 +49,7 @@ contract Deploy is Script {
         console.log("DecisionLog:        ", address(decisionLog));
 
         ReputationOracle oracle = new ReputationOracle(
-            address(vault), registry8004, agentId, initialDeposit
+            address(vault), registry8004, agentId
         );
         console.log("ReputationOracle:   ", address(oracle));
 
@@ -63,14 +65,32 @@ contract Deploy is Script {
         EthenaAdapter ethenaAdapter = new EthenaAdapter(address(vault));
         console.log("EthenaAdapter:      ", address(ethenaAdapter));
 
-        // Whitelist adapters
+        // Whitelist legacy stub adapters
         vault.whitelistStrategy(address(mmAdapter), true);
         vault.whitelistStrategy(address(lendleAdapter), true);
         vault.whitelistStrategy(address(methAdapter), true);
         vault.whitelistStrategy(address(ethenaAdapter), true);
 
-        // Default strategy — mETH Protocol staking (change before mainnet)
-        vault.setCurrentStrategy(address(methAdapter));
+        // Deploy real adapters
+        MerchantMoeRouter moeRouter = new MerchantMoeRouter(LB_ROUTER, WETH, USDC, deployer);
+        console.log("MoeRouter:          ", address(moeRouter));
+
+        AaveV3WethAdapter wethAdapter = new AaveV3WethAdapter(
+            AAVE_POOL, WETH, AWETH, address(vault), deployer
+        );
+        console.log("WethAdapter:        ", address(wethAdapter));
+
+        AaveV3UsdcAdapter usdcAdapter = new AaveV3UsdcAdapter(
+            AAVE_POOL, USDC, AUSDC, address(vault), deployer
+        );
+        console.log("UsdcAdapter:        ", address(usdcAdapter));
+
+        // Whitelist real adapters
+        vault.whitelistStrategy(address(wethAdapter), true);
+        vault.whitelistStrategy(address(usdcAdapter), true);
+
+        // Default strategy — Aave V3 WETH supply
+        vault.setCurrentStrategy(address(wethAdapter));
 
         // Agent placeholder — update to AI agent address before mainnet
         vault.setAgent(deployer);
