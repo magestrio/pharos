@@ -296,6 +296,73 @@ contract Vault8004Test is Test {
         assertEq(meth.balanceOf(address(vault)), 1000 ether);
     }
 
+    function test_Deallocate_OnlyAgent() public {
+        _setupStrategy();
+        _depositAs(user, 100 ether);
+        vm.prank(agent);
+        vault.allocate(bytes32(uint256(1)), 100 ether);
+
+        vm.expectRevert("not agent");
+        vm.prank(user);
+        vault.deallocate(bytes32(uint256(2)), 50 ether);
+    }
+
+    function test_Pause_OnlyOwner() public {
+        vm.expectRevert();
+        vm.prank(user);
+        vault.pause();
+    }
+
+    function test_Unpause_OnlyOwner() public {
+        vm.prank(owner);
+        vault.pause();
+
+        vm.expectRevert();
+        vm.prank(user);
+        vault.unpause();
+    }
+
+    function test_SetCurrentStrategy_OnlyOwner() public {
+        vm.prank(owner);
+        vault.whitelistStrategy(address(strategy), true);
+
+        vm.expectRevert();
+        vm.prank(user);
+        vault.setCurrentStrategy(address(strategy));
+    }
+
+    function test_EmergencyWithdraw_OnlyOwner() public {
+        _setupStrategy();
+        vm.expectRevert();
+        vm.prank(user);
+        vault.emergencyWithdraw(address(strategy));
+    }
+
+    function test_Paused_BlocksWithdraw() public {
+        _depositAs(user, 100 ether);
+
+        vm.prank(owner);
+        vault.pause();
+
+        vm.expectRevert();
+        vm.prank(user);
+        vault.withdraw(50 ether, user, user);
+    }
+
+    function test_Paused_BlocksDeallocate() public {
+        _setupStrategy();
+        _depositAs(user, 100 ether);
+        vm.prank(agent);
+        vault.allocate(bytes32(uint256(1)), 100 ether);
+
+        vm.prank(owner);
+        vault.pause();
+
+        vm.expectRevert();
+        vm.prank(agent);
+        vault.deallocate(bytes32(uint256(2)), 50 ether);
+    }
+
     function test_EmergencyWithdraw_PullsFromStrategy() public {
         _setupStrategy();
         _depositAs(user, 1000 ether);
