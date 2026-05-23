@@ -11,6 +11,17 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import {IStrategyAdapter} from "./adapters/IStrategyAdapter.sol";
 
+/// @notice Chainlink-style L2 Sequencer Uptime Feed minimal surface.
+interface IAggregatorV3 {
+    function latestRoundData() external view returns (
+        uint80 roundId,
+        int256 answer,
+        uint256 startedAt,
+        uint256 updatedAt,
+        uint80 answeredInRound
+    );
+}
+
 contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using EnumerableSet for EnumerableSet.AddressSet;
@@ -22,6 +33,14 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
         AllocationCallKind kind;
         uint256 amount;
     }
+
+    /// @notice Grace period after a sequencer restart during which oracle prices
+    ///         may still be stale and `totalAssets()` will revert.
+    uint256 public constant SEQUENCER_GRACE_PERIOD = 1 hours;
+
+    /// @notice Chainlink L2 Sequencer Uptime Feed. Zero address disables the check
+    ///         (used when no feed is available on the target L2 yet).
+    address public immutable sequencerUptimeFeed;
 
     address public agent;
     EnumerableSet.AddressSet private _whitelisted;
@@ -48,18 +67,50 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
         IERC20 _asset,
         address _owner,
         string memory _name,
-        string memory _symbol
-    ) ERC4626(_asset) ERC20(_name, _symbol) Ownable(_owner) {}
+        string memory _symbol,
+        address _sequencerUptimeFeed
+    ) ERC4626(_asset) ERC20(_name, _symbol) Ownable(_owner) {
+        sequencerUptimeFeed = _sequencerUptimeFeed;
+    }
 
     // ─── ERC-4626 overrides ──────────────────────────────────────────────────
 
+    /// @notice Total assets under management priced in the vault's base asset.
+    /// @dev Sums `valueInBaseAsset()` across every whitelisted adapter plus the
+    ///      free balance held directly by the vault.
+    ///
+    ///      Fail-loud semantics: if ANY adapter's `valueInBaseAsset()` reverts
+    ///      (e.g. its oracle is stale per the rules in IStrategyAdapter), the
+    ///      entire call reverts. This blocks all ERC-4626 entry points
+    ///      (deposit/mint/withdraw/redeem) until the offending adapter is
+    ///      de-whitelisted via `whitelistStrategy(adapter, false)`. This is
+    ///      intentional — silently undervaluing a position would dilute existing
+    ///      depositors. Operator procedure during a degraded oracle:
+    ///        1. `pause()` the vault to halt deposits;
+    ///        2. de-whitelist the broken adapter;
+    ///        3. resume.
+    ///      Owner can also exit funds via `emergencyWithdraw(adapter)` which
+    ///      bypasses `totalAssets()`.
     function totalAssets() public view override returns (uint256) {
+        _checkSequencer();
         uint256 sum = IERC20(asset()).balanceOf(address(this));
         uint256 n = _whitelisted.length();
         for (uint256 i = 0; i < n; ++i) {
             sum += IStrategyAdapter(_whitelisted.at(i)).valueInBaseAsset();
         }
         return sum;
+    }
+
+    /// @dev Reverts if the configured L2 sequencer is down or has restarted
+    ///      within `SEQUENCER_GRACE_PERIOD` (oracle prices likely stale during
+    ///      the grace window). No-op if `sequencerUptimeFeed` is unset.
+    function _checkSequencer() internal view {
+        if (sequencerUptimeFeed == address(0)) return;
+        (, int256 answer, uint256 startedAt, , ) =
+            IAggregatorV3(sequencerUptimeFeed).latestRoundData();
+        // Chainlink L2 sequencer feeds report answer = 0 when up, 1 when down.
+        require(answer == 0, "sequencer down");
+        require(block.timestamp - startedAt >= SEQUENCER_GRACE_PERIOD, "sequencer grace");
     }
 
     // Pause + reentrancy guard applied at the internal hook level so all four

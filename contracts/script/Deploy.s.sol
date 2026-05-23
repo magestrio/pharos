@@ -53,7 +53,14 @@ contract Deploy is Script {
 
         vm.startBroadcast();
 
-        Vault8004 vault = new Vault8004(IERC20(WETH), deployer, "Vault8004 WETH", "v8004-WETH");
+        // Chainlink L2 Sequencer Uptime Feed on Mantle — set via SEQUENCER_FEED env.
+        // Pass address(0) to disable the check (default until feed address is verified).
+        // See notes/addresses.md — research pending.
+        address sequencerFeed = vm.envOr("SEQUENCER_FEED", address(0));
+
+        Vault8004 vault = new Vault8004(
+            IERC20(WETH), deployer, "Vault8004 WETH", "v8004-WETH", sequencerFeed
+        );
         console.log("Vault8004:          ", address(vault));
         console.log("asset (WETH):       ", address(vault.asset()));
 
