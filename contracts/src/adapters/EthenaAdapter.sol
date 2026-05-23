@@ -16,8 +16,9 @@ contract EthenaAdapter is IStrategyAdapter {
         // stub: stake sUSDe via Ethena
     }
 
-    function withdraw(uint256 /*amount*/) external override {
+    function withdraw(uint256 /*amount*/) external override returns (uint256) {
         // stub: unstake sUSDe via Ethena
+        return 0;
     }
 
     function balance() external pure override returns (uint256) {

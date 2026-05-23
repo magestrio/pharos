@@ -23,8 +23,39 @@ contract MockStrategy is IStrategyAdapter {
         _asset.transferFrom(msg.sender, address(this), amount);
     }
 
-    function withdraw(uint256 amount) external override {
+    function withdraw(uint256 amount) external override returns (uint256) {
         _asset.transfer(msg.sender, amount);
+        return amount;
+    }
+
+    function balance() external view override returns (uint256) {
+        return _asset.balanceOf(address(this));
+    }
+
+    function asset() external view override returns (address) {
+        return address(_asset);
+    }
+}
+
+/// @notice Simulates Aave-style 1 wei round-down on deposit. balance() always
+/// reports `depositAmount - 1`. Used to verify Vault8004.deallocate clamps the
+/// requested amount to adapter.balance() instead of reverting.
+contract RoundingDownStrategy is IStrategyAdapter {
+    IERC20 private immutable _asset;
+    address constant BURN = address(0xdEaD);
+
+    constructor(address asset_) {
+        _asset = IERC20(asset_);
+    }
+
+    function deposit(uint256 amount) external override {
+        _asset.transferFrom(msg.sender, address(this), amount);
+        _asset.transfer(BURN, 1);
+    }
+
+    function withdraw(uint256 amount) external override returns (uint256) {
+        _asset.transfer(msg.sender, amount);
+        return amount;
     }
 
     function balance() external view override returns (uint256) {
@@ -195,6 +226,74 @@ contract Vault8004Test is Test {
         vm.expectRevert();
         vm.prank(agent);
         vault.allocate(bytes32(0), 500 ether);
+    }
+
+    function test_Deallocate_ClampsToAdapterBalance() public {
+        // Strategy loses 1 wei to rounding on deposit (Aave-style aToken minting).
+        RoundingDownStrategy lossy = new RoundingDownStrategy(address(meth));
+        vm.startPrank(owner);
+        vault.whitelistStrategy(address(lossy), true);
+        vault.setCurrentStrategy(address(lossy));
+        vault.setAgent(agent);
+        vm.stopPrank();
+
+        _depositAs(user, 1000 ether);
+
+        vm.prank(agent);
+        vault.allocate(bytes32(uint256(1)), 600 ether);
+
+        // balance() now reports 600 ether - 1 due to rounding burn.
+        assertEq(lossy.balance(), 600 ether - 1);
+        assertEq(vault.totalAllocated(), 600 ether);
+
+        // Agent tries to pull the full original deposit amount — without clamping
+        // this would revert. With clamping, the vault pulls what the adapter holds.
+        vm.prank(agent);
+        vault.deallocate(bytes32(uint256(2)), 600 ether);
+
+        // Full exit: adapter empty → totalAllocated zeroed (no phantom debt).
+        assertEq(lossy.balance(), 0);
+        assertEq(vault.totalAllocated(), 0);
+        assertEq(meth.balanceOf(address(vault)), 1000 ether - 1);
+    }
+
+    function test_Deallocate_HandlesAccruedInterest() public {
+        _setupStrategy();
+        _depositAs(user, 1000 ether);
+
+        vm.prank(agent);
+        vault.allocate(bytes32(uint256(1)), 600 ether);
+
+        // Simulate yield: extra 50 mETH appears in strategy (Aave interest).
+        meth.mint(address(strategy), 50 ether);
+        assertEq(strategy.balance(), 650 ether);
+        assertEq(vault.totalAllocated(), 600 ether);
+
+        // Agent pulls the full balance (more than totalAllocated).
+        vm.prank(agent);
+        vault.deallocate(bytes32(uint256(2)), 650 ether);
+
+        // Vault receives the yield; bookkeeping zeroed correctly (no underflow).
+        assertEq(strategy.balance(), 0);
+        assertEq(vault.totalAllocated(), 0);
+        assertEq(meth.balanceOf(address(vault)), 1050 ether);
+    }
+
+    function test_Deallocate_OverRequestClampsWithoutRevert() public {
+        // Agent requests more than the strategy holds at all — clamp should pull
+        // whatever's available rather than reverting.
+        _setupStrategy();
+        _depositAs(user, 1000 ether);
+
+        vm.prank(agent);
+        vault.allocate(bytes32(uint256(1)), 400 ether);
+
+        vm.prank(agent);
+        vault.deallocate(bytes32(uint256(2)), 999 ether);
+
+        assertEq(strategy.balance(), 0);
+        assertEq(vault.totalAllocated(), 0);
+        assertEq(meth.balanceOf(address(vault)), 1000 ether);
     }
 
     function test_EmergencyWithdraw_PullsFromStrategy() public {

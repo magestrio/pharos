@@ -15,8 +15,9 @@ contract LendleAdapter is IStrategyAdapter {
         // stub: supply mETH on Lendle
     }
 
-    function withdraw(uint256 /*amount*/) external override {
+    function withdraw(uint256 /*amount*/) external override returns (uint256) {
         // stub: withdraw mETH from Lendle
+        return 0;
     }
 
     function balance() external pure override returns (uint256) {

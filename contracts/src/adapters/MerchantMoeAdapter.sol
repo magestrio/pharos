@@ -15,8 +15,9 @@ contract MerchantMoeAdapter is IStrategyAdapter {
         // stub: interact with Merchant Moe mETH/cmETH pools
     }
 
-    function withdraw(uint256 /*amount*/) external override {
+    function withdraw(uint256 /*amount*/) external override returns (uint256) {
         // stub: exit Merchant Moe position
+        return 0;
     }
 
     function balance() external pure override returns (uint256) {

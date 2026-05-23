@@ -39,9 +39,10 @@ contract AaveV3WethAdapter is IStrategyAdapter, Ownable {
         aavePool.supply(address(weth), amount, address(this), 0);
     }
 
-    function withdraw(uint256 amount) external onlyVault {
+    function withdraw(uint256 amount) external onlyVault returns (uint256) {
         uint256 received = aavePool.withdraw(address(weth), amount, address(this));
         weth.safeTransfer(vault, received);
+        return received;
     }
 
     function balance() external view returns (uint256) {

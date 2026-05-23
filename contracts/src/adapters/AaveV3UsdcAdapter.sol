@@ -39,9 +39,10 @@ contract AaveV3UsdcAdapter is IStrategyAdapter, Ownable {
         aavePool.supply(address(usdc), amount, address(this), 0);
     }
 
-    function withdraw(uint256 amount) external onlyVault {
+    function withdraw(uint256 amount) external onlyVault returns (uint256) {
         uint256 received = aavePool.withdraw(address(usdc), amount, address(this));
         usdc.safeTransfer(vault, received);
+        return received;
     }
 
     function balance() external view returns (uint256) {

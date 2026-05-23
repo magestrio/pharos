@@ -15,8 +15,9 @@ contract MethProtocolAdapter is IStrategyAdapter {
         // stub: stake mETH via mETH Protocol
     }
 
-    function withdraw(uint256 /*amount*/) external override {
+    function withdraw(uint256 /*amount*/) external override returns (uint256) {
         // stub: unstake mETH via mETH Protocol
+        return 0;
     }
 
     function balance() external pure override returns (uint256) {

@@ -99,13 +99,14 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
 
     function emergencyWithdraw(address strategy) external onlyOwner {
         uint256 bal = IStrategyAdapter(strategy).balance();
+        uint256 received;
         if (bal > 0) {
-            IStrategyAdapter(strategy).withdraw(bal);
+            received = IStrategyAdapter(strategy).withdraw(bal);
         }
         if (strategy == currentStrategy) {
             totalAllocated = 0;
         }
-        emit Deallocated(strategy, bal, bytes32(0));
+        emit Deallocated(strategy, received, bytes32(0));
     }
 
     // ─── Agent-only ──────────────────────────────────────────────────────────
@@ -122,9 +123,21 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
 
     function deallocate(bytes32 decisionId, uint256 amount) external onlyAgent whenNotPaused nonReentrant {
         require(currentStrategy != address(0), "no strategy");
-        IStrategyAdapter(currentStrategy).withdraw(amount);
-        require(totalAllocated >= amount, "underflow");
-        totalAllocated -= amount;
-        emit Deallocated(currentStrategy, amount, decisionId);
+        // Clamp requested amount to the adapter's actual balance. Some protocols
+        // (Aave V3, sUSDe stake-via-router) round aToken/share minting down by 1 wei
+        // on deposit, so withdrawing the original deposit amount would revert.
+        // Also: accrued interest can push balance above totalAllocated — clamping
+        // here keeps totalAllocated bookkeeping consistent with what was withdrawn.
+        uint256 bal = IStrategyAdapter(currentStrategy).balance();
+        if (amount > bal) amount = bal;
+        uint256 received = IStrategyAdapter(currentStrategy).withdraw(amount);
+        if (IStrategyAdapter(currentStrategy).balance() == 0) {
+            // Full exit — zero out bookkeeping regardless of rounding losses or
+            // accrued interest, since the strategy holds nothing on our behalf.
+            totalAllocated = 0;
+        } else {
+            totalAllocated = received >= totalAllocated ? 0 : totalAllocated - received;
+        }
+        emit Deallocated(currentStrategy, received, decisionId);
     }
 }
