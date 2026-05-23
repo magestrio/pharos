@@ -13,16 +13,20 @@ pragma solidity 0.8.24;
 ///              `LBRouter.getSwapOut()`, `Pair.getReserves()`, or any analog as
 ///              a price source. Allowed: Chainlink-style feeds, Aave Oracle,
 ///              or TWAPs with a minimum observation window.
-///           2. `valueInBaseAsset()` MUST revert if its oracle data is stale
-///              (heartbeat exceeded or sequencer-uptime feed reports downtime).
-///              Returning a possibly-wrong value is worse than reverting; the
-///              vault's `totalAssets()` and ERC-4626 share price depend on it.
-///           3. `valueInBaseAsset()` MAY return 0 only when the underlying
-///              position is genuinely 0. It MUST NOT return 0 to mask oracle
-///              failures.
+///           2. Liveness — if the oracle source exposes a timestamp,
+///              `valueInBaseAsset()` MUST revert on stale data
+///              (heartbeat exceeded). Where no on-chain timestamp is exposed
+///              (e.g. some L2 Aave Oracle proxies on Mantle), the
+///              implementation MUST document the fallback: typically the
+///              vault-level Chainlink L2 Sequencer Uptime Feed
+///              (`Vault8004.sequencerUptimeFeed`) plus the source protocol's
+///              own economic incentive to maintain feed liveness.
+///           3. `valueInBaseAsset()` MUST revert on `answer <= 0`. It MAY
+///              return 0 only when the underlying position is genuinely 0.
+///              It MUST NOT return 0 to mask oracle failures.
 ///           4. The chosen oracle source MUST be documented in the
-///              implementation's NatSpec, including the feed address(es) and
-///              the staleness threshold used.
+///              implementation's NatSpec, including feed address(es) and the
+///              staleness check (or its documented absence).
 interface IStrategyAdapter {
     /// @notice Deposit `amount` of `asset()` into the underlying strategy.
     function deposit(uint256 amount) external;

@@ -44,10 +44,15 @@ contract AaveV3UsdcAdapterTest is Test {
         pool  = new MockAavePool();
         pool.setAToken(address(usdc), address(aUsdc));
 
+        // Unit test exercises deposit/withdraw/balance only; valueInBaseAsset()
+        // is covered by the fork test against the real Aave Oracle. Passing
+        // address(0) for oracle + weth keeps this suite hermetic.
         adapter = new AaveV3UsdcAdapter(
             address(pool),
+            address(0),       // aaveOracle (unused in this suite)
             address(usdc),
             address(aUsdc),
+            address(0),       // weth (unused in this suite)
             vault,
             owner
         );

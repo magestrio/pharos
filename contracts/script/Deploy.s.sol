@@ -12,6 +12,7 @@ import {MethProtocolAdapter} from "../src/adapters/MethProtocolAdapter.sol";
 import {EthenaAdapter} from "../src/adapters/EthenaAdapter.sol";
 import {AaveV3WethAdapter} from "../src/adapters/AaveV3WethAdapter.sol";
 import {AaveV3UsdcAdapter} from "../src/adapters/AaveV3UsdcAdapter.sol";
+import {AaveV3SusdeAdapter} from "../src/adapters/AaveV3SusdeAdapter.sol";
 import {MerchantMoeRouter} from "../src/adapters/MerchantMoeRouter.sol";
 
 // Mantle Mainnet addresses (verified via bgd-labs/aave-address-book)
@@ -26,6 +27,7 @@ address constant USDE  = 0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34;
 address constant AAVE_POOL                    = 0x458F293454fE0d67EC0655f3672301301DD51422;
 address constant AAVE_POOL_ADDRESSES_PROVIDER = 0xba50Cd2A20f6DA35D788639E581bca8d0B5d4D5f;
 address constant AAVE_DATA_PROVIDER           = 0x487c5c669D9eee6057C44973207101276cf73b68;
+address constant AAVE_ORACLE                  = 0x47a063CfDa980532267970d478EC340C0F80E8df;
 address constant AWETH                        = 0xeAC30Ed8609F564aE65C809C4bf42dB2fF426D2C;
 address constant AUSDC                        = 0xcb8164415274515867ec43CbD284ab5d6d2b304F;
 address constant ASUSDE                       = 0xaf972F332FF79bd32A6CB6B54f903eA0F9b16C2a;
@@ -98,13 +100,19 @@ contract Deploy is Script {
         console.log("WethAdapter:        ", address(wethAdapter));
 
         AaveV3UsdcAdapter usdcAdapter = new AaveV3UsdcAdapter(
-            AAVE_POOL, USDC, AUSDC, address(vault), deployer
+            AAVE_POOL, AAVE_ORACLE, USDC, AUSDC, WETH, address(vault), deployer
         );
         console.log("UsdcAdapter:        ", address(usdcAdapter));
+
+        AaveV3SusdeAdapter susdeAdapter = new AaveV3SusdeAdapter(
+            AAVE_POOL, AAVE_ORACLE, SUSDE, ASUSDE, WETH, address(vault), deployer
+        );
+        console.log("SusdeAdapter:       ", address(susdeAdapter));
 
         // Whitelist real adapters
         vault.whitelistStrategy(address(wethAdapter), true);
         vault.whitelistStrategy(address(usdcAdapter), true);
+        vault.whitelistStrategy(address(susdeAdapter), true);
 
         vault.setAgent(agentAddress);
         decisionLog.setAgent(agentAddress);
@@ -125,6 +133,7 @@ contract Deploy is Script {
         console.log("ReputationOracle:    %s", address(oracle));
         console.log("AaveV3WethAdapter:   %s", address(wethAdapter));
         console.log("AaveV3UsdcAdapter:   %s", address(usdcAdapter));
+        console.log("AaveV3SusdeAdapter:  %s", address(susdeAdapter));
         console.log("MerchantMoeRouter:   %s", address(moeRouter));
         console.log("MerchantMoeAdapter:  %s (stub, not whitelisted)", address(mmAdapter));
         console.log("LendleAdapter:       %s (stub, not whitelisted)", address(lendleAdapter));
