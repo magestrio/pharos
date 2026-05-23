@@ -38,5 +38,13 @@ class OracleSettings(BaseSettings):
     BYBIT_BASE_URL: str = "https://api.bybit.com"
     BYBIT_RECV_WINDOW: int = 5000
 
+    # Mantle on-chain signer (BybitAttestor.confirmDeposit / confirmWithdraw /
+    # updateBalance). Empty key by default so listener boots in observe-only
+    # mode; ChainWriter.from_settings raises if absent at call time.
+    MANTLE_ATTESTOR_PRIVATE_KEY: SecretStr = SecretStr("")
+    MANTLE_CHAIN_ID: int = 5000
+    MANTLE_TX_RECEIPT_TIMEOUT: int = 120
+    MANTLE_GAS_BUFFER: float = 1.2
+
 
 settings = OracleSettings()
