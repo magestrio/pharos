@@ -42,11 +42,26 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
     ///         (used when no feed is available on the target L2 yet).
     address public immutable sequencerUptimeFeed;
 
+    /// @notice Owner-set cap on total slippage per `executeAllocation`. Basis
+    ///         points of `totalAssets()` measured before vs. after the batch.
+    ///         Default 100 (1%). Protects against compromised-agent scenarios
+    ///         even when the agent passes `minTotalAssetsAfter = 0`.
+    uint16 public maxSlippageBps;
+
+    /// @notice Owner-set cap on slippage of any single call within a batch,
+    ///         measured against `totalAssets()` immediately before that call.
+    ///         Default 100 (1%). Catches a single bad-oracle adapter even when
+    ///         the global cap would otherwise be satisfied by gains elsewhere
+    ///         in the batch.
+    uint16 public maxPerCallLossBps;
+
     address public agent;
     EnumerableSet.AddressSet private _whitelisted;
 
     event AgentSet(address indexed agent);
     event StrategyWhitelisted(address indexed strategy, bool status);
+    event MaxSlippageBpsSet(uint16 newValue);
+    event MaxPerCallLossBpsSet(uint16 newValue);
     event CallExecuted(
         bytes32 indexed decisionId,
         uint256 indexed callIndex,
@@ -71,6 +86,8 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
         address _sequencerUptimeFeed
     ) ERC4626(_asset) ERC20(_name, _symbol) Ownable(_owner) {
         sequencerUptimeFeed = _sequencerUptimeFeed;
+        maxSlippageBps      = 100; // 1%
+        maxPerCallLossBps   = 100; // 1%
     }
 
     // ─── ERC-4626 overrides ──────────────────────────────────────────────────
@@ -165,6 +182,18 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
         emit StrategyWhitelisted(strategy, status);
     }
 
+    function setMaxSlippageBps(uint16 newValue) external onlyOwner {
+        require(newValue <= 10000, "bps > max");
+        maxSlippageBps = newValue;
+        emit MaxSlippageBpsSet(newValue);
+    }
+
+    function setMaxPerCallLossBps(uint16 newValue) external onlyOwner {
+        require(newValue <= 10000, "bps > max");
+        maxPerCallLossBps = newValue;
+        emit MaxPerCallLossBpsSet(newValue);
+    }
+
     function pause() external onlyOwner {
         _pause();
     }
@@ -197,6 +226,9 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
     ) external nonReentrant whenNotPaused onlyAgent {
         require(calls.length > 0, "empty calls");
 
+        uint256 taBefore = totalAssets();
+        uint256 taPreCall = taBefore;
+
         for (uint256 i = 0; i < calls.length; ++i) {
             AllocationCall calldata c = calls[i];
             require(_whitelisted.contains(c.adapter), "not whitelisted");
@@ -211,10 +243,21 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
                 actual = IStrategyAdapter(c.adapter).withdraw(c.amount);
             }
             emit CallExecuted(decisionId, i, c.adapter, c.kind, c.amount, actual);
+
+            uint256 taPostCall = totalAssets();
+            if (taPreCall > 0) {
+                uint256 minPostCall = taPreCall * (10000 - maxPerCallLossBps) / 10000;
+                require(taPostCall >= minPostCall, "per-call loss");
+            }
+            taPreCall = taPostCall;
         }
 
-        uint256 ta = totalAssets();
-        require(ta >= minTotalAssetsAfter, "slippage");
-        emit AllocationExecuted(decisionId, ta);
+        uint256 taAfter = taPreCall; // == totalAssets() after the last call
+        if (taBefore > 0) {
+            uint256 minAfter = taBefore * (10000 - maxSlippageBps) / 10000;
+            require(taAfter >= minAfter, "max slippage");
+        }
+        require(taAfter >= minTotalAssetsAfter, "slippage");
+        emit AllocationExecuted(decisionId, taAfter);
     }
 }
