@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -28,6 +29,14 @@ class OracleSettings(BaseSettings):
     ORACLE_FROM_BLOCK: int = 0
 
     LOG_LEVEL: str = "INFO"
+
+    # Bybit V5 REST. Empty defaults so the listener-only process can boot
+    # without API credentials; the client raises if they're missing at call
+    # time. Switch BYBIT_BASE_URL to https://api-testnet.bybit.com for tests.
+    BYBIT_API_KEY: SecretStr = SecretStr("")
+    BYBIT_API_SECRET: SecretStr = SecretStr("")
+    BYBIT_BASE_URL: str = "https://api.bybit.com"
+    BYBIT_RECV_WINDOW: int = 5000
 
 
 settings = OracleSettings()
