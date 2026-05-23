@@ -8,7 +8,7 @@ import {CapitalManager} from "../src/CapitalManager.sol";
 import {IStrategyAdapter} from "../src/adapters/IStrategyAdapter.sol";
 
 contract SlipMockERC20 is ERC20 {
-    constructor() ERC20("Mock", "MOCK") {}
+    constructor() ERC20("Mock USDC", "mUSDC") {}
     function mint(address to, uint256 amount) external { _mint(to, amount); }
 }
 
@@ -75,26 +75,26 @@ contract CapitalManagerSlippageTest is Test {
     HonestAdapter honest;
     LossyAdapter lossy;
 
-    address owner = address(this);
-    address agent = address(0xCAFE);
-    address user  = address(0xBEEF);
+    address owner     = address(this);
+    address agent     = address(0xCAFE);
+    address vusdcRole = address(this);
+    address user      = address(0xBEEF);
 
     function setUp() public {
         token  = new SlipMockERC20();
-        vault  = new CapitalManager(IERC20(address(token)), owner, "V", "v", address(0));
+        vault  = new CapitalManager(IERC20(address(token)), owner, address(0));
         honest = new HonestAdapter(address(token));
         lossy  = new LossyAdapter(address(token), 2000); // 20% reported loss
 
         vault.whitelistStrategy(address(honest), true);
         vault.whitelistStrategy(address(lossy),  true);
         vault.setAgent(agent);
+        vault.setVusdc(vusdcRole);
 
-        // Seed the vault with 100 tokens (~user deposit).
-        token.mint(user, 100 ether);
-        vm.startPrank(user);
-        token.approve(address(vault), 100 ether);
-        vault.deposit(100 ether, user);
-        vm.stopPrank();
+        // Seed the vault with 100e6 USDC via recordDeposit.
+        token.mint(vusdcRole, 100e6);
+        token.approve(address(vault), 100e6);
+        vault.recordDeposit(100e6);
     }
 
     // ─── defaults ────────────────────────────────────────────────────────────
@@ -137,14 +137,14 @@ contract CapitalManagerSlippageTest is Test {
         calls[0] = CapitalManager.AllocationCall({
             adapter: address(honest),
             kind: CapitalManager.AllocationCallKind.Deposit,
-            amount: 50 ether
+            amount: 50e6
         });
 
         vm.prank(agent);
         vault.executeAllocation(bytes32(uint256(1)), calls, 0);
 
-        // No loss — totalAssets preserved (50 free + 50 in honest adapter).
-        assertEq(vault.totalAssets(), 100 ether);
+        // No loss — totalAssetsUsdc preserved (50 free + 50 in honest adapter).
+        assertEq(vault.totalAssetsUsdc(), 100e6);
     }
 
     // ─── per-call cap: lossy adapter is rejected by default 1% cap ──────────
@@ -154,10 +154,10 @@ contract CapitalManagerSlippageTest is Test {
         calls[0] = CapitalManager.AllocationCall({
             adapter: address(lossy),
             kind: CapitalManager.AllocationCallKind.Deposit,
-            amount: 50 ether
+            amount: 50e6
         });
 
-        // After deposit: 50 free + lossy reports 50*0.8 = 40 → totalAssets = 90.
+        // After deposit: 50 free + lossy reports 50*0.8 = 40 → totalAssetsUsdc = 90.
         // Loss = 10/100 = 1000 bps. Default cap is 100 bps. Reverts.
         vm.expectRevert("per-call loss");
         vm.prank(agent);
@@ -174,13 +174,13 @@ contract CapitalManagerSlippageTest is Test {
         calls[0] = CapitalManager.AllocationCall({
             adapter: address(lossy),
             kind: CapitalManager.AllocationCallKind.Deposit,
-            amount: 50 ether
+            amount: 50e6
         });
 
         vm.prank(agent);
         vault.executeAllocation(bytes32(uint256(1)), calls, 0);
 
-        assertEq(vault.totalAssets(), 90 ether);
+        assertEq(vault.totalAssetsUsdc(), 90e6);
     }
 
     // ─── global cap catches losses even when per-call cap is loose ──────────
@@ -193,7 +193,7 @@ contract CapitalManagerSlippageTest is Test {
         calls[0] = CapitalManager.AllocationCall({
             adapter: address(lossy),
             kind: CapitalManager.AllocationCallKind.Deposit,
-            amount: 50 ether
+            amount: 50e6
         });
 
         // Per-call: -10% (within 50% cap, passes). Global: -10% (exceeds 1% cap, fails).
@@ -212,36 +212,35 @@ contract CapitalManagerSlippageTest is Test {
         calls[0] = CapitalManager.AllocationCall({
             adapter: address(lossy),
             kind: CapitalManager.AllocationCallKind.Deposit,
-            amount: 50 ether
+            amount: 50e6
         });
 
         // Agent insists on no loss → reverts despite loose owner caps.
         vm.expectRevert("slippage");
         vm.prank(agent);
-        vault.executeAllocation(bytes32(uint256(1)), calls, 100 ether);
+        vault.executeAllocation(bytes32(uint256(1)), calls, 100e6);
     }
 
     // ─── empty-vault edge case: pre-call cap is skipped when taBefore == 0 ───
 
     function test_EmptyVault_FirstAllocation_DoesNotRevert() public {
-        // Drain the vault first so totalAssets = 0 before allocation.
-        vm.prank(user);
-        vault.withdraw(100 ether, user, user);
-        assertEq(vault.totalAssets(), 0);
+        // Drain the vault first so totalAssetsUsdc = 0 before allocation.
+        vault.recordWithdraw(100e6, user);
+        assertEq(vault.totalAssetsUsdc(), 0);
 
         // Re-seed tokens directly into the vault to give the deposit something to move.
-        token.mint(address(vault), 50 ether);
+        token.mint(address(vault), 50e6);
 
         CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
         calls[0] = CapitalManager.AllocationCall({
             adapter: address(honest),
             kind: CapitalManager.AllocationCallKind.Deposit,
-            amount: 50 ether
+            amount: 50e6
         });
 
         vm.prank(agent);
         vault.executeAllocation(bytes32(uint256(1)), calls, 0);
 
-        assertEq(vault.totalAssets(), 50 ether);
+        assertEq(vault.totalAssetsUsdc(), 50e6);
     }
 }

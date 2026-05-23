@@ -12,10 +12,8 @@ interface IMintable is IERC20 {
 }
 
 /// @notice Bounded fuzz handler for CapitalManager invariant tests under the
-/// multi-call execution architecture. Wraps every public mutating action in
-/// size + actor bounds so the fuzzer explores meaningful state instead of
-/// drowning in trivial reverts. Maintains ghost variables that downstream
-/// invariants assert against.
+/// post-vUSDC pivot: CapitalManager is a raw capital pool, not ERC-4626. The
+/// handler itself plays the role of vUSDC for recordDeposit/recordWithdraw.
 contract CapitalManagerHandler is Test {
     CapitalManager public immutable vault;
     IMintable public immutable token;
@@ -29,14 +27,10 @@ contract CapitalManagerHandler is Test {
     // ─── ghosts ──────────────────────────────────────────────────────────────
     uint256 public ghost_totalDeposits;
     uint256 public ghost_totalWithdrawals;
-    uint256 public ghost_totalYield;       // tokens minted directly into adapters
-    uint256 public ghost_anchorSharePrice; // share price right after first deposit
-    bool    public ghost_anchorSet;
-    bool    public ghost_sharePriceDecreased; // sticky: ever decreased between observations
-    uint256 public ghost_lastSharePrice;
+    uint256 public ghost_totalYield; // tokens minted directly into adapters
 
-    uint256 constant MAX_DEPOSIT = 1_000_000 ether;
-    uint256 constant MAX_YIELD   = 10_000 ether;
+    uint256 constant MAX_DEPOSIT = 1_000_000e6;
+    uint256 constant MAX_YIELD   = 10_000e6;
 
     constructor(
         CapitalManager _vault,
@@ -64,51 +58,30 @@ contract CapitalManagerHandler is Test {
         return seed % 2 == 0 ? adapterA : adapterB;
     }
 
-    /// @dev Observe share price and update ghost trackers. Called after every
-    /// state-mutating action so monotonicity violations are caught immediately.
-    function _observeSharePrice() internal {
-        if (vault.totalSupply() == 0) return;
-        uint256 cur = vault.convertToAssets(1 ether);
-
-        if (!ghost_anchorSet) {
-            ghost_anchorSharePrice = cur;
-            ghost_lastSharePrice = cur;
-            ghost_anchorSet = true;
-            return;
-        }
-        if (cur < ghost_lastSharePrice) {
-            ghost_sharePriceDecreased = true;
-        }
-        ghost_lastSharePrice = cur;
-    }
-
     // ─── actions ─────────────────────────────────────────────────────────────
 
-    function deposit(uint256 seed, uint256 amt) external {
+    /// @notice Simulates a vUSDC mint: this handler IS the vusdc role. Funds
+    /// itself and calls recordDeposit against the manager.
+    function deposit(uint256 /*seed*/, uint256 amt) external {
         amt = bound(amt, 1, MAX_DEPOSIT);
-        address u = _pickUser(seed);
-        token.mint(u, amt);
-        vm.startPrank(u);
+        token.mint(address(this), amt);
         token.approve(address(vault), amt);
-        vault.deposit(amt, u);
-        vm.stopPrank();
+        vault.recordDeposit(amt);
         ghost_totalDeposits += amt;
-        _observeSharePrice();
     }
 
+    /// @notice Simulates a vUSDC redemption: only as much as the manager has
+    /// in free cash can be withdrawn. The destination is one of the test users.
     function withdraw(uint256 seed, uint256 amt) external {
-        address u = _pickUser(seed);
-        uint256 maxW = vault.maxWithdraw(u);
-        if (maxW == 0) return;
-        amt = bound(amt, 1, maxW);
-        vm.prank(u);
-        vault.withdraw(amt, u, u);
+        uint256 cash = token.balanceOf(address(vault));
+        if (cash == 0) return;
+        amt = bound(amt, 1, cash);
+        address to = _pickUser(seed);
+        vault.recordWithdraw(amt, to);
         ghost_totalWithdrawals += amt;
-        _observeSharePrice();
     }
 
     function allocate(uint256 seed, uint256 amt) external {
-        // Single-Deposit executeAllocation against one of the two adapters.
         IStrategyAdapter a = _pickAdapter(seed);
         uint256 free = token.balanceOf(address(vault));
         if (free == 0) return;
@@ -122,7 +95,6 @@ contract CapitalManagerHandler is Test {
         });
         vm.prank(agent);
         vault.executeAllocation(bytes32(seed), calls, 0);
-        _observeSharePrice();
     }
 
     function deallocate(uint256 seed, uint256 amt) external {
@@ -139,21 +111,16 @@ contract CapitalManagerHandler is Test {
         });
         vm.prank(agent);
         vault.executeAllocation(bytes32(seed), calls, 0);
-        _observeSharePrice();
     }
 
     /// @notice Simulates external yield accruing in an adapter (e.g. Aave
     /// interest). Tokens are minted directly to the adapter, raising its
     /// `valueInUsdc()` without touching vault free balance.
     function accrueYield(uint256 seed, uint256 amt) external {
-        // Yield only makes sense once a depositor exists — otherwise we'd create
-        // assets without backing shares and break ERC-4626 sanity.
-        if (vault.totalSupply() == 0) return;
         IStrategyAdapter a = _pickAdapter(seed);
         amt = bound(amt, 1, MAX_YIELD);
         token.mint(address(a), amt);
         ghost_totalYield += amt;
-        _observeSharePrice();
     }
 
     // ─── view helpers ────────────────────────────────────────────────────────

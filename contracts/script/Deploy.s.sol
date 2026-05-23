@@ -57,11 +57,14 @@ contract Deploy is Script {
         // See notes/addresses.md — research pending.
         address sequencerFeed = vm.envOr("SEQUENCER_FEED", address(0));
 
-        CapitalManager vault = new CapitalManager(
-            IERC20(USDC), deployer, "CapitalManager USDC", "cmUSDC", sequencerFeed
-        );
+        CapitalManager vault = new CapitalManager(IERC20(USDC), deployer, sequencerFeed);
         console.log("CapitalManager:     ", address(vault));
-        console.log("asset (USDC):       ", address(vault.asset()));
+        console.log("USDC:               ", address(vault.usdc()));
+
+        // vUSDC token is deployed in a separate epic (`vusdc-token`). Until then,
+        // setVusdc remains unset and recordDeposit/recordWithdraw are unreachable
+        // from the user surface. The Safe owner will run `setVusdc(vusdcAddr)`
+        // once vUSDC is live (one-shot, immutable thereafter).
 
         DecisionLog decisionLog = new DecisionLog(deployer);
         console.log("DecisionLog:        ", address(decisionLog));

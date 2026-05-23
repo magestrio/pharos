@@ -9,7 +9,7 @@ import {ReputationOracle} from "../src/ReputationOracle.sol";
 contract MockVault {
     uint256 private _assets;
     function setAssets(uint256 a) external { _assets = a; }
-    function totalAssets() external view returns (uint256) { return _assets; }
+    function totalAssetsUsdc() external view returns (uint256) { return _assets; }
 }
 
 contract MockRegistry {

@@ -8,7 +8,7 @@ import {CapitalManager} from "../src/CapitalManager.sol";
 import {IStrategyAdapter} from "../src/adapters/IStrategyAdapter.sol";
 
 contract MockERC20 is ERC20 {
-    constructor() ERC20("Mock", "MOCK") {}
+    constructor() ERC20("Mock USDC", "mUSDC") {}
     function mint(address to, uint256 amount) external { _mint(to, amount); }
 }
 
@@ -84,12 +84,16 @@ contract CapitalManagerTest is Test {
 
     address owner = address(this);
     address agent = address(0xCAFE);
+    // Test contract plays the role of vUSDC for recordDeposit/recordWithdraw.
+    address vusdcRole;
     address user  = address(0xBEEF);
     address other = address(0xDEAD);
 
     function setUp() public {
+        vusdcRole = address(this);
+
         token    = new MockERC20();
-        vault    = new CapitalManager(IERC20(address(token)), owner, "Vault", "vM", address(0));
+        vault    = new CapitalManager(IERC20(address(token)), owner, address(0));
         honestA  = new HonestAdapter(address(token));
         honestB  = new HonestAdapter(address(token));
         reverter = new RevertingAdapter(address(token), "reverter: nope");
@@ -98,6 +102,7 @@ contract CapitalManagerTest is Test {
         vault.whitelistStrategy(address(honestB),  true);
         vault.whitelistStrategy(address(reverter), true);
         vault.setAgent(agent);
+        vault.setVusdc(vusdcRole);
 
         // Raise slippage caps so they don't fire in path-coverage tests.
         // Slippage logic is exercised separately in CapitalManagerSlippage.t.sol.
@@ -105,12 +110,12 @@ contract CapitalManagerTest is Test {
         vault.setMaxPerCallLossBps(10000);
     }
 
-    function _deposit(address who, uint256 amt) internal {
-        token.mint(who, amt);
-        vm.startPrank(who);
+    /// @notice Helper: simulate a user mint of vUSDC by funding the vusdc role
+    /// with `amt` tokens, approving the vault, and calling recordDeposit.
+    function _recordDeposit(uint256 amt) internal {
+        token.mint(vusdcRole, amt);
         token.approve(address(vault), amt);
-        vault.deposit(amt, who);
-        vm.stopPrank();
+        vault.recordDeposit(amt);
     }
 
     function _depositCall(address adapter_, uint256 amt) internal pure returns (CapitalManager.AllocationCall memory) {
@@ -132,78 +137,144 @@ contract CapitalManagerTest is Test {
     // ═══ Deployment / defaults ════════════════════════════════════════════════
 
     function test_Deploy_Basics() public view {
-        assertEq(vault.asset(),  address(token));
-        assertEq(vault.name(),   "Vault");
-        assertEq(vault.symbol(), "vM");
-        assertEq(vault.owner(),  owner);
-        assertEq(vault.agent(),  agent);
+        assertEq(address(vault.usdc()), address(token));
+        assertEq(vault.owner(), owner);
+        assertEq(vault.agent(), agent);
+        assertEq(vault.vusdc(), vusdcRole);
+    }
+
+    function test_Constructor_RevertsOnZeroUsdc() public {
+        vm.expectRevert("zero usdc");
+        new CapitalManager(IERC20(address(0)), owner, address(0));
     }
 
     function test_Constructor_StoresSequencerFeed() public {
-        CapitalManager v = new CapitalManager(
-            IERC20(address(token)), owner, "V", "v", address(0xFEED)
-        );
+        CapitalManager v = new CapitalManager(IERC20(address(token)), owner, address(0xFEED));
         assertEq(v.sequencerUptimeFeed(), address(0xFEED));
     }
 
     function test_Constructor_DefaultsBps() public {
-        CapitalManager v = new CapitalManager(
-            IERC20(address(token)), owner, "V", "v", address(0)
-        );
+        CapitalManager v = new CapitalManager(IERC20(address(token)), owner, address(0));
         assertEq(v.maxSlippageBps(),    100);
         assertEq(v.maxPerCallLossBps(), 100);
     }
 
-    // ═══ ERC-4626 entry points ════════════════════════════════════════════════
+    // ═══ setVusdc ═════════════════════════════════════════════════════════════
 
-    function test_Deposit_MintsSharesOneToOne() public {
-        _deposit(user, 1000 ether);
-        assertEq(vault.balanceOf(user), 1000 ether);
-        assertEq(token.balanceOf(address(vault)), 1000 ether);
-        assertEq(vault.totalAssets(), 1000 ether);
-    }
-
-    function test_Withdraw_BurnsShares() public {
-        _deposit(user, 1000 ether);
+    function test_SetVusdc_OnlyOwner() public {
+        CapitalManager v = new CapitalManager(IERC20(address(token)), owner, address(0));
         vm.prank(user);
-        vault.withdraw(500 ether, user, user);
-        assertEq(vault.balanceOf(user), 500 ether);
-        assertEq(token.balanceOf(user), 500 ether);
-    }
-
-    function test_Mint_Works() public {
-        token.mint(user, 1000 ether);
-        vm.startPrank(user);
-        token.approve(address(vault), 1000 ether);
-        vault.mint(1000 ether, user);
-        vm.stopPrank();
-        assertEq(vault.balanceOf(user), 1000 ether);
-    }
-
-    function test_Redeem_Works() public {
-        _deposit(user, 1000 ether);
-        vm.prank(user);
-        vault.redeem(400 ether, user, user);
-        assertEq(vault.balanceOf(user), 600 ether);
-        assertEq(token.balanceOf(user), 400 ether);
-    }
-
-    function test_Paused_BlocksDeposit() public {
-        vault.pause();
-        token.mint(user, 1 ether);
-        vm.startPrank(user);
-        token.approve(address(vault), 1 ether);
         vm.expectRevert();
-        vault.deposit(1 ether, user);
+        v.setVusdc(address(0xABCD));
+    }
+
+    function test_SetVusdc_RevertsOnZero() public {
+        CapitalManager v = new CapitalManager(IERC20(address(token)), owner, address(0));
+        vm.expectRevert("zero vusdc");
+        v.setVusdc(address(0));
+    }
+
+    function test_SetVusdc_OneShot() public {
+        // setUp() already called setVusdc — a second call must revert.
+        vm.expectRevert("vusdc set");
+        vault.setVusdc(address(0xABCD));
+    }
+
+    function test_SetVusdc_EmitsEvent() public {
+        CapitalManager v = new CapitalManager(IERC20(address(token)), owner, address(0));
+        vm.expectEmit(true, false, false, true);
+        emit CapitalManager.VusdcSet(address(0xABCD));
+        v.setVusdc(address(0xABCD));
+        assertEq(v.vusdc(), address(0xABCD));
+    }
+
+    // ═══ recordDeposit ════════════════════════════════════════════════════════
+
+    function test_RecordDeposit_OnlyVusdc() public {
+        token.mint(other, 1e6);
+        vm.startPrank(other);
+        token.approve(address(vault), 1e6);
+        vm.expectRevert("not vusdc");
+        vault.recordDeposit(1e6);
         vm.stopPrank();
     }
 
-    function test_Paused_BlocksWithdraw() public {
-        _deposit(user, 1 ether);
+    function test_RecordDeposit_RevertsOnZero() public {
+        vm.expectRevert("zero amount");
+        vault.recordDeposit(0);
+    }
+
+    function test_RecordDeposit_PullsUsdc() public {
+        _recordDeposit(1000e6);
+        assertEq(token.balanceOf(address(vault)), 1000e6);
+        assertEq(token.balanceOf(vusdcRole), 0);
+        assertEq(vault.totalAssetsUsdc(), 1000e6);
+    }
+
+    function test_RecordDeposit_EmitsEvent() public {
+        token.mint(vusdcRole, 500e6);
+        token.approve(address(vault), 500e6);
+        vm.expectEmit(false, false, false, true);
+        emit CapitalManager.DepositRecorded(500e6);
+        vault.recordDeposit(500e6);
+    }
+
+    function test_RecordDeposit_Paused() public {
         vault.pause();
-        vm.prank(user);
+        token.mint(vusdcRole, 1e6);
+        token.approve(address(vault), 1e6);
         vm.expectRevert();
-        vault.withdraw(1 ether, user, user);
+        vault.recordDeposit(1e6);
+    }
+
+    // ═══ recordWithdraw ═══════════════════════════════════════════════════════
+
+    function test_RecordWithdraw_OnlyVusdc() public {
+        _recordDeposit(1000e6);
+        vm.prank(other);
+        vm.expectRevert("not vusdc");
+        vault.recordWithdraw(100e6, user);
+    }
+
+    function test_RecordWithdraw_RevertsOnZeroAmount() public {
+        _recordDeposit(1000e6);
+        vm.expectRevert("zero amount");
+        vault.recordWithdraw(0, user);
+    }
+
+    function test_RecordWithdraw_RevertsOnZeroTo() public {
+        _recordDeposit(1000e6);
+        vm.expectRevert("zero to");
+        vault.recordWithdraw(100e6, address(0));
+    }
+
+    function test_RecordWithdraw_TransfersUsdc() public {
+        _recordDeposit(1000e6);
+        vault.recordWithdraw(400e6, user);
+        assertEq(token.balanceOf(user), 400e6);
+        assertEq(token.balanceOf(address(vault)), 600e6);
+        assertEq(vault.totalAssetsUsdc(), 600e6);
+    }
+
+    function test_RecordWithdraw_EmitsEvent() public {
+        _recordDeposit(1000e6);
+        vm.expectEmit(false, true, false, true);
+        emit CapitalManager.WithdrawRecorded(250e6, user);
+        vault.recordWithdraw(250e6, user);
+    }
+
+    function test_RecordWithdraw_Paused() public {
+        _recordDeposit(1000e6);
+        vault.pause();
+        vm.expectRevert();
+        vault.recordWithdraw(100e6, user);
+    }
+
+    function test_RecordWithdraw_InsufficientCashReverts() public {
+        // Less in cash than withdraw amount → SafeERC20 revert.
+        _recordDeposit(100e6);
+        vm.expectRevert();
+        vault.recordWithdraw(200e6, user);
     }
 
     // ═══ Owner functions ══════════════════════════════════════════════════════
@@ -278,67 +349,67 @@ contract CapitalManagerTest is Test {
     // ═══ executeAllocation — happy paths ══════════════════════════════════════
 
     function test_ExecuteAllocation_SingleDeposit() public {
-        _deposit(user, 1000 ether);
+        _recordDeposit(1000e6);
         CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
-        calls[0] = _depositCall(address(honestA), 600 ether);
+        calls[0] = _depositCall(address(honestA), 600e6);
 
         vm.prank(agent);
         vault.executeAllocation(bytes32(uint256(1)), calls, 0);
 
-        assertEq(token.balanceOf(address(vault)),    400 ether);
-        assertEq(token.balanceOf(address(honestA)),  600 ether);
-        assertEq(vault.totalAssets(),                1000 ether);
+        assertEq(token.balanceOf(address(vault)),    400e6);
+        assertEq(token.balanceOf(address(honestA)),  600e6);
+        assertEq(vault.totalAssetsUsdc(),            1000e6);
     }
 
     function test_ExecuteAllocation_SingleWithdraw() public {
-        _deposit(user, 1000 ether);
+        _recordDeposit(1000e6);
         CapitalManager.AllocationCall[] memory deposits = new CapitalManager.AllocationCall[](1);
-        deposits[0] = _depositCall(address(honestA), 700 ether);
+        deposits[0] = _depositCall(address(honestA), 700e6);
         vm.prank(agent);
         vault.executeAllocation(bytes32(uint256(1)), deposits, 0);
 
         CapitalManager.AllocationCall[] memory withdraws = new CapitalManager.AllocationCall[](1);
-        withdraws[0] = _withdrawCall(address(honestA), 200 ether);
+        withdraws[0] = _withdrawCall(address(honestA), 200e6);
         vm.prank(agent);
         vault.executeAllocation(bytes32(uint256(2)), withdraws, 0);
 
-        assertEq(token.balanceOf(address(vault)),    500 ether);
-        assertEq(token.balanceOf(address(honestA)),  500 ether);
+        assertEq(token.balanceOf(address(vault)),    500e6);
+        assertEq(token.balanceOf(address(honestA)),  500e6);
     }
 
     function test_ExecuteAllocation_MultiCallMix_DepositThenWithdraw() public {
-        _deposit(user, 1000 ether);
+        _recordDeposit(1000e6);
 
         CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](2);
-        calls[0] = _depositCall(address(honestA), 600 ether);
-        calls[1] = _withdrawCall(address(honestA), 100 ether);
+        calls[0] = _depositCall(address(honestA), 600e6);
+        calls[1] = _withdrawCall(address(honestA), 100e6);
 
         vm.prank(agent);
         vault.executeAllocation(bytes32(uint256(1)), calls, 0);
 
-        assertEq(token.balanceOf(address(vault)),   500 ether);
-        assertEq(token.balanceOf(address(honestA)), 500 ether);
+        assertEq(token.balanceOf(address(vault)),   500e6);
+        assertEq(token.balanceOf(address(honestA)), 500e6);
     }
 
     function test_ExecuteAllocation_MultiAdapter() public {
-        _deposit(user, 1000 ether);
+        _recordDeposit(1000e6);
 
         CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](2);
-        calls[0] = _depositCall(address(honestA), 300 ether);
-        calls[1] = _depositCall(address(honestB), 200 ether);
+        calls[0] = _depositCall(address(honestA), 300e6);
+        calls[1] = _depositCall(address(honestB), 200e6);
 
         vm.prank(agent);
         vault.executeAllocation(bytes32(uint256(7)), calls, 0);
 
-        assertEq(token.balanceOf(address(honestA)), 300 ether);
-        assertEq(token.balanceOf(address(honestB)), 200 ether);
-        assertEq(token.balanceOf(address(vault)),   500 ether);
+        assertEq(token.balanceOf(address(honestA)), 300e6);
+        assertEq(token.balanceOf(address(honestB)), 200e6);
+        assertEq(token.balanceOf(address(vault)),   500e6);
     }
 
     function test_ExecuteAllocation_EmitsCallExecutedAndAllocationExecuted() public {
-        _deposit(user, 1000 ether);
+        _recordDeposit(1000e6);
         CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
-        calls[0] = _depositCall(address(honestA), 500 ether);
+        calls[0] = _depositCall(address(honestA), 500e6);
 
         vm.expectEmit(true, true, true, true);
         emit CapitalManager.CallExecuted(
@@ -346,11 +417,11 @@ contract CapitalManagerTest is Test {
             0,
             address(honestA),
             CapitalManager.AllocationCallKind.Deposit,
-            500 ether,
-            500 ether
+            500e6,
+            500e6
         );
         vm.expectEmit(true, false, false, true);
-        emit CapitalManager.AllocationExecuted(bytes32(uint256(99)), 1000 ether);
+        emit CapitalManager.AllocationExecuted(bytes32(uint256(99)), 1000e6);
 
         vm.prank(agent);
         vault.executeAllocation(bytes32(uint256(99)), calls, 0);
@@ -359,9 +430,9 @@ contract CapitalManagerTest is Test {
     // ═══ executeAllocation — rejection paths ══════════════════════════════════
 
     function test_ExecuteAllocation_OnlyAgent() public {
-        _deposit(user, 1000 ether);
+        _recordDeposit(1000e6);
         CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
-        calls[0] = _depositCall(address(honestA), 100 ether);
+        calls[0] = _depositCall(address(honestA), 100e6);
 
         vm.expectRevert("not agent");
         vm.prank(user);
@@ -369,10 +440,10 @@ contract CapitalManagerTest is Test {
     }
 
     function test_ExecuteAllocation_Paused() public {
-        _deposit(user, 1000 ether);
+        _recordDeposit(1000e6);
         vault.pause();
         CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
-        calls[0] = _depositCall(address(honestA), 100 ether);
+        calls[0] = _depositCall(address(honestA), 100e6);
 
         vm.expectRevert();
         vm.prank(agent);
@@ -387,11 +458,11 @@ contract CapitalManagerTest is Test {
     }
 
     function test_ExecuteAllocation_NonWhitelistedAdapter_Reverts() public {
-        _deposit(user, 1000 ether);
+        _recordDeposit(1000e6);
         HonestAdapter rogue = new HonestAdapter(address(token));
 
         CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
-        calls[0] = _depositCall(address(rogue), 100 ether);
+        calls[0] = _depositCall(address(rogue), 100e6);
 
         vm.expectRevert("not whitelisted");
         vm.prank(agent);
@@ -401,31 +472,31 @@ contract CapitalManagerTest is Test {
     /// @notice 2-call batch where the second call reverts. The whole tx must
     /// roll back — the vault and the first adapter must look untouched.
     function test_ExecuteAllocation_PartialRevert_RollsBackPreviousCalls() public {
-        _deposit(user, 1000 ether);
+        _recordDeposit(1000e6);
 
         CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](2);
-        calls[0] = _depositCall(address(honestA),  500 ether);
-        calls[1] = _depositCall(address(reverter), 100 ether);
+        calls[0] = _depositCall(address(honestA),  500e6);
+        calls[1] = _depositCall(address(reverter), 100e6);
 
         vm.expectRevert("reverter: nope");
         vm.prank(agent);
         vault.executeAllocation(bytes32(0), calls, 0);
 
         // call[0] must NOT have persisted.
-        assertEq(token.balanceOf(address(vault)),    1000 ether);
+        assertEq(token.balanceOf(address(vault)),    1000e6);
         assertEq(token.balanceOf(address(honestA)),  0);
         assertEq(token.balanceOf(address(reverter)), 0);
     }
 
     function test_ExecuteAllocation_MinTotalAssetsAfter_Reverts() public {
-        _deposit(user, 1000 ether);
+        _recordDeposit(1000e6);
         CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
-        calls[0] = _depositCall(address(honestA), 100 ether);
+        calls[0] = _depositCall(address(honestA), 100e6);
 
         // 1000 TA after the call, agent demands 2000 → revert.
         vm.expectRevert("slippage");
         vm.prank(agent);
-        vault.executeAllocation(bytes32(0), calls, 2000 ether);
+        vault.executeAllocation(bytes32(0), calls, 2000e6);
     }
 
     // ═══ emergencyWithdraw ════════════════════════════════════════════════════
@@ -437,16 +508,16 @@ contract CapitalManagerTest is Test {
     }
 
     function test_EmergencyWithdraw_PullsFullBalance() public {
-        _deposit(user, 1000 ether);
+        _recordDeposit(1000e6);
         CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
-        calls[0] = _depositCall(address(honestA), 400 ether);
+        calls[0] = _depositCall(address(honestA), 400e6);
         vm.prank(agent);
         vault.executeAllocation(bytes32(0), calls, 0);
 
-        assertEq(token.balanceOf(address(honestA)), 400 ether);
+        assertEq(token.balanceOf(address(honestA)), 400e6);
         vault.emergencyWithdraw(address(honestA));
         assertEq(token.balanceOf(address(honestA)), 0);
-        assertEq(token.balanceOf(address(vault)),   1000 ether);
+        assertEq(token.balanceOf(address(vault)),   1000e6);
     }
 
     function test_EmergencyWithdraw_ZeroBalance_NoOp() public {
@@ -456,75 +527,67 @@ contract CapitalManagerTest is Test {
     }
 
     function test_EmergencyWithdraw_EmitsEvent() public {
-        _deposit(user, 100 ether);
+        _recordDeposit(100e6);
         CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
-        calls[0] = _depositCall(address(honestA), 60 ether);
+        calls[0] = _depositCall(address(honestA), 60e6);
         vm.prank(agent);
         vault.executeAllocation(bytes32(0), calls, 0);
 
         vm.expectEmit(true, false, false, true);
-        emit CapitalManager.EmergencyWithdrawn(address(honestA), 60 ether);
+        emit CapitalManager.EmergencyWithdrawn(address(honestA), 60e6);
         vault.emergencyWithdraw(address(honestA));
     }
 
     function test_EmergencyWithdraw_BypassesPause() public {
-        _deposit(user, 100 ether);
+        _recordDeposit(100e6);
         CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
-        calls[0] = _depositCall(address(honestA), 60 ether);
+        calls[0] = _depositCall(address(honestA), 60e6);
         vm.prank(agent);
         vault.executeAllocation(bytes32(0), calls, 0);
 
         vault.pause();
         // Should still succeed when paused — emergency lever.
         vault.emergencyWithdraw(address(honestA));
-        assertEq(token.balanceOf(address(vault)), 100 ether);
+        assertEq(token.balanceOf(address(vault)), 100e6);
     }
 
     // ═══ Sequencer uptime check ═══════════════════════════════════════════════
 
     function test_Sequencer_NoFeed_NoOp() public view {
         // setUp() built vault with address(0) feed.
-        // totalAssets() must succeed without invoking sequencer logic.
-        vault.totalAssets();
+        // totalAssetsUsdc() must succeed without invoking sequencer logic.
+        vault.totalAssetsUsdc();
     }
 
     function test_Sequencer_FeedUp_TotalAssetsOk() public {
         // Move ahead so block.timestamp - startedAt > 1h grace.
         vm.warp(10_000);
         MockSequencerFeed feed = new MockSequencerFeed(0, 1); // up, very old start
-        CapitalManager v = new CapitalManager(
-            IERC20(address(token)), owner, "V", "v", address(feed)
-        );
-        v.totalAssets(); // should not revert
+        CapitalManager v = new CapitalManager(IERC20(address(token)), owner, address(feed));
+        v.totalAssetsUsdc(); // should not revert
     }
 
     function test_Sequencer_Down_TotalAssetsReverts() public {
         MockSequencerFeed feed = new MockSequencerFeed(1, 1); // DOWN
-        CapitalManager v = new CapitalManager(
-            IERC20(address(token)), owner, "V", "v", address(feed)
-        );
+        CapitalManager v = new CapitalManager(IERC20(address(token)), owner, address(feed));
         vm.expectRevert("sequencer down");
-        v.totalAssets();
+        v.totalAssetsUsdc();
     }
 
     function test_Sequencer_RecentlyRestored_TotalAssetsReverts() public {
         // Sequencer up, but restarted seconds ago — still within grace window.
         vm.warp(10_000);
         MockSequencerFeed feed = new MockSequencerFeed(0, 9_999);
-        CapitalManager v = new CapitalManager(
-            IERC20(address(token)), owner, "V", "v", address(feed)
-        );
+        CapitalManager v = new CapitalManager(IERC20(address(token)), owner, address(feed));
         vm.expectRevert("sequencer grace");
-        v.totalAssets();
+        v.totalAssetsUsdc();
     }
 
     function test_Sequencer_GraceElapsed_TotalAssetsOk() public {
         // Sequencer up for longer than the 1h grace.
         vm.warp(10_000);
         MockSequencerFeed feed = new MockSequencerFeed(0, 1);
-        CapitalManager v = new CapitalManager(
-            IERC20(address(token)), owner, "V", "v", address(feed)
-        );
-        v.totalAssets(); // 9999s > 3600s grace → ok
+        CapitalManager v = new CapitalManager(IERC20(address(token)), owner, address(feed));
+        v.totalAssetsUsdc(); // 9999s > 3600s grace → ok
     }
 }

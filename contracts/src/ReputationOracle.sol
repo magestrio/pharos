@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-interface IVault4626 {
-    function totalAssets() external view returns (uint256);
+interface ICapitalManager {
+    function totalAssetsUsdc() external view returns (uint256);
 }
 
 interface IReputationRegistry {
@@ -19,7 +19,7 @@ interface IReputationRegistry {
 }
 
 /// @notice Pull-based reputation oracle. Anyone calls updateReputation(); the
-///         contract reads vault.totalAssets(), computes cumulative annualized
+///         contract reads vault.totalAssetsUsdc(), computes cumulative annualized
 ///         APR in signed bps, and pushes feedback to the canonical ERC-8004 Registry.
 contract ReputationOracle {
     // ─── Constants ───────────────────────────────────────────────────────────
@@ -31,7 +31,7 @@ contract ReputationOracle {
 
     // ─── Immutables ──────────────────────────────────────────────────────────
 
-    IVault4626          public immutable vault;
+    ICapitalManager     public immutable vault;
     IReputationRegistry public immutable registry;
     uint256             public immutable agentId;
 
@@ -67,7 +67,7 @@ contract ReputationOracle {
     constructor(address _vault, address _registry, uint256 _agentId) {
         if (_vault    == address(0)) revert ZeroAddress();
         if (_registry == address(0)) revert ZeroAddress();
-        vault    = IVault4626(_vault);
+        vault    = ICapitalManager(_vault);
         registry = IReputationRegistry(_registry);
         agentId  = _agentId;
     }
@@ -77,7 +77,7 @@ contract ReputationOracle {
     /// @notice Record cumulative APR to the ERC-8004 Registry. Callable by anyone.
     /// @return scoreBps Signed APR in basis points (VALUE_DECIMALS=2, so 1234 = 12.34%).
     function updateReputation() external returns (int128 scoreBps) {
-        uint256 currentAssets = vault.totalAssets();
+        uint256 currentAssets = vault.totalAssetsUsdc();
         if (currentAssets == 0) revert VaultEmpty();
 
         // First call after first deposit: set baseline and push a "started" feedback.
@@ -113,7 +113,7 @@ contract ReputationOracle {
         view
         returns (int128 score, uint256 currentAssets, uint256 elapsed)
     {
-        currentAssets = vault.totalAssets();
+        currentAssets = vault.totalAssetsUsdc();
         if (currentAssets == 0 || baselineAssets == 0) return (0, currentAssets, 0);
         elapsed = block.timestamp - baselineTimestamp;
         if (elapsed == 0) return (0, currentAssets, 0);
@@ -122,7 +122,7 @@ contract ReputationOracle {
 
     /// @notice True when a call to updateReputation() would not revert (ignoring ScoreOverflow).
     function canUpdate() external view returns (bool) {
-        uint256 currentAssets = vault.totalAssets();
+        uint256 currentAssets = vault.totalAssetsUsdc();
         if (currentAssets == 0) return false;
         if (baselineAssets == 0) return true;
         return block.timestamp >= lastUpdateTimestamp + MIN_INTERVAL;

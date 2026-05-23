@@ -13,18 +13,18 @@ contract GasMockERC20 is ERC20 {
 
 /// @notice Trivial adapter for gas profiling: valueInUsdc() returns a constant,
 /// no SLOAD past the function body itself. Establishes a *lower bound* on the cost
-/// of totalAssets() iteration per whitelisted adapter.
+/// of totalAssetsUsdc() iteration per whitelisted adapter.
 contract NoopAdapter is IStrategyAdapter {
     function deposit(uint256) external pure override {}
     function withdraw(uint256) external pure override returns (uint256) { return 0; }
     function balance() external pure override returns (uint256) { return 0; }
     function asset() external pure override returns (address) { return address(0); }
-    function valueInUsdc() external pure override returns (uint256) { return 1e18; }
+    function valueInUsdc() external pure override returns (uint256) { return 1e6; }
 }
 
-/// @notice Measures gas cost of CapitalManager.totalAssets() at increasing whitelist sizes
-/// so that we can set a sane soft-cap on the number of adapters. The iteration is
-/// SLOAD + EXTCALL per adapter — bounded but not free.
+/// @notice Measures gas cost of CapitalManager.totalAssetsUsdc() at increasing
+/// whitelist sizes so that we can set a sane soft-cap on adapter count. Each
+/// iteration is SLOAD + EXTCALL — bounded but not free.
 /// Run: forge test --match-contract TotalAssetsGas -vv
 contract TotalAssetsGasTest is Test {
     CapitalManager vault;
@@ -32,9 +32,7 @@ contract TotalAssetsGasTest is Test {
 
     function setUp() public {
         token = new GasMockERC20();
-        vault = new CapitalManager(
-            IERC20(address(token)), address(this), "Vault Gas", "vGAS", address(0)
-        );
+        vault = new CapitalManager(IERC20(address(token)), address(this), address(0));
     }
 
     function _whitelistN(uint256 n) internal {
@@ -47,9 +45,9 @@ contract TotalAssetsGasTest is Test {
     function _measure(uint256 n) internal returns (uint256 gasUsed) {
         _whitelistN(n);
         uint256 g = gasleft();
-        vault.totalAssets();
+        vault.totalAssetsUsdc();
         gasUsed = g - gasleft();
-        console.log("totalAssets() at N adapters:", n, "gas:", gasUsed);
+        console.log("totalAssetsUsdc() at N adapters:", n, "gas:", gasUsed);
     }
 
     function test_GasProfile_1Adapter() public {
@@ -67,8 +65,8 @@ contract TotalAssetsGasTest is Test {
 
     function test_GasProfile_20Adapters() public {
         uint256 g = _measure(20);
-        // Soft cap: under 250k gas at N=20 keeps `totalAssets()` viable inside
-        // ERC-4626 paths that callers expect to be cheap.
+        // Soft cap: under 250k gas at N=20 keeps `totalAssetsUsdc()` viable
+        // inside vUSDC paths that callers expect to be cheap.
         assertLt(g, 250_000, "20 adapters too expensive");
     }
 }
