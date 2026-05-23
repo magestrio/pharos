@@ -32,6 +32,21 @@ address constant AUSDC                        = 0xcb8164415274515867ec43CbD284ab
 // Merchant Moe
 address constant LB_ROUTER = 0x013e138EF6008ae5FDFDE29700e3f2Bc61d21E3a;
 
+/// @notice Two-phase deployment for the post-pivot vUSDC architecture.
+///
+/// Phase A — VUSDC_ADDR env unset:
+///   Deploys CapitalManager + adapters + setAgent. Deployer remains owner so
+///   the wiring of vUSDC (which is deployed in a separate epic) can be done
+///   atomically with `setVusdc` + ownership transfer in Phase B.
+///
+/// Phase B — VUSDC_ADDR env set:
+///   Re-running with VUSDC_ADDR after vUSDC is live: the script (assuming the
+///   manager is still owned by the broadcaster) will call `setVusdc(VUSDC_ADDR)`
+///   one-shot, then transfer ownership to SAFE_OWNER.
+///
+/// The wiring of an already-deployed CapitalManager (just setVusdc + transfer)
+/// belongs in a follow-up script under the `vusdc-token` / `mainnet-deploy`
+/// epics. This script is the cold-start path.
 contract Deploy is Script {
     function run() external {
         address deployer = vm.envAddress("DEPLOYER_ADDRESS");
@@ -42,12 +57,19 @@ contract Deploy is Script {
         // Falls back to deployer if not set — useful for sepolia smoke runs.
         // For mainnet this MUST be explicitly set to the AI agent's address.
         address agentAddress = vm.envOr("AGENT_ADDRESS", deployer);
+        // vUSDC token address. If unset, the deploy stops short of setVusdc +
+        // transferOwnership so a follow-up phase can wire vUSDC atomically.
+        address vusdcAddr = vm.envOr("VUSDC_ADDR", address(0));
 
         console.log("DEPLOYER_ADDRESS:   ", deployer);
         console.log("SAFE_OWNER:         ", safeOwner);
         console.log("AGENT_ADDRESS:      ", agentAddress);
+        console.log("VUSDC_ADDR:         ", vusdcAddr);
         if (agentAddress == deployer) {
             console.log("WARN: agentAddress == deployer. Set AGENT_ADDRESS env var before mainnet broadcast.");
+        }
+        if (vusdcAddr == address(0)) {
+            console.log("INFO: VUSDC_ADDR unset - Phase A (deployer remains owner; setVusdc + transfer deferred).");
         }
 
         vm.startBroadcast();
@@ -57,14 +79,10 @@ contract Deploy is Script {
         // See notes/addresses.md — research pending.
         address sequencerFeed = vm.envOr("SEQUENCER_FEED", address(0));
 
+        // 1. Deploy CapitalManager (raw USDC capital pool, post-vUSDC pivot).
         CapitalManager vault = new CapitalManager(IERC20(USDC), deployer, sequencerFeed);
         console.log("CapitalManager:     ", address(vault));
         console.log("USDC:               ", address(vault.usdc()));
-
-        // vUSDC token is deployed in a separate epic (`vusdc-token`). Until then,
-        // setVusdc remains unset and recordDeposit/recordWithdraw are unreachable
-        // from the user surface. The Safe owner will run `setVusdc(vusdcAddr)`
-        // once vUSDC is live (one-shot, immutable thereafter).
 
         DecisionLog decisionLog = new DecisionLog(deployer);
         console.log("DecisionLog:        ", address(decisionLog));
@@ -74,6 +92,8 @@ contract Deploy is Script {
         );
         console.log("ReputationOracle:   ", address(oracle));
 
+        // Stub adapters: deployed for address reservation, revert on
+        // deposit/withdraw. Not whitelisted (would burn gas in totalAssetsUsdc).
         MerchantMoeAdapter mmAdapter = new MerchantMoeAdapter(address(vault));
         console.log("MerchantMoeAdapter: ", address(mmAdapter));
 
@@ -86,13 +106,8 @@ contract Deploy is Script {
         EthenaAdapter ethenaAdapter = new EthenaAdapter(address(vault));
         console.log("EthenaAdapter:      ", address(ethenaAdapter));
 
-        // Stub adapters are deployed for address reservation only; they revert
-        // on deposit/withdraw (see .3 security pass). Whitelisting them would
-        // burn ~80k gas with zero benefit since allocate() would always revert.
-
-        // Deploy real adapters. MerchantMoeRouter kept for future WETH→USDC
-        // swap leg, but uses placeholder address(0) for the sUSDe slot until
-        // a swap adapter wiring lands. Pre-pivot router signature retained.
+        // Real adapters. MerchantMoeRouter kept for future WETH→USDC swap leg,
+        // uses placeholder address(0) for the sUSDe slot (out-of-MVP).
         MerchantMoeRouter moeRouter = new MerchantMoeRouter(LB_ROUTER, USDC, USDE, address(0), deployer);
         console.log("MoeRouter:          ", address(moeRouter));
 
@@ -106,19 +121,31 @@ contract Deploy is Script {
         );
         console.log("UsdcAdapter:        ", address(usdcAdapter));
 
-        // Whitelist real adapters
+        // 2. Whitelist real adapters + set agent. Done BEFORE setVusdc/transfer
+        // so these calls go through deployer EOA, not 2/3 Safe signatures.
         vault.whitelistStrategy(address(wethAdapter), true);
         vault.whitelistStrategy(address(usdcAdapter), true);
 
         vault.setAgent(agentAddress);
         decisionLog.setAgent(agentAddress);
 
-        // Transfer ownership to Gnosis Safe (2-of-3) — must be LAST
-        // after whitelistStrategy / setAgent, otherwise those setup calls
-        // would require 2/3 Safe signatures.
-        vault.transferOwnership(safeOwner);
-        decisionLog.transferOwnership(safeOwner);
-        console.log("Ownership transferred to Safe:", safeOwner);
+        // 3. Wire vUSDC (Phase B only). setVusdc is one-shot; once set, the
+        // recordDeposit/recordWithdraw entry points become callable from vUSDC.
+        if (vusdcAddr != address(0)) {
+            vault.setVusdc(vusdcAddr);
+            console.log("setVusdc executed:  ", vusdcAddr);
+        }
+
+        // 4. Transfer ownership to Gnosis Safe (2-of-3). Deferred in Phase A so
+        // the deployer can call setVusdc atomically in Phase B without needing
+        // Safe signatures for the one-shot setter.
+        if (vusdcAddr != address(0)) {
+            vault.transferOwnership(safeOwner);
+            decisionLog.transferOwnership(safeOwner);
+            console.log("Ownership transferred to Safe:", safeOwner);
+        } else {
+            console.log("Ownership NOT transferred (Phase A). Re-run with VUSDC_ADDR set.");
+        }
 
         vm.stopBroadcast();
 
