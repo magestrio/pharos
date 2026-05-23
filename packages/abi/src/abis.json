@@ -1961,7 +1961,7 @@
     },
     {
       "type": "function",
-      "name": "valueInBaseAsset",
+      "name": "valueInUsdc",
       "inputs": [],
       "outputs": [
         {
@@ -2058,7 +2058,7 @@
     },
     {
       "type": "function",
-      "name": "valueInBaseAsset",
+      "name": "valueInUsdc",
       "inputs": [],
       "outputs": [
         {
@@ -2155,7 +2155,7 @@
     },
     {
       "type": "function",
-      "name": "valueInBaseAsset",
+      "name": "valueInUsdc",
       "inputs": [],
       "outputs": [
         {
@@ -2279,7 +2279,7 @@
     },
     {
       "type": "function",
-      "name": "valueInBaseAsset",
+      "name": "valueInUsdc",
       "inputs": [],
       "outputs": [
         {

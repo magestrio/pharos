@@ -1967,7 +1967,7 @@ export const MerchantMoeAdapterABI = [
   },
   {
     "type": "function",
-    "name": "valueInBaseAsset",
+    "name": "valueInUsdc",
     "inputs": [],
     "outputs": [
       {
@@ -2065,7 +2065,7 @@ export const LendleAdapterABI = [
   },
   {
     "type": "function",
-    "name": "valueInBaseAsset",
+    "name": "valueInUsdc",
     "inputs": [],
     "outputs": [
       {
@@ -2163,7 +2163,7 @@ export const MethProtocolAdapterABI = [
   },
   {
     "type": "function",
-    "name": "valueInBaseAsset",
+    "name": "valueInUsdc",
     "inputs": [],
     "outputs": [
       {
@@ -2288,7 +2288,7 @@ export const EthenaAdapterABI = [
   },
   {
     "type": "function",
-    "name": "valueInBaseAsset",
+    "name": "valueInUsdc",
     "inputs": [],
     "outputs": [
       {

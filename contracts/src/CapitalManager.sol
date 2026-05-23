@@ -92,11 +92,11 @@ contract CapitalManager is ERC4626, Ownable, Pausable, ReentrancyGuard {
 
     // ─── ERC-4626 overrides ──────────────────────────────────────────────────
 
-    /// @notice Total assets under management priced in the vault's base asset.
-    /// @dev Sums `valueInBaseAsset()` across every whitelisted adapter plus the
-    ///      free balance held directly by the vault.
+    /// @notice Total assets under management priced in USDC units (6 decimals).
+    /// @dev Sums `valueInUsdc()` across every whitelisted adapter plus the
+    ///      free USDC balance held directly by the vault.
     ///
-    ///      Fail-loud semantics: if ANY adapter's `valueInBaseAsset()` reverts
+    ///      Fail-loud semantics: if ANY adapter's `valueInUsdc()` reverts
     ///      (e.g. its oracle is stale per the rules in IStrategyAdapter), the
     ///      entire call reverts. This blocks all ERC-4626 entry points
     ///      (deposit/mint/withdraw/redeem) until the offending adapter is
@@ -113,7 +113,7 @@ contract CapitalManager is ERC4626, Ownable, Pausable, ReentrancyGuard {
         uint256 sum = IERC20(asset()).balanceOf(address(this));
         uint256 n = _whitelisted.length();
         for (uint256 i = 0; i < n; ++i) {
-            sum += IStrategyAdapter(_whitelisted.at(i)).valueInBaseAsset();
+            sum += IStrategyAdapter(_whitelisted.at(i)).valueInUsdc();
         }
         return sum;
     }

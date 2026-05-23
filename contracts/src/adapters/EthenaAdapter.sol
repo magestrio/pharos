@@ -28,7 +28,7 @@ contract EthenaAdapter is IStrategyAdapter {
         return IERC4626(vault).asset();
     }
 
-    function valueInBaseAsset() external pure override returns (uint256) {
+    function valueInUsdc() external pure override returns (uint256) {
         revert("EthenaAdapter: not implemented");
     }
 

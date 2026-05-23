@@ -11,7 +11,7 @@ contract GasMockERC20 is ERC20 {
     constructor() ERC20("Mock", "MOCK") {}
 }
 
-/// @notice Trivial adapter for gas profiling: valueInBaseAsset() returns a constant,
+/// @notice Trivial adapter for gas profiling: valueInUsdc() returns a constant,
 /// no SLOAD past the function body itself. Establishes a *lower bound* on the cost
 /// of totalAssets() iteration per whitelisted adapter.
 contract NoopAdapter is IStrategyAdapter {
@@ -19,7 +19,7 @@ contract NoopAdapter is IStrategyAdapter {
     function withdraw(uint256) external pure override returns (uint256) { return 0; }
     function balance() external pure override returns (uint256) { return 0; }
     function asset() external pure override returns (address) { return address(0); }
-    function valueInBaseAsset() external pure override returns (uint256) { return 1e18; }
+    function valueInUsdc() external pure override returns (uint256) { return 1e18; }
 }
 
 /// @notice Measures gas cost of CapitalManager.totalAssets() at increasing whitelist sizes

@@ -13,7 +13,7 @@ contract InvMockERC20 is ERC20, IMintable {
     function mint(address to, uint256 amount) external override { _mint(to, amount); }
 }
 
-/// @notice Honest adapter — `valueInBaseAsset()` matches held token balance 1:1.
+/// @notice Honest adapter — `valueInUsdc()` matches held token balance 1:1.
 /// Used so share-price-monotonic invariant has a chance to hold (no oracle
 /// loss). Lossy / bad-oracle adapters are covered in unit/slippage suites.
 contract InvHonestAdapter is IStrategyAdapter {
@@ -30,7 +30,7 @@ contract InvHonestAdapter is IStrategyAdapter {
         return underlying.balanceOf(address(this));
     }
     function asset() external view override returns (address) { return address(underlying); }
-    function valueInBaseAsset() external view override returns (uint256) {
+    function valueInUsdc() external view override returns (uint256) {
         return underlying.balanceOf(address(this));
     }
 }
@@ -82,13 +82,13 @@ contract CapitalManagerInvariantTest is Test {
     // ─── invariants ──────────────────────────────────────────────────────────
 
     /// @notice `totalAssets()` MUST equal vault free balance plus the sum of
-    /// `valueInBaseAsset()` across every whitelisted adapter — the very
+    /// `valueInUsdc()` across every whitelisted adapter — the very
     /// definition `totalAssets()` is implemented to honour. Regression guard.
     function invariant_TotalAssetsConsistency() public view {
         uint256 sum = token.balanceOf(address(vault));
         uint256 n = vault.whitelistedCount();
         for (uint256 i = 0; i < n; ++i) {
-            sum += IStrategyAdapter(vault.whitelistedAt(i)).valueInBaseAsset();
+            sum += IStrategyAdapter(vault.whitelistedAt(i)).valueInUsdc();
         }
         assertEq(vault.totalAssets(), sum, "totalAssets != free + sum(value)");
     }

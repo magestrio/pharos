@@ -44,15 +44,10 @@ contract AaveV3UsdcAdapterTest is Test {
         pool  = new MockAavePool();
         pool.setAToken(address(usdc), address(aUsdc));
 
-        // Unit test exercises deposit/withdraw/balance only; valueInBaseAsset()
-        // is covered by the fork test against the real Aave Oracle. Passing
-        // address(0) for oracle + weth keeps this suite hermetic.
         adapter = new AaveV3UsdcAdapter(
             address(pool),
-            address(0),       // aaveOracle (unused in this suite)
             address(usdc),
             address(aUsdc),
-            address(0),       // weth (unused in this suite)
             vault,
             owner
         );
@@ -90,6 +85,7 @@ contract AaveV3UsdcAdapterTest is Test {
         assertEq(usdc.balanceOf(address(pool)), amount);
         assertEq(aUsdc.balanceOf(address(adapter)), amount);
         assertEq(adapter.balance(), amount);
+        assertEq(adapter.valueInUsdc(), amount, "valueInUsdc tracks aUSDC balance 1:1");
     }
 
     function test_Withdraw_ReturnsToVault() public {
@@ -101,5 +97,9 @@ contract AaveV3UsdcAdapterTest is Test {
         adapter.withdraw(amount);
 
         assertEq(usdc.balanceOf(vault), amount);
+    }
+
+    function test_ValueInUsdc_ZeroOnEmpty() public view {
+        assertEq(adapter.valueInUsdc(), 0);
     }
 }

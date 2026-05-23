@@ -6,13 +6,29 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IStrategyAdapter} from "./IStrategyAdapter.sol";
 import {IAaveV3Pool} from "./interfaces/IAaveV3Pool.sol";
+import {IAaveOracle, IChainlinkAggregator} from "./interfaces/IAaveOracle.sol";
 
+/// @notice Aave V3 WETH strategy adapter.
+/// @dev `valueInUsdc()` prices the aWETH position in USDC units via the
+///      Aave V3 Oracle on Mantle (0x47a063CfDa980532267970d478EC340C0F80E8df).
+///      Both WETH and USDC source aggregators are fetched fresh via
+///      `getSourceOfAsset()`.
+///
+///      Liveness: Mantle's Aave V3 Oracle proxies expose only `latestAnswer()`
+///      (no `latestTimestamp` / `latestRoundData` surface), so an on-chain
+///      heartbeat check is not possible from this adapter. Liveness is enforced
+///      one layer up by `CapitalManager._checkSequencer()` (Chainlink L2 Sequencer
+///      Uptime Feed, see `CapitalManager.sequencerUptimeFeed`) plus Aave's own
+///      economic incentive to maintain feed freshness (a stale feed bricks
+///      their lending market). `answer > 0` is the only adapter-side sanity check.
 contract AaveV3WethAdapter is IStrategyAdapter, Ownable {
     using SafeERC20 for IERC20;
 
     IAaveV3Pool public immutable aavePool;
+    IAaveOracle public immutable aaveOracle;
     IERC20      public immutable weth;
     IERC20      public immutable aWeth;
+    address     public immutable usdc;
     address     public immutable vault;
 
     modifier onlyVault() {
@@ -20,13 +36,21 @@ contract AaveV3WethAdapter is IStrategyAdapter, Ownable {
         _;
     }
 
-    constructor(address _aavePool, address _weth, address _aWeth, address _vault, address _owner)
-        Ownable(_owner)
-    {
-        aavePool = IAaveV3Pool(_aavePool);
-        weth     = IERC20(_weth);
-        aWeth    = IERC20(_aWeth);
-        vault    = _vault;
+    constructor(
+        address _aavePool,
+        address _aaveOracle,
+        address _weth,
+        address _aWeth,
+        address _usdc,
+        address _vault,
+        address _owner
+    ) Ownable(_owner) {
+        aavePool   = IAaveV3Pool(_aavePool);
+        aaveOracle = IAaveOracle(_aaveOracle);
+        weth       = IERC20(_weth);
+        aWeth      = IERC20(_aWeth);
+        usdc       = _usdc;
+        vault      = _vault;
     }
 
     function asset() external view returns (address) {
@@ -53,8 +77,25 @@ contract AaveV3WethAdapter is IStrategyAdapter, Ownable {
         return aWeth.balanceOf(address(this));
     }
 
-    /// @notice aWETH is 1:1 with WETH — no oracle required.
-    function valueInBaseAsset() external view returns (uint256) {
-        return aWeth.balanceOf(address(this));
+    function valueInUsdc() external view returns (uint256) {
+        uint256 wethBalance = aWeth.balanceOf(address(this));
+        if (wethBalance == 0) return 0;
+
+        // Both prices come from Chainlink-style feeds with 8 decimals (BASE_CURRENCY_UNIT
+        // = 1e8 on Aave V3 Mantle). WETH has 18 decimals, USDC has 6 — the (1e6 / 1e18)
+        // factor bridges the unit gap. Both feeds are checked for `answer > 0`.
+        uint256 wethPrice = _getPriceFresh(address(weth));
+        uint256 usdcPrice = _getPriceFresh(usdc);
+        return (wethBalance * wethPrice * 1e6) / (usdcPrice * 1e18);
+    }
+
+    /// @dev Reads `asset`'s price from its Aave-registered Chainlink V2 aggregator.
+    ///      No on-chain heartbeat check — see contract-level NatSpec on liveness.
+    function _getPriceFresh(address _asset) internal view returns (uint256) {
+        address source = aaveOracle.getSourceOfAsset(_asset);
+        require(source != address(0), "no oracle source");
+        int256 answer = IChainlinkAggregator(source).latestAnswer();
+        require(answer > 0, "invalid price");
+        return uint256(answer);
     }
 }

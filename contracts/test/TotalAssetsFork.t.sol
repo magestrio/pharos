@@ -4,19 +4,19 @@ pragma solidity 0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {CapitalManager} from "../src/CapitalManager.sol";
-import {AaveV3WethAdapter} from "../src/adapters/AaveV3WethAdapter.sol";
+import {AaveV3UsdcAdapter} from "../src/adapters/AaveV3UsdcAdapter.sol";
 
-/// @notice Fork-test for CapitalManager.totalAssets() with real Aave V3 WETH adapter
+/// @notice Fork-test for CapitalManager.totalAssets() with real Aave V3 USDC adapter
 /// on Mantle mainnet. Verifies that totalAssets() correctly sums vault free
-/// balance + adapter valueInBaseAsset().
+/// balance + adapter valueInUsdc().
 /// Run: forge test --match-contract TotalAssetsFork -vv
 contract TotalAssetsForkTest is Test {
     address constant AAVE_POOL = 0x458F293454fE0d67EC0655f3672301301DD51422;
-    address constant WETH      = 0xdEAddEaDdeadDEadDEADDEAddEADDEAddead1111;
-    address constant aWETH     = 0xeAC30Ed8609F564aE65C809C4bf42dB2fF426D2C;
+    address constant USDC      = 0x09Bc4E0D864854c6aFB6eB9A9cdF58aC190D0dF9;
+    address constant aUSDC     = 0xcb8164415274515867ec43CbD284ab5d6d2b304F;
 
-    CapitalManager vault;
-    AaveV3WethAdapter adapter;
+    CapitalManager    vault;
+    AaveV3UsdcAdapter adapter;
 
     address owner = address(this);
     address agent = address(0xCAFE);
@@ -27,8 +27,8 @@ contract TotalAssetsForkTest is Test {
         vm.createSelectFork(rpc);
 
         // Sequencer feed disabled (address(0)) — Mantle feed address not yet verified.
-        vault = new CapitalManager(IERC20(WETH), owner, "CapitalManager WETH", "v8004-WETH", address(0));
-        adapter = new AaveV3WethAdapter(AAVE_POOL, WETH, aWETH, address(vault), owner);
+        vault   = new CapitalManager(IERC20(USDC), owner, "CapitalManager USDC", "cmUSDC", address(0));
+        adapter = new AaveV3UsdcAdapter(AAVE_POOL, USDC, aUSDC, address(vault), owner);
 
         vault.whitelistStrategy(address(adapter), true);
         vault.setAgent(agent);
@@ -39,39 +39,37 @@ contract TotalAssetsForkTest is Test {
     }
 
     function test_TotalAssets_OnlyFreeBalance() public {
-        deal(WETH, address(vault), 1e18);
-        assertEq(vault.totalAssets(), 1e18, "free balance only");
+        deal(USDC, address(vault), 1000e6);
+        assertEq(vault.totalAssets(), 1000e6, "free balance only");
     }
 
     function test_TotalAssets_SumsFreeAndAdapter() public {
-        // User deposits 1 WETH into the vault.
-        deal(WETH, user, 1e18);
+        // User deposits 1000 USDC into the vault.
+        deal(USDC, user, 1000e6);
         vm.startPrank(user);
-        IERC20(WETH).approve(address(vault), 1e18);
-        vault.deposit(1e18, user);
+        IERC20(USDC).approve(address(vault), 1000e6);
+        vault.deposit(1000e6, user);
         vm.stopPrank();
 
-        // Agent allocates half to the Aave adapter.
+        // Agent allocates half (500 USDC) to the Aave adapter.
         CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
         calls[0] = CapitalManager.AllocationCall({
             adapter: address(adapter),
             kind: CapitalManager.AllocationCallKind.Deposit,
-            amount: 0.5e18
+            amount: 500e6
         });
 
         vm.prank(agent);
         vault.executeAllocation(bytes32(uint256(1)), calls, 0);
 
-        // After allocation: 0.5 WETH free + 0.5 WETH in adapter (aWETH ~1:1).
+        // After allocation: 500 USDC free + 500 USDC in adapter (aUSDC ~1:1).
         // Aave can round aToken minting down by 1 wei, hence the tolerance.
-        assertApproxEqAbs(vault.totalAssets(), 1e18, 1, "free + adapter sum");
+        assertApproxEqAbs(vault.totalAssets(), 1000e6, 1, "free + adapter sum");
     }
 
-    function test_TotalAssets_Bricked_WhenAdapterRevertsValueInBaseAsset() public {
-        // Whitelist a stub adapter whose valueInBaseAsset() reverts (e.g. AaveV3UsdcAdapter
-        // before .4 wires its oracle). totalAssets() MUST revert — fail-loud guarantee.
-        // We simulate by whitelisting an arbitrary address that has no code; the staticcall
-        // will revert with an empty return data, which propagates up.
+    function test_TotalAssets_Bricked_WhenAdapterRevertsValueInUsdc() public {
+        // Whitelist a phantom adapter whose valueInUsdc() reverts (no code at address).
+        // totalAssets() MUST revert — fail-loud guarantee.
         address phantom = address(0xDEAD1234);
         vault.whitelistStrategy(phantom, true);
 

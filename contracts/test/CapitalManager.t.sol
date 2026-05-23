@@ -12,7 +12,7 @@ contract MockERC20 is ERC20 {
     function mint(address to, uint256 amount) external { _mint(to, amount); }
 }
 
-/// @notice Honest adapter — 1:1 between balance and valueInBaseAsset.
+/// @notice Honest adapter — 1:1 between balance and valueInUsdc.
 contract HonestAdapter is IStrategyAdapter {
     IERC20 public immutable underlying;
 
@@ -31,7 +31,7 @@ contract HonestAdapter is IStrategyAdapter {
     function asset() external view override returns (address) {
         return address(underlying);
     }
-    function valueInBaseAsset() external view override returns (uint256) {
+    function valueInUsdc() external view override returns (uint256) {
         return underlying.balanceOf(address(this));
     }
 }
@@ -54,7 +54,7 @@ contract RevertingAdapter is IStrategyAdapter {
     }
     function balance() external pure override returns (uint256) { return 0; }
     function asset() external view override returns (address) { return address(underlying); }
-    function valueInBaseAsset() external pure override returns (uint256) { return 0; }
+    function valueInUsdc() external pure override returns (uint256) { return 0; }
 }
 
 /// @notice Controllable Chainlink-style sequencer-uptime feed mock.

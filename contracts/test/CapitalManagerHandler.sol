@@ -144,7 +144,7 @@ contract CapitalManagerHandler is Test {
 
     /// @notice Simulates external yield accruing in an adapter (e.g. Aave
     /// interest). Tokens are minted directly to the adapter, raising its
-    /// `valueInBaseAsset()` without touching vault free balance.
+    /// `valueInUsdc()` without touching vault free balance.
     function accrueYield(uint256 seed, uint256 amt) external {
         // Yield only makes sense once a depositor exists — otherwise we'd create
         // assets without backing shares and break ERC-4626 sanity.

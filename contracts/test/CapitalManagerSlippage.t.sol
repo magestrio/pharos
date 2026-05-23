@@ -13,7 +13,7 @@ contract SlipMockERC20 is ERC20 {
 }
 
 /// @notice Adapter that holds the underlying asset 1:1 but reports a haircut
-/// in `valueInBaseAsset()` — simulates an oracle-mismatch or slippage scenario.
+/// in `valueInUsdc()` — simulates an oracle-mismatch or slippage scenario.
 /// `lossBps` is the % of the held balance treated as "lost" for accounting.
 contract LossyAdapter is IStrategyAdapter {
     IERC20  public immutable underlying;
@@ -39,13 +39,13 @@ contract LossyAdapter is IStrategyAdapter {
     function asset() external view override returns (address) {
         return address(underlying);
     }
-    function valueInBaseAsset() external view override returns (uint256) {
+    function valueInUsdc() external view override returns (uint256) {
         uint256 bal = underlying.balanceOf(address(this));
         return bal * (10000 - lossBps) / 10000;
     }
 }
 
-/// @notice Honest adapter — `valueInBaseAsset()` matches `balance()`.
+/// @notice Honest adapter — `valueInUsdc()` matches `balance()`.
 contract HonestAdapter is IStrategyAdapter {
     IERC20 public immutable underlying;
 
@@ -64,7 +64,7 @@ contract HonestAdapter is IStrategyAdapter {
     function asset() external view override returns (address) {
         return address(underlying);
     }
-    function valueInBaseAsset() external view override returns (uint256) {
+    function valueInUsdc() external view override returns (uint256) {
         return underlying.balanceOf(address(this));
     }
 }

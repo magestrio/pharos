@@ -12,7 +12,6 @@ import {MethProtocolAdapter} from "../src/adapters/MethProtocolAdapter.sol";
 import {EthenaAdapter} from "../src/adapters/EthenaAdapter.sol";
 import {AaveV3WethAdapter} from "../src/adapters/AaveV3WethAdapter.sol";
 import {AaveV3UsdcAdapter} from "../src/adapters/AaveV3UsdcAdapter.sol";
-import {AaveV3SusdeAdapter} from "../src/adapters/AaveV3SusdeAdapter.sol";
 import {MerchantMoeRouter} from "../src/adapters/MerchantMoeRouter.sol";
 
 // Mantle Mainnet addresses (verified via bgd-labs/aave-address-book)
@@ -20,7 +19,6 @@ address constant WETH  = 0xdEAddEaDdeadDEadDEADDEAddEADDEAddead1111;
 address constant USDC  = 0x09Bc4E0D864854c6aFB6eB9A9cdF58aC190D0dF9;
 address constant METH  = 0xcDA86A272531e8640cD7F1a92c01839911B90bb0;
 address constant CMETH = 0xE6829d9a7eE3040e1276Fa75293Bde931859e8fA;
-address constant SUSDE = 0x211Cc4DD073734dA055fbF44a2b4667d5E5fE5d2;
 address constant USDE  = 0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34;
 
 // Aave V3 Mantle
@@ -30,7 +28,6 @@ address constant AAVE_DATA_PROVIDER           = 0x487c5c669D9eee6057C44973207101
 address constant AAVE_ORACLE                  = 0x47a063CfDa980532267970d478EC340C0F80E8df;
 address constant AWETH                        = 0xeAC30Ed8609F564aE65C809C4bf42dB2fF426D2C;
 address constant AUSDC                        = 0xcb8164415274515867ec43CbD284ab5d6d2b304F;
-address constant ASUSDE                       = 0xaf972F332FF79bd32A6CB6B54f903eA0F9b16C2a;
 
 // Merchant Moe
 address constant LB_ROUTER = 0x013e138EF6008ae5FDFDE29700e3f2Bc61d21E3a;
@@ -61,10 +58,10 @@ contract Deploy is Script {
         address sequencerFeed = vm.envOr("SEQUENCER_FEED", address(0));
 
         CapitalManager vault = new CapitalManager(
-            IERC20(WETH), deployer, "Vault8004 WETH", "v8004-WETH", sequencerFeed
+            IERC20(USDC), deployer, "CapitalManager USDC", "cmUSDC", sequencerFeed
         );
         console.log("CapitalManager:     ", address(vault));
-        console.log("asset (WETH):       ", address(vault.asset()));
+        console.log("asset (USDC):       ", address(vault.asset()));
 
         DecisionLog decisionLog = new DecisionLog(deployer);
         console.log("DecisionLog:        ", address(decisionLog));
@@ -90,29 +87,25 @@ contract Deploy is Script {
         // on deposit/withdraw (see .3 security pass). Whitelisting them would
         // burn ~80k gas with zero benefit since allocate() would always revert.
 
-        // Deploy real adapters
-        MerchantMoeRouter moeRouter = new MerchantMoeRouter(LB_ROUTER, USDC, USDE, SUSDE, deployer);
+        // Deploy real adapters. MerchantMoeRouter kept for future WETH→USDC
+        // swap leg, but uses placeholder address(0) for the sUSDe slot until
+        // a swap adapter wiring lands. Pre-pivot router signature retained.
+        MerchantMoeRouter moeRouter = new MerchantMoeRouter(LB_ROUTER, USDC, USDE, address(0), deployer);
         console.log("MoeRouter:          ", address(moeRouter));
 
         AaveV3WethAdapter wethAdapter = new AaveV3WethAdapter(
-            AAVE_POOL, WETH, AWETH, address(vault), deployer
+            AAVE_POOL, AAVE_ORACLE, WETH, AWETH, USDC, address(vault), deployer
         );
         console.log("WethAdapter:        ", address(wethAdapter));
 
         AaveV3UsdcAdapter usdcAdapter = new AaveV3UsdcAdapter(
-            AAVE_POOL, AAVE_ORACLE, USDC, AUSDC, WETH, address(vault), deployer
+            AAVE_POOL, USDC, AUSDC, address(vault), deployer
         );
         console.log("UsdcAdapter:        ", address(usdcAdapter));
-
-        AaveV3SusdeAdapter susdeAdapter = new AaveV3SusdeAdapter(
-            AAVE_POOL, AAVE_ORACLE, SUSDE, ASUSDE, WETH, address(vault), deployer
-        );
-        console.log("SusdeAdapter:       ", address(susdeAdapter));
 
         // Whitelist real adapters
         vault.whitelistStrategy(address(wethAdapter), true);
         vault.whitelistStrategy(address(usdcAdapter), true);
-        vault.whitelistStrategy(address(susdeAdapter), true);
 
         vault.setAgent(agentAddress);
         decisionLog.setAgent(agentAddress);
@@ -133,7 +126,6 @@ contract Deploy is Script {
         console.log("ReputationOracle:    %s", address(oracle));
         console.log("AaveV3WethAdapter:   %s", address(wethAdapter));
         console.log("AaveV3UsdcAdapter:   %s", address(usdcAdapter));
-        console.log("AaveV3SusdeAdapter:  %s", address(susdeAdapter));
         console.log("MerchantMoeRouter:   %s", address(moeRouter));
         console.log("MerchantMoeAdapter:  %s (stub, not whitelisted)", address(mmAdapter));
         console.log("LendleAdapter:       %s (stub, not whitelisted)", address(lendleAdapter));
