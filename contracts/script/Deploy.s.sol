@@ -39,9 +39,17 @@ contract Deploy is Script {
         address safeOwner = vm.envAddress("SAFE_OWNER");
         address registry8004 = vm.envOr("REGISTRY_8004", address(0));
         uint256 agentId = vm.envOr("AGENT_ID", uint256(1));
+        // AGENT_ADDRESS = operational EOA that calls allocate/deallocate.
+        // Falls back to deployer if not set — useful for sepolia smoke runs.
+        // For mainnet this MUST be explicitly set to the AI agent's address.
+        address agentAddress = vm.envOr("AGENT_ADDRESS", deployer);
 
         console.log("DEPLOYER_ADDRESS:   ", deployer);
         console.log("SAFE_OWNER:         ", safeOwner);
+        console.log("AGENT_ADDRESS:      ", agentAddress);
+        if (agentAddress == deployer) {
+            console.log("WARN: agentAddress == deployer. Set AGENT_ADDRESS env var before mainnet broadcast.");
+        }
 
         vm.startBroadcast();
 
@@ -69,14 +77,12 @@ contract Deploy is Script {
         EthenaAdapter ethenaAdapter = new EthenaAdapter(address(vault));
         console.log("EthenaAdapter:      ", address(ethenaAdapter));
 
-        // Whitelist legacy stub adapters
-        vault.whitelistStrategy(address(mmAdapter), true);
-        vault.whitelistStrategy(address(lendleAdapter), true);
-        vault.whitelistStrategy(address(methAdapter), true);
-        vault.whitelistStrategy(address(ethenaAdapter), true);
+        // Stub adapters are deployed for address reservation only; they revert
+        // on deposit/withdraw (see .3 security pass). Whitelisting them would
+        // burn ~80k gas with zero benefit since allocate() would always revert.
 
         // Deploy real adapters
-        MerchantMoeRouter moeRouter = new MerchantMoeRouter(LB_ROUTER, WETH, USDC, deployer);
+        MerchantMoeRouter moeRouter = new MerchantMoeRouter(LB_ROUTER, USDC, USDE, SUSDE, deployer);
         console.log("MoeRouter:          ", address(moeRouter));
 
         AaveV3WethAdapter wethAdapter = new AaveV3WethAdapter(
@@ -93,19 +99,29 @@ contract Deploy is Script {
         vault.whitelistStrategy(address(wethAdapter), true);
         vault.whitelistStrategy(address(usdcAdapter), true);
 
-        // Default strategy — Aave V3 WETH supply
-        vault.setCurrentStrategy(address(wethAdapter));
-
-        // Agent placeholder — update to AI agent address before mainnet
-        vault.setAgent(deployer);
+        vault.setAgent(agentAddress);
+        decisionLog.setAgent(agentAddress);
 
         // Transfer ownership to Gnosis Safe (2-of-3) — must be LAST
-        // after whitelistStrategy / setCurrentStrategy / setAgent, otherwise
-        // those setup calls would require 2/3 Safe signatures.
+        // after whitelistStrategy / setAgent, otherwise those setup calls
+        // would require 2/3 Safe signatures.
         vault.transferOwnership(safeOwner);
         decisionLog.transferOwnership(safeOwner);
         console.log("Ownership transferred to Safe:", safeOwner);
 
         vm.stopBroadcast();
+
+        console.log("");
+        console.log("=== DEPLOYMENT SUMMARY (copy to notes/addresses.md) ===");
+        console.log("Vault8004:           %s", address(vault));
+        console.log("DecisionLog:         %s", address(decisionLog));
+        console.log("ReputationOracle:    %s", address(oracle));
+        console.log("AaveV3WethAdapter:   %s", address(wethAdapter));
+        console.log("AaveV3UsdcAdapter:   %s", address(usdcAdapter));
+        console.log("MerchantMoeRouter:   %s", address(moeRouter));
+        console.log("MerchantMoeAdapter:  %s (stub, not whitelisted)", address(mmAdapter));
+        console.log("LendleAdapter:       %s (stub, not whitelisted)", address(lendleAdapter));
+        console.log("MethProtocolAdapter: %s (stub, not whitelisted)", address(methAdapter));
+        console.log("EthenaAdapter:       %s (stub, not whitelisted)", address(ethenaAdapter));
     }
 }

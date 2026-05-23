@@ -52,4 +52,9 @@ contract AaveV3WethAdapter is IStrategyAdapter, Ownable {
     function balance() external view returns (uint256) {
         return aWeth.balanceOf(address(this));
     }
+
+    /// @notice aWETH is 1:1 with WETH — no oracle required.
+    function valueInBaseAsset() external view returns (uint256) {
+        return aWeth.balanceOf(address(this));
+    }
 }

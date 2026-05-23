@@ -26,4 +26,8 @@ contract MethProtocolAdapter is IStrategyAdapter {
     function asset() external view override returns (address) {
         return IERC4626(vault).asset();
     }
+
+    function valueInBaseAsset() external pure override returns (uint256) {
+        revert("MethProtocolAdapter: not implemented");
+    }
 }

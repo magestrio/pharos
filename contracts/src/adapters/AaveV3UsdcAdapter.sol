@@ -52,4 +52,10 @@ contract AaveV3UsdcAdapter is IStrategyAdapter, Ownable {
     function balance() external view returns (uint256) {
         return aUsdc.balanceOf(address(this));
     }
+
+    /// @dev Stub — wired up in `multi-call-execution-vault.4`. Will price aUSDC -> WETH
+    ///      via Aave Oracle (0x47a063CfDa980532267970d478EC340C0F80E8df) on Mantle.
+    function valueInBaseAsset() external pure returns (uint256) {
+        revert("AaveV3UsdcAdapter: valueInBaseAsset not implemented");
+    }
 }

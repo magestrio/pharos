@@ -8,26 +8,36 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import {IStrategyAdapter} from "./adapters/IStrategyAdapter.sol";
 
 contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
+    using EnumerableSet for EnumerableSet.AddressSet;
 
-    // NOTE: ERC4626 already exposes asset() → address. We do NOT redeclare
-    // `IERC20 public immutable asset` here — that would generate a getter with a
-    // mismatched return type (IERC20 vs address) and fail to compile.
-    // Use IERC20(asset()) wherever the token reference is needed internally.
+    enum AllocationCallKind { Deposit, Withdraw }
+
+    struct AllocationCall {
+        address adapter;
+        AllocationCallKind kind;
+        uint256 amount;
+    }
 
     address public agent;
-    address public currentStrategy;
-    mapping(address => bool) public whitelistedStrategies;
-    uint256 public totalAllocated;
+    EnumerableSet.AddressSet private _whitelisted;
 
     event AgentSet(address indexed agent);
     event StrategyWhitelisted(address indexed strategy, bool status);
-    event StrategyChanged(address indexed oldStrategy, address indexed newStrategy);
-    event Allocated(address indexed strategy, uint256 amount, bytes32 indexed decisionId);
-    event Deallocated(address indexed strategy, uint256 amount, bytes32 indexed decisionId);
+    event CallExecuted(
+        bytes32 indexed decisionId,
+        uint256 indexed callIndex,
+        address indexed adapter,
+        AllocationCallKind kind,
+        uint256 requested,
+        uint256 actualResult
+    );
+    event AllocationExecuted(bytes32 indexed decisionId, uint256 totalAssetsAfter);
+    event EmergencyWithdrawn(address indexed strategy, uint256 received);
 
     modifier onlyAgent() {
         require(msg.sender == agent, "not agent");
@@ -44,10 +54,12 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
     // ─── ERC-4626 overrides ──────────────────────────────────────────────────
 
     function totalAssets() public view override returns (uint256) {
-        uint256 strategyBal = currentStrategy != address(0)
-            ? IStrategyAdapter(currentStrategy).balance()
-            : 0;
-        return IERC20(asset()).balanceOf(address(this)) + strategyBal;
+        uint256 sum = IERC20(asset()).balanceOf(address(this));
+        uint256 n = _whitelisted.length();
+        for (uint256 i = 0; i < n; ++i) {
+            sum += IStrategyAdapter(_whitelisted.at(i)).valueInBaseAsset();
+        }
+        return sum;
     }
 
     // Pause + reentrancy guard applied at the internal hook level so all four
@@ -70,6 +82,20 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
         super._withdraw(caller, receiver, owner, assets, shares);
     }
 
+    // ─── Whitelist views ─────────────────────────────────────────────────────
+
+    function isWhitelisted(address strategy) external view returns (bool) {
+        return _whitelisted.contains(strategy);
+    }
+
+    function whitelistedCount() external view returns (uint256) {
+        return _whitelisted.length();
+    }
+
+    function whitelistedAt(uint256 i) external view returns (address) {
+        return _whitelisted.at(i);
+    }
+
     // ─── Owner-only ──────────────────────────────────────────────────────────
 
     function setAgent(address _agent) external onlyOwner {
@@ -79,15 +105,13 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
     }
 
     function whitelistStrategy(address strategy, bool status) external onlyOwner {
-        whitelistedStrategies[strategy] = status;
+        require(strategy != address(0), "zero strategy");
+        if (status) {
+            _whitelisted.add(strategy);
+        } else {
+            _whitelisted.remove(strategy);
+        }
         emit StrategyWhitelisted(strategy, status);
-    }
-
-    function setCurrentStrategy(address strategy) external onlyOwner {
-        require(whitelistedStrategies[strategy], "not whitelisted");
-        address old = currentStrategy;
-        currentStrategy = strategy;
-        emit StrategyChanged(old, strategy);
     }
 
     function pause() external onlyOwner {
@@ -104,43 +128,42 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
         if (bal > 0) {
             received = IStrategyAdapter(strategy).withdraw(bal);
         }
-        if (strategy == currentStrategy) {
-            totalAllocated = 0;
-        }
-        emit Deallocated(strategy, received, bytes32(0));
+        emit EmergencyWithdrawn(strategy, received);
     }
 
     // ─── Agent-only ──────────────────────────────────────────────────────────
 
-    function allocate(bytes32 decisionId, uint256 amount) external nonReentrant whenNotPaused onlyAgent {
-        require(currentStrategy != address(0), "no strategy");
-        uint256 free = IERC20(asset()).balanceOf(address(this)) - totalAllocated;
-        require(amount <= free, "insufficient free cash");
-        // CEI: update bookkeeping before the external call. If deposit() reverts,
-        // the entire tx reverts and totalAllocated unwinds with it.
-        totalAllocated += amount;
-        IERC20(asset()).forceApprove(currentStrategy, amount);
-        IStrategyAdapter(currentStrategy).deposit(amount);
-        emit Allocated(currentStrategy, amount, decisionId);
-    }
+    /// @notice Atomically execute a sequence of adapter calls.
+    /// @param decisionId IPFS-CID-hashed pointer to the rationale that authored
+    ///                   this allocation. Logged on DecisionLog off-band.
+    /// @param calls Ordered list of deposit/withdraw calls against whitelisted adapters.
+    /// @param minTotalAssetsAfter Slippage / oracle-manipulation guard: revert if
+    ///                            post-execution `totalAssets()` falls below this.
+    function executeAllocation(
+        bytes32 decisionId,
+        AllocationCall[] calldata calls,
+        uint256 minTotalAssetsAfter
+    ) external nonReentrant whenNotPaused onlyAgent {
+        require(calls.length > 0, "empty calls");
 
-    function deallocate(bytes32 decisionId, uint256 amount) external nonReentrant whenNotPaused onlyAgent {
-        require(currentStrategy != address(0), "no strategy");
-        // Clamp requested amount to the adapter's actual balance. Some protocols
-        // (Aave V3, sUSDe stake-via-router) round aToken/share minting down by 1 wei
-        // on deposit, so withdrawing the original deposit amount would revert.
-        // Also: accrued interest can push balance above totalAllocated — clamping
-        // here keeps totalAllocated bookkeeping consistent with what was withdrawn.
-        uint256 bal = IStrategyAdapter(currentStrategy).balance();
-        if (amount > bal) amount = bal;
-        uint256 received = IStrategyAdapter(currentStrategy).withdraw(amount);
-        if (IStrategyAdapter(currentStrategy).balance() == 0) {
-            // Full exit — zero out bookkeeping regardless of rounding losses or
-            // accrued interest, since the strategy holds nothing on our behalf.
-            totalAllocated = 0;
-        } else {
-            totalAllocated = received >= totalAllocated ? 0 : totalAllocated - received;
+        for (uint256 i = 0; i < calls.length; ++i) {
+            AllocationCall calldata c = calls[i];
+            require(_whitelisted.contains(c.adapter), "not whitelisted");
+
+            uint256 actual;
+            if (c.kind == AllocationCallKind.Deposit) {
+                address adapterAsset = IStrategyAdapter(c.adapter).asset();
+                IERC20(adapterAsset).forceApprove(c.adapter, c.amount);
+                IStrategyAdapter(c.adapter).deposit(c.amount);
+                actual = c.amount;
+            } else {
+                actual = IStrategyAdapter(c.adapter).withdraw(c.amount);
+            }
+            emit CallExecuted(decisionId, i, c.adapter, c.kind, c.amount, actual);
         }
-        emit Deallocated(currentStrategy, received, decisionId);
+
+        uint256 ta = totalAssets();
+        require(ta >= minTotalAssetsAfter, "slippage");
+        emit AllocationExecuted(decisionId, ta);
     }
 }
