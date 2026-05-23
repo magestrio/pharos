@@ -4,7 +4,7 @@ pragma solidity 0.8.24;
 import {Test, console} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import {Vault8004} from "../src/Vault8004.sol";
+import {CapitalManager} from "../src/CapitalManager.sol";
 import {IStrategyAdapter} from "../src/adapters/IStrategyAdapter.sol";
 
 contract GasMockERC20 is ERC20 {
@@ -22,17 +22,17 @@ contract NoopAdapter is IStrategyAdapter {
     function valueInBaseAsset() external pure override returns (uint256) { return 1e18; }
 }
 
-/// @notice Measures gas cost of Vault8004.totalAssets() at increasing whitelist sizes
+/// @notice Measures gas cost of CapitalManager.totalAssets() at increasing whitelist sizes
 /// so that we can set a sane soft-cap on the number of adapters. The iteration is
 /// SLOAD + EXTCALL per adapter — bounded but not free.
 /// Run: forge test --match-contract TotalAssetsGas -vv
 contract TotalAssetsGasTest is Test {
-    Vault8004 vault;
+    CapitalManager vault;
     GasMockERC20 token;
 
     function setUp() public {
         token = new GasMockERC20();
-        vault = new Vault8004(
+        vault = new CapitalManager(
             IERC20(address(token)), address(this), "Vault Gas", "vGAS", address(0)
         );
     }

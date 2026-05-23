@@ -8,7 +8,7 @@ const OUT_DIR = path.resolve(__dirname, "../out");
 const ABI_SRC = path.resolve(__dirname, "../../packages/abi/src");
 
 const CONTRACTS = [
-  "Vault8004",
+  "CapitalManager",
   "DecisionLog",
   "ReputationOracle",
   "MerchantMoeAdapter",

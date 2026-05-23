@@ -15,7 +15,7 @@ _ZERO_ADDR = "0x0000000000000000000000000000000000000000"
 
 
 async def get_vault_state() -> VaultState:
-    """Reads on-chain state of Vault8004 + adapters."""
+    """Reads on-chain state of CapitalManager + adapters."""
     w3 = Web3(Web3.HTTPProvider(settings.MANTLE_RPC_URL))
     vault = w3.eth.contract(address=settings.VAULT_ADDRESS, abi=_VAULT_ABI)
 

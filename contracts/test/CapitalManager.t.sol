@@ -4,7 +4,7 @@ pragma solidity 0.8.24;
 import {Test, console} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import {Vault8004} from "../src/Vault8004.sol";
+import {CapitalManager} from "../src/CapitalManager.sol";
 import {IStrategyAdapter} from "../src/adapters/IStrategyAdapter.sol";
 
 contract MockERC20 is ERC20 {
@@ -75,8 +75,8 @@ contract MockSequencerFeed {
     }
 }
 
-contract Vault8004Test is Test {
-    Vault8004 vault;
+contract CapitalManagerTest is Test {
+    CapitalManager vault;
     MockERC20 token;
     HonestAdapter honestA;
     HonestAdapter honestB;
@@ -89,7 +89,7 @@ contract Vault8004Test is Test {
 
     function setUp() public {
         token    = new MockERC20();
-        vault    = new Vault8004(IERC20(address(token)), owner, "Vault", "vM", address(0));
+        vault    = new CapitalManager(IERC20(address(token)), owner, "Vault", "vM", address(0));
         honestA  = new HonestAdapter(address(token));
         honestB  = new HonestAdapter(address(token));
         reverter = new RevertingAdapter(address(token), "reverter: nope");
@@ -100,7 +100,7 @@ contract Vault8004Test is Test {
         vault.setAgent(agent);
 
         // Raise slippage caps so they don't fire in path-coverage tests.
-        // Slippage logic is exercised separately in Vault8004Slippage.t.sol.
+        // Slippage logic is exercised separately in CapitalManagerSlippage.t.sol.
         vault.setMaxSlippageBps(10000);
         vault.setMaxPerCallLossBps(10000);
     }
@@ -113,18 +113,18 @@ contract Vault8004Test is Test {
         vm.stopPrank();
     }
 
-    function _depositCall(address adapter_, uint256 amt) internal pure returns (Vault8004.AllocationCall memory) {
-        return Vault8004.AllocationCall({
+    function _depositCall(address adapter_, uint256 amt) internal pure returns (CapitalManager.AllocationCall memory) {
+        return CapitalManager.AllocationCall({
             adapter: adapter_,
-            kind: Vault8004.AllocationCallKind.Deposit,
+            kind: CapitalManager.AllocationCallKind.Deposit,
             amount: amt
         });
     }
 
-    function _withdrawCall(address adapter_, uint256 amt) internal pure returns (Vault8004.AllocationCall memory) {
-        return Vault8004.AllocationCall({
+    function _withdrawCall(address adapter_, uint256 amt) internal pure returns (CapitalManager.AllocationCall memory) {
+        return CapitalManager.AllocationCall({
             adapter: adapter_,
-            kind: Vault8004.AllocationCallKind.Withdraw,
+            kind: CapitalManager.AllocationCallKind.Withdraw,
             amount: amt
         });
     }
@@ -140,14 +140,14 @@ contract Vault8004Test is Test {
     }
 
     function test_Constructor_StoresSequencerFeed() public {
-        Vault8004 v = new Vault8004(
+        CapitalManager v = new CapitalManager(
             IERC20(address(token)), owner, "V", "v", address(0xFEED)
         );
         assertEq(v.sequencerUptimeFeed(), address(0xFEED));
     }
 
     function test_Constructor_DefaultsBps() public {
-        Vault8004 v = new Vault8004(
+        CapitalManager v = new CapitalManager(
             IERC20(address(token)), owner, "V", "v", address(0)
         );
         assertEq(v.maxSlippageBps(),    100);
@@ -279,7 +279,7 @@ contract Vault8004Test is Test {
 
     function test_ExecuteAllocation_SingleDeposit() public {
         _deposit(user, 1000 ether);
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](1);
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
         calls[0] = _depositCall(address(honestA), 600 ether);
 
         vm.prank(agent);
@@ -292,12 +292,12 @@ contract Vault8004Test is Test {
 
     function test_ExecuteAllocation_SingleWithdraw() public {
         _deposit(user, 1000 ether);
-        Vault8004.AllocationCall[] memory deposits = new Vault8004.AllocationCall[](1);
+        CapitalManager.AllocationCall[] memory deposits = new CapitalManager.AllocationCall[](1);
         deposits[0] = _depositCall(address(honestA), 700 ether);
         vm.prank(agent);
         vault.executeAllocation(bytes32(uint256(1)), deposits, 0);
 
-        Vault8004.AllocationCall[] memory withdraws = new Vault8004.AllocationCall[](1);
+        CapitalManager.AllocationCall[] memory withdraws = new CapitalManager.AllocationCall[](1);
         withdraws[0] = _withdrawCall(address(honestA), 200 ether);
         vm.prank(agent);
         vault.executeAllocation(bytes32(uint256(2)), withdraws, 0);
@@ -309,7 +309,7 @@ contract Vault8004Test is Test {
     function test_ExecuteAllocation_MultiCallMix_DepositThenWithdraw() public {
         _deposit(user, 1000 ether);
 
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](2);
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](2);
         calls[0] = _depositCall(address(honestA), 600 ether);
         calls[1] = _withdrawCall(address(honestA), 100 ether);
 
@@ -323,7 +323,7 @@ contract Vault8004Test is Test {
     function test_ExecuteAllocation_MultiAdapter() public {
         _deposit(user, 1000 ether);
 
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](2);
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](2);
         calls[0] = _depositCall(address(honestA), 300 ether);
         calls[1] = _depositCall(address(honestB), 200 ether);
 
@@ -337,20 +337,20 @@ contract Vault8004Test is Test {
 
     function test_ExecuteAllocation_EmitsCallExecutedAndAllocationExecuted() public {
         _deposit(user, 1000 ether);
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](1);
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
         calls[0] = _depositCall(address(honestA), 500 ether);
 
         vm.expectEmit(true, true, true, true);
-        emit Vault8004.CallExecuted(
+        emit CapitalManager.CallExecuted(
             bytes32(uint256(99)),
             0,
             address(honestA),
-            Vault8004.AllocationCallKind.Deposit,
+            CapitalManager.AllocationCallKind.Deposit,
             500 ether,
             500 ether
         );
         vm.expectEmit(true, false, false, true);
-        emit Vault8004.AllocationExecuted(bytes32(uint256(99)), 1000 ether);
+        emit CapitalManager.AllocationExecuted(bytes32(uint256(99)), 1000 ether);
 
         vm.prank(agent);
         vault.executeAllocation(bytes32(uint256(99)), calls, 0);
@@ -360,7 +360,7 @@ contract Vault8004Test is Test {
 
     function test_ExecuteAllocation_OnlyAgent() public {
         _deposit(user, 1000 ether);
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](1);
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
         calls[0] = _depositCall(address(honestA), 100 ether);
 
         vm.expectRevert("not agent");
@@ -371,7 +371,7 @@ contract Vault8004Test is Test {
     function test_ExecuteAllocation_Paused() public {
         _deposit(user, 1000 ether);
         vault.pause();
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](1);
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
         calls[0] = _depositCall(address(honestA), 100 ether);
 
         vm.expectRevert();
@@ -380,7 +380,7 @@ contract Vault8004Test is Test {
     }
 
     function test_ExecuteAllocation_EmptyCalls_Reverts() public {
-        Vault8004.AllocationCall[] memory empty = new Vault8004.AllocationCall[](0);
+        CapitalManager.AllocationCall[] memory empty = new CapitalManager.AllocationCall[](0);
         vm.expectRevert("empty calls");
         vm.prank(agent);
         vault.executeAllocation(bytes32(0), empty, 0);
@@ -390,7 +390,7 @@ contract Vault8004Test is Test {
         _deposit(user, 1000 ether);
         HonestAdapter rogue = new HonestAdapter(address(token));
 
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](1);
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
         calls[0] = _depositCall(address(rogue), 100 ether);
 
         vm.expectRevert("not whitelisted");
@@ -403,7 +403,7 @@ contract Vault8004Test is Test {
     function test_ExecuteAllocation_PartialRevert_RollsBackPreviousCalls() public {
         _deposit(user, 1000 ether);
 
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](2);
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](2);
         calls[0] = _depositCall(address(honestA),  500 ether);
         calls[1] = _depositCall(address(reverter), 100 ether);
 
@@ -419,7 +419,7 @@ contract Vault8004Test is Test {
 
     function test_ExecuteAllocation_MinTotalAssetsAfter_Reverts() public {
         _deposit(user, 1000 ether);
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](1);
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
         calls[0] = _depositCall(address(honestA), 100 ether);
 
         // 1000 TA after the call, agent demands 2000 → revert.
@@ -438,7 +438,7 @@ contract Vault8004Test is Test {
 
     function test_EmergencyWithdraw_PullsFullBalance() public {
         _deposit(user, 1000 ether);
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](1);
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
         calls[0] = _depositCall(address(honestA), 400 ether);
         vm.prank(agent);
         vault.executeAllocation(bytes32(0), calls, 0);
@@ -457,19 +457,19 @@ contract Vault8004Test is Test {
 
     function test_EmergencyWithdraw_EmitsEvent() public {
         _deposit(user, 100 ether);
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](1);
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
         calls[0] = _depositCall(address(honestA), 60 ether);
         vm.prank(agent);
         vault.executeAllocation(bytes32(0), calls, 0);
 
         vm.expectEmit(true, false, false, true);
-        emit Vault8004.EmergencyWithdrawn(address(honestA), 60 ether);
+        emit CapitalManager.EmergencyWithdrawn(address(honestA), 60 ether);
         vault.emergencyWithdraw(address(honestA));
     }
 
     function test_EmergencyWithdraw_BypassesPause() public {
         _deposit(user, 100 ether);
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](1);
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
         calls[0] = _depositCall(address(honestA), 60 ether);
         vm.prank(agent);
         vault.executeAllocation(bytes32(0), calls, 0);
@@ -492,7 +492,7 @@ contract Vault8004Test is Test {
         // Move ahead so block.timestamp - startedAt > 1h grace.
         vm.warp(10_000);
         MockSequencerFeed feed = new MockSequencerFeed(0, 1); // up, very old start
-        Vault8004 v = new Vault8004(
+        CapitalManager v = new CapitalManager(
             IERC20(address(token)), owner, "V", "v", address(feed)
         );
         v.totalAssets(); // should not revert
@@ -500,7 +500,7 @@ contract Vault8004Test is Test {
 
     function test_Sequencer_Down_TotalAssetsReverts() public {
         MockSequencerFeed feed = new MockSequencerFeed(1, 1); // DOWN
-        Vault8004 v = new Vault8004(
+        CapitalManager v = new CapitalManager(
             IERC20(address(token)), owner, "V", "v", address(feed)
         );
         vm.expectRevert("sequencer down");
@@ -511,7 +511,7 @@ contract Vault8004Test is Test {
         // Sequencer up, but restarted seconds ago — still within grace window.
         vm.warp(10_000);
         MockSequencerFeed feed = new MockSequencerFeed(0, 9_999);
-        Vault8004 v = new Vault8004(
+        CapitalManager v = new CapitalManager(
             IERC20(address(token)), owner, "V", "v", address(feed)
         );
         vm.expectRevert("sequencer grace");
@@ -522,7 +522,7 @@ contract Vault8004Test is Test {
         // Sequencer up for longer than the 1h grace.
         vm.warp(10_000);
         MockSequencerFeed feed = new MockSequencerFeed(0, 1);
-        Vault8004 v = new Vault8004(
+        CapitalManager v = new CapitalManager(
             IERC20(address(token)), owner, "V", "v", address(feed)
         );
         v.totalAssets(); // 9999s > 3600s grace → ok

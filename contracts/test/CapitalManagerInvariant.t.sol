@@ -4,9 +4,9 @@ pragma solidity 0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import {Vault8004} from "../src/Vault8004.sol";
+import {CapitalManager} from "../src/CapitalManager.sol";
 import {IStrategyAdapter} from "../src/adapters/IStrategyAdapter.sol";
-import {Vault8004Handler, IMintable} from "./Vault8004Handler.sol";
+import {CapitalManagerHandler, IMintable} from "./CapitalManagerHandler.sol";
 
 contract InvMockERC20 is ERC20, IMintable {
     constructor() ERC20("Mock", "MOCK") {}
@@ -35,19 +35,19 @@ contract InvHonestAdapter is IStrategyAdapter {
     }
 }
 
-contract Vault8004InvariantTest is Test {
-    Vault8004 vault;
+contract CapitalManagerInvariantTest is Test {
+    CapitalManager vault;
     InvMockERC20 token;
     InvHonestAdapter adapterA;
     InvHonestAdapter adapterB;
-    Vault8004Handler handler;
+    CapitalManagerHandler handler;
 
     address owner = address(0xBEEF);
     address agent = address(0xCAFE);
 
     function setUp() public {
         token   = new InvMockERC20();
-        vault   = new Vault8004(IERC20(address(token)), owner, "V", "v", address(0));
+        vault   = new CapitalManager(IERC20(address(token)), owner, "V", "v", address(0));
         adapterA = new InvHonestAdapter(address(token));
         adapterB = new InvHonestAdapter(address(token));
 
@@ -66,16 +66,16 @@ contract Vault8004InvariantTest is Test {
         users[1] = address(0xB0B);
         users[2] = address(0xCA42);
 
-        handler = new Vault8004Handler(vault, token, adapterA, adapterB, owner, agent, users);
+        handler = new CapitalManagerHandler(vault, token, adapterA, adapterB, owner, agent, users);
 
         targetContract(address(handler));
 
         bytes4[] memory selectors = new bytes4[](5);
-        selectors[0] = Vault8004Handler.deposit.selector;
-        selectors[1] = Vault8004Handler.withdraw.selector;
-        selectors[2] = Vault8004Handler.allocate.selector;
-        selectors[3] = Vault8004Handler.deallocate.selector;
-        selectors[4] = Vault8004Handler.accrueYield.selector;
+        selectors[0] = CapitalManagerHandler.deposit.selector;
+        selectors[1] = CapitalManagerHandler.withdraw.selector;
+        selectors[2] = CapitalManagerHandler.allocate.selector;
+        selectors[3] = CapitalManagerHandler.deallocate.selector;
+        selectors[4] = CapitalManagerHandler.accrueYield.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
 

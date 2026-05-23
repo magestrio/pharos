@@ -22,7 +22,7 @@ interface IAggregatorV3 {
     );
 }
 
-contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
+contract CapitalManager is ERC4626, Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using EnumerableSet for EnumerableSet.AddressSet;
 

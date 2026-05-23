@@ -4,7 +4,7 @@ pragma solidity 0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import {Vault8004} from "../src/Vault8004.sol";
+import {CapitalManager} from "../src/CapitalManager.sol";
 import {IStrategyAdapter} from "../src/adapters/IStrategyAdapter.sol";
 
 contract SlipMockERC20 is ERC20 {
@@ -69,8 +69,8 @@ contract HonestAdapter is IStrategyAdapter {
     }
 }
 
-contract Vault8004SlippageTest is Test {
-    Vault8004 vault;
+contract CapitalManagerSlippageTest is Test {
+    CapitalManager vault;
     SlipMockERC20 token;
     HonestAdapter honest;
     LossyAdapter lossy;
@@ -81,7 +81,7 @@ contract Vault8004SlippageTest is Test {
 
     function setUp() public {
         token  = new SlipMockERC20();
-        vault  = new Vault8004(IERC20(address(token)), owner, "V", "v", address(0));
+        vault  = new CapitalManager(IERC20(address(token)), owner, "V", "v", address(0));
         honest = new HonestAdapter(address(token));
         lossy  = new LossyAdapter(address(token), 2000); // 20% reported loss
 
@@ -133,10 +133,10 @@ contract Vault8004SlippageTest is Test {
     // ─── happy path: honest adapter passes default caps ──────────────────────
 
     function test_Allocate_Honest_PassesGuards() public {
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](1);
-        calls[0] = Vault8004.AllocationCall({
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
+        calls[0] = CapitalManager.AllocationCall({
             adapter: address(honest),
-            kind: Vault8004.AllocationCallKind.Deposit,
+            kind: CapitalManager.AllocationCallKind.Deposit,
             amount: 50 ether
         });
 
@@ -150,10 +150,10 @@ contract Vault8004SlippageTest is Test {
     // ─── per-call cap: lossy adapter is rejected by default 1% cap ──────────
 
     function test_PerCallCap_RejectsLossyDeposit_Default() public {
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](1);
-        calls[0] = Vault8004.AllocationCall({
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
+        calls[0] = CapitalManager.AllocationCall({
             adapter: address(lossy),
-            kind: Vault8004.AllocationCallKind.Deposit,
+            kind: CapitalManager.AllocationCallKind.Deposit,
             amount: 50 ether
         });
 
@@ -170,10 +170,10 @@ contract Vault8004SlippageTest is Test {
         vault.setMaxPerCallLossBps(2000); // 20%
         vault.setMaxSlippageBps(2000);    // 20% global, otherwise global cap kicks in
 
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](1);
-        calls[0] = Vault8004.AllocationCall({
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
+        calls[0] = CapitalManager.AllocationCall({
             adapter: address(lossy),
-            kind: Vault8004.AllocationCallKind.Deposit,
+            kind: CapitalManager.AllocationCallKind.Deposit,
             amount: 50 ether
         });
 
@@ -189,10 +189,10 @@ contract Vault8004SlippageTest is Test {
         // Raise per-call cap so it doesn't fire first; global cap still 1%.
         vault.setMaxPerCallLossBps(5000); // 50%
 
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](1);
-        calls[0] = Vault8004.AllocationCall({
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
+        calls[0] = CapitalManager.AllocationCall({
             adapter: address(lossy),
-            kind: Vault8004.AllocationCallKind.Deposit,
+            kind: CapitalManager.AllocationCallKind.Deposit,
             amount: 50 ether
         });
 
@@ -208,10 +208,10 @@ contract Vault8004SlippageTest is Test {
         vault.setMaxPerCallLossBps(5000);
         vault.setMaxSlippageBps(5000);
 
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](1);
-        calls[0] = Vault8004.AllocationCall({
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
+        calls[0] = CapitalManager.AllocationCall({
             adapter: address(lossy),
-            kind: Vault8004.AllocationCallKind.Deposit,
+            kind: CapitalManager.AllocationCallKind.Deposit,
             amount: 50 ether
         });
 
@@ -232,10 +232,10 @@ contract Vault8004SlippageTest is Test {
         // Re-seed tokens directly into the vault to give the deposit something to move.
         token.mint(address(vault), 50 ether);
 
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](1);
-        calls[0] = Vault8004.AllocationCall({
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
+        calls[0] = CapitalManager.AllocationCall({
             adapter: address(honest),
-            kind: Vault8004.AllocationCallKind.Deposit,
+            kind: CapitalManager.AllocationCallKind.Deposit,
             amount: 50 ether
         });
 

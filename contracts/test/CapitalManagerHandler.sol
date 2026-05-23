@@ -4,20 +4,20 @@ pragma solidity 0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import {Vault8004} from "../src/Vault8004.sol";
+import {CapitalManager} from "../src/CapitalManager.sol";
 import {IStrategyAdapter} from "../src/adapters/IStrategyAdapter.sol";
 
 interface IMintable is IERC20 {
     function mint(address to, uint256 amount) external;
 }
 
-/// @notice Bounded fuzz handler for Vault8004 invariant tests under the
+/// @notice Bounded fuzz handler for CapitalManager invariant tests under the
 /// multi-call execution architecture. Wraps every public mutating action in
 /// size + actor bounds so the fuzzer explores meaningful state instead of
 /// drowning in trivial reverts. Maintains ghost variables that downstream
 /// invariants assert against.
-contract Vault8004Handler is Test {
-    Vault8004 public immutable vault;
+contract CapitalManagerHandler is Test {
+    CapitalManager public immutable vault;
     IMintable public immutable token;
     IStrategyAdapter public immutable adapterA;
     IStrategyAdapter public immutable adapterB;
@@ -39,7 +39,7 @@ contract Vault8004Handler is Test {
     uint256 constant MAX_YIELD   = 10_000 ether;
 
     constructor(
-        Vault8004 _vault,
+        CapitalManager _vault,
         IMintable _token,
         IStrategyAdapter _adapterA,
         IStrategyAdapter _adapterB,
@@ -114,10 +114,10 @@ contract Vault8004Handler is Test {
         if (free == 0) return;
         amt = bound(amt, 1, free);
 
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](1);
-        calls[0] = Vault8004.AllocationCall({
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
+        calls[0] = CapitalManager.AllocationCall({
             adapter: address(a),
-            kind: Vault8004.AllocationCallKind.Deposit,
+            kind: CapitalManager.AllocationCallKind.Deposit,
             amount: amt
         });
         vm.prank(agent);
@@ -131,10 +131,10 @@ contract Vault8004Handler is Test {
         if (bal == 0) return;
         amt = bound(amt, 1, bal);
 
-        Vault8004.AllocationCall[] memory calls = new Vault8004.AllocationCall[](1);
-        calls[0] = Vault8004.AllocationCall({
+        CapitalManager.AllocationCall[] memory calls = new CapitalManager.AllocationCall[](1);
+        calls[0] = CapitalManager.AllocationCall({
             adapter: address(a),
-            kind: Vault8004.AllocationCallKind.Withdraw,
+            kind: CapitalManager.AllocationCallKind.Withdraw,
             amount: amt
         });
         vm.prank(agent);

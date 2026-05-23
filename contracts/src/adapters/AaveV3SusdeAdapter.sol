@@ -19,7 +19,7 @@ import {IAaveOracle, IChainlinkAggregator} from "./interfaces/IAaveOracle.sol";
 ///      Liveness: Mantle's Aave V3 Oracle proxies expose only `latestAnswer()`
 ///      (no `latestTimestamp` / `latestRoundData` surface), so an on-chain
 ///      heartbeat check is not possible from this adapter. Liveness is enforced
-///      one layer up by `Vault8004._checkSequencer()` plus Aave's own economic
+///      one layer up by `CapitalManager._checkSequencer()` plus Aave's own economic
 ///      incentive to maintain feed freshness. `answer > 0` is the only
 ///      adapter-side sanity check.
 contract AaveV3SusdeAdapter is IStrategyAdapter, Ownable {

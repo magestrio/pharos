@@ -17,7 +17,7 @@ interface IAaveOracle {
 ///      `latestRoundData()` (V3) nor `latestTimestamp()` (V2 timestamp) is
 ///      available, so on-chain heartbeat checks are not possible from the
 ///      adapter; liveness is enforced via vault-level sequencer-uptime feed
-///      (see `Vault8004._checkSequencer`) and Aave's own economic security.
+///      (see `CapitalManager._checkSequencer`) and Aave's own economic security.
 interface IChainlinkAggregator {
     function latestAnswer() external view returns (int256);
 }

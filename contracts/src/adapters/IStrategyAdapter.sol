@@ -2,7 +2,7 @@
 pragma solidity 0.8.24;
 
 /// @title IStrategyAdapter
-/// @notice Adapter contract used by Vault8004 multi-call execution layer.
+/// @notice Adapter contract used by CapitalManager multi-call execution layer.
 ///
 ///         Base asset on Mantle: WETH = 0xdEAddEaDdeadDEadDEADDEAddEADDEAddead1111.
 ///         All `valueInBaseAsset()` returns MUST be denominated in WETH wei (18 decimals).
@@ -19,7 +19,7 @@ pragma solidity 0.8.24;
 ///              (e.g. some L2 Aave Oracle proxies on Mantle), the
 ///              implementation MUST document the fallback: typically the
 ///              vault-level Chainlink L2 Sequencer Uptime Feed
-///              (`Vault8004.sequencerUptimeFeed`) plus the source protocol's
+///              (`CapitalManager.sequencerUptimeFeed`) plus the source protocol's
 ///              own economic incentive to maintain feed liveness.
 ///           3. `valueInBaseAsset()` MUST revert on `answer <= 0`. It MAY
 ///              return 0 only when the underlying position is genuinely 0.

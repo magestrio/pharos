@@ -3,7 +3,7 @@ pragma solidity 0.8.24;
 
 import {Script, console} from "forge-std/Script.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {Vault8004} from "../src/Vault8004.sol";
+import {CapitalManager} from "../src/CapitalManager.sol";
 import {DecisionLog} from "../src/DecisionLog.sol";
 import {ReputationOracle} from "../src/ReputationOracle.sol";
 import {MerchantMoeAdapter} from "../src/adapters/MerchantMoeAdapter.sol";
@@ -60,10 +60,10 @@ contract Deploy is Script {
         // See notes/addresses.md — research pending.
         address sequencerFeed = vm.envOr("SEQUENCER_FEED", address(0));
 
-        Vault8004 vault = new Vault8004(
+        CapitalManager vault = new CapitalManager(
             IERC20(WETH), deployer, "Vault8004 WETH", "v8004-WETH", sequencerFeed
         );
-        console.log("Vault8004:          ", address(vault));
+        console.log("CapitalManager:     ", address(vault));
         console.log("asset (WETH):       ", address(vault.asset()));
 
         DecisionLog decisionLog = new DecisionLog(deployer);
@@ -128,7 +128,7 @@ contract Deploy is Script {
 
         console.log("");
         console.log("=== DEPLOYMENT SUMMARY (copy to notes/addresses.md) ===");
-        console.log("Vault8004:           %s", address(vault));
+        console.log("CapitalManager:      %s", address(vault));
         console.log("DecisionLog:         %s", address(decisionLog));
         console.log("ReputationOracle:    %s", address(oracle));
         console.log("AaveV3WethAdapter:   %s", address(wethAdapter));
