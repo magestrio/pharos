@@ -25,6 +25,7 @@ contract DecisionLog is Ownable {
     constructor(address _owner) Ownable(_owner) {}
 
     function setAgent(address _agent) external onlyOwner {
+        require(_agent != address(0), "zero agent");
         agent = _agent;
         emit AgentSet(_agent);
     }

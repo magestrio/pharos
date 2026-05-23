@@ -11,13 +11,12 @@ contract MerchantMoeAdapter is IStrategyAdapter {
         vault = _vault;
     }
 
-    function deposit(uint256 /*amount*/) external override {
-        // stub: interact with Merchant Moe mETH/cmETH pools
+    function deposit(uint256 /*amount*/) external pure override {
+        revert("MerchantMoeAdapter: not implemented");
     }
 
-    function withdraw(uint256 /*amount*/) external override returns (uint256) {
-        // stub: exit Merchant Moe position
-        return 0;
+    function withdraw(uint256 /*amount*/) external pure override returns (uint256) {
+        revert("MerchantMoeAdapter: not implemented");
     }
 
     function balance() external pure override returns (uint256) {

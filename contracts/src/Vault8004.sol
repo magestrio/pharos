@@ -26,8 +26,8 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
     event AgentSet(address indexed agent);
     event StrategyWhitelisted(address indexed strategy, bool status);
     event StrategyChanged(address indexed oldStrategy, address indexed newStrategy);
-    event Allocated(address indexed strategy, uint256 amount, bytes32 decisionId);
-    event Deallocated(address indexed strategy, uint256 amount, bytes32 decisionId);
+    event Allocated(address indexed strategy, uint256 amount, bytes32 indexed decisionId);
+    event Deallocated(address indexed strategy, uint256 amount, bytes32 indexed decisionId);
 
     modifier onlyAgent() {
         require(msg.sender == agent, "not agent");
@@ -55,8 +55,8 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares)
         internal
         override
-        whenNotPaused
         nonReentrant
+        whenNotPaused
     {
         super._deposit(caller, receiver, assets, shares);
     }
@@ -64,8 +64,8 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
     function _withdraw(address caller, address receiver, address owner, uint256 assets, uint256 shares)
         internal
         override
-        whenNotPaused
         nonReentrant
+        whenNotPaused
     {
         super._withdraw(caller, receiver, owner, assets, shares);
     }
@@ -73,6 +73,7 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
     // ─── Owner-only ──────────────────────────────────────────────────────────
 
     function setAgent(address _agent) external onlyOwner {
+        require(_agent != address(0), "zero agent");
         agent = _agent;
         emit AgentSet(_agent);
     }
@@ -97,9 +98,9 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
         _unpause();
     }
 
-    function emergencyWithdraw(address strategy) external onlyOwner {
+    function emergencyWithdraw(address strategy) external nonReentrant onlyOwner {
         uint256 bal = IStrategyAdapter(strategy).balance();
-        uint256 received;
+        uint256 received = 0;
         if (bal > 0) {
             received = IStrategyAdapter(strategy).withdraw(bal);
         }
@@ -111,17 +112,19 @@ contract Vault8004 is ERC4626, Ownable, Pausable, ReentrancyGuard {
 
     // ─── Agent-only ──────────────────────────────────────────────────────────
 
-    function allocate(bytes32 decisionId, uint256 amount) external onlyAgent whenNotPaused nonReentrant {
+    function allocate(bytes32 decisionId, uint256 amount) external nonReentrant whenNotPaused onlyAgent {
         require(currentStrategy != address(0), "no strategy");
         uint256 free = IERC20(asset()).balanceOf(address(this)) - totalAllocated;
         require(amount <= free, "insufficient free cash");
+        // CEI: update bookkeeping before the external call. If deposit() reverts,
+        // the entire tx reverts and totalAllocated unwinds with it.
+        totalAllocated += amount;
         IERC20(asset()).forceApprove(currentStrategy, amount);
         IStrategyAdapter(currentStrategy).deposit(amount);
-        totalAllocated += amount;
         emit Allocated(currentStrategy, amount, decisionId);
     }
 
-    function deallocate(bytes32 decisionId, uint256 amount) external onlyAgent whenNotPaused nonReentrant {
+    function deallocate(bytes32 decisionId, uint256 amount) external nonReentrant whenNotPaused onlyAgent {
         require(currentStrategy != address(0), "no strategy");
         // Clamp requested amount to the adapter's actual balance. Some protocols
         // (Aave V3, sUSDe stake-via-router) round aToken/share minting down by 1 wei

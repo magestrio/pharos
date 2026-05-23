@@ -11,13 +11,12 @@ contract MethProtocolAdapter is IStrategyAdapter {
         vault = _vault;
     }
 
-    function deposit(uint256 /*amount*/) external override {
-        // stub: stake mETH via mETH Protocol
+    function deposit(uint256 /*amount*/) external pure override {
+        revert("MethProtocolAdapter: not implemented");
     }
 
-    function withdraw(uint256 /*amount*/) external override returns (uint256) {
-        // stub: unstake mETH via mETH Protocol
-        return 0;
+    function withdraw(uint256 /*amount*/) external pure override returns (uint256) {
+        revert("MethProtocolAdapter: not implemented");
     }
 
     function balance() external pure override returns (uint256) {

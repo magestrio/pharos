@@ -12,13 +12,12 @@ contract EthenaAdapter is IStrategyAdapter {
         vault = _vault;
     }
 
-    function deposit(uint256 /*amount*/) external override {
-        // stub: stake sUSDe via Ethena
+    function deposit(uint256 /*amount*/) external pure override {
+        revert("EthenaAdapter: not implemented");
     }
 
-    function withdraw(uint256 /*amount*/) external override returns (uint256) {
-        // stub: unstake sUSDe via Ethena
-        return 0;
+    function withdraw(uint256 /*amount*/) external pure override returns (uint256) {
+        revert("EthenaAdapter: not implemented");
     }
 
     function balance() external pure override returns (uint256) {

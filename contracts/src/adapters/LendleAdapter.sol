@@ -11,13 +11,12 @@ contract LendleAdapter is IStrategyAdapter {
         vault = _vault;
     }
 
-    function deposit(uint256 /*amount*/) external override {
-        // stub: supply mETH on Lendle
+    function deposit(uint256 /*amount*/) external pure override {
+        revert("LendleAdapter: not implemented");
     }
 
-    function withdraw(uint256 /*amount*/) external override returns (uint256) {
-        // stub: withdraw mETH from Lendle
-        return 0;
+    function withdraw(uint256 /*amount*/) external pure override returns (uint256) {
+        revert("LendleAdapter: not implemented");
     }
 
     function balance() external pure override returns (uint256) {

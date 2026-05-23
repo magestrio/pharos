@@ -34,6 +34,10 @@ contract AaveV3UsdcAdapter is IStrategyAdapter, Ownable {
     }
 
     function deposit(uint256 amount) external onlyVault {
+        // `vault` is immutable and callers are restricted by `onlyVault`, so
+        // `safeTransferFrom(vault, ...)` is safe — only the vault itself can
+        // invoke this path. Slither reports false-positive otherwise.
+        // slither-disable-next-line arbitrary-send-erc20
         usdc.safeTransferFrom(vault, address(this), amount);
         usdc.forceApprove(address(aavePool), amount);
         aavePool.supply(address(usdc), amount, address(this), 0);
