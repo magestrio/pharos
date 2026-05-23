@@ -1,0 +1,15 @@
+{
+  "name": "Vault8004 Agent",
+  "description": "Autonomous AI portfolio manager on Mantle. Rebalances mETH/cmETH/sUSDe/Aave-V3-USDC every 4h. Every decision recorded on-chain in DecisionLog, with rationale pinned to IPFS. Reputation pushed to canonical ERC-8004 ReputationRegistry as cumulative annualized APR in basis points.",
+  "image": "ipfs://__IMAGE_CID__",
+  "endpoint": "https://vault8004.xyz/agent.json",
+  "attributes": [
+    {"trait_type": "Model",          "value": "Claude Opus 4.7"},
+    {"trait_type": "Strategy",       "value": "Multi-asset yield (WETH/USDC/sUSDe)"},
+    {"trait_type": "Risk Profile",   "value": "Conservative DeFi yield"},
+    {"trait_type": "Cycle Interval", "value": "4h"},
+    {"trait_type": "Mainnet",        "value": "Mantle"},
+    {"trait_type": "Reputation",     "value": "ERC-8004 ReputationRegistry"},
+    {"trait_type": "Owner",          "value": "Gnosis Safe (2-of-3)"}
+  ]
+}
