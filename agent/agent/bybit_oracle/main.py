@@ -6,6 +6,7 @@ from .abi import load_bybit_attestor_abi
 from .bybit_client import BybitClient
 from .chain_writer import ChainWriter
 from .config import settings
+from .hedge import NullHedgeTrigger
 from .listener import make_contract, run_listener
 from .orchestrator import DepositOrchestrator
 from .product_picker import FlexibleUsdcPicker
@@ -38,6 +39,7 @@ async def _main() -> None:
         bybit_client=bybit_client,
         picker=picker,
         swap_stake=swap_stake,
+        hedge=NullHedgeTrigger(),  # blocked-by:hedge-engine
     )
     log.info("orchestrator_ready", extra={"attestor_addr": chain_writer.address})
 

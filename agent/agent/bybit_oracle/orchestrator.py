@@ -45,12 +45,14 @@ from decimal import Decimal
 from .bybit_client import BybitClient, BybitOrderError
 from .chain_writer import ChainSendError, ChainWriter
 from .events import DepositRequested
+from .hedge import HedgeTrigger, NullHedgeTrigger
 from .product_picker import NoProductAvailable, ProductPicker
 from .state import (
     DEPOSIT_CONFIRMED,
     DEPOSIT_ESCROW_WITHDRAWN,
     DEPOSIT_FAILED,
     DEPOSIT_HEDGE_SKIPPED,
+    DEPOSIT_HEDGED,
     DEPOSIT_ON_BYBIT,
     DEPOSIT_PRODUCT_SELECTED,
     DEPOSIT_RECEIVED,
@@ -87,11 +89,13 @@ class DepositOrchestrator:
         bybit_client: BybitClient,
         picker: ProductPicker,
         swap_stake: SwapStakeExecutor,
+        hedge: HedgeTrigger | None = None,
     ) -> None:
         self._chain = chain_writer
         self._bybit = bybit_client
         self._picker = picker
         self._swap_stake = swap_stake
+        self._hedge: HedgeTrigger = hedge or NullHedgeTrigger()
 
     async def handle(self, conn: sqlite3.Connection, event: DepositRequested) -> None:
         # Seed/refresh the row. If the row already exists at a later state
@@ -220,12 +224,16 @@ class DepositOrchestrator:
         if _row_status(conn, event.tx_id) != DEPOSIT_STAKED:
             return
 
-        # .12g placeholder. Real impl: inspect picked.target_coin; if volatile
-        # and hedge-engine available, open short perp + advance HEDGED.
-        # MVP / .15 smoke uses FlexibleUsdcPicker (USDC only) → always skip.
-        log.info("phase_hedge_skipped", extra={"tx_id": event.tx_id, "reason": "stub"})
-        advance_deposit_status(
-            conn, event.tx_id, DEPOSIT_STAKED, DEPOSIT_HEDGE_SKIPPED
+        picked = getattr(self, "_last_picked", None)
+        coin = picked.target_coin if picked is not None else "USDC"
+        amount = _micro_to_decimal(event.amount)
+
+        outcome = await self._hedge.maybe_trigger(coin=coin, amount=amount)
+        next_status = DEPOSIT_HEDGED if outcome == "hedged" else DEPOSIT_HEDGE_SKIPPED
+        advance_deposit_status(conn, event.tx_id, DEPOSIT_STAKED, next_status)
+        log.info(
+            "phase_hedge_done",
+            extra={"tx_id": event.tx_id, "outcome": outcome, "coin": coin},
         )
 
     # --- Phase 6: finalize FSM ---------------------------------------------
@@ -233,17 +241,16 @@ class DepositOrchestrator:
     async def _phase_confirm(
         self, conn: sqlite3.Connection, event: DepositRequested
     ) -> None:
-        if _row_status(conn, event.tx_id) != DEPOSIT_HEDGE_SKIPPED:
+        current = _row_status(conn, event.tx_id)
+        if current not in (DEPOSIT_HEDGE_SKIPPED, DEPOSIT_HEDGED):
             return
 
         # No on-chain action here — confirmDeposit was already pushed in
         # phase 1 (Flow A). The periodic `.14` updateBalance cron will start
         # reporting yield-grown values; this terminal advance just marks the
         # cycle complete for accounting / dashboards.
-        advance_deposit_status(
-            conn, event.tx_id, DEPOSIT_HEDGE_SKIPPED, DEPOSIT_CONFIRMED
-        )
-        log.info("deposit_cycle_done", extra={"tx_id": event.tx_id})
+        advance_deposit_status(conn, event.tx_id, current, DEPOSIT_CONFIRMED)
+        log.info("deposit_cycle_done", extra={"tx_id": event.tx_id, "from": current})
 
     # --- Failure handling --------------------------------------------------
 

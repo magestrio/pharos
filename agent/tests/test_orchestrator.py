@@ -49,6 +49,7 @@ def _make_orchestrator(
     bridge_delta: Decimal = Decimal("100"),
     picked: PickedProduct | None = None,
     earn_order_id: str = "earn-1",
+    hedge_outcome: str = "skipped",
 ):
     chain = MagicMock(name="ChainWriter")
     chain.read_attested_balance.return_value = current_attested
@@ -90,13 +91,17 @@ def _make_orchestrator(
 
     swap_stake.execute.side_effect = fake_execute
 
+    hedge = AsyncMock(name="HedgeTrigger")
+    hedge.maybe_trigger.return_value = hedge_outcome
+
     orch = DepositOrchestrator(
         chain_writer=chain,
         bybit_client=bybit,
         picker=picker,
         swap_stake=swap_stake,
+        hedge=hedge,
     )
-    return orch, chain, bybit, picker, swap_stake
+    return orch, chain, bybit, picker, swap_stake, hedge
 
 
 def _status(db, tx_id):
@@ -108,7 +113,7 @@ def _status(db, tx_id):
 
 @pytest.mark.asyncio
 async def test_happy_path_end_to_end(db, event):
-    orch, chain, bybit, picker, swap_stake = _make_orchestrator(current_attested=0)
+    orch, chain, bybit, picker, swap_stake, _hedge = _make_orchestrator(current_attested=0)
 
     await orch.handle(db, event)
 
@@ -160,7 +165,7 @@ async def test_resume_from_on_bybit_skips_first_two_phases(db, event):
     )
     db.commit()
 
-    orch, chain, bybit, picker, swap_stake = _make_orchestrator()
+    orch, chain, bybit, picker, swap_stake, _hedge = _make_orchestrator()
     await orch.handle(db, event)
 
     assert _status(db, 42) == DEPOSIT_CONFIRMED
@@ -181,7 +186,7 @@ async def test_resume_from_staked_only_runs_tail(db, event):
     )
     db.commit()
 
-    orch, chain, bybit, picker, swap_stake = _make_orchestrator()
+    orch, chain, bybit, picker, swap_stake, _hedge = _make_orchestrator()
     await orch.handle(db, event)
 
     assert _status(db, 42) == DEPOSIT_CONFIRMED
@@ -212,7 +217,7 @@ async def test_bybit_order_error_marks_failed_mid_flight(db, event):
     """BybitOrderError from swap_stake (e.g. Earn product paused). FSM was
     advanced to PRODUCT_SELECTED before the failure — must end at FAILED.
     """
-    orch, _chain, _bybit, _picker, swap_stake = _make_orchestrator()
+    orch, _chain, _bybit, _picker, swap_stake, _hedge = _make_orchestrator()
     swap_stake.execute.side_effect = BybitOrderError("product paused")
 
     with pytest.raises(BybitOrderError):
@@ -223,7 +228,7 @@ async def test_bybit_order_error_marks_failed_mid_flight(db, event):
 
 @pytest.mark.asyncio
 async def test_no_product_available_marks_failed(db, event):
-    orch, _chain, _bybit, picker, _swap_stake = _make_orchestrator()
+    orch, _chain, _bybit, picker, _swap_stake, _hedge = _make_orchestrator()
     picker.pick.side_effect = NoProductAvailable("none enabled")
 
     with pytest.raises(NoProductAvailable):
@@ -237,7 +242,7 @@ async def test_idempotent_replay_after_confirmed(db, event):
     """handle() called twice — second call should no-op (row at CONFIRMED,
     every phase guard short-circuits) and NOT re-call any infra.
     """
-    orch, chain, bybit, picker, swap_stake = _make_orchestrator()
+    orch, chain, bybit, picker, swap_stake, _hedge = _make_orchestrator()
     await orch.handle(db, event)
     assert _status(db, 42) == DEPOSIT_CONFIRMED
 
@@ -267,7 +272,7 @@ async def test_volatile_picker_passes_target_coin_to_swap_stake(db, event):
     eth_pick = PickedProduct(
         product_id="prod-ETH-flex", target_coin="ETH", estimated_apr=Decimal("3.5")
     )
-    orch, _chain, _bybit, _picker, swap_stake = _make_orchestrator(picked=eth_pick)
+    orch, _chain, _bybit, _picker, swap_stake, _hedge = _make_orchestrator(picked=eth_pick)
 
     await orch.handle(db, event)
 
@@ -289,7 +294,7 @@ async def test_resume_re_queries_picker_when_orchestrator_lost_state(db, event):
     )
     db.commit()
 
-    orch, _chain, _bybit, picker, swap_stake = _make_orchestrator()
+    orch, _chain, _bybit, picker, swap_stake, _hedge = _make_orchestrator()
     # Fresh orchestrator instance has no _last_picked attribute.
     await orch.handle(db, event)
 
@@ -297,6 +302,35 @@ async def test_resume_re_queries_picker_when_orchestrator_lost_state(db, event):
     # Picker queried once during resume.
     picker.pick.assert_awaited_once()
     swap_stake.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_hedge_skipped_routes_to_hedge_skipped(db, event):
+    """Default NullHedgeTrigger returns 'skipped' → FSM lands at HEDGE_SKIPPED
+    on the way to CONFIRMED.
+    """
+    orch, _chain, _bybit, _picker, _swap_stake, hedge = _make_orchestrator(
+        hedge_outcome="skipped"
+    )
+    await orch.handle(db, event)
+    assert _status(db, 42) == DEPOSIT_CONFIRMED
+    hedge.maybe_trigger.assert_awaited_once_with(coin="USDC", amount=Decimal("100"))
+
+
+@pytest.mark.asyncio
+async def test_hedge_hedged_routes_to_hedged(db, event):
+    """Future real trigger returns 'hedged' → FSM goes STAKED → HEDGED → CONFIRMED.
+    Verifies the HEDGED branch (currently dead in MVP but reachable).
+    """
+    eth_pick = PickedProduct(
+        product_id="prod-ETH", target_coin="ETH", estimated_apr=Decimal("3.5")
+    )
+    orch, _chain, _bybit, _picker, _swap_stake, hedge = _make_orchestrator(
+        picked=eth_pick, hedge_outcome="hedged"
+    )
+    await orch.handle(db, event)
+    assert _status(db, 42) == DEPOSIT_CONFIRMED
+    hedge.maybe_trigger.assert_awaited_once_with(coin="ETH", amount=Decimal("100"))
 
 
 @pytest.mark.asyncio
