@@ -37,6 +37,29 @@ from .structured_log import get_logger
 log = get_logger(__name__)
 
 
+# Minimal ERC-20 surface — only what we need to send USDC and read balances.
+# Avoids pulling a full token ABI into the repo.
+_ERC20_MINIMAL_ABI: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "transfer",
+        "stateMutability": "nonpayable",
+        "inputs": [
+            {"name": "to", "type": "address"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "outputs": [{"name": "", "type": "bool"}],
+    },
+    {
+        "type": "function",
+        "name": "balanceOf",
+        "stateMutability": "view",
+        "inputs": [{"name": "account", "type": "address"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+    },
+]
+
+
 class ChainSendError(RuntimeError):
     """A tx was mined but reverted on-chain. Do NOT retry — same call will
     revert again. Caller's job to advance FSM to `failed` and alert.
@@ -53,6 +76,7 @@ class ChainWriter:
         account: LocalAccount,
         contract_address: str,
         abi: list[dict[str, Any]],
+        usdc_address: str | None = None,
         chain_id: int = 5000,
         gas_buffer: float = 1.2,
         receipt_timeout: int = 120,
@@ -64,6 +88,17 @@ class ChainWriter:
         self._receipt_timeout = receipt_timeout
         self._contract: Contract = w3.eth.contract(
             address=Web3.to_checksum_address(contract_address), abi=abi
+        )
+        # USDC token is optional — only the orchestrator needs it for bridging
+        # USDC from the attestor wallet to Bybit. Read-only paths (just
+        # confirmDeposit / confirmWithdraw / updateBalance) can leave it None.
+        self._usdc: Contract | None = (
+            w3.eth.contract(
+                address=Web3.to_checksum_address(usdc_address),
+                abi=_ERC20_MINIMAL_ABI,
+            )
+            if usdc_address
+            else None
         )
 
     @classmethod
@@ -85,6 +120,7 @@ class ChainWriter:
             account=account,
             contract_address=cfg.BYBIT_ATTESTOR_ADDRESS,
             abi=load_bybit_attestor_abi(),
+            usdc_address=cfg.MANTLE_USDC_ADDRESS,
             chain_id=cfg.MANTLE_CHAIN_ID,
             gas_buffer=cfg.MANTLE_GAS_BUFFER,
             receipt_timeout=cfg.MANTLE_TX_RECEIPT_TIMEOUT,
@@ -103,15 +139,42 @@ class ChainWriter:
     def push_update_balance(self, new_balance: int) -> str:
         return self._send("updateBalance", new_balance)
 
+    def read_attested_balance(self) -> int:
+        """Read `attestedBalance()` from the BybitAttestor contract.
+        Used by the orchestrator to compute `newBalance = current + amount`
+        for confirmDeposit's sanity check.
+        """
+        return int(self._contract.functions.attestedBalance().call())
+
+    def transfer_usdc(self, to_address: str, amount_micro: int) -> str:
+        """Send `amount_micro` (uint256 micro-USDC, 6 decimals) USDC from the
+        attestor wallet to `to_address` on Mantle. Used by the orchestrator
+        to bridge escrow-released USDC to the Bybit deposit address.
+
+        Requires `usdc_address` to have been passed at construction; raises
+        otherwise. ERC-20 transfer returns bool — wraps `_send` with a
+        contract overriden to the USDC instance for this call.
+        """
+        if self._usdc is None:
+            raise RuntimeError(
+                "transfer_usdc called but ChainWriter has no usdc_address configured"
+            )
+        return self._send_on_contract(
+            self._usdc, "transfer", Web3.to_checksum_address(to_address), amount_micro
+        )
+
+    def _send(self, fn_name: str, *args: Any) -> str:
+        return self._send_on_contract(self._contract, fn_name, *args)
+
     @retry(
         retry=retry_if_exception_type(_TRANSIENT),
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         reraise=True,
     )
-    def _send(self, fn_name: str, *args: Any) -> str:
+    def _send_on_contract(self, contract: Contract, fn_name: str, *args: Any) -> str:
         sender = self._account.address
-        fn = self._contract.functions[fn_name](*args)
+        fn = contract.functions[fn_name](*args)
 
         nonce = self._w3.eth.get_transaction_count(sender, "pending")
         # estimate_gas will revert-simulate the call — catches obvious failures

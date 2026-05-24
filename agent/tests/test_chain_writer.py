@@ -220,8 +220,9 @@ def test_transient_transport_error_retried():
     ]
     # Override the default tenacity wait — tests must not actually sleep.
     writer = _make_writer(w3)
-    # Patch the underlying retry's wait to zero for this test.
-    writer._send.retry.wait = lambda *_a, **_k: 0  # type: ignore[attr-defined]
+    # Patch the underlying retry's wait to zero for this test. Retry decorator
+    # now lives on `_send_on_contract` (so `transfer_usdc` shares the policy).
+    writer._send_on_contract.retry.wait = lambda *_a, **_k: 0  # type: ignore[attr-defined]
 
     tx_hash = writer.push_confirm_deposit(1, 1)
     assert tx_hash == TX_HASH_HEX

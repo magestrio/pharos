@@ -46,5 +46,9 @@ class OracleSettings(BaseSettings):
     MANTLE_TX_RECEIPT_TIMEOUT: int = 120
     MANTLE_GAS_BUFFER: float = 1.2
 
+    # USDC on Mantle (used by the orchestrator to bridge escrow-released
+    # USDC from attestor wallet to the Bybit deposit address).
+    MANTLE_USDC_ADDRESS: str = "0x09Bc4E0D864854c6aFB6eB9A9cdF58aC190D0dF9"
+
 
 settings = OracleSettings()

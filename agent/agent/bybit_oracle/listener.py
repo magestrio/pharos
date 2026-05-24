@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+from collections.abc import Awaitable, Callable
 
 from web3 import Web3
 from web3.contract import Contract
@@ -12,6 +13,9 @@ from .state import mark_event_processed
 from .structured_log import get_logger
 
 log = get_logger(__name__)
+
+DepositHandler = Callable[[sqlite3.Connection, DepositRequested], Awaitable[None]]
+WithdrawHandler = Callable[[sqlite3.Connection, WithdrawRequested], Awaitable[None]]
 
 
 def make_contract(w3: Web3, address: str, abi: list[dict]) -> Contract:
@@ -31,7 +35,9 @@ def _event_payload(log_entry) -> str:
     )
 
 
-async def _dispatch_deposit(conn: sqlite3.Connection, log_entry) -> None:
+async def _dispatch_deposit(
+    conn: sqlite3.Connection, log_entry, handler: DepositHandler
+) -> None:
     if not mark_event_processed(
         conn,
         log_entry["transactionHash"].hex(),
@@ -47,10 +53,12 @@ async def _dispatch_deposit(conn: sqlite3.Connection, log_entry) -> None:
         log_index=log_entry["logIndex"],
         block_number=log_entry["blockNumber"],
     )
-    await handle_deposit_requested(conn, event)
+    await handler(conn, event)
 
 
-async def _dispatch_withdraw(conn: sqlite3.Connection, log_entry) -> None:
+async def _dispatch_withdraw(
+    conn: sqlite3.Connection, log_entry, handler: WithdrawHandler
+) -> None:
     if not mark_event_processed(
         conn,
         log_entry["transactionHash"].hex(),
@@ -66,10 +74,15 @@ async def _dispatch_withdraw(conn: sqlite3.Connection, log_entry) -> None:
         log_index=log_entry["logIndex"],
         block_number=log_entry["blockNumber"],
     )
-    await handle_withdraw_requested(conn, event)
+    await handler(conn, event)
 
 
-async def run_listener(conn: sqlite3.Connection, contract: Contract) -> None:
+async def run_listener(
+    conn: sqlite3.Connection,
+    contract: Contract,
+    deposit_handler: DepositHandler = handle_deposit_requested,
+    withdraw_handler: WithdrawHandler = handle_withdraw_requested,
+) -> None:
     from_block = settings.ORACLE_FROM_BLOCK or "latest"
     deposit_filter = contract.events.DepositRequested.create_filter(from_block=from_block)
     withdraw_filter = contract.events.WithdrawRequested.create_filter(from_block=from_block)
@@ -86,9 +99,9 @@ async def run_listener(conn: sqlite3.Connection, contract: Contract) -> None:
     while True:
         try:
             for entry in deposit_filter.get_new_entries():
-                await _dispatch_deposit(conn, entry)
+                await _dispatch_deposit(conn, entry, deposit_handler)
             for entry in withdraw_filter.get_new_entries():
-                await _dispatch_withdraw(conn, entry)
+                await _dispatch_withdraw(conn, entry, withdraw_handler)
         except Exception:
             log.exception("listener_poll_failed")
         await asyncio.sleep(settings.POLL_INTERVAL_SECONDS)
