@@ -7,8 +7,6 @@ from agent.backtest.simulator import accrue_apy, rebalance
 from agent.backtest.metrics import compute_metrics
 from agent.backtest.policy import PolicyProtocol
 from agent.data.storage import load_parquet
-from agent.reason.schema import Decision
-from agent.validate.rules import validate
 
 
 def run_backtest(
@@ -34,31 +32,6 @@ def run_backtest(
         current_alloc = portfolio.to_allocation()
 
         target = policy.decide(market, current_alloc)
-
-        # validate() expects Decision, not TargetAllocation
-        decision_wrapper = Decision(
-            thesis="Backtest decision placeholder.",
-            target_allocation=target,
-            confidence=0.9,
-        )
-        try:
-            valid, errors = validate(decision_wrapper)
-        except (NotImplementedError, AttributeError):
-            valid, errors = True, []
-
-        if not valid:
-            portfolio = accrue_apy(portfolio, market)
-            portfolio = portfolio.model_copy(update={"date": date})
-            days.append(DayResult(
-                date=date,
-                portfolio=portfolio,
-                target_allocation=current_alloc,
-                rebalanced=False,
-                rebalance_cost_usd=0.0,
-                skipped=True,
-                skip_reason="; ".join(errors),
-            ))
-            continue
 
         portfolio_rebalanced, slip = rebalance(portfolio, target, market)
         portfolio_after = accrue_apy(portfolio_rebalanced, market)

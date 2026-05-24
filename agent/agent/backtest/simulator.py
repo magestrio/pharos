@@ -1,5 +1,5 @@
 from agent.backtest.models import PortfolioState
-from agent.reason.schema import TargetAllocation
+from agent.reason.schema import LegacyTargetAllocation
 from agent.gather.models import MarketData
 
 # Slippage assumptions per asset class (in bps; 1 bp = 0.01%)
@@ -30,7 +30,7 @@ def accrue_apy(portfolio: PortfolioState, market: MarketData) -> PortfolioState:
 
 def rebalance(
     portfolio: PortfolioState,
-    target: TargetAllocation,
+    target: LegacyTargetAllocation,
     market: MarketData,
 ) -> tuple[PortfolioState, float]:
     """
