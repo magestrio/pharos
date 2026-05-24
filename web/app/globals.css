@@ -2,11 +2,116 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  color-scheme: light dark;
-}
-
 html,
 body {
-  height: 100%;
+  background: #070a14;
+  color: #e6eaf2;
+}
+
+body {
+  font-family: var(--font-sans), "Inter", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.font-mono,
+.mono {
+  font-family: var(--font-mono), "JetBrains Mono", ui-monospace, monospace;
+  font-feature-settings: "tnum" 1, "zero" 1;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+.bg-grid {
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.025) 1px, transparent 1px);
+  background-size: 56px 56px;
+  background-position: -1px -1px;
+}
+
+.bg-dots {
+  background-image: radial-gradient(rgba(255, 255, 255, 0.06) 1px, transparent 1px);
+  background-size: 18px 18px;
+}
+
+@keyframes pulseDot {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(0, 255, 136, 0.55);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(0, 255, 136, 0);
+  }
+}
+
+.live-dot {
+  animation: pulseDot 1.6s ease-out infinite;
+}
+
+@keyframes tickerSlide {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(-50%);
+  }
+}
+
+.ticker-track {
+  animation: tickerSlide 60s linear infinite;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #1a2138;
+  border-radius: 6px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #222b44;
+}
+
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fade-up {
+  opacity: 1;
+  animation: fadeUp 0.35s ease-out;
+}
+
+@keyframes barFill {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+.bar-fill {
+  transform-origin: left;
+  animation: barFill 2s linear forwards;
+}
+
+::selection {
+  background: rgba(0, 255, 136, 0.25);
+  color: #e6eaf2;
+}
+
+.no-scroll-x {
+  overflow-x: hidden;
 }
