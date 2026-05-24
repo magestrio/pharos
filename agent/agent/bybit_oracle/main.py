@@ -10,9 +10,11 @@ from .hedge import NullHedgeTrigger
 from .listener import make_contract, run_listener
 from .orchestrator import DepositOrchestrator
 from .product_picker import FlexibleUsdcPicker
+from .redeem_swap import RedeemSwapExecutor
 from .state import open_db
 from .structured_log import get_logger, setup_logging
 from .swap_stake import SwapStakeExecutor
+from .withdraw_orchestrator import WithdrawOrchestrator
 
 
 async def _main() -> None:
@@ -34,17 +36,31 @@ async def _main() -> None:
     chain_writer = ChainWriter.from_settings(cfg=settings, w3=w3)
     picker = FlexibleUsdcPicker()
     swap_stake = SwapStakeExecutor(bybit_client)
-    orchestrator = DepositOrchestrator(
+    redeem_swap = RedeemSwapExecutor(bybit_client)
+    hedge = NullHedgeTrigger()  # blocked-by:hedge-engine
+    deposit_orchestrator = DepositOrchestrator(
         chain_writer=chain_writer,
         bybit_client=bybit_client,
         picker=picker,
         swap_stake=swap_stake,
-        hedge=NullHedgeTrigger(),  # blocked-by:hedge-engine
+        hedge=hedge,
+    )
+    withdraw_orchestrator = WithdrawOrchestrator(
+        chain_writer=chain_writer,
+        bybit_client=bybit_client,
+        picker=picker,
+        redeem_swap=redeem_swap,
+        hedge=hedge,
     )
     log.info("orchestrator_ready", extra={"attestor_addr": chain_writer.address})
 
     try:
-        await run_listener(conn, contract, deposit_handler=orchestrator.handle)
+        await run_listener(
+            conn,
+            contract,
+            deposit_handler=deposit_orchestrator.handle,
+            withdraw_handler=withdraw_orchestrator.handle,
+        )
     finally:
         await bybit_client.aclose()
 

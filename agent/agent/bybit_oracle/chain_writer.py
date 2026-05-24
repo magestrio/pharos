@@ -142,6 +142,14 @@ class ChainWriter:
     def address(self) -> str:
         return self._account.address
 
+    @property
+    def attestor_contract_address(self) -> str:
+        """The BybitAttestor contract address. Exposed so the withdraw
+        orchestrator can pass it to `approve_usdc` without re-importing
+        settings — keeps the orchestrator decoupled from config.
+        """
+        return self._contract.address
+
     def push_confirm_deposit(self, tx_id: int, new_attested_balance: int) -> str:
         return self._send("confirmDeposit", tx_id, new_attested_balance)
 
