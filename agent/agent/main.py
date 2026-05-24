@@ -1,13 +1,15 @@
-from apscheduler.schedulers.blocking import BlockingScheduler
+import asyncio
+import logging
 
-from agent.loop import run_cycle
+from agent.scheduler.main import main_loop
 
 
 def main() -> None:
-    scheduler = BlockingScheduler()
-    scheduler.add_job(run_cycle, "cron", hour="*/4")
-    print("Vault8004 agent starting — rebalancing every 4 hours")
-    scheduler.start()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    asyncio.run(main_loop())
 
 
 if __name__ == "__main__":
