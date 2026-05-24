@@ -15,6 +15,7 @@ remedy. Callers should advance the FSM row to `failed` and surface to ops.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -174,6 +175,23 @@ class ChainWriter:
             self._usdc, "transfer", Web3.to_checksum_address(to_address), amount_micro
         )
 
+    def read_usdc_balance(self, address: str) -> int:
+        """Read USDC balance (raw micro-USDC, uint256) of `address`. Used by
+        the withdraw orchestrator to detect Bybit→Mantle bridge credit.
+
+        Sync — wrap in `asyncio.to_thread` from async callers. Cheap RPC
+        call, no signing.
+        """
+        if self._usdc is None:
+            raise RuntimeError(
+                "read_usdc_balance called but ChainWriter has no usdc_address configured"
+            )
+        return int(
+            self._usdc.functions.balanceOf(
+                Web3.to_checksum_address(address)
+            ).call()
+        )
+
     def approve_usdc(self, spender: str, amount_micro: int) -> str:
         """Approve `spender` to pull up to `amount_micro` USDC from the
         attestor wallet. Used by the withdraw orchestrator: BybitAttestor's
@@ -265,3 +283,49 @@ class ChainWriter:
             },
         )
         return tx_hash
+
+
+async def poll_mantle_usdc_credit(
+    writer: ChainWriter,
+    address: str,
+    baseline: int,
+    min_credit: int,
+    timeout_seconds: float = 1800,
+    interval_seconds: float = 15,
+) -> int:
+    """Block until `address` ERC-20 USDC balance grows by at least `min_credit`
+    micro-USDC versus `baseline`. Returns the actual delta.
+
+    Used by the withdraw orchestrator after triggering Bybit→Mantle bridge
+    withdrawal: snapshot baseline before the Bybit call, then poll here until
+    Bybit's on-chain transfer lands. Free function (not method) so ChainWriter
+    stays purely sync — we wrap the sync `read_usdc_balance` in `to_thread`.
+
+    Raises TimeoutError if not credited within timeout_seconds.
+    """
+    log.info(
+        "mantle_credit_wait_started",
+        extra={
+            "address": address,
+            "baseline": baseline,
+            "min_credit": min_credit,
+            "timeout_seconds": timeout_seconds,
+        },
+    )
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout_seconds
+    while True:
+        current = await asyncio.to_thread(writer.read_usdc_balance, address)
+        delta = current - baseline
+        if delta >= min_credit:
+            log.info(
+                "mantle_credit_landed",
+                extra={"address": address, "delta": delta},
+            )
+            return delta
+        if loop.time() >= deadline:
+            raise TimeoutError(
+                f"mantle USDC not credited to {address} within {timeout_seconds}s "
+                f"(delta={delta}, needed={min_credit})"
+            )
+        await asyncio.sleep(interval_seconds)

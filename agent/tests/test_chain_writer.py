@@ -6,7 +6,11 @@ from eth_account import Account
 from web3 import Web3
 from web3.exceptions import Web3RPCError
 
-from agent.bybit_oracle.chain_writer import ChainSendError, ChainWriter
+from agent.bybit_oracle.chain_writer import (
+    ChainSendError,
+    ChainWriter,
+    poll_mantle_usdc_credit,
+)
 
 # Deterministic test key — burner, never to touch any chain.
 TEST_PRIVATE_KEY = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
@@ -310,5 +314,105 @@ def test_approve_usdc_raises_without_usdc_address():
     writer = _make_writer(w3)  # no usdc_address
     with pytest.raises(RuntimeError, match="approve_usdc.*usdc_address"):
         writer.approve_usdc(SPENDER, 1)
+
+
+# --- .13d: Mantle USDC balance polling -------------------------------------
+
+
+def _w3_with_balance_sequence(balances: list[int]) -> MagicMock:
+    """Build a w3 mock where `usdc_contract.functions.balanceOf(addr).call()`
+    returns successive values from `balances` (last value sticks).
+    """
+    w3 = MagicMock(name="Web3")
+    type(w3.eth).gas_price = PropertyMock(return_value=1_000_000)
+
+    contract = MagicMock(name="Contract", address=CONTRACT_ADDR)
+    fn_mock = MagicMock(name="ContractFn")
+    fn_mock.estimate_gas.return_value = 100_000
+    fn_mock.build_transaction.return_value = {
+        "from": ATTESTOR_ADDR, "nonce": 0, "gas": 120_000,
+        "gasPrice": 1_000_000, "chainId": 5000, "data": "0x", "value": 0,
+    }
+    contract.functions = MagicMock()
+    contract.functions.__getitem__.return_value = MagicMock(return_value=fn_mock)
+
+    # balanceOf factory: each call returns a callable whose `.call()` produces
+    # the next value in `balances`.
+    iter_balances = iter(balances)
+
+    def balance_of_factory(_addr):
+        node = MagicMock()
+        try:
+            node.call.return_value = next(iter_balances)
+        except StopIteration:
+            # Keep returning the last value if we run out.
+            node.call.return_value = balances[-1]
+        return node
+
+    contract.functions.balanceOf = balance_of_factory
+    w3.eth.contract.return_value = contract
+    return w3
+
+
+def test_read_usdc_balance_calls_balance_of():
+    w3 = _w3_with_balance_sequence([1_000_000])
+    writer = _make_writer_with_usdc(w3)
+    assert writer.read_usdc_balance(ATTESTOR_ADDR) == 1_000_000
+
+
+def test_read_usdc_balance_raises_without_usdc():
+    w3, _ = _make_w3_mock()
+    writer = _make_writer(w3)
+    with pytest.raises(RuntimeError, match="read_usdc_balance.*usdc_address"):
+        writer.read_usdc_balance(ATTESTOR_ADDR)
+
+
+@pytest.mark.asyncio
+async def test_poll_mantle_usdc_credit_returns_delta():
+    """Baseline 100M, then 100M (not yet), then 150M (credit landed).
+    Caller asked for min_credit=40M → returns 50M.
+    """
+    w3 = _w3_with_balance_sequence([100_000_000, 100_000_000, 150_000_000])
+    writer = _make_writer_with_usdc(w3)
+
+    delta = await poll_mantle_usdc_credit(
+        writer=writer,
+        address=ATTESTOR_ADDR,
+        baseline=100_000_000,
+        min_credit=40_000_000,
+        interval_seconds=0,
+    )
+    assert delta == 50_000_000
+
+
+@pytest.mark.asyncio
+async def test_poll_mantle_usdc_credit_immediate():
+    """First poll already shows full credit — must return without sleeping."""
+    w3 = _w3_with_balance_sequence([200_000_000])
+    writer = _make_writer_with_usdc(w3)
+    delta = await poll_mantle_usdc_credit(
+        writer=writer,
+        address=ATTESTOR_ADDR,
+        baseline=100_000_000,
+        min_credit=50_000_000,
+        interval_seconds=0,
+    )
+    assert delta == 100_000_000
+
+
+@pytest.mark.asyncio
+async def test_poll_mantle_usdc_credit_timeout():
+    """Balance never grows past baseline — TimeoutError after deadline."""
+    w3 = _w3_with_balance_sequence([100_000_000])  # stuck at baseline
+    writer = _make_writer_with_usdc(w3)
+    with pytest.raises(TimeoutError, match="mantle USDC not credited"):
+        await poll_mantle_usdc_credit(
+            writer=writer,
+            address=ATTESTOR_ADDR,
+            baseline=100_000_000,
+            min_credit=10_000_000,
+            timeout_seconds=0.05,
+            interval_seconds=0.01,
+        )
 
 
