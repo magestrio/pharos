@@ -169,6 +169,61 @@ Side = Literal["Buy", "Sell"]
 EarnSide = Literal["Stake", "Redeem"]
 
 
+class LinearTicker(BaseModel):
+    """Single perpetual ticker entry from `/v5/market/tickers?category=linear`."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    symbol: str
+    lastPrice: str
+    markPrice: str | None = None
+    fundingRate: str | None = None  # current 8h funding, signed decimal-string
+    nextFundingTime: str | None = None  # unix ms as string
+    openInterestValue: str | None = None  # USD
+
+
+class TickerList(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+    items: list[LinearTicker] = Field(default_factory=list, alias="list")
+
+
+class OrderbookSnapshot(BaseModel):
+    """`/v5/market/orderbook` payload. `b` is bids, `a` is asks, each a
+    list of [price, size] decimal-strings, best price first."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    s: str  # symbol
+    b: list[list[str]] = Field(default_factory=list)
+    a: list[list[str]] = Field(default_factory=list)
+
+
+class InstrumentLotSizeFilter(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    maxOrderQty: str | None = None
+    minOrderQty: str | None = None
+    qtyStep: str | None = None
+
+
+class InstrumentLeverageFilter(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    maxLeverage: str | None = None
+    minLeverage: str | None = None
+
+
+class LinearInstrument(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    symbol: str
+    status: str | None = None
+    leverageFilter: InstrumentLeverageFilter | None = None
+    lotSizeFilter: InstrumentLotSizeFilter | None = None
+
+
+class InstrumentList(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+    items: list[LinearInstrument] = Field(default_factory=list, alias="list")
+
+
 class BybitClient:
     """Async Bybit V5 REST wrapper.
 
@@ -553,3 +608,42 @@ class BybitClient:
             body["orderLinkId"] = order_link_id
         data = await self._request("POST", "/v5/order/create", body=body)
         return BybitResponse[SpotOrderResult].model_validate(data).result  # type: ignore[return-value]
+
+    # ─── Public market data (signed harmlessly for consistency) ──────────
+
+    async def get_tickers(
+        self, category: str = "linear", symbol: str | None = None
+    ) -> list[LinearTicker]:
+        """`/v5/market/tickers`. For `category=linear`, each item carries
+        `fundingRate` and `markPrice`."""
+        data = await self._request(
+            "GET", "/v5/market/tickers", params={"category": category, "symbol": symbol}
+        )
+        parsed = BybitResponse[TickerList].model_validate(data)
+        return parsed.result.items if parsed.result else []
+
+    async def get_orderbook(
+        self, symbol: str, category: str = "linear", limit: int = 50
+    ) -> OrderbookSnapshot | None:
+        """`/v5/market/orderbook`. `limit` is depth levels per side; Bybit
+        caps at 200 for linear."""
+        data = await self._request(
+            "GET",
+            "/v5/market/orderbook",
+            params={"category": category, "symbol": symbol, "limit": limit},
+        )
+        parsed = BybitResponse[OrderbookSnapshot].model_validate(data)
+        return parsed.result
+
+    async def get_instruments_info(
+        self, category: str = "linear", symbol: str | None = None
+    ) -> list[LinearInstrument]:
+        """`/v5/market/instruments-info`. For `category=linear`, each item
+        carries `leverageFilter.maxLeverage` and lot-size constraints."""
+        data = await self._request(
+            "GET",
+            "/v5/market/instruments-info",
+            params={"category": category, "symbol": symbol},
+        )
+        parsed = BybitResponse[InstrumentList].model_validate(data)
+        return parsed.result.items if parsed.result else []

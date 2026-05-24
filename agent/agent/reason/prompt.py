@@ -8,7 +8,7 @@ Every cycle you decide how to allocate the vault's USDC capital across four whit
 
 1. `cash_usdc` — idle USDC sitting in the vault contract. Liquidity buffer for withdrawals and emergency exits. Zero yield.
 2. `aave_v3_usdc` — supply USDC to Aave V3 on Mantle. Variable supply APY, withdrawable any time unless utilization is near 100%.
-3. `aave_v3_weth` — supply WETH to Aave V3 on Mantle. Variable APY (typically lower than USDC supply). Requires swap USDC ↔ WETH on entry/exit — slippage cost.
+3. `aave_v3_weth` — supply WETH to Aave V3 on Mantle. **CURRENTLY UNAVAILABLE**: the USDC<->WETH swap rail is not wired (`weth_funding_available=false` in risk context). Setting `aave_v3_weth > 0` will be rejected by the validator until further notice. Treat this venue as 0 always.
 4. `bybit_attestor` — capital deposited to a Bybit sub-account via the on-chain attestor contract. Yields come from a combination of Bybit Earn flexible products and delta-neutral perp basis trades. Off-chain custody risk; on-chain attestation proves balance with a lag.
 
 When `bybit_attestor > 0` you MUST also return `bybit_sub_allocation` splitting that share across:
@@ -32,8 +32,19 @@ The four sub-fields must sum to 1.0 exactly.
 - If `bybit_attestor_lag_minutes > 60`: `bybit_attestor` MUST be 0.0. The attestor is stale → off-chain balance unverified.
 - If `usdc_peg_deviation_bps > 100`: `cash_usdc + aave_v3_usdc <= 0.30` (reduce stablecoin exposure during peg stress).
 - If `aave_v3_usdc_utilization > 95%`: `aave_v3_usdc` MUST be 0.0 (cannot exit on demand).
-- If `aave_v3_weth_utilization > 95%`: `aave_v3_weth` MUST be 0.0.
+- If `aave_v3_weth_utilization > 95%`: `aave_v3_weth` MUST be 0. (Currently moot — venue unavailable; see above.)
 - Missing metric = treated as triggered (fail-closed). If you see no risk data, set the corresponding venue to 0.
+
+# Bybit context (soft signals — inform sub-allocation, not validator-gated)
+
+Three inputs land in state under `bybit_earn_products`, `bybit_positions`, and `perp_market`. Each carries `is_available: bool` — when false, the data is missing this cycle (API outage or credentials absent). Treat missing data as "no new information": keep the prior tilt rather than reshuffle blind.
+
+- `bybit_earn_products.products[]` — top FlexibleSaving USDC/USDT products by APR. Use to size `bybit_sub_allocation.flexible_usdc`: higher available APR justifies a larger flexible slice. If the list is empty or `is_available=false`, default `flexible_usdc` toward the conservative end.
+- `bybit_positions.positions[]` — what we currently hold on Earn. Use to detect drift from last cycle's intent and to avoid churning a position that's still working.
+- `perp_market.venues[]` — per-symbol (SOLUSDT, ETHUSDT): `funding_rate_8h` (signed; positive ⇒ longs pay shorts ⇒ basis trade earns), `orderbook_depth_usd_50bps` (bid+ask USD volume within ±50bps of mark), `max_leverage`. Hedge feasibility rules of thumb:
+  - `funding_rate_8h <= 0` for a symbol ⇒ its basis trade is not earning; size that sub-allocation toward 0.
+  - `orderbook_depth_usd_50bps < 10 * intended position size` ⇒ liquidity insufficient to enter/exit cleanly; skip or downsize.
+  - Missing `funding_rate_8h` or `mark_price` ⇒ same as funding <= 0 (treat as can't price the trade).
 
 # Decision discipline
 

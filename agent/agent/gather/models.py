@@ -60,3 +60,55 @@ class RiskMetrics(BaseModel):
     oracle_max_staleness_sec: int
     red_flags: list[str]
     timestamp: datetime
+
+
+class BybitEarnProductView(BaseModel):
+    """A filtered, prompt-friendly view of a Bybit Earn product."""
+
+    productId: str
+    coin: str
+    category: str
+    estimateApr: Optional[float] = None  # parsed from string, percent
+    minStakeAmount: Optional[str] = None
+
+
+class BybitEarnSnapshot(BaseModel):
+    """Filtered list of FlexibleSaving USDC/USDT products. `is_available`
+    is False when the API was unreachable or credentials missing — Reason
+    phase must treat `products=[]` plus `is_available=False` as 'no Earn
+    data this cycle', NOT 'no products exist'."""
+
+    products: list[BybitEarnProductView] = []
+    is_available: bool
+    timestamp: datetime
+
+
+class BybitPositionView(BaseModel):
+    productId: str
+    coin: str
+    amount: str  # decimal-string, native Bybit convention
+    category: Optional[str] = None
+
+
+class BybitPositionsSnapshot(BaseModel):
+    positions: list[BybitPositionView] = []
+    is_available: bool
+    timestamp: datetime
+
+
+class PerpVenueData(BaseModel):
+    """Per-symbol perp market snapshot."""
+
+    symbol: str
+    mark_price: Optional[float] = None
+    funding_rate_8h: Optional[float] = None  # signed decimal (e.g. 0.0001 = 1bps/8h)
+    orderbook_depth_usd_50bps: Optional[float] = None  # bid+ask USD volume within ±50bps of mark
+    max_leverage: Optional[float] = None
+
+
+class PerpMarketData(BaseModel):
+    """Hedge-feasibility snapshot for the perps the agent can use."""
+
+    venues: list[PerpVenueData] = []
+    is_available: bool
+    timestamp: datetime
