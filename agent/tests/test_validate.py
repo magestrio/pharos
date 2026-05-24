@@ -1,6 +1,6 @@
 import pytest
 
-from agent.reason.schema import Decision, TargetAllocation
+from agent.reason.schema import BybitSubAllocation, Decision, TargetAllocation
 from agent.validate import RiskContext, validate
 from agent.validate.rules import (
     check_sum,
@@ -21,12 +21,19 @@ def _alloc(**kwargs) -> TargetAllocation:
     return TargetAllocation(**defaults)
 
 
+def _sub() -> BybitSubAllocation:
+    return BybitSubAllocation(flexible_usdc=0.40, sol_basis_trade=0.30, eth_basis_trade=0.20, buffer_cash=0.10)
+
+
 def _decision(**kwargs) -> Decision:
     alloc = kwargs.pop("target_allocation", _alloc())
+    sub_default = _sub() if alloc.bybit_attestor > 0 else None
     return Decision(
         thesis="Balanced allocation with sufficient cash buffer and no red flags",
         target_allocation=alloc,
+        bybit_sub_allocation=kwargs.pop("bybit_sub_allocation", sub_default),
         confidence=kwargs.pop("confidence", 0.8),
+        expected_blended_apr_pct=kwargs.pop("expected_blended_apr_pct", 6.0),
         **kwargs,
     )
 
@@ -265,8 +272,10 @@ def test_validate_fails_multiple():
     d = Decision(
         thesis="Aggressive allocation ignoring hard caps completely",
         target_allocation=bad,
+        bybit_sub_allocation=_sub(),
         confidence=0.3,
         risk_flags=["usdc_depeg"],
+        expected_blended_apr_pct=10.0,
     )
     ok, errors = validate(d, _safe_ctx())
     assert not ok
