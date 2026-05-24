@@ -13,6 +13,7 @@ import {EthenaAdapter} from "../src/adapters/EthenaAdapter.sol";
 import {AaveV3WethAdapter} from "../src/adapters/AaveV3WethAdapter.sol";
 import {AaveV3UsdcAdapter} from "../src/adapters/AaveV3UsdcAdapter.sol";
 import {MerchantMoeRouter} from "../src/adapters/MerchantMoeRouter.sol";
+import {BybitAttestor} from "../src/adapters/BybitAttestor.sol";
 
 // Mantle Mainnet addresses (verified via bgd-labs/aave-address-book)
 address constant WETH  = 0xdEAddEaDdeadDEadDEADDEAddEADDEAddead1111;
@@ -57,6 +58,10 @@ contract Deploy is Script {
         // Falls back to deployer if not set — useful for sepolia smoke runs.
         // For mainnet this MUST be explicitly set to the AI agent's address.
         address agentAddress = vm.envOr("AGENT_ADDRESS", deployer);
+        // ATTESTOR_ADDRESS = Safe (2-of-3) controlling the Bybit account that
+        // confirms BybitAttestor deposits/withdraws and pushes balance updates.
+        // Falls back to deployer for dev. Mainnet MUST set this to the Safe.
+        address attestorAddress = vm.envOr("ATTESTOR_ADDRESS", deployer);
         // vUSDC token address. If unset, the deploy stops short of setVusdc +
         // transferOwnership so a follow-up phase can wire vUSDC atomically.
         address vusdcAddr = vm.envOr("VUSDC_ADDR", address(0));
@@ -64,9 +69,13 @@ contract Deploy is Script {
         console.log("DEPLOYER_ADDRESS:   ", deployer);
         console.log("SAFE_OWNER:         ", safeOwner);
         console.log("AGENT_ADDRESS:      ", agentAddress);
+        console.log("ATTESTOR_ADDRESS:   ", attestorAddress);
         console.log("VUSDC_ADDR:         ", vusdcAddr);
         if (agentAddress == deployer) {
             console.log("WARN: agentAddress == deployer. Set AGENT_ADDRESS env var before mainnet broadcast.");
+        }
+        if (attestorAddress == deployer) {
+            console.log("WARN: attestorAddress == deployer. Set ATTESTOR_ADDRESS env var (the Safe) before mainnet broadcast.");
         }
         if (vusdcAddr == address(0)) {
             console.log("INFO: VUSDC_ADDR unset - Phase A (deployer remains owner; setVusdc + transfer deferred).");
@@ -121,10 +130,16 @@ contract Deploy is Script {
         );
         console.log("UsdcAdapter:        ", address(usdcAdapter));
 
+        BybitAttestor bybitAttestor = new BybitAttestor(
+            USDC, address(vault), attestorAddress, deployer
+        );
+        console.log("BybitAttestor:      ", address(bybitAttestor));
+
         // 2. Whitelist real adapters + set agent. Done BEFORE setVusdc/transfer
         // so these calls go through deployer EOA, not 2/3 Safe signatures.
         vault.whitelistStrategy(address(wethAdapter), true);
         vault.whitelistStrategy(address(usdcAdapter), true);
+        vault.whitelistStrategy(address(bybitAttestor), true);
 
         vault.setAgent(agentAddress);
         decisionLog.setAgent(agentAddress);
@@ -156,6 +171,7 @@ contract Deploy is Script {
         console.log("ReputationOracle:    %s", address(oracle));
         console.log("AaveV3WethAdapter:   %s", address(wethAdapter));
         console.log("AaveV3UsdcAdapter:   %s", address(usdcAdapter));
+        console.log("BybitAttestor:       %s", address(bybitAttestor));
         console.log("MerchantMoeRouter:   %s", address(moeRouter));
         console.log("MerchantMoeAdapter:  %s (stub, not whitelisted)", address(mmAdapter));
         console.log("LendleAdapter:       %s (stub, not whitelisted)", address(lendleAdapter));
