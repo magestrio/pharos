@@ -3,6 +3,7 @@ import asyncio
 from web3 import Web3
 
 from .abi import load_bybit_attestor_abi
+from .balance_updater import BalanceUpdater
 from .bybit_client import BybitClient
 from .chain_writer import ChainWriter
 from .config import settings
@@ -52,15 +53,32 @@ async def _main() -> None:
         redeem_swap=redeem_swap,
         hedge=hedge,
     )
+    balance_updater = BalanceUpdater(
+        chain_writer=chain_writer, bybit_client=bybit_client, cfg=settings,
+    )
     log.info("orchestrator_ready", extra={"attestor_addr": chain_writer.address})
 
-    try:
-        await run_listener(
+    listener_task = asyncio.create_task(
+        run_listener(
             conn,
             contract,
             deposit_handler=deposit_orchestrator.handle,
             withdraw_handler=withdraw_orchestrator.handle,
+        ),
+        name="listener",
+    )
+    balance_task = asyncio.create_task(balance_updater.run_loop(), name="balance_updater")
+
+    try:
+        # If either coroutine exits (it shouldn't — both are infinite loops),
+        # cancel the other and surface the result.
+        done, pending = await asyncio.wait(
+            {listener_task, balance_task}, return_when=asyncio.FIRST_COMPLETED,
         )
+        for task in pending:
+            task.cancel()
+        for task in done:
+            task.result()  # re-raises if the task errored
     finally:
         await bybit_client.aclose()
 

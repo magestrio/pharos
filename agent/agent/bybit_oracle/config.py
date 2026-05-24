@@ -50,5 +50,12 @@ class OracleSettings(BaseSettings):
     # USDC from attestor wallet to the Bybit deposit address).
     MANTLE_USDC_ADDRESS: str = "0x09Bc4E0D864854c6aFB6eB9A9cdF58aC190D0dF9"
 
+    # Balance-update cron (.14). Poll Bybit positions, push `updateBalance`
+    # when computed USDC equivalent drifts >threshold from on-chain attested,
+    # or when more than `max_age` seconds since the last push.
+    BALANCE_POLL_INTERVAL_SECONDS: float = 60.0
+    BALANCE_THRESHOLD_BPS: int = 10  # 0.1% (10 basis points)
+    BALANCE_MAX_AGE_SECONDS: float = 300.0  # force push every 5 min
+
 
 settings = OracleSettings()
