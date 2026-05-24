@@ -10,6 +10,7 @@ import pytest
 from agent.bybit_oracle.bybit_client import (
     BybitAPIError,
     BybitClient,
+    BybitOrderError,
     DepositChain,
     EarnProduct,
 )
@@ -365,3 +366,81 @@ async def test_poll_deposit_credited_immediate_credit(captured):
             coin="USDC", min_credit="50", interval_seconds=0
         )
     assert delta == Decimal("100")
+
+
+# --- .12e: spot order polling ----------------------------------------------
+
+
+def _order_status(status: str, qty: str = "0", reject: str | None = None) -> dict:
+    payload: dict = {
+        "list": [
+            {"orderId": "ord-1", "orderStatus": status, "cumExecQty": qty}
+        ]
+    }
+    if reject is not None:
+        payload["list"][0]["rejectReason"] = reject
+    return payload
+
+
+@pytest.mark.asyncio
+async def test_get_spot_order_status_calls_realtime_with_category(captured):
+    async with _client(captured, lambda _r: _ok(_order_status("Filled", "0.5"))) as c:
+        status = await c.get_spot_order_status("ord-1")
+
+    assert status.orderStatus == "Filled"
+    assert status.cumExecQty == "0.5"
+    req = captured[0]
+    assert req.url.path == "/v5/order/realtime"
+    assert dict(req.url.params) == {"category": "spot", "orderId": "ord-1"}
+
+
+@pytest.mark.asyncio
+async def test_get_spot_order_status_empty_list_raises(captured):
+    """Bybit removes orders from realtime shortly after finalization.
+    Absence is signal, not noise — caller must handle.
+    """
+    async with _client(captured, lambda _r: _ok({"list": []})) as c:
+        with pytest.raises(BybitOrderError, match="not found in realtime"):
+            await c.get_spot_order_status("ord-1")
+
+
+@pytest.mark.asyncio
+async def test_poll_spot_order_filled_returns_qty(captured):
+    responses = iter([
+        _order_status("New"),
+        _order_status("PartiallyFilled", "0.3"),
+        _order_status("Filled", "1.25"),
+    ])
+    async with _client(captured, lambda _r: _ok(next(responses))) as c:
+        qty = await c.poll_spot_order_filled(
+            order_id="ord-1", interval_seconds=0
+        )
+    assert qty == Decimal("1.25")
+
+
+@pytest.mark.asyncio
+async def test_poll_spot_order_filled_cancelled_raises(captured):
+    """Cancelled is terminal — must NOT timeout-wait, must raise immediately."""
+    async with _client(
+        captured,
+        lambda _r: _ok(_order_status("Cancelled", reject="insufficient balance")),
+    ) as c:
+        with pytest.raises(BybitOrderError, match="Cancelled"):
+            await c.poll_spot_order_filled(order_id="ord-1", interval_seconds=0)
+
+
+@pytest.mark.asyncio
+async def test_poll_spot_order_filled_rejected_raises(captured):
+    async with _client(captured, lambda _r: _ok(_order_status("Rejected"))) as c:
+        with pytest.raises(BybitOrderError, match="Rejected"):
+            await c.poll_spot_order_filled(order_id="ord-1", interval_seconds=0)
+
+
+@pytest.mark.asyncio
+async def test_poll_spot_order_filled_timeout(captured):
+    """Stuck in `New` — TimeoutError after deadline."""
+    async with _client(captured, lambda _r: _ok(_order_status("New"))) as c:
+        with pytest.raises(TimeoutError, match="not filled"):
+            await c.poll_spot_order_filled(
+                order_id="ord-1", timeout_seconds=0.05, interval_seconds=0.01
+            )

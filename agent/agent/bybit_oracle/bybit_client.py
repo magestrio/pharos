@@ -125,6 +125,29 @@ class SpotOrderResult(BaseModel):
     orderLinkId: str | None = None
 
 
+class SpotOrderStatus(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    orderId: str
+    orderStatus: str
+    cumExecQty: str = "0"
+    cumExecValue: str = "0"
+    avgPrice: str | None = None
+    rejectReason: str | None = None
+
+
+class SpotOrderStatusList(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+    items: list[SpotOrderStatus] = Field(default_factory=list, alias="list")
+
+
+class BybitOrderError(RuntimeError):
+    """A spot order reached a terminal non-Filled state (Cancelled, Rejected,
+    PartiallyFilledCancelled, Deactivated). Caller should advance FSM to
+    failed and surface — these are not transient, retry won't help.
+    """
+
+
 class DepositChain(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -396,6 +419,62 @@ class BybitClient:
                 raise TimeoutError(
                     f"{coin} not credited within {timeout_seconds}s "
                     f"(delta={delta}, needed={threshold})"
+                )
+            await asyncio.sleep(interval_seconds)
+
+    async def get_spot_order_status(self, order_id: str) -> SpotOrderStatus:
+        """Look up a single spot order via `/v5/order/realtime`. Bybit removes
+        orders from the realtime endpoint a few seconds after terminal state —
+        absence means "finalized", not "doesn't exist". Caller should fall
+        back to order/history if they need post-mortem detail.
+        """
+        data = await self._request(
+            "GET",
+            "/v5/order/realtime",
+            params={"category": "spot", "orderId": order_id},
+        )
+        parsed = BybitResponse[SpotOrderStatusList].model_validate(data)
+        if parsed.result is None or not parsed.result.items:
+            raise BybitOrderError(
+                f"order {order_id} not found in realtime (likely already finalized)"
+            )
+        return parsed.result.items[0]
+
+    async def poll_spot_order_filled(
+        self,
+        order_id: str,
+        timeout_seconds: float = 120,
+        interval_seconds: float = 2,
+    ) -> Decimal:
+        """Poll until the spot order reaches `Filled`. Returns `cumExecQty`
+        as Decimal (the base-coin amount actually received).
+
+        Raises BybitOrderError on any terminal non-Filled state — those are
+        operator/exchange-side failures (insufficient balance, lot-size
+        violation, manual cancel) that the orchestrator must surface, not
+        silently retry.
+        """
+        _TERMINAL_BAD = {
+            "Cancelled",
+            "Rejected",
+            "Deactivated",
+            "PartiallyFilledCanceled",  # note Bybit's actual spelling
+        }
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout_seconds
+        while True:
+            status = await self.get_spot_order_status(order_id)
+            if status.orderStatus == "Filled":
+                return Decimal(status.cumExecQty)
+            if status.orderStatus in _TERMINAL_BAD:
+                raise BybitOrderError(
+                    f"order {order_id} terminal status={status.orderStatus} "
+                    f"reason={status.rejectReason}"
+                )
+            if loop.time() >= deadline:
+                raise TimeoutError(
+                    f"order {order_id} not filled within {timeout_seconds}s "
+                    f"(last_status={status.orderStatus}, cumExecQty={status.cumExecQty})"
                 )
             await asyncio.sleep(interval_seconds)
 
