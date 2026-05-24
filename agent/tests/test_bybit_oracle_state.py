@@ -14,8 +14,19 @@ from agent.bybit_oracle.state import (
     DEPOSIT_RECEIVED,
     DEPOSIT_STAKED,
     DEPOSIT_SWAPPED,
+    WITHDRAW_CONFIRMED,
+    WITHDRAW_FAILED,
+    WITHDRAW_HEDGE_CLOSE_SKIPPED,
+    WITHDRAW_HEDGE_CLOSED,
+    WITHDRAW_ON_MANTLE,
+    WITHDRAW_RECEIVED,
+    WITHDRAW_REDEEMED,
+    WITHDRAW_SWAP_SKIPPED,
+    WITHDRAW_SWAPPED_TO_USDC,
     advance_deposit_status,
+    advance_withdraw_status,
     increment_deposit_retry,
+    increment_withdraw_retry,
     mark_event_processed,
     open_db,
     upsert_deposit_request,
@@ -259,4 +270,192 @@ def test_open_db_migrates_existing_db_without_new_columns(tmp_path: Path):
     row = conn.execute("SELECT * FROM deposit_requests WHERE tx_id = 1").fetchone()
     assert row["amount"] == 100
     assert row["retry_count"] == 0  # default value applied to legacy row
+    conn.close()
+
+
+# --- Withdraw FSM (.13a) ----------------------------------------------------
+
+
+@pytest.fixture
+def withdraw_row(db):
+    upsert_withdraw_request(db, tx_id=1, amount=50_000_000, status=WITHDRAW_RECEIVED)
+    return db
+
+
+def test_advance_withdraw_happy_path(withdraw_row):
+    assert advance_withdraw_status(
+        withdraw_row, 1, WITHDRAW_RECEIVED, WITHDRAW_HEDGE_CLOSE_SKIPPED
+    )
+    row = withdraw_row.execute(
+        "SELECT status FROM withdraw_requests WHERE tx_id = 1"
+    ).fetchone()
+    assert row["status"] == WITHDRAW_HEDGE_CLOSE_SKIPPED
+
+
+def test_advance_withdraw_with_field_writes_column(withdraw_row):
+    assert advance_withdraw_status(
+        withdraw_row,
+        1,
+        WITHDRAW_RECEIVED,
+        WITHDRAW_HEDGE_CLOSED,
+        bybit_swap_order_id="hedge-close-1",
+    )
+    row = withdraw_row.execute(
+        "SELECT status, bybit_swap_order_id FROM withdraw_requests WHERE tx_id = 1"
+    ).fetchone()
+    assert row["status"] == WITHDRAW_HEDGE_CLOSED
+    assert row["bybit_swap_order_id"] == "hedge-close-1"
+
+
+def test_advance_withdraw_is_idempotent(withdraw_row):
+    assert advance_withdraw_status(
+        withdraw_row, 1, WITHDRAW_RECEIVED, WITHDRAW_HEDGE_CLOSE_SKIPPED
+    )
+    # Replay returns False — row no longer at RECEIVED.
+    assert (
+        advance_withdraw_status(
+            withdraw_row, 1, WITHDRAW_RECEIVED, WITHDRAW_HEDGE_CLOSE_SKIPPED
+        )
+        is False
+    )
+
+
+def test_advance_withdraw_returns_false_for_unknown_tx(db):
+    assert (
+        advance_withdraw_status(
+            db, 999, WITHDRAW_RECEIVED, WITHDRAW_HEDGE_CLOSE_SKIPPED
+        )
+        is False
+    )
+
+
+def test_advance_withdraw_illegal_transition_raises(withdraw_row):
+    # received → redeemed isn't allowed (must go through hedge step first).
+    with pytest.raises(ValueError, match="illegal transition"):
+        advance_withdraw_status(withdraw_row, 1, WITHDRAW_RECEIVED, WITHDRAW_REDEEMED)
+
+
+def test_advance_withdraw_unknown_source_raises(withdraw_row):
+    """CONFIRMED is terminal — no outgoing edges, so isn't a valid source."""
+    with pytest.raises(ValueError, match="unknown source status"):
+        advance_withdraw_status(withdraw_row, 1, WITHDRAW_CONFIRMED, WITHDRAW_FAILED)
+
+
+def test_advance_withdraw_unknown_field_raises(withdraw_row):
+    with pytest.raises(ValueError, match="unknown fields"):
+        advance_withdraw_status(
+            withdraw_row, 1, WITHDRAW_RECEIVED, WITHDRAW_HEDGE_CLOSE_SKIPPED, bogus="x"
+        )
+
+
+def test_withdraw_failed_reachable_from_every_nonterminal(withdraw_row):
+    chain = [
+        WITHDRAW_RECEIVED,
+        WITHDRAW_HEDGE_CLOSE_SKIPPED,
+        WITHDRAW_REDEEMED,
+        WITHDRAW_SWAP_SKIPPED,
+        WITHDRAW_ON_MANTLE,
+    ]
+    for src in chain:
+        withdraw_row.execute(
+            "UPDATE withdraw_requests SET status = ? WHERE tx_id = 1", (src,)
+        )
+        assert advance_withdraw_status(withdraw_row, 1, src, WITHDRAW_FAILED), (
+            f"failed should be reachable from {src}"
+        )
+
+
+def test_full_withdraw_usdc_path(withdraw_row):
+    """USDC-staked deposit being withdrawn — skip hedge close, skip swap-back."""
+    steps = [
+        (WITHDRAW_RECEIVED, WITHDRAW_HEDGE_CLOSE_SKIPPED, {}),
+        (WITHDRAW_HEDGE_CLOSE_SKIPPED, WITHDRAW_REDEEMED, {"bybit_earn_redeem_id": "rd-1"}),
+        (WITHDRAW_REDEEMED, WITHDRAW_SWAP_SKIPPED, {}),
+        (WITHDRAW_SWAP_SKIPPED, WITHDRAW_ON_MANTLE, {
+            "bybit_withdraw_id": "wd-1",
+            "mantle_tx_hash": "0xdeadbeef",
+        }),
+        (WITHDRAW_ON_MANTLE, WITHDRAW_CONFIRMED, {"delivered_amount": 50_000_000}),
+    ]
+    for src, dst, fields in steps:
+        assert advance_withdraw_status(withdraw_row, 1, src, dst, **fields), (
+            f"happy path stalled at {src} → {dst}"
+        )
+
+    row = withdraw_row.execute("SELECT * FROM withdraw_requests WHERE tx_id = 1").fetchone()
+    assert row["status"] == WITHDRAW_CONFIRMED
+    assert row["bybit_earn_redeem_id"] == "rd-1"
+    assert row["bybit_withdraw_id"] == "wd-1"
+    assert row["mantle_tx_hash"] == "0xdeadbeef"
+    assert row["delivered_amount"] == 50_000_000
+
+
+def test_full_withdraw_volatile_path(withdraw_row):
+    """ETH-staked deposit being withdrawn — hedge close + swap back to USDC."""
+    steps = [
+        (WITHDRAW_RECEIVED, WITHDRAW_HEDGE_CLOSED, {}),
+        (WITHDRAW_HEDGE_CLOSED, WITHDRAW_REDEEMED, {}),
+        (WITHDRAW_REDEEMED, WITHDRAW_SWAPPED_TO_USDC, {"bybit_swap_order_id": "swap-back-1"}),
+        (WITHDRAW_SWAPPED_TO_USDC, WITHDRAW_ON_MANTLE, {}),
+        (WITHDRAW_ON_MANTLE, WITHDRAW_CONFIRMED, {}),
+    ]
+    for src, dst, fields in steps:
+        assert advance_withdraw_status(withdraw_row, 1, src, dst, **fields)
+
+
+def test_increment_withdraw_retry(withdraw_row):
+    assert increment_withdraw_retry(withdraw_row, 1, "bybit timeout") == 1
+    assert increment_withdraw_retry(withdraw_row, 1, "bybit timeout") == 2
+    row = withdraw_row.execute(
+        "SELECT retry_count, last_error, status FROM withdraw_requests WHERE tx_id = 1"
+    ).fetchone()
+    assert row["retry_count"] == 2
+    assert row["last_error"] == "bybit timeout"
+    assert row["status"] == WITHDRAW_RECEIVED  # retry must NOT change status
+
+
+def test_increment_withdraw_retry_unknown_tx_raises(db):
+    with pytest.raises(LookupError):
+        increment_withdraw_retry(db, 12345, "x")
+
+
+def test_open_db_migrates_legacy_withdraw_requests(tmp_path: Path):
+    """Existing .10-era DB with old withdraw_requests schema must pick up
+    new FSM columns on open.
+    """
+    path = tmp_path / "legacy.sqlite"
+    legacy = sqlite3.connect(path)
+    legacy.executescript(
+        """
+        CREATE TABLE withdraw_requests (
+            tx_id INTEGER PRIMARY KEY,
+            amount INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            bybit_withdraw_id TEXT,
+            delivered_amount INTEGER,
+            last_error TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        """
+    )
+    legacy.execute(
+        "INSERT INTO withdraw_requests (tx_id, amount, status, created_at, updated_at) "
+        "VALUES (1, 100, 'received', 0, 0)"
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = open_db(path)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(withdraw_requests)").fetchall()}
+    expected = {
+        "bybit_earn_redeem_id",
+        "bybit_swap_order_id",
+        "mantle_tx_hash",
+        "retry_count",
+    }
+    assert expected <= cols
+    row = conn.execute("SELECT * FROM withdraw_requests WHERE tx_id = 1").fetchone()
+    assert row["amount"] == 100
+    assert row["retry_count"] == 0
     conn.close()

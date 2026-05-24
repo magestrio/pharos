@@ -27,14 +27,18 @@ CREATE TABLE IF NOT EXISTS deposit_requests (
 );
 
 CREATE TABLE IF NOT EXISTS withdraw_requests (
-    tx_id              INTEGER PRIMARY KEY,
-    amount             INTEGER NOT NULL,
-    status             TEXT    NOT NULL,
-    bybit_withdraw_id  TEXT,
-    delivered_amount   INTEGER,
-    last_error         TEXT,
-    created_at         INTEGER NOT NULL,
-    updated_at         INTEGER NOT NULL
+    tx_id                  INTEGER PRIMARY KEY,
+    amount                 INTEGER NOT NULL,
+    status                 TEXT    NOT NULL,
+    bybit_withdraw_id      TEXT,
+    bybit_earn_redeem_id   TEXT,
+    bybit_swap_order_id    TEXT,
+    mantle_tx_hash         TEXT,
+    delivered_amount       INTEGER,
+    retry_count            INTEGER NOT NULL DEFAULT 0,
+    last_error             TEXT,
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL
 );
 """
 
@@ -88,6 +92,53 @@ _DEPOSIT_ADDED_COLUMNS = {
 }
 
 
+# Withdraw state machine (mirror of deposit FSM).
+# Linear except for two branches:
+#   received → hedge_closed (volatile) | hedge_close_skipped (stable)
+#   redeemed → swapped_to_usdc (volatile target) | swap_skipped (USDC target)
+WITHDRAW_RECEIVED = "received"
+WITHDRAW_HEDGE_CLOSED = "hedge_closed"
+WITHDRAW_HEDGE_CLOSE_SKIPPED = "hedge_close_skipped"
+WITHDRAW_REDEEMED = "redeemed"
+WITHDRAW_SWAPPED_TO_USDC = "swapped_to_usdc"
+WITHDRAW_SWAP_SKIPPED = "swap_skipped"
+WITHDRAW_ON_MANTLE = "on_mantle"
+WITHDRAW_CONFIRMED = "confirmed"
+WITHDRAW_FAILED = "failed"
+
+WITHDRAW_TRANSITIONS: dict[str, set[str]] = {
+    WITHDRAW_RECEIVED: {
+        WITHDRAW_HEDGE_CLOSED,
+        WITHDRAW_HEDGE_CLOSE_SKIPPED,
+        WITHDRAW_FAILED,
+    },
+    WITHDRAW_HEDGE_CLOSED: {WITHDRAW_REDEEMED, WITHDRAW_FAILED},
+    WITHDRAW_HEDGE_CLOSE_SKIPPED: {WITHDRAW_REDEEMED, WITHDRAW_FAILED},
+    WITHDRAW_REDEEMED: {WITHDRAW_SWAPPED_TO_USDC, WITHDRAW_SWAP_SKIPPED, WITHDRAW_FAILED},
+    WITHDRAW_SWAPPED_TO_USDC: {WITHDRAW_ON_MANTLE, WITHDRAW_FAILED},
+    WITHDRAW_SWAP_SKIPPED: {WITHDRAW_ON_MANTLE, WITHDRAW_FAILED},
+    WITHDRAW_ON_MANTLE: {WITHDRAW_CONFIRMED, WITHDRAW_FAILED},
+}
+
+_WITHDRAW_UPDATABLE_FIELDS = frozenset(
+    {
+        "bybit_withdraw_id",
+        "bybit_earn_redeem_id",
+        "bybit_swap_order_id",
+        "mantle_tx_hash",
+        "delivered_amount",
+        "last_error",
+    }
+)
+
+_WITHDRAW_ADDED_COLUMNS = {
+    "bybit_earn_redeem_id": "TEXT",
+    "bybit_swap_order_id": "TEXT",
+    "mantle_tx_hash": "TEXT",
+    "retry_count": "INTEGER NOT NULL DEFAULT 0",
+}
+
+
 def _migrate_added_columns(
     conn: sqlite3.Connection, table: str, columns: dict[str, str]
 ) -> None:
@@ -108,6 +159,7 @@ def open_db(path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     _migrate_added_columns(conn, "deposit_requests", _DEPOSIT_ADDED_COLUMNS)
+    _migrate_added_columns(conn, "withdraw_requests", _WITHDRAW_ADDED_COLUMNS)
     return conn
 
 
@@ -237,4 +289,66 @@ def increment_deposit_retry(
     conn.commit()
     if row is None:
         raise LookupError(f"deposit_requests row for tx_id={tx_id} not found")
+    return int(row[0])
+
+
+def advance_withdraw_status(
+    conn: sqlite3.Connection,
+    tx_id: int,
+    expected_from: str,
+    new_status: str,
+    **fields: str | int | None,
+) -> bool:
+    """Atomic CAS transition for `withdraw_requests`. Mirrors
+    `advance_deposit_status`; see that function's docstring for the
+    idempotency contract.
+    """
+    allowed = WITHDRAW_TRANSITIONS.get(expected_from)
+    if allowed is None:
+        raise ValueError(f"unknown source status {expected_from!r}")
+    if new_status not in allowed:
+        raise ValueError(
+            f"illegal transition {expected_from!r} -> {new_status!r}; "
+            f"allowed: {sorted(allowed)}"
+        )
+
+    unknown = set(fields) - _WITHDRAW_UPDATABLE_FIELDS
+    if unknown:
+        raise ValueError(f"unknown fields: {sorted(unknown)}")
+
+    set_clauses = ["status = :new_status", "updated_at = :now"]
+    params: dict[str, str | int | None] = {
+        "tx_id": tx_id,
+        "expected_from": expected_from,
+        "new_status": new_status,
+        "now": int(time.time()),
+    }
+    for key, value in fields.items():
+        set_clauses.append(f"{key} = :{key}")
+        params[key] = value
+
+    cur = conn.execute(
+        f"UPDATE withdraw_requests SET {', '.join(set_clauses)} "
+        f"WHERE tx_id = :tx_id AND status = :expected_from",
+        params,
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def increment_withdraw_retry(
+    conn: sqlite3.Connection,
+    tx_id: int,
+    error: str,
+) -> int:
+    cur = conn.execute(
+        "UPDATE withdraw_requests "
+        "SET retry_count = retry_count + 1, last_error = ?, updated_at = ? "
+        "WHERE tx_id = ? RETURNING retry_count",
+        (error, int(time.time()), tx_id),
+    )
+    row = cur.fetchone()
+    conn.commit()
+    if row is None:
+        raise LookupError(f"withdraw_requests row for tx_id={tx_id} not found")
     return int(row[0])
