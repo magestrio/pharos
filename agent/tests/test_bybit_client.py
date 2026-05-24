@@ -1,6 +1,8 @@
+import asyncio
 import hashlib
 import hmac
 import json
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -8,6 +10,7 @@ import pytest
 from agent.bybit_oracle.bybit_client import (
     BybitAPIError,
     BybitClient,
+    DepositChain,
     EarnProduct,
 )
 
@@ -209,3 +212,156 @@ async def test_from_settings_requires_credentials():
     cfg = OracleSettings(_env_file=None)
     with pytest.raises(RuntimeError, match="BYBIT_API_KEY"):
         BybitClient.from_settings(cfg=cfg)
+
+
+# --- .12c: deposit address + bridge wait -----------------------------------
+
+
+_DEPOSIT_PAYLOAD = {
+    "coin": "USDC",
+    "chains": [
+        {
+            "chain": "ETH",
+            "chainType": "ERC20",
+            "addressDeposit": "0xeth-address",
+            "tagDeposit": "",
+        },
+        {
+            "chain": "MANTLE",
+            "chainType": "Mantle",
+            "addressDeposit": "0xmantle-address",
+            "tagDeposit": "",
+        },
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_get_deposit_address_picks_requested_chain(captured):
+    async with _client(captured, lambda _r: _ok(_DEPOSIT_PAYLOAD)) as c:
+        entry = await c.get_deposit_address(coin="USDC", chain="MANTLE")
+
+    assert isinstance(entry, DepositChain)
+    assert entry.chain == "MANTLE"
+    assert entry.addressDeposit == "0xmantle-address"
+
+    req = captured[0]
+    assert req.url.path == "/v5/asset/deposit/query-address"
+    assert dict(req.url.params) == {"coin": "USDC"}
+
+
+@pytest.mark.asyncio
+async def test_get_deposit_address_chain_case_insensitive(captured):
+    async with _client(captured, lambda _r: _ok(_DEPOSIT_PAYLOAD)) as c:
+        entry = await c.get_deposit_address(coin="USDC", chain="mantle")
+    assert entry.chain == "MANTLE"
+
+
+@pytest.mark.asyncio
+async def test_get_deposit_address_missing_chain_raises(captured):
+    payload = {"coin": "USDC", "chains": [_DEPOSIT_PAYLOAD["chains"][0]]}  # ETH only
+    async with _client(captured, lambda _r: _ok(payload)) as c:
+        with pytest.raises(ValueError, match="no deposit address.*MANTLE"):
+            await c.get_deposit_address(coin="USDC", chain="MANTLE")
+
+
+def _wallet_response(unified_balance: str) -> dict:
+    return {
+        "list": [
+            {
+                "accountType": "UNIFIED",
+                "coin": [{"coin": "USDC", "walletBalance": unified_balance}],
+            }
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_poll_deposit_credited_returns_delta(captured):
+    """Baseline 100.0, then 100.0 again (not yet credited), then 150.5
+    (credit landed). Caller asked for min_credit=50 → must return 50.5.
+    """
+    balances = iter([
+        _wallet_response("100.0"),  # baseline
+        _wallet_response("100.0"),  # not yet
+        _wallet_response("150.5"),  # credited
+    ])
+    async with _client(captured, lambda _r: _ok(next(balances))) as c:
+        delta = await c.poll_deposit_credited(
+            coin="USDC", min_credit="50", interval_seconds=0
+        )
+
+    assert delta == Decimal("50.5")
+    # baseline + 2 polls = 3 wallet calls total
+    assert sum(1 for r in captured if r.url.path.endswith("wallet-balance")) == 3
+
+
+@pytest.mark.asyncio
+async def test_poll_deposit_credited_timeout(captured):
+    """Balance never increases past baseline — raise TimeoutError."""
+    async with _client(captured, lambda _r: _ok(_wallet_response("100.0"))) as c:
+        with pytest.raises(asyncio.TimeoutError, match="not credited"):
+            await c.poll_deposit_credited(
+                coin="USDC",
+                min_credit="10",
+                timeout_seconds=0.05,
+                interval_seconds=0.01,
+            )
+
+
+@pytest.mark.asyncio
+async def test_poll_deposit_credited_sums_across_accounts(captured):
+    """USDC sitting in both UNIFIED and FUND must be summed."""
+    def payload(unified: str, fund: str) -> dict:
+        return {
+            "list": [
+                {
+                    "accountType": "UNIFIED",
+                    "coin": [{"coin": "USDC", "walletBalance": unified}],
+                },
+                {
+                    "accountType": "FUND",
+                    "coin": [{"coin": "USDC", "walletBalance": fund}],
+                },
+            ]
+        }
+
+    balances = iter([
+        payload("100.0", "0"),    # baseline 100
+        payload("100.0", "50.5"), # credited landed in FUND → total 150.5
+    ])
+    async with _client(captured, lambda _r: _ok(next(balances))) as c:
+        delta = await c.poll_deposit_credited(
+            coin="USDC", min_credit="50", interval_seconds=0
+        )
+    assert delta == Decimal("50.5")
+
+
+@pytest.mark.asyncio
+async def test_poll_deposit_credited_zero_baseline_ok(captured):
+    """First-ever deposit (baseline 0) credits the full amount."""
+    balances = iter([
+        _wallet_response("0"),
+        _wallet_response("25"),
+    ])
+    async with _client(captured, lambda _r: _ok(next(balances))) as c:
+        delta = await c.poll_deposit_credited(
+            coin="USDC", min_credit="20", interval_seconds=0
+        )
+    assert delta == Decimal("25")
+
+
+@pytest.mark.asyncio
+async def test_poll_deposit_credited_immediate_credit(captured):
+    """Credit visible on the very first poll (no waiting needed) — verifies
+    we don't sleep an extra interval after success.
+    """
+    balances = iter([
+        _wallet_response("100.0"),  # baseline
+        _wallet_response("200.0"),  # already there on first poll
+    ])
+    async with _client(captured, lambda _r: _ok(next(balances))) as c:
+        delta = await c.poll_deposit_credited(
+            coin="USDC", min_credit="50", interval_seconds=0
+        )
+    assert delta == Decimal("100")

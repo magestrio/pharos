@@ -13,11 +13,13 @@ JSON body for POST/PUT.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
 import time
 import urllib.parse
+from decimal import Decimal
 from typing import Any, Generic, Literal, TypeVar
 
 import httpx
@@ -121,6 +123,23 @@ class SpotOrderResult(BaseModel):
 
     orderId: str
     orderLinkId: str | None = None
+
+
+class DepositChain(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    chain: str
+    chainType: str | None = None
+    addressDeposit: str
+    tagDeposit: str | None = None
+    addressType: str | None = None
+
+
+class DepositAddressResult(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    coin: str
+    chains: list[DepositChain] = Field(default_factory=list)
 
 
 Side = Literal["Buy", "Sell"]
@@ -311,6 +330,86 @@ class BybitClient:
         }
         data = await self._request("POST", "/v5/asset/withdraw/create", body=body)
         return BybitResponse[WithdrawResult].model_validate(data).result  # type: ignore[return-value]
+
+    async def get_deposit_address(self, coin: str, chain: str = "MANTLE") -> DepositChain:
+        """Return the deposit address for `coin` on `chain`. Bybit returns
+        all enabled chains for the coin; we filter client-side because the
+        endpoint's `chainType` param is finicky across asset types.
+
+        Raises ValueError if `coin` exists but isn't enabled on `chain` —
+        that's an operator misconfiguration (forgot to enable Mantle in
+        Bybit UI), not a runtime condition to retry.
+        """
+        data = await self._request(
+            "GET", "/v5/asset/deposit/query-address", params={"coin": coin}
+        )
+        parsed = BybitResponse[DepositAddressResult].model_validate(data)
+        if parsed.result is None:
+            raise ValueError(f"no deposit address payload for {coin}")
+        wanted = chain.upper()
+        for entry in parsed.result.chains:
+            if entry.chain.upper() == wanted:
+                return entry
+        available = [c.chain for c in parsed.result.chains]
+        raise ValueError(
+            f"no deposit address for {coin} on chain {chain}; available: {available}"
+        )
+
+    async def poll_deposit_credited(
+        self,
+        coin: str,
+        min_credit: str | Decimal,
+        timeout_seconds: float = 1800,
+        interval_seconds: float = 15,
+    ) -> Decimal:
+        """Block until `coin` balance grows by at least `min_credit` versus
+        the baseline captured at call entry. Returns the actual delta.
+
+        Used after a Mantle USDC transfer to a Bybit deposit address — we
+        poll the Bybit wallet, not the chain, because Bybit credit lag (a
+        few minutes after on-chain confirmation) is the binding wait.
+
+        Raises TimeoutError if not credited within timeout. Sums
+        across all account types (UNIFIED + FUND + ...) so transfers that
+        land in either are detected.
+        """
+        threshold = Decimal(str(min_credit))
+        baseline = self._sum_coin_balance(await self.get_wallet_balance(coin=coin), coin)
+        log.info(
+            "bridge_wait_started",
+            extra={"coin": coin, "baseline": str(baseline), "threshold": str(threshold)},
+        )
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout_seconds
+        while True:
+            current = self._sum_coin_balance(
+                await self.get_wallet_balance(coin=coin), coin
+            )
+            delta = current - baseline
+            if delta >= threshold:
+                log.info(
+                    "bridge_wait_credited",
+                    extra={"coin": coin, "delta": str(delta)},
+                )
+                return delta
+            if loop.time() >= deadline:
+                raise TimeoutError(
+                    f"{coin} not credited within {timeout_seconds}s "
+                    f"(delta={delta}, needed={threshold})"
+                )
+            await asyncio.sleep(interval_seconds)
+
+    @staticmethod
+    def _sum_coin_balance(accounts: list[WalletAccount], coin: str) -> Decimal:
+        """Sum walletBalance for `coin` across all returned accounts.
+        Bybit returns decimal strings; Decimal avoids drift on small credits.
+        """
+        total = Decimal(0)
+        for account in accounts:
+            for entry in account.coin:
+                if entry.coin == coin:
+                    total += Decimal(entry.walletBalance)
+        return total
 
     async def place_spot_order(
         self,
