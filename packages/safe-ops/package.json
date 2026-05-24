@@ -1,0 +1,22 @@
+{
+  "name": "@vault8004/safe-ops",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "tx": "tsx src/bin/safe-tx.ts",
+    "set-agent-uri": "tsx src/bin/safe-set-agent-uri.ts",
+    "register-agent": "tsx src/bin/safe-register-agent.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@safe-global/protocol-kit": "^5.2.0",
+    "dotenv": "^16.4.5",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.16.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
