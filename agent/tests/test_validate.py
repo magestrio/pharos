@@ -11,6 +11,7 @@ from agent.validate.rules import (
     check_risk_flags,
     check_bybit_lag,
     check_usdc_peg,
+    check_weth_available,
     check_aave_utilization,
 )
 
@@ -39,12 +40,15 @@ def _decision(**kwargs) -> Decision:
 
 
 def _safe_ctx() -> RiskContext:
-    """Risk context with no rule triggered."""
+    """Risk context with no rule triggered. `weth_funding_available=True`
+    here so tests of unrelated rules can use _alloc() defaults that
+    include a WETH leg without tripping check_weth_available."""
     return RiskContext(
         bybit_attestor_lag_minutes=10,
         usdc_peg_deviation_bps=20,
         aave_v3_usdc_utilization=0.70,
         aave_v3_weth_utilization=0.70,
+        weth_funding_available=True,
     )
 
 
@@ -267,6 +271,28 @@ def test_validate_passes():
     assert errors == []
 
 
+# --- check_weth_available ---
+
+def test_weth_available_when_target_zero():
+    """target.aave_v3_weth=0 always passes regardless of flag."""
+    alloc = _alloc(cash_usdc=0.10, aave_v3_usdc=0.50, aave_v3_weth=0.0, bybit_attestor=0.40)
+    ok, _ = check_weth_available(_decision(target_allocation=alloc), RiskContext(weth_funding_available=False))
+    assert ok
+
+
+def test_weth_blocked_when_flag_false_and_target_above_zero():
+    alloc = _alloc(cash_usdc=0.05, aave_v3_usdc=0.25, aave_v3_weth=0.30, bybit_attestor=0.40)
+    ok, err = check_weth_available(_decision(target_allocation=alloc), RiskContext(weth_funding_available=False))
+    assert not ok
+    assert "weth-funding-gap" in err
+
+
+def test_weth_allowed_when_flag_true():
+    alloc = _alloc(cash_usdc=0.05, aave_v3_usdc=0.25, aave_v3_weth=0.30, bybit_attestor=0.40)
+    ok, _ = check_weth_available(_decision(target_allocation=alloc), RiskContext(weth_funding_available=True))
+    assert ok
+
+
 def test_validate_fails_multiple():
     bad = _alloc(cash_usdc=0.05, aave_v3_usdc=0.05, aave_v3_weth=0.15, bybit_attestor=0.75)  # bybit > both caps
     d = Decision(
@@ -284,9 +310,10 @@ def test_validate_fails_multiple():
 
 
 def test_validate_fails_on_missing_risk_metrics():
-    """Default RiskContext (all None) fails closed on every conditional rule."""
+    """Default RiskContext (all None, weth_funding_available=False) fails
+    closed on every conditional rule."""
     alloc = _alloc(cash_usdc=0.10, aave_v3_usdc=0.25, aave_v3_weth=0.25, bybit_attestor=0.40)
     ok, errors = validate(_decision(target_allocation=alloc), RiskContext())
     assert not ok
-    # bybit_lag + usdc_peg + aave_utilization (both pools rolled into one error string)
-    assert len(errors) == 3
+    # bybit_lag + usdc_peg + weth_available + aave_utilization (both pools rolled into one)
+    assert len(errors) == 4

@@ -86,6 +86,20 @@ def check_usdc_peg(d: Decision, ctx: RiskContext) -> tuple[bool, str | None]:
     return True, None
 
 
+def check_weth_available(d: Decision, ctx: RiskContext) -> tuple[bool, str | None]:
+    """Reject any aave_v3_weth allocation while the USDC<->WETH swap rail
+    is missing (weth-funding-gap). Defense-in-depth on top of the
+    execute-layer raise: validator should catch the bad decision before
+    we ever try to build calls."""
+    if not ctx.weth_funding_available and d.target_allocation.aave_v3_weth > 0:
+        return False, (
+            f"aave_v3_weth={d.target_allocation.aave_v3_weth:.2%} but "
+            "weth_funding_available=False (weth-funding-gap unresolved: "
+            "no USDC<->WETH swap rail). Set aave_v3_weth=0."
+        )
+    return True, None
+
+
 def check_aave_utilization(d: Decision, ctx: RiskContext) -> tuple[bool, str | None]:
     """Forced exit per-pool when utilization > 95% OR metric unavailable."""
     errors: list[str] = []
@@ -116,6 +130,7 @@ def validate(decision: Decision, risk_context: RiskContext) -> tuple[bool, list[
         check_risk_flags(decision),
         check_bybit_lag(decision, risk_context),
         check_usdc_peg(decision, risk_context),
+        check_weth_available(decision, risk_context),
         check_aave_utilization(decision, risk_context),
     ]
     errors = [msg for ok, msg in checks if not ok and msg]
