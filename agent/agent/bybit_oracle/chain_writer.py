@@ -37,7 +37,8 @@ from .structured_log import get_logger
 log = get_logger(__name__)
 
 
-# Minimal ERC-20 surface — only what we need to send USDC and read balances.
+# Minimal ERC-20 surface — only what we need to send USDC, read balances,
+# and approve the BybitAttestor contract to pull USDC in confirmWithdraw.
 # Avoids pulling a full token ABI into the repo.
 _ERC20_MINIMAL_ABI: list[dict[str, Any]] = [
     {
@@ -56,6 +57,16 @@ _ERC20_MINIMAL_ABI: list[dict[str, Any]] = [
         "stateMutability": "view",
         "inputs": [{"name": "account", "type": "address"}],
         "outputs": [{"name": "", "type": "uint256"}],
+    },
+    {
+        "type": "function",
+        "name": "approve",
+        "stateMutability": "nonpayable",
+        "inputs": [
+            {"name": "spender", "type": "address"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "outputs": [{"name": "", "type": "bool"}],
     },
 ]
 
@@ -161,6 +172,27 @@ class ChainWriter:
             )
         return self._send_on_contract(
             self._usdc, "transfer", Web3.to_checksum_address(to_address), amount_micro
+        )
+
+    def approve_usdc(self, spender: str, amount_micro: int) -> str:
+        """Approve `spender` to pull up to `amount_micro` USDC from the
+        attestor wallet. Used by the withdraw orchestrator: BybitAttestor's
+        `confirmWithdraw` does `safeTransferFrom(attestor, this, amount)` —
+        which only works if the attestor first approved the contract.
+
+        Pattern: orchestrator calls approve right before confirmWithdraw,
+        with the exact amount (not unlimited) so a compromised contract
+        can't drain extra. Cost: one extra tx per withdraw cycle.
+        """
+        if self._usdc is None:
+            raise RuntimeError(
+                "approve_usdc called but ChainWriter has no usdc_address configured"
+            )
+        return self._send_on_contract(
+            self._usdc,
+            "approve",
+            Web3.to_checksum_address(spender),
+            amount_micro,
         )
 
     def _send(self, fn_name: str, *args: Any) -> str:

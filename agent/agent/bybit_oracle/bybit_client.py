@@ -316,6 +316,44 @@ class BybitClient:
         data = await self._request("POST", "/v5/earn/place-order", body=body)
         return BybitResponse[EarnOrderResult].model_validate(data).result  # type: ignore[return-value]
 
+    async def redeem_from_earn(
+        self,
+        product_id: str,
+        amount: str,
+        order_link_id: str | None = None,
+    ) -> EarnOrderResult:
+        """Named wrapper over `place_earn_order(..., side="Redeem")`. Same
+        endpoint, separate method so withdraw-side callers read clearly
+        ("redeem from Earn") instead of `place_earn_order(side="Redeem")`.
+        """
+        return await self.place_earn_order(
+            product_id=product_id,
+            amount=amount,
+            side="Redeem",
+            order_link_id=order_link_id,
+        )
+
+    async def poll_redemption_credited(
+        self,
+        coin: str,
+        min_credit: str | Decimal,
+        timeout_seconds: float = 900,
+        interval_seconds: float = 5,
+    ) -> Decimal:
+        """Poll Bybit wallet until `coin` balance grows by at least
+        `min_credit`. Semantically identical to `poll_deposit_credited` —
+        same baseline + delta logic. Separate method gives the withdraw
+        orchestrator a clearly-named hook and lets us tune defaults
+        independently (Flexible Saving redemption is usually <1min; default
+        timeout 15min covers congestion).
+        """
+        return await self.poll_deposit_credited(
+            coin=coin,
+            min_credit=min_credit,
+            timeout_seconds=timeout_seconds,
+            interval_seconds=interval_seconds,
+        )
+
     async def get_earn_positions(self, category: str | None = None) -> list[EarnPosition]:
         data = await self._request("GET", "/v5/earn/position", params={"category": category})
         parsed = BybitResponse[EarnPositionList].model_validate(data)

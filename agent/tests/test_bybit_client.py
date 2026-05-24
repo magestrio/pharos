@@ -444,3 +444,44 @@ async def test_poll_spot_order_filled_timeout(captured):
             await c.poll_spot_order_filled(
                 order_id="ord-1", timeout_seconds=0.05, interval_seconds=0.01
             )
+
+
+# --- .13b: Earn redeem helpers --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_redeem_from_earn_sends_redeem_side(captured):
+    async with _client(captured, lambda _r: _ok({"orderId": "redeem-1"})) as c:
+        result = await c.redeem_from_earn(
+            product_id="prod-1", amount="100", order_link_id="link-1"
+        )
+
+    assert result.orderId == "redeem-1"
+    req = captured[0]
+    assert req.url.path == "/v5/earn/place-order"
+    body = json.loads(req.content.decode())
+    assert body == {
+        "productId": "prod-1",
+        "amount": "100",
+        "orderType": "Redeem",
+        "orderLinkId": "link-1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_poll_redemption_credited_delegates_to_deposit_poller(captured):
+    """Semantically identical to poll_deposit_credited — verify by checking
+    that the same wallet-balance polling happens and the returned delta
+    matches.
+    """
+    balances = iter([
+        {"list": [{"accountType": "UNIFIED", "coin": [{"coin": "USDC", "walletBalance": "0"}]}]},
+        {"list": [{"accountType": "UNIFIED", "coin": [{"coin": "USDC", "walletBalance": "50"}]}]},
+    ])
+    async with _client(captured, lambda _r: _ok(next(balances))) as c:
+        delta = await c.poll_redemption_credited(
+            coin="USDC", min_credit="50", interval_seconds=0
+        )
+    assert delta == Decimal("50")
+    # 1 baseline + 1 poll
+    assert sum(1 for r in captured if r.url.path.endswith("wallet-balance")) == 2

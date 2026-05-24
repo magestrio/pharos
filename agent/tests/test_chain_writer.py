@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, PropertyMock
 import httpx
 import pytest
 from eth_account import Account
+from web3 import Web3
 from web3.exceptions import Web3RPCError
 
 from agent.bybit_oracle.chain_writer import ChainSendError, ChainWriter
@@ -255,5 +256,59 @@ def test_address_property_matches_account():
     w3, _ = _make_w3_mock()
     writer = _make_writer(w3)
     assert writer.address == ATTESTOR_ADDR
+
+
+# --- .13b: USDC approve ----------------------------------------------------
+
+
+USDC_ADDR = "0x" + "22" * 20
+SPENDER = "0x" + "33" * 20
+
+
+def _make_writer_with_usdc(w3: MagicMock) -> ChainWriter:
+    """Variant that includes a USDC contract for transfer_usdc / approve_usdc.
+    The w3.eth.contract mock returns the same fn_mock for any contract
+    instance — fine because we assert on call args, not contract identity.
+    """
+    account = Account.from_key(TEST_PRIVATE_KEY)
+    return ChainWriter(
+        w3=w3,
+        account=account,
+        contract_address=CONTRACT_ADDR,
+        abi=ABI,
+        usdc_address=USDC_ADDR,
+        chain_id=5000,
+        gas_buffer=1.2,
+        receipt_timeout=30,
+    )
+
+
+def test_approve_usdc_calls_approve_with_spender_and_amount():
+    w3, _ = _make_w3_mock()
+    writer = _make_writer_with_usdc(w3)
+
+    tx_hash = writer.approve_usdc(spender=SPENDER, amount_micro=50_000_000)
+    assert tx_hash == TX_HASH_HEX
+
+    # The USDC contract's `functions["approve"]` was invoked with the
+    # correctly checksummed spender + raw amount.
+    # Since both ChainWriter contracts use the same w3.eth.contract mock,
+    # we inspect the latest `functions[name]` call.
+    contract_fns = w3.eth.contract.return_value.functions
+    contract_fns.__getitem__.assert_called_with("approve")
+    factory = contract_fns.__getitem__.return_value
+    args, _ = factory.call_args
+    assert args[0] == Web3.to_checksum_address(SPENDER)
+    assert args[1] == 50_000_000
+
+
+def test_approve_usdc_raises_without_usdc_address():
+    """ChainWriter constructed without usdc_address (listener-only mode)
+    must refuse approve_usdc — explicit error beats silent NoneType crash.
+    """
+    w3, _ = _make_w3_mock()
+    writer = _make_writer(w3)  # no usdc_address
+    with pytest.raises(RuntimeError, match="approve_usdc.*usdc_address"):
+        writer.approve_usdc(SPENDER, 1)
 
 
