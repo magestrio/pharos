@@ -11,3 +11,7 @@ __pycache__/
 dist/
 *.log
 .DS_Store
+agent/agent/sandbox/captures/
+agent/agent/sandbox/snapshots/
+agent/agent/sandbox/decisions/
+agent/agent/sandbox/executions/
