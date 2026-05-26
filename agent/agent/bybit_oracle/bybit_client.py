@@ -1,28 +1,30 @@
 """Bybit V5 REST client.
 
 Direct httpx wrapper instead of the official `pybit` SDK — we already depend
-on httpx, and the V5 protocol is just REST + HMAC-SHA256, so a thin client
+on httpx, and the V5 protocol is just REST + RSA-SHA256, so a thin client
 keeps deps frozen and avoids surprises when SDK lags behind new endpoints.
 
-Signing scheme (V5 RECV_WINDOW header style):
+Signing scheme (V5 RECV_WINDOW header style, RSA / sign-type=1):
     sign_string = timestamp + api_key + recv_window + payload
-    signature   = hex(hmac_sha256(api_secret, sign_string))
+    signature   = base64(rsa_sha256_pkcs1v15(private_key, sign_string))
 where `payload` is the URL-encoded query string for GET/DELETE and the raw
-JSON body for POST/PUT.
+JSON body for POST/PUT. Bybit V5 expects PKCS#1 v1.5 padding (NOT PSS).
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
+import base64
 import json
 import time
 import urllib.parse
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Generic, Literal, TypeVar
 
 import httpx
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from pydantic import BaseModel, ConfigDict, Field
 
 from .config import OracleSettings, settings
@@ -54,16 +56,56 @@ class BybitResponse(BaseModel, Generic[T]):
     result: T | None = None
 
 
+class BonusEvent(BaseModel):
+    """Promotional APR layered on top of `estimateApr` (e.g. "Yesterday's
+    Rewards APR"). Bybit returns these for products under active campaigns.
+    Discrepancy between UI promo number and API `estimateApr` typically
+    lives here — Phase A.3 observation."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    apr: str | None = None
+    coin: str | None = None
+    announcement: str | None = None
+
+
 class EarnProduct(BaseModel):
+    """Basic Earn product (FlexibleSaving | OnChain) per /v5/earn/product.
+
+    Field families:
+    - identity: productId, coin, category, status
+    - APR / amounts: estimateApr, min/maxStakeAmount, min/maxRedeemAmount,
+      precision, bonusEvents
+    - shape: duration ("Fixed" | "Flexible"), term (days, Fixed OnChain),
+      rewardDistributionType, rewardIntervalMinute, redeemProcessingMinute
+    - LST-only (OnChain): swapCoin, swapCoinPrecision, stakeExchangeRate,
+      redeemExchangeRate, stakeTime, interestCalculationTime
+    """
+
     model_config = ConfigDict(extra="ignore")
 
     productId: str
     coin: str
     category: str
-    status: str | None = None
+    status: str | None = None  # Available | NotAvailable
     estimateApr: str | None = None
     minStakeAmount: str | None = None
     maxStakeAmount: str | None = None
+    precision: str | None = None
+    bonusEvents: list[BonusEvent] = Field(default_factory=list)
+    minRedeemAmount: str | None = None
+    maxRedeemAmount: str | None = None
+    duration: str | None = None  # Fixed | Flexible; empty string for some products
+    term: int | None = None  # in days; non-zero only for OnChain Fixed
+    swapCoin: str | None = None
+    swapCoinPrecision: str | None = None
+    stakeExchangeRate: str | None = None
+    redeemExchangeRate: str | None = None
+    rewardDistributionType: str | None = None  # Simple | Compound | Other
+    rewardIntervalMinute: int | None = None
+    redeemProcessingMinute: str | None = None
+    stakeTime: str | None = None  # unix ms as string
+    interestCalculationTime: str | None = None  # unix ms as string
 
 
 class EarnProductList(BaseModel):
@@ -71,14 +113,46 @@ class EarnProductList(BaseModel):
     items: list[EarnProduct] = Field(default_factory=list, alias="list")
 
 
+class FreezeDetail(BaseModel):
+    """A portion of an Earn position locked out of redemption (e.g.
+    collateralizing a Fixed-Rate Loan). `availableAmount` on the parent
+    position already nets these out — useful here for explainability."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    amount: str | None = None
+    description: str | None = None
+
+
 class EarnPosition(BaseModel):
+    """Basic Earn position per /v5/earn/position. `category` is added by
+    the gather layer (Bybit doesn't echo it in the response) — kept
+    optional so direct API calls don't break parsing.
+
+    OnChain positions carry the richer lifecycle fields (id, orderId,
+    estimate*Time, settlementTime, freezeDetails). FlexibleSaving
+    positions typically only populate amount / availableAmount /
+    autoReinvest / claimableYield.
+    """
+
     model_config = ConfigDict(extra="ignore")
 
     productId: str
     coin: str
     amount: str
     category: str | None = None
-    status: str | None = None
+    status: str | None = None  # Processing | Active (OnChain only)
+    totalPnl: str | None = None  # OnChain non-LST only
+    claimableYield: str | None = None
+    id: str | None = None  # position id (OnChain only)
+    orderId: str | None = None
+    estimateRedeemTime: str | None = None  # unix ms
+    estimateStakeTime: str | None = None  # unix ms
+    estimateInterestCalculationTime: str | None = None  # unix ms
+    settlementTime: str | None = None  # unix ms, OnChain Fixed
+    autoReinvest: str | None = None  # Enable | Disable
+    availableAmount: str | None = None
+    freezeDetails: list[FreezeDetail] = Field(default_factory=list)
 
 
 class EarnPositionList(BaseModel):
@@ -167,6 +241,21 @@ class DepositAddressResult(BaseModel):
 
 Side = Literal["Buy", "Sell"]
 EarnSide = Literal["Stake", "Redeem"]
+AccountType = Literal["FUND", "UNIFIED"]
+EarnCategory = Literal["FlexibleSaving", "OnChain"]
+AdvanceEarnCategory = Literal[
+    "SmartLeverage", "DiscountBuy", "DualAssets", "DoubleWin", "LiquidityMining"
+]
+
+# Per the V5 enum (Advanced-Earn-category, checked 2026-05-27). All five
+# share the same /v5/earn/advance/* endpoint family and discriminate by
+# `category` query/body param. The standalone `/v5/earn/liquidity-mining/
+# product-info` returns 404 — LM rides the shared advance endpoint like
+# the other categories; if Bybit doesn't recognize the name the call
+# surfaces as BybitAPIError, which is fine.
+ADVANCE_EARN_CATEGORIES: frozenset[str] = frozenset(
+    {"SmartLeverage", "DiscountBuy", "DualAssets", "DoubleWin", "LiquidityMining"}
+)
 
 
 class LinearTicker(BaseModel):
@@ -238,14 +327,14 @@ class BybitClient:
     def __init__(
         self,
         api_key: str,
-        api_secret: str,
+        private_key: rsa.RSAPrivateKey,
         base_url: str = "https://api.bybit.com",
         recv_window: int = 5000,
         transport: httpx.AsyncBaseTransport | None = None,
         timeout: float = 10.0,
     ) -> None:
         self._api_key = api_key
-        self._api_secret = api_secret.encode()
+        self._private_key = private_key
         self._base_url = base_url.rstrip("/")
         self._recv_window = str(recv_window)
         self._client = httpx.AsyncClient(
@@ -262,14 +351,22 @@ class BybitClient:
     ) -> BybitClient:
         cfg = cfg or settings
         key = cfg.BYBIT_API_KEY.get_secret_value()
-        secret = cfg.BYBIT_API_SECRET.get_secret_value()
-        if not key or not secret:
+        if not key:
+            raise RuntimeError("BYBIT_API_KEY is required to call private endpoints")
+        pem_path = Path(cfg.BYBIT_PRIVATE_KEY_PATH).expanduser()
+        if not pem_path.is_file():
             raise RuntimeError(
-                "BYBIT_API_KEY / BYBIT_API_SECRET are required to call private endpoints"
+                f"BYBIT_PRIVATE_KEY_PATH={pem_path} does not exist — "
+                "generate the RSA keypair and register the public PEM in Bybit UI"
+            )
+        loaded = serialization.load_pem_private_key(pem_path.read_bytes(), password=None)
+        if not isinstance(loaded, rsa.RSAPrivateKey):
+            raise RuntimeError(
+                f"BYBIT_PRIVATE_KEY_PATH={pem_path} is not an RSA private key"
             )
         return cls(
             api_key=key,
-            api_secret=secret,
+            private_key=loaded,
             base_url=cfg.BYBIT_BASE_URL,
             recv_window=cfg.BYBIT_RECV_WINDOW,
             transport=transport,
@@ -289,7 +386,8 @@ class BybitClient:
 
     def _sign(self, timestamp: str, payload: str) -> str:
         message = (timestamp + self._api_key + self._recv_window + payload).encode()
-        return hmac.new(self._api_secret, message, hashlib.sha256).hexdigest()
+        sig = self._private_key.sign(message, padding.PKCS1v15(), hashes.SHA256())
+        return base64.b64encode(sig).decode()
 
     def _auth_headers(self, timestamp: str, signature: str) -> dict[str, str]:
         return {
@@ -297,7 +395,7 @@ class BybitClient:
             "X-BAPI-TIMESTAMP": timestamp,
             "X-BAPI-RECV-WINDOW": self._recv_window,
             "X-BAPI-SIGN": signature,
-            "X-BAPI-SIGN-TYPE": "2",
+            "X-BAPI-SIGN-TYPE": "1",
         }
 
     async def _request(
@@ -342,8 +440,10 @@ class BybitClient:
     async def list_earn_products(
         self, category: str | None = None, coin: str | None = None
     ) -> list[EarnProduct]:
-        """List Earn products. Covers all categories: FlexibleSaving, OnChain,
-        FixedSaving, LiquidityMining, DualAsset, DiscountBuy.
+        """List Earn products via the legacy `/v5/earn/product` endpoint.
+        `category` accepts `FlexibleSaving` (default) and `OnChain`. Other
+        Earn families live on different paths — use
+        `list_extended_earn_products` for those.
         """
         data = await self._request(
             "GET", "/v5/earn/product", params={"category": category, "coin": coin}
@@ -351,40 +451,213 @@ class BybitClient:
         parsed = BybitResponse[EarnProductList].model_validate(data)
         return parsed.result.items if parsed.result else []
 
+    # All advance-Earn categories share the same endpoint family
+    # (/v5/earn/advance/{product,product-extra-info,position,place-order,
+    # get-redeem-est-amount-list}) and discriminate by `category`. Schemas
+    # vary per category, so list/quote/position methods return raw dicts.
+    _ADVANCE_EARN_CATEGORIES: frozenset[str] = ADVANCE_EARN_CATEGORIES
+
+    async def list_advance_earn_products(
+        self, category: str, coin: str | None = None
+    ) -> list[dict[str, Any]]:
+        """List Earn products for advance-Earn categories
+        (SmartLeverage, DiscountBuy, DualAssets, DoubleWin). Returns raw
+        dicts since per-category schemas differ. Raises `ValueError` for
+        unknown categories.
+        """
+        self._require_advance_category(category)
+        data = await self._request(
+            "GET",
+            "/v5/earn/advance/product",
+            params={"category": category, "coin": coin},
+        )
+        result = data.get("result") or {}
+        items = result.get("list", [])
+        return list(items) if isinstance(items, list) else []
+
+    async def get_advance_product_quote(
+        self, category: str, product_id: str | None = None
+    ) -> dict[str, Any]:
+        """Fetch the latest quote for an advance-Earn product via
+        `/v5/earn/advance/product-extra-info`. For Stake orders this is a
+        mandatory pre-call — `initialPrice`, `breakevenPrice`, `apyE8`,
+        etc. must be echoed back into place-order. Returns the raw `result`
+        dict because per-category fields differ (DiscountBuy returns
+        `offers: [...]`; SmartLeverage returns a single quote object).
+        """
+        self._require_advance_category(category)
+        data = await self._request(
+            "GET",
+            "/v5/earn/advance/product-extra-info",
+            params={"category": category, "productId": product_id},
+        )
+        return data.get("result") or {}
+
+    async def get_advance_earn_positions(
+        self, category: str, product_id: str
+    ) -> list[dict[str, Any]]:
+        """Query open advance-Earn positions. Both `category` and
+        `product_id` are required by the V5 endpoint. Returns raw dicts —
+        position payloads carry per-category fields (positionId,
+        strikePrice, breakevenPrice, expiryTime, ...) that don't fit the
+        flat basic-Earn `EarnPosition` shape.
+        """
+        self._require_advance_category(category)
+        data = await self._request(
+            "GET",
+            "/v5/earn/advance/position",
+            params={"category": category, "productId": product_id},
+        )
+        result = data.get("result") or {}
+        items = result.get("list", [])
+        return list(items) if isinstance(items, list) else []
+
+    async def get_redeem_estimate(
+        self, category: str, position_ids: list[str] | str
+    ) -> dict[str, Any]:
+        """Get estimated redeem amount for one or more advance-Earn
+        positions. Bybit caches the estimate for ~10min server-side; pass
+        it back into `place_advance_earn_order` via the appropriate
+        `*RedeemExtra` block.
+        """
+        self._require_advance_category(category)
+        ids = ",".join(position_ids) if isinstance(position_ids, list) else position_ids
+        data = await self._request(
+            "GET",
+            "/v5/earn/advance/get-redeem-est-amount-list",
+            params={"category": category, "positionIds": ids},
+        )
+        return data.get("result") or {}
+
+    async def place_advance_earn_order(
+        self,
+        *,
+        category: str,
+        product_id: str,
+        side: EarnSide,
+        account_type: AccountType,
+        order_link_id: str,
+        coin: str | None = None,
+        amount: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Stake or Redeem an advance-Earn product via
+        `/v5/earn/advance/place-order`.
+
+        The per-category `*Extra` block (smartLeverageStakeExtra,
+        discountBuyExtra, dualAssetsExtra, doubleWinStakeExtra,
+        smartLeverageRedeemExtra, ...) is passed as `extra` — caller is
+        responsible for constructing it from the matching
+        `get_advance_product_quote` / `get_redeem_estimate` response.
+
+        `coin` and `amount` are required for Stake, omitted for Redeem
+        (the position carries the coin). Returns raw `{orderId,
+        orderLinkId}` dict since the place-order envelope is the same
+        across categories.
+        """
+        self._require_advance_category(category)
+        body: dict[str, Any] = {
+            "category": category,
+            "productId": product_id,
+            "orderType": side,
+            "accountType": account_type,
+            "orderLinkId": order_link_id,
+        }
+        if coin is not None:
+            body["coin"] = coin
+        if amount is not None:
+            body["amount"] = amount
+        if extra:
+            body.update(extra)
+        data = await self._request("POST", "/v5/earn/advance/place-order", body=body)
+        return data.get("result") or {}
+
+    async def get_hourly_yield(
+        self,
+        category: str,
+        product_id: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Historical hourly yield via `/v5/earn/hourly-yield`. Window is
+        capped at 7d server-side; paginate with `cursor` for longer
+        ranges. Returns the raw `{list, nextPageCursor}` dict.
+        """
+        params: dict[str, Any] = {"category": category}
+        if product_id is not None:
+            params["productId"] = product_id
+        if start_time is not None:
+            params["startTime"] = start_time
+        if end_time is not None:
+            params["endTime"] = end_time
+        if limit is not None:
+            params["limit"] = limit
+        if cursor is not None:
+            params["cursor"] = cursor
+        data = await self._request("GET", "/v5/earn/hourly-yield", params=params)
+        return data.get("result") or {}
+
+    @classmethod
+    def _require_advance_category(cls, category: str) -> None:
+        if category not in cls._ADVANCE_EARN_CATEGORIES:
+            raise ValueError(
+                f"unknown advance-Earn category {category!r}; "
+                f"valid: {sorted(cls._ADVANCE_EARN_CATEGORIES)}"
+            )
+
     async def place_earn_order(
         self,
+        *,
+        category: EarnCategory,
         product_id: str,
         amount: str,
         side: EarnSide,
-        order_link_id: str | None = None,
+        coin: str,
+        account_type: AccountType,
+        order_link_id: str,
     ) -> EarnOrderResult:
-        """Stake or Redeem an Earn product. `amount` is decimal-string per
-        Bybit convention to avoid float drift.
+        """Stake or Redeem a basic Earn product (FlexibleSaving | OnChain).
+        All seven fields are required by V5 `/v5/earn/place-order`:
+        OnChain only accepts `accountType=FUND`; the same `order_link_id`
+        cannot be reused within 30min (Bybit dedupes by it).
+
+        For advance categories use `place_advance_earn_order`.
         """
         body: dict[str, Any] = {
+            "category": category,
             "productId": product_id,
             "amount": amount,
             "orderType": side,
+            "coin": coin,
+            "accountType": account_type,
+            "orderLinkId": order_link_id,
         }
-        if order_link_id is not None:
-            body["orderLinkId"] = order_link_id
         data = await self._request("POST", "/v5/earn/place-order", body=body)
         return BybitResponse[EarnOrderResult].model_validate(data).result  # type: ignore[return-value]
 
     async def redeem_from_earn(
         self,
+        *,
+        category: EarnCategory,
         product_id: str,
         amount: str,
-        order_link_id: str | None = None,
+        coin: str,
+        account_type: AccountType,
+        order_link_id: str,
     ) -> EarnOrderResult:
         """Named wrapper over `place_earn_order(..., side="Redeem")`. Same
         endpoint, separate method so withdraw-side callers read clearly
         ("redeem from Earn") instead of `place_earn_order(side="Redeem")`.
         """
         return await self.place_earn_order(
+            category=category,
             product_id=product_id,
             amount=amount,
             side="Redeem",
+            coin=coin,
+            account_type=account_type,
             order_link_id=order_link_id,
         )
 

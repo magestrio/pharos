@@ -3,6 +3,10 @@ from pathlib import Path
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# RSA private key default path. Sandbox creds live outside the repo;
+# CI/tests can override via env or by patching OracleSettings.
+_DEFAULT_RSA_KEY_PATH = Path.home() / ".config" / "vault8004" / "bybit-sandbox-rsa.pem"
+
 
 class OracleSettings(BaseSettings):
     """Bybit oracle settings, loaded from .env.
@@ -30,11 +34,12 @@ class OracleSettings(BaseSettings):
 
     LOG_LEVEL: str = "INFO"
 
-    # Bybit V5 REST. Empty defaults so the listener-only process can boot
-    # without API credentials; the client raises if they're missing at call
-    # time. Switch BYBIT_BASE_URL to https://api-testnet.bybit.com for tests.
+    # Bybit V5 REST. RSA auth only (sign-type=1). Empty defaults so the
+    # listener-only process can boot without credentials; the client raises
+    # if they're missing at call time. Switch BYBIT_BASE_URL to
+    # https://api-testnet.bybit.com for tests.
     BYBIT_API_KEY: SecretStr = SecretStr("")
-    BYBIT_API_SECRET: SecretStr = SecretStr("")
+    BYBIT_PRIVATE_KEY_PATH: Path = _DEFAULT_RSA_KEY_PATH
     BYBIT_BASE_URL: str = "https://api.bybit.com"
     BYBIT_RECV_WINDOW: int = 5000
 

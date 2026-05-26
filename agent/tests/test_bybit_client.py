@@ -1,11 +1,12 @@
 import asyncio
-import hashlib
-import hmac
+import base64
 import json
 from decimal import Decimal
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from agent.bybit_oracle.bybit_client import (
     BybitAPIError,
@@ -14,15 +15,21 @@ from agent.bybit_oracle.bybit_client import (
     DepositChain,
     EarnProduct,
 )
+from agent.bybit_oracle.bybit_client import (  # noqa: E501 — keep typed-model surface explicit
+    BonusEvent,
+    EarnPosition,
+    FreezeDetail,
+)
 
 API_KEY = "test-key"
-API_SECRET = "test-secret"
 RECV_WINDOW = 5000
+PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 
 def _expected_signature(timestamp: str, payload: str) -> str:
     msg = (timestamp + API_KEY + str(RECV_WINDOW) + payload).encode()
-    return hmac.new(API_SECRET.encode(), msg, hashlib.sha256).hexdigest()
+    sig = PRIVATE_KEY.sign(msg, padding.PKCS1v15(), hashes.SHA256())
+    return base64.b64encode(sig).decode()
 
 
 def _ok(result: dict | None = None) -> httpx.Response:
@@ -43,7 +50,7 @@ def _client(captured: list[httpx.Request], responder) -> BybitClient:
 
     return BybitClient(
         api_key=API_KEY,
-        api_secret=API_SECRET,
+        private_key=PRIVATE_KEY,
         base_url="https://api.bybit.com",
         recv_window=RECV_WINDOW,
         transport=httpx.MockTransport(_handler),
@@ -88,7 +95,15 @@ async def test_post_signs_raw_json_body(captured):
     async with _client(
         captured, lambda _r: _ok({"orderId": "ord-1"})
     ) as c:
-        await c.place_earn_order(product_id="p1", amount="100", side="Stake")
+        await c.place_earn_order(
+            category="FlexibleSaving",
+            product_id="p1",
+            amount="100",
+            side="Stake",
+            coin="USDC",
+            account_type="FUND",
+            order_link_id="link-1",
+        )
 
     req = captured[0]
     assert req.method == "POST"
@@ -97,9 +112,13 @@ async def test_post_signs_raw_json_body(captured):
 
     body_text = req.content.decode()
     assert json.loads(body_text) == {
+        "category": "FlexibleSaving",
         "productId": "p1",
         "amount": "100",
         "orderType": "Stake",
+        "coin": "USDC",
+        "accountType": "FUND",
+        "orderLinkId": "link-1",
     }
     ts = req.headers["X-BAPI-TIMESTAMP"]
     assert req.headers["X-BAPI-SIGN"] == _expected_signature(ts, body_text)
@@ -453,7 +472,12 @@ async def test_poll_spot_order_filled_timeout(captured):
 async def test_redeem_from_earn_sends_redeem_side(captured):
     async with _client(captured, lambda _r: _ok({"orderId": "redeem-1"})) as c:
         result = await c.redeem_from_earn(
-            product_id="prod-1", amount="100", order_link_id="link-1"
+            category="FlexibleSaving",
+            product_id="prod-1",
+            amount="100",
+            coin="USDC",
+            account_type="FUND",
+            order_link_id="link-1",
         )
 
     assert result.orderId == "redeem-1"
@@ -461,9 +485,12 @@ async def test_redeem_from_earn_sends_redeem_side(captured):
     assert req.url.path == "/v5/earn/place-order"
     body = json.loads(req.content.decode())
     assert body == {
+        "category": "FlexibleSaving",
         "productId": "prod-1",
         "amount": "100",
         "orderType": "Redeem",
+        "coin": "USDC",
+        "accountType": "FUND",
         "orderLinkId": "link-1",
     }
 
@@ -485,3 +512,525 @@ async def test_poll_redemption_credited_delegates_to_deposit_poller(captured):
     assert delta == Decimal("50")
     # 1 baseline + 1 poll
     assert sum(1 for r in captured if r.url.path.endswith("wallet-balance")) == 2
+
+
+# ─── advance Earn categories (multi-category routing) ───────────────────────
+
+
+@pytest.mark.parametrize(
+    "category",
+    ["DualAssets", "DiscountBuy", "SmartLeverage", "DoubleWin", "LiquidityMining"],
+)
+@pytest.mark.asyncio
+async def test_list_advance_earn_products_routes_to_correct_path(captured, category):
+    fixture = {"list": [{"productId": f"x-{category}", "coin": "USDC"}]}
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        items = await c.list_advance_earn_products(category=category, coin="USDC")
+
+    req = captured[0]
+    assert req.url.path == "/v5/earn/advance/product"
+    assert dict(req.url.params) == {"category": category, "coin": "USDC"}
+    assert items == [{"productId": f"x-{category}", "coin": "USDC"}]
+
+
+@pytest.mark.asyncio
+async def test_list_advance_earn_products_omits_none_coin(captured):
+    async with _client(captured, lambda _r: _ok({"list": []})) as c:
+        await c.list_advance_earn_products(category="DualAssets")
+
+    req = captured[0]
+    assert dict(req.url.params) == {"category": "DualAssets"}
+
+
+@pytest.mark.asyncio
+async def test_list_advance_earn_products_rejects_unknown_category():
+    async with _client([], lambda _r: _ok({"list": []})) as c:
+        with pytest.raises(ValueError, match="unknown advance-Earn category"):
+            await c.list_advance_earn_products(category="NotARealCategory")
+
+
+@pytest.mark.asyncio
+async def test_list_advance_earn_products_rejects_legacy_category():
+    """FlexibleSaving / OnChain belong to `list_earn_products`, not advance."""
+    async with _client([], lambda _r: _ok({"list": []})) as c:
+        with pytest.raises(ValueError, match="unknown advance-Earn category"):
+            await c.list_advance_earn_products(category="FlexibleSaving")
+
+
+@pytest.mark.asyncio
+async def test_list_advance_earn_products_handles_empty_result(captured):
+    async with _client(captured, lambda _r: _ok({})) as c:
+        items = await c.list_advance_earn_products(category="DualAssets")
+    assert items == []
+
+
+@pytest.mark.asyncio
+async def test_list_advance_earn_products_returns_raw_dicts_not_models(captured):
+    """Schemas vary per advance-Earn category — caller gets raw dicts to
+    preserve structured-product fields (DualAssets has strikePrice/expiryTime,
+    DiscountBuy has knockoutPrice/instUid, etc.)."""
+    fixture = {
+        "list": [
+            {
+                "productId": "da-001",
+                "underlyingPair": "BTC-USDC",
+                "strikePrice": "70000",
+                "expiryTime": "1735689600000",
+                "estimateApr": "0.45",
+                "settlementCoin": "USDC",
+            }
+        ]
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        items = await c.list_advance_earn_products(category="DualAssets")
+
+    assert len(items) == 1
+    assert items[0] == fixture["list"][0]
+    # caller can inspect category-specific fields without pydantic dropping them
+    assert items[0]["strikePrice"] == "70000"
+    assert items[0]["expiryTime"] == "1735689600000"
+
+
+# ─── advance Earn — quote / position / redeem-estimate / place ──────────────
+
+
+@pytest.mark.asyncio
+async def test_get_advance_product_quote_routes_correctly(captured):
+    fixture = {
+        "productId": "12999",
+        "breakevenPrice": "68650.62",
+        "currentPrice": "68403.67",
+        "category": "SmartLeverage",
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        result = await c.get_advance_product_quote(
+            category="SmartLeverage", product_id="12999"
+        )
+
+    assert result == fixture
+    req = captured[0]
+    assert req.url.path == "/v5/earn/advance/product-extra-info"
+    assert dict(req.url.params) == {
+        "category": "SmartLeverage",
+        "productId": "12999",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_advance_product_quote_omits_none_product_id(captured):
+    """For DiscountBuy you may want all offers — productId is optional."""
+    async with _client(captured, lambda _r: _ok({"offers": []})) as c:
+        await c.get_advance_product_quote(category="DiscountBuy")
+    assert dict(captured[0].url.params) == {"category": "DiscountBuy"}
+
+
+@pytest.mark.asyncio
+async def test_get_advance_product_quote_rejects_basic_category():
+    async with _client([], lambda _r: _ok({})) as c:
+        with pytest.raises(ValueError, match="unknown advance-Earn category"):
+            await c.get_advance_product_quote(category="FlexibleSaving")
+
+
+@pytest.mark.asyncio
+async def test_get_advance_earn_positions_requires_product_id(captured):
+    fixture = {
+        "list": [
+            {
+                "positionId": "1277",
+                "productId": "12999",
+                "strikePrice": "68650",
+                "settlementCoin": "USDC",
+            }
+        ]
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        result = await c.get_advance_earn_positions(
+            category="SmartLeverage", product_id="12999"
+        )
+    assert len(result) == 1
+    assert result[0]["positionId"] == "1277"
+    req = captured[0]
+    assert req.url.path == "/v5/earn/advance/position"
+    assert dict(req.url.params) == {
+        "category": "SmartLeverage",
+        "productId": "12999",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_redeem_estimate_serializes_position_id_list(captured):
+    async with _client(captured, lambda _r: _ok({"list": []})) as c:
+        await c.get_redeem_estimate(
+            category="DoubleWin", position_ids=["2847", "2848"]
+        )
+    req = captured[0]
+    assert req.url.path == "/v5/earn/advance/get-redeem-est-amount-list"
+    assert dict(req.url.params) == {
+        "category": "DoubleWin",
+        "positionIds": "2847,2848",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_redeem_estimate_accepts_csv_string(captured):
+    async with _client(captured, lambda _r: _ok({})) as c:
+        await c.get_redeem_estimate(category="DoubleWin", position_ids="42")
+    assert dict(captured[0].url.params)["positionIds"] == "42"
+
+
+@pytest.mark.asyncio
+async def test_place_advance_earn_order_stake_body(captured):
+    async with _client(
+        captured,
+        lambda _r: _ok({"orderId": "ord-99", "orderLinkId": "link-99"}),
+    ) as c:
+        result = await c.place_advance_earn_order(
+            category="SmartLeverage",
+            product_id="12999",
+            side="Stake",
+            account_type="FUND",
+            order_link_id="link-99",
+            coin="USDT",
+            amount="100",
+            extra={
+                "smartLeverageStakeExtra": {
+                    "initialPrice": "68403",
+                    "breakevenPrice": "68650",
+                }
+            },
+        )
+
+    assert result == {"orderId": "ord-99", "orderLinkId": "link-99"}
+    req = captured[0]
+    assert req.url.path == "/v5/earn/advance/place-order"
+    body = json.loads(req.content.decode())
+    assert body == {
+        "category": "SmartLeverage",
+        "productId": "12999",
+        "orderType": "Stake",
+        "accountType": "FUND",
+        "orderLinkId": "link-99",
+        "coin": "USDT",
+        "amount": "100",
+        "smartLeverageStakeExtra": {
+            "initialPrice": "68403",
+            "breakevenPrice": "68650",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_place_advance_earn_order_redeem_omits_coin_and_amount(captured):
+    """Per the V5 docs Redeem orders don't need coin/amount — the position
+    carries them. The wrapper must omit None fields from the body."""
+    async with _client(captured, lambda _r: _ok({"orderId": "redeem-9"})) as c:
+        await c.place_advance_earn_order(
+            category="SmartLeverage",
+            product_id="12999",
+            side="Redeem",
+            account_type="FUND",
+            order_link_id="link-100",
+            extra={
+                "smartLeverageRedeemExtra": {
+                    "positionId": "1277",
+                    "estRedeemAmount": "77.85",
+                    "isSlippageProtected": True,
+                }
+            },
+        )
+
+    body = json.loads(captured[0].content.decode())
+    assert "coin" not in body
+    assert "amount" not in body
+    assert body["orderType"] == "Redeem"
+    assert body["smartLeverageRedeemExtra"]["positionId"] == "1277"
+
+
+@pytest.mark.asyncio
+async def test_place_advance_earn_order_rejects_basic_category():
+    async with _client([], lambda _r: _ok({"orderId": "x"})) as c:
+        with pytest.raises(ValueError, match="unknown advance-Earn category"):
+            await c.place_advance_earn_order(
+                category="FlexibleSaving",
+                product_id="p",
+                side="Stake",
+                account_type="FUND",
+                order_link_id="lid",
+            )
+
+
+# ─── hourly-yield ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_hourly_yield_includes_all_provided_params(captured):
+    fixture = {
+        "list": [{"productId": "428", "coin": "USDT", "amount": "0.06"}],
+        "nextPageCursor": "abc",
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        result = await c.get_hourly_yield(
+            category="FlexibleSaving",
+            product_id="428",
+            start_time=1700000000000,
+            end_time=1700500000000,
+            limit=100,
+            cursor="prev",
+        )
+
+    assert result == fixture
+    req = captured[0]
+    assert req.url.path == "/v5/earn/hourly-yield"
+    params = dict(req.url.params)
+    assert params == {
+        "category": "FlexibleSaving",
+        "productId": "428",
+        "startTime": "1700000000000",
+        "endTime": "1700500000000",
+        "limit": "100",
+        "cursor": "prev",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_hourly_yield_omits_unset_params(captured):
+    """Optional params (productId, startTime, ...) must not show up as
+    empty strings — Bybit interprets `productId=` as a filter for an
+    empty product, not a wildcard."""
+    async with _client(captured, lambda _r: _ok({"list": []})) as c:
+        await c.get_hourly_yield(category="FlexibleSaving")
+    assert dict(captured[0].url.params) == {"category": "FlexibleSaving"}
+
+
+# ─── typed-model coverage: full V5 /v5/earn/product + /position fields ──────
+
+
+@pytest.mark.asyncio
+async def test_earn_product_parses_full_flexible_saving_payload(captured):
+    """Verbatim Flexible BTC sample from the V5 spec — must not drop any
+    documented field."""
+    fixture = {
+        "list": [
+            {
+                "category": "FlexibleSaving",
+                "estimateApr": "3%",
+                "coin": "BTC",
+                "minStakeAmount": "0.001",
+                "maxStakeAmount": "10",
+                "precision": "8",
+                "productId": "430",
+                "status": "Available",
+                "bonusEvents": [],
+                "minRedeemAmount": "",
+                "maxRedeemAmount": "",
+                "duration": "",
+                "term": 0,
+                "swapCoin": "",
+                "swapCoinPrecision": "",
+                "stakeExchangeRate": "",
+                "redeemExchangeRate": "",
+                "rewardDistributionType": "",
+                "rewardIntervalMinute": 0,
+                "redeemProcessingMinute": "0",
+                "stakeTime": "",
+                "interestCalculationTime": "",
+            }
+        ]
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        products = await c.list_earn_products(category="FlexibleSaving", coin="BTC")
+
+    assert len(products) == 1
+    p = products[0]
+    assert p.productId == "430"
+    assert p.status == "Available"
+    assert p.precision == "8"
+    assert p.duration == ""
+    assert p.term == 0
+    assert p.bonusEvents == []
+    assert p.rewardIntervalMinute == 0
+
+
+@pytest.mark.asyncio
+async def test_earn_product_distinguishes_fixed_vs_flexible(captured):
+    """OnChain Fixed product carries `term > 0` and `duration=Fixed` —
+    that is the model-level signal the oracle uses to differentiate
+    locked products from flex pools."""
+    fixture = {
+        "list": [
+            {
+                "productId": "fixed-30d",
+                "coin": "USDC",
+                "category": "OnChain",
+                "duration": "Fixed",
+                "term": 30,
+                "estimateApr": "8.5%",
+                "rewardDistributionType": "Compound",
+                "stakeTime": "1735689600000",
+                "interestCalculationTime": "1735776000000",
+                "rewardIntervalMinute": 1440,
+            },
+            {
+                "productId": "flex-usdc",
+                "coin": "USDC",
+                "category": "OnChain",
+                "duration": "Flexible",
+                "term": 0,
+                "estimateApr": "4.2%",
+                "rewardDistributionType": "Simple",
+            },
+        ]
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        products = await c.list_earn_products(category="OnChain")
+
+    fixed = next(p for p in products if p.productId == "fixed-30d")
+    flex = next(p for p in products if p.productId == "flex-usdc")
+    assert fixed.duration == "Fixed"
+    assert fixed.term == 30
+    assert fixed.rewardDistributionType == "Compound"
+    assert fixed.rewardIntervalMinute == 1440
+    assert flex.duration == "Flexible"
+    assert flex.term == 0
+
+
+@pytest.mark.asyncio
+async def test_earn_product_parses_bonus_events(captured):
+    """Promo-APR layer: UI 7.52% vs API estimateApr 0.7% delta lives in
+    bonusEvents.apr — Phase A.3 observation. Must surface as typed
+    BonusEvent objects, not be dropped to extra=ignore."""
+    fixture = {
+        "list": [
+            {
+                "productId": "usd1-promo",
+                "coin": "USD1",
+                "category": "FlexibleSaving",
+                "estimateApr": "0.70%",
+                "bonusEvents": [
+                    {
+                        "apr": "6.82%",
+                        "coin": "USD1",
+                        "announcement": "https://announcements.bybit.com/promo-123",
+                    }
+                ],
+            }
+        ]
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        products = await c.list_earn_products(category="FlexibleSaving")
+
+    assert len(products[0].bonusEvents) == 1
+    bonus = products[0].bonusEvents[0]
+    assert isinstance(bonus, BonusEvent)
+    assert bonus.apr == "6.82%"
+    assert bonus.coin == "USD1"
+
+
+@pytest.mark.asyncio
+async def test_earn_product_parses_lst_fields(captured):
+    """OnChain LST mode populates swap-pair fields — needed when the
+    oracle reasons about cmETH-like products that wrap stake-by-swap."""
+    fixture = {
+        "list": [
+            {
+                "productId": "lst-cmeth",
+                "coin": "ETH",
+                "category": "OnChain",
+                "swapCoin": "cmETH",
+                "swapCoinPrecision": "6",
+                "stakeExchangeRate": "1.0234",
+                "redeemExchangeRate": "1.0231",
+                "minRedeemAmount": "0.01",
+                "maxRedeemAmount": "100",
+            }
+        ]
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        products = await c.list_earn_products(category="OnChain")
+
+    p = products[0]
+    assert p.swapCoin == "cmETH"
+    assert p.swapCoinPrecision == "6"
+    assert p.stakeExchangeRate == "1.0234"
+    assert p.redeemExchangeRate == "1.0231"
+    assert p.minRedeemAmount == "0.01"
+
+
+@pytest.mark.asyncio
+async def test_earn_position_parses_full_onchain_payload(captured):
+    """Verbatim OnChain Fixed BTC position sample from the V5 spec —
+    settlementTime / freezeDetails / autoReinvest / availableAmount /
+    estimate*Time must all land as typed fields."""
+    fixture = {
+        "list": [
+            {
+                "coin": "BTC",
+                "productId": "8",
+                "amount": "0.1",
+                "totalPnl": "0.000027397260273973",
+                "claimableYield": "0",
+                "id": "326",
+                "status": "Active",
+                "orderId": "1a5a8945-e042-4dd5-a93f-c0f0577377ad",
+                "estimateRedeemTime": "",
+                "estimateStakeTime": "",
+                "estimateInterestCalculationTime": "1744243200000",
+                "settlementTime": "1744675200000",
+                "autoReinvest": "Enable",
+                "availableAmount": "4900",
+                "freezeDetails": [
+                    {"amount": "100", "description": "Locked in Fixed-Rate Loan"}
+                ],
+            }
+        ]
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        positions = await c.get_earn_positions(category="OnChain")
+
+    assert len(positions) == 1
+    pos = positions[0]
+    assert isinstance(pos, EarnPosition)
+    assert pos.id == "326"
+    assert pos.status == "Active"
+    assert pos.totalPnl == "0.000027397260273973"
+    assert pos.claimableYield == "0"
+    assert pos.orderId == "1a5a8945-e042-4dd5-a93f-c0f0577377ad"
+    assert pos.settlementTime == "1744675200000"
+    assert pos.estimateInterestCalculationTime == "1744243200000"
+    assert pos.autoReinvest == "Enable"
+    assert pos.availableAmount == "4900"
+    assert len(pos.freezeDetails) == 1
+    fr = pos.freezeDetails[0]
+    assert isinstance(fr, FreezeDetail)
+    assert fr.amount == "100"
+    assert fr.description == "Locked in Fixed-Rate Loan"
+
+
+@pytest.mark.asyncio
+async def test_earn_position_handles_minimal_flexible_payload(captured):
+    """FlexibleSaving positions typically only populate amount /
+    claimableYield / availableAmount — OnChain-only fields must default
+    to None, never raise."""
+    fixture = {
+        "list": [
+            {
+                "coin": "USDC",
+                "productId": "430",
+                "amount": "1000.50",
+                "claimableYield": "0.012",
+                "availableAmount": "1000.50",
+            }
+        ]
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        positions = await c.get_earn_positions(category="FlexibleSaving")
+
+    pos = positions[0]
+    assert pos.amount == "1000.50"
+    assert pos.claimableYield == "0.012"
+    assert pos.availableAmount == "1000.50"
+    assert pos.id is None
+    assert pos.status is None
+    assert pos.totalPnl is None
+    assert pos.settlementTime is None
+    assert pos.freezeDetails == []

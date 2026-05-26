@@ -1,5 +1,6 @@
 import httpx
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from agent.bybit_oracle.bybit_client import BybitClient
 from agent.gather import bybit as bybit_gather
@@ -12,7 +13,7 @@ from agent.gather.bybit import (
 
 
 API_KEY = "test-key"
-API_SECRET = "test-secret"
+PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 
 def _ok(result: dict) -> httpx.Response:
@@ -26,7 +27,7 @@ def _err(code: int = 10001, msg: str = "fail") -> httpx.Response:
 def _make_client(responder) -> BybitClient:
     return BybitClient(
         api_key=API_KEY,
-        api_secret=API_SECRET,
+        private_key=PRIVATE_KEY,
         base_url="https://api.bybit.com",
         recv_window=5000,
         transport=httpx.MockTransport(responder),
