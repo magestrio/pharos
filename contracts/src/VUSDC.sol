@@ -52,10 +52,19 @@ contract VUSDC is ERC20 {
     ///
     ///      Reverts if any underlying adapter's oracle is stale or the L2
     ///      sequencer is down (propagated from `CapitalManager.totalAssetsUsdc`).
-    function exchangeRate() external view returns (uint256) {
+    function exchangeRate() public view returns (uint256) {
         uint256 supply = totalSupply();
         if (supply == 0) return 1e18;
         return (capitalManager.totalAssetsUsdc() * 1e18) / supply;
+    }
+
+    /// @notice Alias of `exchangeRate()` exposing the per-share value under the
+    ///         name expected by `ReputationOracle.ICapitalManager`. Lets the
+    ///         oracle track exchange-rate growth (pure yield) instead of raw
+    ///         pool size (which moves with mint/redeem).
+    /// @dev Same revert surface as `exchangeRate()`.
+    function totalAssetsUsdc() external view returns (uint256) {
+        return exchangeRate();
     }
 
     /// @notice Returns how much vUSDC `mint(usdcAmount, ...)` would credit at

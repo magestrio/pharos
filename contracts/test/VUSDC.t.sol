@@ -141,6 +141,16 @@ contract VUSDCTest is Test {
         assertEq(vusdc.exchangeRate(), 1.5e18);
     }
 
+    function test_totalAssetsUsdc_aliasesExchangeRate() public {
+        // Zero supply branch.
+        assertEq(vusdc.totalAssetsUsdc(), vusdc.exchangeRate());
+        // After mint + yield.
+        _mint(alice, 100e6);
+        _addYield(50e6);
+        assertEq(vusdc.totalAssetsUsdc(), vusdc.exchangeRate());
+        assertEq(vusdc.totalAssetsUsdc(), 1.5e18);
+    }
+
     function test_mint_atHigherRate_givesFewerShares() public {
         _mint(alice, 100e6);          // supply=100, ta=100
         _addYield(100e6);             // ta=200 → rate=2.0

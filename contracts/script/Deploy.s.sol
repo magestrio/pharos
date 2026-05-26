@@ -96,10 +96,10 @@ contract Deploy is Script {
         DecisionLog decisionLog = new DecisionLog(deployer);
         console.log("DecisionLog:        ", address(decisionLog));
 
-        ReputationOracle oracle = new ReputationOracle(
-            address(vault), registry8004, agentId
-        );
-        console.log("ReputationOracle:   ", address(oracle));
+        // ReputationOracle is wired to vUSDC, not CapitalManager — it tracks
+        // per-share exchange rate (pure yield), not raw pool size (which moves
+        // with mint/redeem). Therefore deferred until Phase B when vUSDC exists.
+        ReputationOracle oracle;
 
         // Stub adapters: deployed for address reservation, revert on
         // deposit/withdraw. Not whitelisted (would burn gas in totalAssetsUsdc).
@@ -146,9 +146,14 @@ contract Deploy is Script {
 
         // 3. Wire vUSDC (Phase B only). setVusdc is one-shot; once set, the
         // recordDeposit/recordWithdraw entry points become callable from vUSDC.
+        // ReputationOracle is also deployed here — it reads vUSDC.exchangeRate()
+        // (aliased as totalAssetsUsdc) so the score reflects pure yield.
         if (vusdcAddr != address(0)) {
             vault.setVusdc(vusdcAddr);
             console.log("setVusdc executed:  ", vusdcAddr);
+
+            oracle = new ReputationOracle(vusdcAddr, registry8004, agentId);
+            console.log("ReputationOracle:   ", address(oracle));
         }
 
         // 4. Transfer ownership to Gnosis Safe (2-of-3). Deferred in Phase A so
@@ -168,7 +173,11 @@ contract Deploy is Script {
         console.log("=== DEPLOYMENT SUMMARY (copy to notes/addresses.md) ===");
         console.log("CapitalManager:      %s", address(vault));
         console.log("DecisionLog:         %s", address(decisionLog));
-        console.log("ReputationOracle:    %s", address(oracle));
+        if (address(oracle) != address(0)) {
+            console.log("ReputationOracle:    %s", address(oracle));
+        } else {
+            console.log("ReputationOracle:    (deferred - Phase A, vUSDC not yet wired)");
+        }
         console.log("AaveV3WethAdapter:   %s", address(wethAdapter));
         console.log("AaveV3UsdcAdapter:   %s", address(usdcAdapter));
         console.log("BybitAttestor:       %s", address(bybitAttestor));
