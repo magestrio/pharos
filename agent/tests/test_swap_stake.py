@@ -70,9 +70,12 @@ async def test_usdc_path_skips_swap(deposit_at_product_selected):
     client.place_spot_order.assert_not_awaited()
     client.poll_spot_order_filled.assert_not_awaited()
     client.place_earn_order.assert_awaited_once_with(
+        category="FlexibleSaving",
         product_id="prod-USDC-flex",
         amount="100",
         side="Stake",
+        coin="USDC",
+        account_type="FUND",
         order_link_id=_link_id(1, "stake"),
     )
 
@@ -119,10 +122,14 @@ async def test_volatile_path_swaps_then_stakes(deposit_at_product_selected):
     )
     client.poll_spot_order_filled.assert_awaited_once_with(order_id="swap-1")
     # Earn stake gets the FILLED qty, NOT the original USDC amount.
+    # And the staked coin is the swapped-into ETH, not the source USDC.
     client.place_earn_order.assert_awaited_once_with(
+        category="FlexibleSaving",
         product_id="prod-ETH-flex",
         amount="0.025",
         side="Stake",
+        coin="ETH",
+        account_type="FUND",
         order_link_id=_link_id(1, "stake"),
     )
 

@@ -1,6 +1,6 @@
 from typing import Protocol
 from agent.gather.models import MarketData
-from agent.reason.schema import LegacyTargetAllocation
+from agent.backtest.models import LegacyTargetAllocation
 
 
 class PolicyProtocol(Protocol):

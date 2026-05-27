@@ -81,7 +81,9 @@ class SwapStakeExecutor:
         picked: PickedProduct,
         amount: Decimal,
     ) -> str:
-        order_id = await self._place_earn_order(picked.product_id, amount, tx_id)
+        order_id = await self._place_earn_order(
+            picked.product_id, amount, tx_id, coin=picked.target_coin.upper()
+        )
         ok = advance_deposit_status(
             conn,
             tx_id,
@@ -123,7 +125,7 @@ class SwapStakeExecutor:
         )
 
         earn_order_id = await self._place_earn_order(
-            picked.product_id, filled_qty, tx_id
+            picked.product_id, filled_qty, tx_id, coin=picked.target_coin.upper()
         )
         advance_deposit_status(
             conn,
@@ -175,13 +177,18 @@ class SwapStakeExecutor:
         reraise=True,
     )
     async def _place_earn_order(
-        self, product_id: str, amount: Decimal, tx_id: int
+        self, product_id: str, amount: Decimal, tx_id: int, *, coin: str
     ) -> str:
         try:
+            # MVP picker stakes FlexibleSaving; the deposit/swap proceeds
+            # land in the FUND wallet, so debit there.
             result = await self._client.place_earn_order(
+                category="FlexibleSaving",
                 product_id=product_id,
                 amount=str(amount),
                 side="Stake",
+                coin=coin,
+                account_type="FUND",
                 order_link_id=_link_id(tx_id, "stake"),
             )
         except BybitOrderError:

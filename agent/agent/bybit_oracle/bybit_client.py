@@ -363,6 +363,37 @@ class InstrumentList(BaseModel):
     items: list[LinearInstrument] = Field(default_factory=list, alias="list")
 
 
+class PerpPosition(BaseModel):
+    """Open linear-perp position from `/v5/position/list?category=linear`.
+
+    `side="None"` (string) is what Bybit returns for a flat position — the
+    row may still exist with `size="0"` after a close. Caller should treat
+    those as "no position" and filter them out (see `_open_only` helper
+    used by the snapshot collector).
+
+    `positionValue` is server-computed USD notional (size × markPrice at
+    fetch time); use it as the source of truth for hedge sizing rather
+    than recomputing client-side.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    symbol: str
+    side: str  # "Buy" | "Sell" | "None"
+    size: str  # base-coin quantity, decimal string ("0" when flat)
+    positionValue: str | None = None  # USD notional (size × markPrice)
+    avgPrice: str | None = None
+    markPrice: str | None = None
+    unrealisedPnl: str | None = None
+    leverage: str | None = None
+    positionIdx: int | None = None  # 0 one-way, 1/2 hedge-mode
+
+
+class PerpPositionList(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+    items: list[PerpPosition] = Field(default_factory=list, alias="list")
+
+
 class BybitClient:
     """Async Bybit V5 REST wrapper.
 
@@ -906,6 +937,67 @@ class BybitClient:
         parsed = BybitResponse[EarnPositionList].model_validate(data)
         return parsed.result.items if parsed.result else []
 
+    async def permission_probe(self) -> dict[str, str]:
+        """Fail-fast read-only check of every endpoint the sandbox loop
+        depends on. Returns `{endpoint_label: status}` where status is
+        one of:
+
+            "ok"                  — request returned retCode=0
+            "permission_denied"   — retCode=10005 (sub-account scope gate)
+            "error:<code>"        — other BybitAPIError, e.g. 180001
+            "transport_error"     — non-API failure (httpx, signing)
+
+        Loop drivers call this before the first cycle so a missing
+        permission surfaces at startup (`.26`), not mid-cycle after a
+        snapshot already wrote to disk. Calls run in parallel — total
+        wall-clock is ~one round trip plus signing.
+        """
+        probes: list[tuple[str, Any]] = [
+            (
+                "wallet_balance[UNIFIED]",
+                self.get_wallet_balance(account_type="UNIFIED"),
+            ),
+            (
+                "list_earn_products[FlexibleSaving]",
+                self.list_earn_products(category="FlexibleSaving"),
+            ),
+            (
+                "list_earn_products[OnChain]",
+                self.list_earn_products(category="OnChain"),
+            ),
+            (
+                "earn_positions[FlexibleSaving]",
+                self.get_earn_positions(category="FlexibleSaving"),
+            ),
+            (
+                "lm_products",
+                self.list_liquidity_mining_products(),
+            ),
+            (
+                "advance_products[DualAssets]",
+                self.list_advance_earn_products(category="DualAssets"),
+            ),
+            (
+                "tickers_linear",
+                self.get_tickers(category="linear", symbol="BTCUSDT"),
+            ),
+        ]
+        results = await asyncio.gather(
+            *(coro for _, coro in probes), return_exceptions=True
+        )
+        out: dict[str, str] = {}
+        for (label, _), res in zip(probes, results):
+            if isinstance(res, BybitAPIError):
+                if res.ret_code == 10005:
+                    out[label] = "permission_denied"
+                else:
+                    out[label] = f"error:{res.ret_code}"
+            elif isinstance(res, BaseException):
+                out[label] = "transport_error"
+            else:
+                out[label] = "ok"
+        return out
+
     async def get_wallet_balance(
         self, coin: str | None = None, account_type: str = "UNIFIED"
     ) -> list[WalletAccount]:
@@ -1137,6 +1229,100 @@ class BybitClient:
             body["orderLinkId"] = order_link_id
         data = await self._request("POST", "/v5/order/create", body=body)
         return BybitResponse[SpotOrderResult].model_validate(data).result  # type: ignore[return-value]
+
+    async def place_perp_order(
+        self,
+        symbol: str,
+        side: Side,
+        qty: str,
+        *,
+        order_type: Literal["Market", "Limit"] = "Market",
+        price: str | None = None,
+        reduce_only: bool = False,
+        order_link_id: str | None = None,
+    ) -> SpotOrderResult:
+        """Place a linear-perp order via `/v5/order/create` with
+        `category=linear`. Same response shape as `place_spot_order`
+        (`{orderId, orderLinkId}`), so `SpotOrderResult` is reused.
+
+        Caller is responsible for honoring per-symbol lot size / min-
+        notional rules — get them from `get_instruments_info`. For the
+        hedge-leg of the sandbox loop, `qty` is in base coin (computed
+        as `hedge_notional_usd / mark_price`) and `side="Sell"` for a
+        short hedge. `reduce_only=True` is used when closing an existing
+        hedge so we don't accidentally flip into the opposite direction.
+        """
+        body: dict[str, Any] = {
+            "category": "linear",
+            "symbol": symbol,
+            "side": side,
+            "orderType": order_type,
+            "qty": qty,
+        }
+        if price is not None:
+            body["price"] = price
+        if reduce_only:
+            body["reduceOnly"] = True
+        if order_link_id is not None:
+            body["orderLinkId"] = order_link_id
+        data = await self._request("POST", "/v5/order/create", body=body)
+        return BybitResponse[SpotOrderResult].model_validate(data).result  # type: ignore[return-value]
+
+    async def set_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        category: str = "linear",
+    ) -> None:
+        """Set leverage on a linear-perp symbol via `/v5/position/set-leverage`.
+        Bybit defaults a fresh symbol to ~10x; the sandbox always hedges
+        at 1x so price moves don't unbalance the cross-position margin.
+        Idempotent — calling with the already-set value returns
+        `retCode=110043 leverage not modified`, which we swallow."""
+        try:
+            await self._request(
+                "POST",
+                "/v5/position/set-leverage",
+                body={
+                    "category": category,
+                    "symbol": symbol,
+                    "buyLeverage": str(leverage),
+                    "sellLeverage": str(leverage),
+                },
+            )
+        except BybitAPIError as e:
+            if e.ret_code == 110043:  # leverage not modified — already set
+                return
+            raise
+
+    async def get_positions(
+        self,
+        category: str = "linear",
+        *,
+        symbol: str | None = None,
+        settle_coin: str | None = None,
+    ) -> list[PerpPosition]:
+        """`/v5/position/list` — open derivatives positions.
+
+        For `category=linear` Bybit requires either `symbol`, `settleCoin`,
+        or `baseCoin`. Sandbox hedges always settle in USDT so the default
+        production call passes `settle_coin="USDT"` and gets back every
+        open linear position in one request.
+
+        Returns the parsed list as-is; callers that only want truly-open
+        positions should filter by `side in ("Buy","Sell")` and
+        `Decimal(size) > 0` — Bybit may echo rows for symbols you've
+        traded recently with `side="None", size="0"`.
+        """
+        params: dict[str, Any] = {"category": category}
+        if symbol is not None:
+            params["symbol"] = symbol
+        if settle_coin is not None:
+            params["settleCoin"] = settle_coin
+        data = await self._request("GET", "/v5/position/list", params=params)
+        parsed = BybitResponse[PerpPositionList].model_validate(data)
+        return parsed.result.items if parsed.result else []
 
     # ─── Public market data (signed harmlessly for consistency) ──────────
 

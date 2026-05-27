@@ -20,6 +20,7 @@ from agent.bybit_oracle.bybit_client import (  # noqa: E501 — keep typed-model
     BonusEvent,
     EarnPosition,
     FreezeDetail,
+    PerpPosition,
 )
 
 API_KEY = "test-key"
@@ -1337,3 +1338,161 @@ async def test_earn_position_handles_minimal_flexible_payload(captured):
     assert pos.totalPnl is None
     assert pos.settlementTime is None
     assert pos.freezeDetails == []
+
+
+# ─── permission_probe (.26) ─────────────────────────────────────────────────
+
+
+def _probe_responder(per_path_status: dict[str, int]):
+    """Build an httpx responder that returns retCode per request path.
+
+    `per_path_status` maps a substring of the request URL path to a
+    Bybit retCode: 0 = success, 10005 = permission denied, others =
+    arbitrary error. Any unmatched path defaults to retCode=0 so the
+    test only has to specify the *failing* paths.
+    """
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        ret_code = 0
+        for key, code in per_path_status.items():
+            if key in path:
+                ret_code = code
+                break
+        if ret_code == 0:
+            return _ok({"list": []})
+        return httpx.Response(
+            200,
+            json={"retCode": ret_code, "retMsg": "denied or invalid", "result": {}},
+        )
+
+    return _handler
+
+
+@pytest.mark.asyncio
+async def test_permission_probe_all_ok(captured: list[httpx.Request]) -> None:
+    async with _client(captured, _probe_responder({})) as c:
+        out = await c.permission_probe()
+    # Every probed endpoint should be present and "ok".
+    expected = {
+        "wallet_balance[UNIFIED]",
+        "list_earn_products[FlexibleSaving]",
+        "list_earn_products[OnChain]",
+        "earn_positions[FlexibleSaving]",
+        "lm_products",
+        "advance_products[DualAssets]",
+        "tickers_linear",
+    }
+    assert set(out) == expected
+    assert all(v == "ok" for v in out.values())
+
+
+@pytest.mark.asyncio
+async def test_permission_probe_classifies_10005_as_permission_denied(
+    captured: list[httpx.Request],
+) -> None:
+    # /v5/earn/position returns 10005 → "permission_denied" tag.
+    async with _client(
+        captured, _probe_responder({"/v5/earn/position": 10005})
+    ) as c:
+        out = await c.permission_probe()
+    assert out["earn_positions[FlexibleSaving]"] == "permission_denied"
+    assert out["wallet_balance[UNIFIED]"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_permission_probe_classifies_other_errors_as_error_code(
+    captured: list[httpx.Request],
+) -> None:
+    async with _client(
+        captured, _probe_responder({"/v5/earn/advance/product": 180001})
+    ) as c:
+        out = await c.permission_probe()
+    assert out["advance_products[DualAssets]"] == "error:180001"
+
+
+@pytest.mark.asyncio
+async def test_permission_probe_runs_in_parallel(
+    captured: list[httpx.Request],
+) -> None:
+    """All probe endpoints fire concurrently — captured length matches
+    the probe size and no in-order dependency exists between calls."""
+    async with _client(captured, _probe_responder({})) as c:
+        await c.permission_probe()
+    # 7 endpoints in `permission_probe` → 7 captured requests.
+    assert len(captured) == 7
+
+
+# ─── /v5/position/list (.32) ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_positions_routes_to_position_list_with_settle_coin(
+    captured: list[httpx.Request],
+) -> None:
+    fixture = {
+        "list": [
+            {
+                "symbol": "TONUSDT",
+                "side": "Sell",
+                "size": "25",
+                "positionValue": "50.00",
+                "avgPrice": "2.0",
+                "markPrice": "2.0",
+                "unrealisedPnl": "0",
+                "leverage": "1",
+                "positionIdx": 0,
+            }
+        ]
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        positions = await c.get_positions(category="linear", settle_coin="USDT")
+    assert len(positions) == 1
+    p = positions[0]
+    assert isinstance(p, PerpPosition)
+    assert p.symbol == "TONUSDT"
+    assert p.side == "Sell"
+    assert p.size == "25"
+    assert p.positionValue == "50.00"
+
+    req = captured[0]
+    assert req.method == "GET"
+    assert req.url.path == "/v5/position/list"
+    assert dict(req.url.params) == {"category": "linear", "settleCoin": "USDT"}
+
+
+@pytest.mark.asyncio
+async def test_get_positions_handles_empty_list(
+    captured: list[httpx.Request],
+) -> None:
+    async with _client(captured, lambda _r: _ok({"list": []})) as c:
+        positions = await c.get_positions(category="linear", settle_coin="USDT")
+    assert positions == []
+
+
+@pytest.mark.asyncio
+async def test_get_positions_omits_none_params_from_signature(
+    captured: list[httpx.Request],
+) -> None:
+    async with _client(captured, lambda _r: _ok({"list": []})) as c:
+        await c.get_positions(category="linear")
+    req = captured[0]
+    # Only `category` makes it into the query string — None settle_coin
+    # and symbol must not appear (otherwise the signed payload mismatches
+    # what we send and Bybit returns 10004).
+    assert dict(req.url.params) == {"category": "linear"}
+
+
+@pytest.mark.asyncio
+async def test_get_positions_propagates_bybit_api_error(
+    captured: list[httpx.Request],
+) -> None:
+    def err(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"retCode": 10005, "retMsg": "permission denied", "result": {}}
+        )
+
+    async with _client(captured, err) as c:
+        with pytest.raises(BybitAPIError) as exc:
+            await c.get_positions(category="linear", settle_coin="USDT")
+    assert exc.value.ret_code == 10005

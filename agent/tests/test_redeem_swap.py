@@ -83,8 +83,11 @@ async def test_usdc_path_skips_swap_from_hedge_close_skipped(db):
     client.poll_spot_order_filled.assert_not_awaited()
     # Redeem went out with correct args + linkId.
     client.redeem_from_earn.assert_awaited_once_with(
+        category="FlexibleSaving",
         product_id="prod-USDC",
         amount="50",
+        coin="USDC",
+        account_type="FUND",
         order_link_id=_link_id(1, "redeem"),
     )
 
@@ -135,8 +138,11 @@ async def test_volatile_path_redeems_then_sells(db):
 
     # Redeem went out for ETH
     client.redeem_from_earn.assert_awaited_once_with(
+        category="FlexibleSaving",
         product_id="prod-ETH",
         amount="0.025",
+        coin="ETH",
+        account_type="FUND",
         order_link_id=_link_id(1, "redeem"),
     )
     # Polled the ETH spot wallet

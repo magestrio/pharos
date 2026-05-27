@@ -106,6 +106,7 @@ class RedeemSwapExecutor:
             product_id=source.product_id,
             amount=source.redeem_amount,
             tx_id=tx_id,
+            coin=source.staked_coin.upper(),
         )
 
         credited = await self._client.poll_redemption_credited(
@@ -157,10 +158,17 @@ class RedeemSwapExecutor:
         wait=wait_exponential(multiplier=1, min=2, max=10),
         reraise=True,
     )
-    async def _place_redeem(self, *, product_id: str, amount: Decimal, tx_id: int) -> str:
+    async def _place_redeem(
+        self, *, product_id: str, amount: Decimal, tx_id: int, coin: str
+    ) -> str:
+        # Mirror of swap_stake — FlexibleSaving, FUND was the account the
+        # deposit-side stake debited from.
         result = await self._client.redeem_from_earn(
+            category="FlexibleSaving",
             product_id=product_id,
             amount=str(amount),
+            coin=coin,
+            account_type="FUND",
             order_link_id=_link_id(tx_id, "redeem"),
         )
         log.info(

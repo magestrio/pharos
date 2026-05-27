@@ -1,5 +1,5 @@
 from agent.backtest.models import PortfolioState
-from agent.reason.schema import LegacyTargetAllocation
+from agent.backtest.models import LegacyTargetAllocation
 from agent.gather.models import MarketData
 
 # Slippage assumptions per asset class (in bps; 1 bp = 0.01%)

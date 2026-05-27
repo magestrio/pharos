@@ -20,16 +20,19 @@ from agent.bybit_oracle.bybit_client import (
     FlexibleEarnProduct,
     LinearTicker,
     OnChainEarnProduct,
+    PerpPosition,
 )
 from agent.sandbox.snapshot import (
     ProductSummary,
     Snapshot,
     UsdcPegSnapshot,
     _flex_or_onchain_summary,
+    _is_open_perp,
     _lm_summary,
     _parse_percent,
     _rank,
     _safe_earn,
+    _safe_perp_positions,
     collect_snapshot,
 )
 
@@ -253,6 +256,9 @@ def _mock_client_full() -> AsyncMock:
             "maxLeverage": 10,
         }
     ]
+    # Advance-Earn families default to empty for the legacy shape test —
+    # surfacing is exercised in a dedicated test below.
+    client.list_advance_earn_products.return_value = []
     client.get_tickers.side_effect = lambda category, symbol: (
         [
             LinearTicker(
@@ -278,6 +284,9 @@ def _mock_client_full() -> AsyncMock:
     client.get_liquidity_mining_positions.side_effect = BybitAPIError(
         10005, "Permission denied", "/v5/earn/liquidity-mining/position"
     )
+    # `.32`: perp positions default to empty so the snapshot collector
+    # has something iterable to consume. Per-test overrides patch this.
+    client.get_positions.return_value = []
     return client
 
 
@@ -314,7 +323,8 @@ async def test_collect_snapshot_full_shape_and_promo_override():
     # Positions (10005 swallowed, warnings recorded)
     assert snap.earn_positions == []
     assert snap.lm_positions == []
-    assert len(snap.errors) == 2
+    # 3 entries: earn_positions[FlexibleSaving], earn_positions[OnChain], lm_positions
+    assert len(snap.errors) == 3
     assert all("Earn permission denied" in e for e in snap.errors)
     # Products: per-category, ranked, USD1 uses promo whitelist
     assert set(snap.products) == {"FlexibleSaving", "OnChain", "LiquidityMining"}
@@ -420,3 +430,86 @@ async def test_fetch_usdc_peg_real_helper_parses_success():
 
     assert peg.price_usd == Decimal("1.0003")
     assert peg.deviation_bps == Decimal("3.0000")
+
+
+# ─── perp_positions collector (.32) ────────────────────────────────────────
+
+
+def _open_short(coin: str, size: str, position_value: str) -> PerpPosition:
+    return PerpPosition(
+        symbol=f"{coin}USDT",
+        side="Sell",
+        size=size,
+        positionValue=position_value,
+        avgPrice="1.0",
+        markPrice="1.0",
+    )
+
+
+def test_is_open_perp_filters_flat_and_none_side() -> None:
+    assert _is_open_perp(_open_short("TON", "25", "50"))
+    assert not _is_open_perp(PerpPosition(symbol="TONUSDT", side="None", size="0"))
+    assert not _is_open_perp(PerpPosition(symbol="TONUSDT", side="Sell", size="0"))
+    assert not _is_open_perp(
+        PerpPosition(symbol="TONUSDT", side="Sell", size="not-a-decimal")
+    )
+
+
+@pytest.mark.asyncio
+async def test_safe_perp_positions_swallows_bybit_error() -> None:
+    async def boom():
+        raise BybitAPIError(10005, "perp permission denied", "/v5/position/list")
+
+    errors: list[str] = []
+    out = await _safe_perp_positions(boom(), errors, "perp_positions[linear]")
+    assert out == []
+    assert len(errors) == 1
+    assert "retCode=10005" in errors[0]
+
+
+@pytest.mark.asyncio
+async def test_safe_perp_positions_returns_value_on_success() -> None:
+    pos = _open_short("TON", "25", "50")
+
+    async def ok():
+        return [pos]
+
+    errors: list[str] = []
+    out = await _safe_perp_positions(ok(), errors, "perp_positions[linear]")
+    assert out == [pos]
+    assert errors == []
+
+
+@pytest.mark.asyncio
+async def test_collect_snapshot_populates_perp_positions_and_filters_flat() -> None:
+    client = _mock_client_full()
+    client.get_positions.return_value = [
+        _open_short("TON", "25", "50"),
+        _open_short("DOGE", "1000", "200"),
+        # Flat row Bybit echoes for a symbol you've traded recently — must
+        # be filtered out so the executor doesn't try to close it.
+        PerpPosition(symbol="BTCUSDT", side="None", size="0", positionValue="0"),
+    ]
+
+    with patch("agent.sandbox.snapshot._fetch_usdc_peg", _fake_peg_ok):
+        snap = await collect_snapshot(client)
+
+    assert len(snap.perp_positions) == 2
+    symbols = {p.symbol for p in snap.perp_positions}
+    assert symbols == {"TONUSDT", "DOGEUSDT"}
+
+
+@pytest.mark.asyncio
+async def test_collect_snapshot_degrades_when_perp_positions_fail() -> None:
+    """A perm/permission error on `/v5/position/list` must NOT crash the
+    snapshot — empty list + warning is the contract."""
+    client = _mock_client_full()
+    client.get_positions.side_effect = BybitAPIError(
+        10005, "perp permission denied", "/v5/position/list"
+    )
+
+    with patch("agent.sandbox.snapshot._fetch_usdc_peg", _fake_peg_ok):
+        snap = await collect_snapshot(client)
+
+    assert snap.perp_positions == []
+    assert any("perp_positions" in e for e in snap.errors)

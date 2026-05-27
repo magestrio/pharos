@@ -1,6 +1,20 @@
-from pydantic import BaseModel, computed_field
+from pydantic import BaseModel, Field, computed_field
 from datetime import datetime
 from typing import Optional
+
+
+class LegacyTargetAllocation(BaseModel):
+    """Pre-vUSDC-pivot venue set kept for backtest baselines whose asset
+    universe (mETH/cmETH/sUSDe/Lendle USDC) lives only in the historical
+    parquet data under `data/processed/`. Not used by the live agent —
+    the production path uses `agent.reason.schema.Decision` instead.
+    """
+
+    mETH_staked: float = Field(ge=0, le=1)
+    cmETH: float = Field(ge=0, le=1)
+    sUSDe: float = Field(ge=0, le=1)
+    lendle_usdc: float = Field(ge=0, le=1)
+    cash: float = Field(ge=0.03, le=1)
 
 
 class PortfolioState(BaseModel):
