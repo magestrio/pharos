@@ -318,6 +318,7 @@ class LinearTicker(BaseModel):
     fundingRate: str | None = None  # current 8h funding, signed decimal-string
     nextFundingTime: str | None = None  # unix ms as string
     openInterestValue: str | None = None  # USD
+    price24hPcnt: str | None = None  # 24h % change, signed decimal (0.01 = +1%)
 
 
 class TickerList(BaseModel):
