@@ -802,6 +802,149 @@ async def test_get_hourly_yield_omits_unset_params(captured):
     assert dict(captured[0].url.params) == {"category": "FlexibleSaving"}
 
 
+# ─── apr-history / yield-history ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_apr_history_windows_days_into_timestamps(captured, monkeypatch):
+    """`days` is windowed client-side into `startTime`/`endTime` (epoch
+    ms). Freeze `time.time()` so the assertion isn't flaky."""
+    fixture = {
+        "list": [
+            {"timestamp": "1735000000000", "apr": "0.5%"},
+            {"timestamp": "1735086400000", "apr": "0.5%"},
+        ]
+    }
+    monkeypatch.setattr(
+        "agent.bybit_oracle.bybit_client.time.time", lambda: 1_735_000_000.0
+    )
+
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        result = await c.get_apr_history(
+            category="FlexibleSaving", product_id="1131", days=30
+        )
+
+    assert result == fixture
+    req = captured[0]
+    assert req.url.path == "/v5/earn/apr-history"
+    end_ms = 1_735_000_000_000
+    start_ms = end_ms - 30 * 24 * 60 * 60 * 1000
+    assert dict(req.url.params) == {
+        "category": "FlexibleSaving",
+        "productId": "1131",
+        "startTime": str(start_ms),
+        "endTime": str(end_ms),
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_yield_history_includes_all_provided_params(captured):
+    fixture = {
+        "yield": [
+            {
+                "productId": "428",
+                "coin": "USDT",
+                "id": "1002096",
+                "amount": "0.0608",
+                "yieldType": "Normal",
+                "status": "Success",
+                "createdAt": "1759993805000",
+            }
+        ],
+        "nextPageCursor": "next-page",
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        result = await c.get_yield_history(
+            category="FlexibleSaving",
+            start_time=1_700_000_000_000,
+            end_time=1_700_500_000_000,
+            product_id="428",
+            limit=50,
+            cursor="prev",
+        )
+
+    assert result == fixture
+    req = captured[0]
+    assert req.url.path == "/v5/earn/yield"
+    assert dict(req.url.params) == {
+        "category": "FlexibleSaving",
+        "startTime": "1700000000000",
+        "endTime": "1700500000000",
+        "productId": "428",
+        "limit": "50",
+        "cursor": "prev",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_yield_history_omits_unset_optionals(captured):
+    """Required category/startTime/endTime always sent; productId/limit/
+    cursor must drop out entirely when None — Bybit treats empty-string
+    filters as literal filters, not wildcards."""
+    async with _client(captured, lambda _r: _ok({"yield": []})) as c:
+        await c.get_yield_history(
+            category="OnChain",
+            start_time=1_700_000_000_000,
+            end_time=1_700_500_000_000,
+        )
+    assert dict(captured[0].url.params) == {
+        "category": "OnChain",
+        "startTime": "1700000000000",
+        "endTime": "1700500000000",
+    }
+
+
+# ─── asset-overview ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_asset_overview_includes_provided_params(captured):
+    fixture = {
+        "totalEquity": "1254.56",
+        "list": [
+            {
+                "accountType": "UNIFIED",
+                "totalEquity": "1234.56",
+                "valuationCurrency": "USD",
+                "snapshotTime": "1735000000000",
+                "coinDetail": [{"coin": "USDC", "equity": "1234.56"}],
+            },
+            {
+                "accountType": "FUND",
+                "totalEquity": "20.00",
+                "valuationCurrency": "USD",
+                "snapshotTime": "1735000000000",
+                "coinDetail": [{"coin": "USDC", "equity": "20.00"}],
+            },
+        ],
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        result = await c.get_asset_overview(
+            account_type="UNIFIED",
+            valuation_currency="USD",
+            member_id="123456",
+        )
+
+    assert result == fixture
+    req = captured[0]
+    assert req.url.path == "/v5/asset/asset-overview"
+    assert dict(req.url.params) == {
+        "accountType": "UNIFIED",
+        "valuationCurrency": "USD",
+        "memberId": "123456",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_asset_overview_omits_unset_params(captured):
+    """All params optional — omitting `accountType` asks Bybit for the
+    cross-account aggregate. Empty-string filters would be interpreted
+    literally, so they must drop out of the query entirely."""
+    async with _client(captured, lambda _r: _ok({"list": []})) as c:
+        await c.get_asset_overview()
+    assert dict(captured[0].url.params) == {}
+
+
 # ─── typed-model coverage: full V5 /v5/earn/product + /position fields ──────
 
 

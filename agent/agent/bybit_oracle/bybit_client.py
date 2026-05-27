@@ -599,6 +599,84 @@ class BybitClient:
         data = await self._request("GET", "/v5/earn/hourly-yield", params=params)
         return data.get("result") or {}
 
+    async def get_apr_history(
+        self,
+        category: str,
+        product_id: str,
+        days: int = 30,
+    ) -> dict[str, Any]:
+        """Daily APR history via `/v5/earn/apr-history`. Scoped to
+        FlexibleSaving + OnChain categories; 6-month server-side cap.
+        Snapshot ranker must use this instead of `EarnProduct.estimateApr`
+        — the latter is base APR only and excludes promo/subsidy (USD1
+        Flexible: estimateApr=0.65% vs effective 7.52%, a 10x+ gap).
+
+        `days` is windowed client-side into `startTime` / `endTime` so the
+        caller doesn't have to compute unix-ms boundaries. Returns the raw
+        `{list: [{timestamp, apr}, ...]}` envelope — let Phase B /
+        snapshot collector decide the typed shape once we have live
+        captures.
+
+        Path note: V5 docs originally placed this under
+        `/v5/earn/easy-onchain/apr-history`; live-probe 2026-05-27
+        confirmed the deployed path is `/v5/earn/apr-history` (no
+        `/easy-onchain` segment).
+        """
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - days * 24 * 60 * 60 * 1000
+        data = await self._request(
+            "GET",
+            "/v5/earn/apr-history",
+            params={
+                "category": category,
+                "productId": product_id,
+                "startTime": start_ms,
+                "endTime": end_ms,
+            },
+        )
+        return data.get("result") or {}
+
+    async def get_yield_history(
+        self,
+        category: str,
+        start_time: int,
+        end_time: int,
+        product_id: str | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Realized yield records via `/v5/earn/yield`. Post-hoc accruals
+        per active position over [start_time, end_time] (unix ms).
+        Server caps the window at 7 days and retains 3 months of data;
+        paginate with `cursor` for longer scans.
+
+        `product_id` filter is **not** supported for `category=OnChain`
+        — Bybit returns an error if passed.
+
+        Distinct from `get_apr_history` (forward-looking daily APR) and
+        `get_hourly_yield` (hourly granularity). Returns raw
+        `{yield: [...], nextPageCursor}` envelope.
+
+        Path note: V5 docs originally placed this under
+        `/v5/earn/easy-onchain/yield-history` (and the V5 changelog
+        adds a third spelling `/v5/finance/earn/easy-onchain/yield-history`);
+        both 404. Live-probe 2026-05-27 confirmed deployed path is
+        `/v5/earn/yield`.
+        """
+        params: dict[str, Any] = {
+            "category": category,
+            "startTime": start_time,
+            "endTime": end_time,
+        }
+        if product_id is not None:
+            params["productId"] = product_id
+        if limit is not None:
+            params["limit"] = limit
+        if cursor is not None:
+            params["cursor"] = cursor
+        data = await self._request("GET", "/v5/earn/yield", params=params)
+        return data.get("result") or {}
+
     @classmethod
     def _require_advance_category(cls, category: str) -> None:
         if category not in cls._ADVANCE_EARN_CATEGORIES:
@@ -697,6 +775,43 @@ class BybitClient:
         )
         parsed = BybitResponse[WalletBalanceResult].model_validate(data)
         return parsed.result.items if parsed.result else []
+
+    async def get_asset_overview(
+        self,
+        account_type: str | None = None,
+        valuation_currency: str | None = None,
+        member_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Single-call holdings across all product categories
+        (Spot, Derivatives, Earn, Funding, TradingBot, CopyTrading) for
+        master + subaccounts via `/v5/asset/asset-overview`. Replaces
+        what would otherwise be N separate `get_wallet_balance(account
+        type=...)` calls in the snapshot collector.
+
+        All params optional:
+        - `account_type` — filter to one (UNIFIED|FUND|CONTRACT|OPTION|
+          Earn|TradingBot|CopyTrading|...); omitted = all accounts
+        - `valuation_currency` — fiat to value in; defaults to USD
+        - `member_id` — required when master API key queries a subaccount
+
+        Returns raw `{totalEquity, list: [{accountType, totalEquity,
+        coinDetail?|categories?}, ...]}`. Typed shape deferred to `.6`
+        once we have live captures.
+
+        Path note: the V5 docs originally listed this under
+        `/v5/asset/balance/asset-overview`; live-probe 2026-05-27
+        confirmed the deployed path is `/v5/asset/asset-overview`
+        (without `/balance`).
+        """
+        params: dict[str, Any] = {}
+        if account_type is not None:
+            params["accountType"] = account_type
+        if valuation_currency is not None:
+            params["valuationCurrency"] = valuation_currency
+        if member_id is not None:
+            params["memberId"] = member_id
+        data = await self._request("GET", "/v5/asset/asset-overview", params=params)
+        return data.get("result") or {}
 
     async def withdraw_to_mantle(
         self,

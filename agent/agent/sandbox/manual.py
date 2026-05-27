@@ -263,6 +263,91 @@ def hourly_yield(
     asyncio.run(run())
 
 
+@cli.command(name="apr-history")
+@click.argument("product_id")
+@click.option("--category", default="FlexibleSaving", show_default=True,
+              help="FlexibleSaving | OnChain (only these two supported).")
+@click.option("--days", type=int, default=30, show_default=True)
+@click.pass_context
+def apr_history(ctx: click.Context, product_id: str, category: str, days: int) -> None:
+    """Daily APR history (/v5/earn/apr-history)."""
+
+    async def run() -> None:
+        async with _build_client(ctx.obj["env_file"]) as client:
+            result = await client.get_apr_history(
+                category=category, product_id=product_id, days=days
+            )
+        _print(result)
+        path = _capture(f"apr-history-{category}-{product_id}", result)
+        click.secho(f"\ncaptured → {path}", fg="green")
+
+    asyncio.run(run())
+
+
+@cli.command(name="yield-history")
+@click.option("--category", default="FlexibleSaving", show_default=True)
+@click.option("--start", "start_time", type=int, required=True, help="Unix ms.")
+@click.option("--end", "end_time", type=int, required=True, help="Unix ms.")
+@click.option("--product-id", default=None)
+@click.option("--limit", type=int, default=None)
+@click.option("--cursor", default=None)
+@click.pass_context
+def yield_history(
+    ctx: click.Context,
+    category: str,
+    start_time: int,
+    end_time: int,
+    product_id: str | None,
+    limit: int | None,
+    cursor: str | None,
+) -> None:
+    """Realized yield records (/v5/earn/yield). 7d window cap server-side."""
+
+    async def run() -> None:
+        async with _build_client(ctx.obj["env_file"]) as client:
+            result = await client.get_yield_history(
+                category=category,
+                start_time=start_time,
+                end_time=end_time,
+                product_id=product_id,
+                limit=limit,
+                cursor=cursor,
+            )
+        _print(result)
+        path = _capture(f"yield-history-{category}", result)
+        click.secho(f"\ncaptured → {path}", fg="green")
+
+    asyncio.run(run())
+
+
+@cli.command(name="asset-overview")
+@click.option("--account-type", default=None, help="Omit for cross-account aggregate.")
+@click.option("--valuation-currency", default=None, help="Defaults to USD on Bybit side.")
+@click.option("--member-id", default=None, help="Required when master key queries subaccount.")
+@click.pass_context
+def asset_overview(
+    ctx: click.Context,
+    account_type: str | None,
+    valuation_currency: str | None,
+    member_id: str | None,
+) -> None:
+    """Single-call holdings across Spot/Derivatives/Earn/Funding
+    (/v5/asset/asset-overview)."""
+
+    async def run() -> None:
+        async with _build_client(ctx.obj["env_file"]) as client:
+            result = await client.get_asset_overview(
+                account_type=account_type,
+                valuation_currency=valuation_currency,
+                member_id=member_id,
+            )
+        _print(result)
+        path = _capture(f"asset-overview-{account_type or 'all'}", result)
+        click.secho(f"\ncaptured → {path}", fg="green")
+
+    asyncio.run(run())
+
+
 @cli.command()
 @click.option("--coin", default=None, help="Restrict to a single coin (default: all).")
 @click.option(
