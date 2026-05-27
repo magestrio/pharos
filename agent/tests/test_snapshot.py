@@ -82,17 +82,19 @@ def _onchain(
     return OnChainEarnProduct.model_validate(data)
 
 
-def test_flex_summary_uses_promo_whitelist_when_hit():
-    """USD1 productId=1131 is in promo_whitelist at 7.52% — must
-    override the much lower API `estimateApr`."""
+def test_flex_summary_uses_estimate_apr_from_api():
+    """No promo override — `estimateApr` is the single source. USD1's
+    UI-only 7.52% promo lives outside the OpenAPI surface and is
+    explicitly NOT carried in the snapshot (see `.40` follow-up for
+    dynamic promo discovery)."""
     p = _flex("1131", "0.65%", coin="USD1")
     s = _flex_or_onchain_summary(p, "FlexibleSaving")
-    assert s.effective_apr == Decimal("0.0752")
-    assert s.apr_source == "promo_whitelist"
+    assert s.effective_apr == Decimal("0.0065")
+    assert s.apr_source == "estimate_apr"
     assert s.base_apr_string == "0.65%"
 
 
-def test_flex_summary_falls_back_to_estimate_apr_when_not_whitelisted():
+def test_flex_summary_uses_estimate_apr_for_non_special_product():
     p = _flex("9999", "1.07%")
     s = _flex_or_onchain_summary(p, "FlexibleSaving")
     assert s.effective_apr == Decimal("0.0107")
@@ -331,14 +333,15 @@ async def test_collect_snapshot_full_shape_and_promo_override():
     assert len(earn_errors) == 3
     assert any("on_chain_state: skipped" in e for e in snap.errors)
     assert snap.on_chain_state is None
-    # Products: per-category, ranked, USD1 uses promo whitelist
+    # Products: per-category, ranked by estimate_apr. No promo override —
+    # USD1 surfaces at its raw API APR (0.65%), below USDC's 1.07%.
     assert set(snap.products) == {"FlexibleSaving", "OnChain", "LiquidityMining"}
     flex = snap.products["FlexibleSaving"]
     usd1 = next(p for p in flex if p.product_id == "1131")
-    assert usd1.effective_apr == Decimal("0.0752")
-    assert usd1.apr_source == "promo_whitelist"
-    # USD1 (7.52% promo) ranks above USDC product 2 (1.07%)
-    assert flex[0].product_id == "1131"
+    assert usd1.effective_apr == Decimal("0.0065")
+    assert usd1.apr_source == "estimate_apr"
+    # USDC product 2 (1.07%) ranks above USD1 1131 (0.65%) under clean estimate_apr.
+    assert flex[0].product_id == "2"
     # OnChain summary carries swap_to note
     onchain = snap.products["OnChain"]
     assert onchain[0].notes == ["swap_to=USDE"]
@@ -371,7 +374,9 @@ async def test_collect_snapshot_serializes_to_valid_json():
     # Round-trip back through Pydantic to prove the JSON is self-describing.
     reparsed = Snapshot.model_validate_json(blob)
     assert reparsed.wallet.total_equity_usd == snap.wallet.total_equity_usd
-    assert reparsed.products["FlexibleSaving"][0].product_id == "1131"
+    # USDC product 2 (1.07%) tops the ranking under clean estimate_apr —
+    # USD1 1131 (0.65%) is below it after promo override was removed.
+    assert reparsed.products["FlexibleSaving"][0].product_id == "2"
 
 
 @pytest.mark.asyncio

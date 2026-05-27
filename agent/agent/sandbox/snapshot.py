@@ -41,7 +41,6 @@ from agent.bybit_oracle.bybit_client import (
     OnChainEarnProduct,
     PerpPosition,
 )
-from agent.bybit_oracle.promo_whitelist import get_promo_effective_apr
 from agent.sandbox.on_chain import (
     AAVE_V3_POOL_ADDRESS,
     AaveV3UsdcState,
@@ -89,7 +88,7 @@ class ProductSummary(BaseModel):
     product_id: str
     coin: str  # for LM: f"{baseCoin}/{quoteCoin}"
     effective_apr: Decimal  # fractional [0, 1]
-    apr_source: str  # promo_whitelist | estimate_apr | apy_e8 | missing
+    apr_source: str  # measured_yield | estimate_apr | apy_e8 | aave_pool | quote_dual_offer | quote_discount | missing
     base_apr_string: str | None = None  # raw Bybit value (debug / audit)
     redeem_lockup_minutes: int | None = None
     notes: list[str] = Field(default_factory=list)
@@ -107,6 +106,12 @@ class WalletSnapshot(BaseModel):
     # whether to swap USDC → USDT before opening a hedge. Stored as
     # USD-equivalent (USDT ~ $1 by construction).
     usdt_available_usd: Decimal = Decimal(0)
+    # Per-coin balances in UNIFIED, in native coin units. Lets the
+    # executor diff plan a USDC → pick.coin swap leg when an Earn
+    # SUBSCRIBE targets a stable (USD1 / FDUSD / DAI / USDE …) that the
+    # wallet doesn't hold yet. Empty dict when the asset-overview has
+    # no UNIFIED account.
+    unified_coin_balances: dict[str, Decimal] = Field(default_factory=dict)
 
 
 class MarketSnapshot(BaseModel):
@@ -232,12 +237,23 @@ def _parse_percent(value: str | None) -> Decimal | None:
 
 
 def _flex_or_onchain_summary(
-    p: FlexibleEarnProduct | OnChainEarnProduct, category: str
+    p: FlexibleEarnProduct | OnChainEarnProduct,
+    category: str,
+    measured_apr: Decimal | None = None,
 ) -> ProductSummary:
+    # APR resolution order:
+    #   1. `measured_apr` — realized APR computed from
+    #      `/v5/earn/hourly-yield` records on our open position. This is
+    #      the ground truth, captures any UI-only promo subsidies
+    #      Bybit's `estimateApr` field doesn't carry (e.g. USD1 shows
+    #      0.59% in API but realized ~7% under "Hold USD1, Earn WLFI").
+    #      Available ONLY for products with an active position +
+    #      ≥1 hourly settlement on Bybit's side.
+    #   2. `estimateApr` — Bybit's quoted base APR. Excludes promos.
+    #   3. `missing` — neither available → 0% / validator rejects pick.
     base = _parse_percent(p.estimateApr)
-    promo = get_promo_effective_apr(category, p.productId)
-    if promo is not None:
-        eff, src = promo, "promo_whitelist"
+    if measured_apr is not None and measured_apr > 0:
+        eff, src = measured_apr, "measured_yield"
     elif base is not None:
         eff, src = base, "estimate_apr"
     else:
@@ -505,6 +521,54 @@ def _rank(
     return sorted(merged, key=lambda s: s.effective_apr, reverse=True)
 
 
+async def _measure_realized_apr(
+    client: BybitClient,
+    category: str,
+    product_id: str,
+    *,
+    lookback_hours: int = 24,
+) -> Decimal | None:
+    """Compute realized APR for an Earn position from Bybit's
+    `/v5/earn/hourly-yield` records (`.40` dynamic promo discovery).
+
+    Each row carries `{amount, effectiveStakingAmount, hourlyDate}`:
+    `amount` is the yield credited that hour (in the product's coin),
+    `effectiveStakingAmount` is the active stake size that hour.
+    Per-row APR = `amount / effectiveStakingAmount × 24 × 365`. We
+    average across the lookback window so a single noisy hour doesn't
+    skew the signal.
+
+    Returns None when no rows are available (fresh position before
+    Bybit's first hourly settlement, or position closed before
+    lookback). Caller falls back to `estimateApr`."""
+    end_ms = int(datetime.now(UTC).timestamp() * 1000)
+    start_ms = end_ms - lookback_hours * 3600 * 1000
+    try:
+        data = await client.get_hourly_yield(
+            category=category,
+            product_id=product_id,
+            start_time=start_ms,
+            end_time=end_ms,
+            limit=lookback_hours + 4,
+        )
+    except BybitAPIError:
+        return None
+    rows = data.get("list") or []
+    aprs: list[Decimal] = []
+    for r in rows:
+        try:
+            yld = Decimal(str(r.get("amount", "0")))
+            stake = Decimal(str(r.get("effectiveStakingAmount", "0")))
+        except InvalidOperation:
+            continue
+        if stake <= 0:
+            continue
+        aprs.append(yld / stake * Decimal(24 * 365))
+    if not aprs:
+        return None
+    return sum(aprs, Decimal(0)) / Decimal(len(aprs))
+
+
 async def _safe_earn(
     coro, errors: list[str], label: str, default: Any
 ) -> Any:
@@ -603,6 +667,28 @@ def _usdt_in_unified(accounts: list[dict[str, Any]]) -> Decimal:
             except (InvalidOperation, TypeError):
                 return Decimal(0)
     return Decimal(0)
+
+
+def _all_coins_in_unified(accounts: list[dict[str, Any]]) -> dict[str, Decimal]:
+    """Build `{coin: balance}` for every coin in the UNIFIED account.
+    Lets the executor diff plan an auto-swap (USDC → pick.coin) ahead of
+    a SUBSCRIBE_EARN when the wallet doesn't already carry the pick's
+    coin. Balances are in NATIVE coin units (1 USDT = 1.0, 1 BTC = 1.0)
+    — caller is responsible for USD-equivalent conversion if needed."""
+    out: dict[str, Decimal] = {}
+    for acct in accounts:
+        if acct.get("accountType") not in _UNIFIED_ACCOUNT_TYPES:
+            continue
+        for entry in acct.get("coinDetail") or []:
+            coin = entry.get("coin")
+            if not coin:
+                continue
+            raw = entry.get("equity") or entry.get("walletBalance") or "0"
+            try:
+                out[coin] = Decimal(str(raw))
+            except (InvalidOperation, TypeError):
+                continue
+    return out
 
 
 async def _fetch_perp_info(
@@ -968,6 +1054,32 @@ async def collect_snapshot(
             p.category = "OnChain"
     earn_positions = list(earn_flex_positions) + list(earn_onchain_positions)
 
+    # Measured-yield APR (`.40` dynamic promo discovery). For every
+    # active Earn position we hold, fetch `/v5/earn/hourly-yield` and
+    # derive realized APR. Captures any UI-only promo subsidy that
+    # Bybit's `estimateApr` field doesn't carry (e.g. USD1 "Hold/Earn
+    # WLFI" campaign — estimateApr=0.59% but realized ~7%). All fans
+    # out concurrently; per-product failures degrade silently to None
+    # so the snapshot still builds when Bybit hourly-yield rate-limits.
+    measured_apr_pairs = [
+        (p.category or "", p.productId)
+        for p in earn_positions
+        if p.category and p.productId
+    ]
+    measured_aprs: dict[tuple[str, str], Decimal] = {}
+    if measured_apr_pairs:
+        results = await asyncio.gather(
+            *(_measure_realized_apr(client, cat, pid)
+              for cat, pid in measured_apr_pairs),
+            return_exceptions=True,
+        )
+        for (cat, pid), apr in zip(measured_apr_pairs, results):
+            if isinstance(apr, BaseException):
+                errors.append(f"measured_apr[{cat}/{pid}]: {type(apr).__name__}: {apr}")
+                continue
+            if apr is not None:
+                measured_aprs[(cat, pid)] = apr
+
     # Wallet
     try:
         total_equity = Decimal(str(asset_overview.get("totalEquity", "0") or "0"))
@@ -975,17 +1087,32 @@ async def collect_snapshot(
         total_equity = Decimal(0)
     accounts = asset_overview.get("list", []) or []
     usdt_available = _usdt_in_unified(accounts)
+    unified_coins = _all_coins_in_unified(accounts)
 
     # Products: normalize + rank with diversification floor.
     stable_floor = lambda s: s.coin in STABLES  # noqa: E731
     lm_unleveraged = lambda s: "max_leverage=1" in s.notes  # noqa: E731
     products = {
         "FlexibleSaving": _rank(
-            [_flex_or_onchain_summary(p, "FlexibleSaving") for p in flex_products],
+            [
+                _flex_or_onchain_summary(
+                    p,
+                    "FlexibleSaving",
+                    measured_apr=measured_aprs.get(("FlexibleSaving", p.productId)),
+                )
+                for p in flex_products
+            ],
             must_include=stable_floor,
         ),
         "OnChain": _rank(
-            [_flex_or_onchain_summary(p, "OnChain") for p in onchain_products],
+            [
+                _flex_or_onchain_summary(
+                    p,
+                    "OnChain",
+                    measured_apr=measured_aprs.get(("OnChain", p.productId)),
+                )
+                for p in onchain_products
+            ],
             must_include=stable_floor,
         ),
         "LiquidityMining": _rank(
@@ -1092,6 +1219,7 @@ async def collect_snapshot(
             total_equity_usd=total_equity,
             accounts=accounts,
             usdt_available_usd=usdt_available,
+            unified_coin_balances=unified_coins,
         ),
         earn_positions=earn_positions_dump,
         lm_positions=lm_positions,

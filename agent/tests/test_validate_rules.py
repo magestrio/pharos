@@ -98,7 +98,7 @@ def _snapshot(
     field they care about."""
     products: dict[str, list[ProductSummary]] = {
         "FlexibleSaving": flex_products
-        or [_product("1131", "FlexibleSaving", coin="USD1", effective_apr="0.0752", apr_source="promo_whitelist")],
+        or [_product("1131", "FlexibleSaving", coin="USD1", effective_apr="0.0752", apr_source="estimate_apr")],
         "OnChain": onchain_products
         or [_product("26", "OnChain", coin="USDC", effective_apr="0.04")],
         "LiquidityMining": lm_products
@@ -306,7 +306,7 @@ def test_check_effective_pick_cap_passes_when_split() -> None:
     # Need both picks present in snapshot
     s = _snapshot(
         flex_products=[
-            _product("1131", "FlexibleSaving", coin="USD1", effective_apr="0.075", apr_source="promo_whitelist"),
+            _product("1131", "FlexibleSaving", coin="USD1", effective_apr="0.075", apr_source="estimate_apr"),
             _product("1", "FlexibleSaving", coin="USDT", effective_apr="0.015"),
         ]
     )

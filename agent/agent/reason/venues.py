@@ -91,7 +91,7 @@ VENUE_REGISTRY: dict[str, VenueMeta] = {
     "bybit_flex": VenueMeta(
         venue_id="bybit_flex",
         enabled=True,
-        max_weight=0.70,
+        max_weight=0.90,  # .14 smoke test — bumped from 0.70 for 2-venue small-vault concentration; revert after
         requires_picks=True,
         snapshot_category="FlexibleSaving",
         notes=(

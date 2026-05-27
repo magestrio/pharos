@@ -105,10 +105,11 @@ If you cannot enter a required hedge (orderbook too thin, funding heavily negati
 - `wallet.accounts[].coinDetail[]` — per-coin holdings. If a product's coin is not in `coinDetail`, an action requires a prior swap — note this in `notes`.
 - `market.btc_24h_change_pct`, `market.btc_funding_rate`, `market.eth_funding_rate` — broad regime indicators. Risk-off (sharp down 24h + negative funding) ⇒ bias toward `cash_usdc` and `bybit_flex`. Calm + positive funding ⇒ `bybit_onchain` / `bybit_lm` are safer to size up.
 - Per-product `notes` carry metadata: `swap_to=<coin>` (staking requires a swap), `fixed_term_days=<N>` (lockup days), `bonus_events=<N>` (API-visible promo bonus), `max_leverage=<N>` (LM only). Advance-Earn products carry additional fields: `duration=<period>`, `settlement_ms=<ts>`, `underlying=<coin>`, `direction=Long|Short`, `leverage=<N>`, `range_buffer=±<lower|upper>` — read them to understand the conditional payoff before sizing.
-- Per-product `apr_source` values:
-  - `promo_whitelist` — operator-curated effective APR (UI-sourced promo subsidy not visible via API). Trust this number ahead of `estimate_apr`.
+- Per-product `apr_source` values (resolution order — `measured_yield` wins when present):
+  - `measured_yield` — REALIZED APR computed from `/v5/earn/hourly-yield` records on our currently-held position. Captures the full economic yield INCLUDING any UI-only promo subsidy (e.g. USD1 estimateApr=0.59% but measured ~7% under "Hold USD1, Earn WLFI"). This is the ground truth; trust it ahead of `estimate_apr`. Only available for products where we already have a stake AND at least one hourly settlement has happened. **Strategic implication**: a tiny "probe" position (~$10) in a high-potential product unlocks measured APR for the NEXT cycle's allocation decision.
+  - `estimate_apr` — Bybit's quoted base APR. Real but excludes promo subsidies (delta vs `measured_yield` can be 5-10×). When a similar stable carries `measured_yield` and another only has `estimate_apr`, the measured one is a more reliable comparison.
   - `apy_e8` — LM's `apyE8 / 1e8`. Real but excludes IL on the underlying pair.
-  - `estimate_apr` — Bybit's reported base APR. Real but excludes promo subsidies.
+  - `aave_pool` — Aave V3 USDC supply APR read from `getReserveData().currentLiquidityRate / 1e27`. Real, variable.
   - `quote_dual_offer` — DualAssets best-offer APR from `/v5/earn/advance/product-extra-info`. **Conditional**: realized only if the underlying does NOT settle past the strike side. APR can be very high (100-500%+) precisely because conversion risk is asymmetric. Size SMALL: respect the `bybit_dual_asset` cap (20%) and treat the headline as a ceiling, not a guarantee.
   - `quote_discount` — DiscountBuy implicit annualized yield from `(currentPrice − purchasePrice) / purchasePrice × 365 / duration_days`. **Conditional**: realized only if the underlying does NOT touch the `knockoutPrice` before settlement. Same advice — headline 50-150% APRs are knockout-conditional; size within the venue cap (20%).
   - `missing` — quote not available (SmartLeverage / DoubleWin, or expired DualAssets / DiscountBuy window). Picks with `apr_source="missing"` are rejected by the validator — leave weight 0.
@@ -120,6 +121,25 @@ If you cannot enter a required hedge (orderbook too thin, funding heavily negati
 - `confidence` reflects how robust the thesis is to noise, not how much you like the trade. Below 0.4 → cycle is skipped. Don't bias upward to "look decisive".
 - `risk_flags` is for show-stopping conditions the static caps may have missed: protocol exploit chatter, oracle anomaly, peg break beyond 100 bps, suspicious APR spike. Any flag = cycle skipped — use sparingly, but use it.
 - `thesis` is the rationale. Under ~200 words: cite the snapshot fields that drove the call, name the biggest risk you're accepting, explain why the size is appropriate.
+
+# Small-vault venue concentration
+
+When `wallet.total_equity_usd < 100`, **pick at most 2 venues** out of the enabled set. Diversification beyond 2 at this size pushes per-product allocations below Bybit Earn min-purchase thresholds (`$5-10` is typical, `$1-3` slices get rejected with `retCode=180012`) and forces hedge notionals into shapes the ±20% sizing tolerance cannot satisfy. Pick the two venues where the snapshot signals the highest risk-adjusted APR — usually `cash_usdc` (mandatory floor) plus the single best-APR Earn venue — and accept the higher per-venue concentration as the right tradeoff at this size.
+
+**Cap stack still applies even in 2-venue mode.** If your chosen Earn venue has `max_weight=0.70`, then the maximum weight for that venue is 0.70 — the leftover (e.g. 0.30) must go to `cash_usdc`, NOT to the Earn venue. Don't set the Earn venue above its cap.
+
+<!--
+DO NOT EVER RESTRICT TO USDC-ONLY PRODUCTS HERE.
+Hard requirement from operator (2026-05-27): the agent picks across ALL
+Bybit products (USDC / USDT / USD1 / FDUSD / DAI / USDE / etc.) on equal
+footing — the vault is USDC-denominated but coin diversification is a
+deliberate yield strategy. Any "stick to USDC products" rule is FORBIDDEN.
+If subscribes fail with retCode=180016/180001 because the wallet lacks
+the pick's coin, fix it in the EXECUTOR with an auto-swap (USDC → pick.coin)
+ahead of the SUBSCRIBE_EARN — same pattern as `.33` SWAP_SPOT for hedge
+margin. NEVER ever narrow the picker to USDC products as a workaround.
+-->
+
 
 # Whipsaw discipline — anchor on the prior cycle
 

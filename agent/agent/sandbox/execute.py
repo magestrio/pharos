@@ -58,6 +58,12 @@ MIN_ACTION_USDC = Decimal("0.50")
 # against the decision's target USD doesn't drift cycle-over-cycle as
 # the underlying moves. Single source of truth lives in
 # `agent.sandbox.snapshot.STABLES`.
+#
+# DO NOT EVER use this set (or any other gate) to restrict Earn picks
+# to USDC-only. Operator hard rule (2026-05-27): all Bybit Earn products
+# are eligible regardless of base coin. If the wallet lacks the pick's
+# coin at execute time, build an auto-swap leg (USDC → pick.coin) ahead
+# of the SUBSCRIBE_EARN — same shape as `_swap_actions_for_hedges`.
 _STABLES = STABLES
 
 # Earn account-type per category. FlexibleSaving runs on UNIFIED;
@@ -178,7 +184,7 @@ def diff_to_actions(
     current = _current_positions_by_pid(
         snapshot.earn_positions, snapshot.perp_market
     )
-    targets = _target_usd_by_pid(decision, total_book_usd)
+    targets = _target_usd_by_pid(decision, total_book_usd, snapshot)
 
     redeems: list[Action] = []
     subscribes: list[Action] = []
@@ -288,15 +294,38 @@ def diff_to_actions(
         snapshot_ts,
         idx_offset=len(all_pids),
     )
-    swaps = _swap_actions_for_hedges(
+    hedge_swaps = _swap_actions_for_hedges(
         snapshot,
         hedge_opens,
         hedge_closes,
         snapshot_ts,
         idx_offset=len(all_pids) + len(hedge_closes) + len(hedge_opens),
     )
+    # Earn-pick coin swaps run AFTER hedge swaps so the cursor doesn't
+    # collide on orderLinkId and so subscribes coming next see the
+    # wallet already topped up with their target coins.
+    earn_swaps = _swap_actions_for_earn_picks(
+        snapshot,
+        subscribes,
+        redeems,
+        snapshot_ts,
+        idx_offset=(
+            len(all_pids)
+            + len(hedge_closes)
+            + len(hedge_opens)
+            + len(hedge_swaps)
+        ),
+    )
 
-    return redeems + hedge_closes + swaps + hedge_opens + subscribes + skips
+    return (
+        redeems
+        + hedge_closes
+        + hedge_swaps
+        + earn_swaps
+        + hedge_opens
+        + subscribes
+        + skips
+    )
 
 
 def _coin_from_perp_symbol(symbol: str) -> str:
@@ -637,6 +666,91 @@ def _build_advance_extra(category: str, offer: dict[str, Any]) -> dict[str, Any]
             }
         }
     return {}
+
+
+def _swap_actions_for_earn_picks(
+    snapshot: Snapshot,
+    subscribe_actions: list[Action],
+    redeem_actions: list[Action],
+    snapshot_ts: str,
+    *,
+    idx_offset: int,
+) -> list[Action]:
+    """Plan USDC → pick.coin swaps when SUBSCRIBE_EARN actions target
+    coins the wallet doesn't carry. Bybit Earn stakes the product's
+    base coin directly — there's no auto-conversion — so a USD1 pick
+    against a USDC-only wallet would 180016 "Balance not enough". We
+    pre-emptively swap each shortfall via the `USDC<coin>` spot pair
+    (Sell USDC base, receive target quote).
+
+    Skips:
+      - USDC picks (source coin, no swap needed),
+      - non-stable picks (this layer is for Earn stables only; perp
+        margin gets its own `_swap_actions_for_hedges`),
+      - shortfalls below `MIN_SWAP_USDC` (Bybit pair fees > yield gain).
+
+    Aggregated per coin so a 3-product split like USD1/USDT/FDUSD in
+    one venue produces 3 distinct swaps (one per target coin), not
+    one per pick.
+    """
+    required_per_coin: dict[str, Decimal] = {}
+    for a in subscribe_actions:
+        if a.kind != ActionKind.SUBSCRIBE_EARN:
+            continue
+        coin = a.coin
+        # Skip the source coin and anything we wouldn't recognize as
+        # a stable — the perp-hedge swap layer handles USDT margin
+        # separately, and we don't auto-convert into non-stables (an
+        # OnChain non-USD pick already requires a paired hedge).
+        if coin == "USDC":
+            continue
+        if coin not in _STABLES:
+            continue
+        required_per_coin[coin] = required_per_coin.get(coin, Decimal(0)) + a.amount
+
+    # Pending REDEEM_EARN actions return their coin to the wallet
+    # in-cycle, so credit them against the requirement before sizing
+    # any swap. Mirrors the `hedge_closes` credit in
+    # `_swap_actions_for_hedges`. Without this we'd double-fund a
+    # rebalance (e.g. redeem $13 USD1 then swap USDC → USDT to
+    # subscribe USDT, while the USD1 just sits idle).
+    redeem_credit_per_coin: dict[str, Decimal] = {}
+    for a in redeem_actions:
+        if a.kind != ActionKind.REDEEM_EARN:
+            continue
+        redeem_credit_per_coin[a.coin] = (
+            redeem_credit_per_coin.get(a.coin, Decimal(0)) + a.amount
+        )
+
+    swaps: list[Action] = []
+    cursor = idx_offset
+    for coin, need in required_per_coin.items():
+        wallet_balance = snapshot.wallet.unified_coin_balances.get(coin, Decimal(0))
+        redeem_inflow = redeem_credit_per_coin.get(coin, Decimal(0))
+        available = wallet_balance + redeem_inflow
+        shortfall = need - available
+        if shortfall < MIN_SWAP_USDC:
+            continue
+        # 1% buffer for spot pair spread + Bybit lot-size rounding so
+        # the SUBSCRIBE that follows has comfortable headroom.
+        qty = (shortfall * Decimal("1.01")).quantize(Decimal("0.01"))
+        symbol = f"USDC{coin}"
+        swaps.append(
+            Action(
+                kind=ActionKind.SWAP_SPOT,
+                category="Spot",
+                product_id=symbol,
+                coin=coin,  # target coin of the swap
+                amount=qty,  # USDC to sell — Bybit Sell uses base-coin qty
+                order_link_id=_order_link_id(snapshot_ts, cursor),
+                reason=(
+                    f"swap {qty} USDC → {coin} for Earn subscribe coverage "
+                    f"(need ${need:.2f}, have ${available:.2f})"
+                ),
+            )
+        )
+        cursor += 1
+    return swaps
 
 
 def _swap_actions_for_hedges(
@@ -1030,23 +1144,37 @@ def _amount_to_usd(
 
 
 def _target_usd_by_pid(
-    decision: Decision, total_book_usd: Decimal
+    decision: Decision,
+    total_book_usd: Decimal,
+    snapshot: Snapshot,
 ) -> dict[tuple[str, str], _TargetPos]:
     """Convert venue + pick weights into per-product USD targets. Cash
     venue has no picks. Non-stable picks are kept in the target (so a
     redeem-direction action against a non-stable current position can
     still be planned), but the executor itself only places orders on
-    stable-coin categories."""
+    stable-coin categories.
+
+    The pick's underlying coin is resolved from `snapshot.products` —
+    Bybit's `/v5/earn/place-order` rejects mismatched `coin` vs product
+    with `retCode=180008 Invalid Product`, so we must send the coin
+    matching the product (e.g. `1131` → `USD1`, `1` → `USDT`). The
+    placeholder fallback (`USDC`) only fires when the LLM picks a
+    product that isn't surfaced in the snapshot at all (which should
+    have been caught by `check_hallucinated_picks` already)."""
     out: dict[tuple[str, str], _TargetPos] = {}
     for v in decision.venues:
         meta = VENUE_REGISTRY[v.venue_id]
         if not meta.snapshot_category or not v.picks:
             continue
         category = meta.snapshot_category
+        product_coin = {
+            p.product_id: p.coin
+            for p in snapshot.products.get(category, [])
+        }
         for pick in v.picks:
             usd_amount = total_book_usd * Decimal(str(v.weight)) * Decimal(str(pick.weight))
             out[(category, pick.product_id)] = _TargetPos(
-                coin="USDC",  # placeholder; real coin resolved from snapshot if needed
+                coin=product_coin.get(pick.product_id, "USDC"),
                 amount_usd=usd_amount,
             )
     return out
