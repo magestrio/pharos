@@ -95,6 +95,11 @@ class WalletSnapshot(BaseModel):
     # `accountType` (long-form `UnifiedTradingAccount` etc.) +
     # optional `coinDetail` / `categories` blocks per .19.
     accounts: list[dict[str, Any]] = Field(default_factory=list)
+    # USDT sitting in UNIFIED — the margin currency for linear perps.
+    # Parsed from `accounts` so the diff layer (`.33`) can decide
+    # whether to swap USDC → USDT before opening a hedge. Stored as
+    # USD-equivalent (USDT ~ $1 by construction).
+    usdt_available_usd: Decimal = Decimal(0)
 
 
 class MarketSnapshot(BaseModel):
@@ -154,6 +159,14 @@ class Snapshot(BaseModel):
     # Populated for non-stable coins surfaced in OnChain top-K so the
     # hedging-feasibility rules in the prompt have something to score.
     perp_market: dict[str, PerpInfo] = Field(default_factory=dict)
+    # Raw `/v5/earn/advance/product-extra-info` quote payloads, keyed by
+    # `"<Category>/<ProductId>"` (pydantic dislikes tuple keys). Carries
+    # the actionable offer details (selectPrice, expiredAt, instUid,
+    # purchasePrice, knockoutPrice, apyE8) the executor needs to build
+    # the per-category `*Extra` block for `place_advance_earn_order`.
+    # LLM doesn't see this — it consumes the normalized APR via
+    # `products[Category][i].effective_apr` instead.
+    advance_earn_quotes: dict[str, dict[str, Any]] = Field(default_factory=dict)
     # Open linear-perp positions (USDT-settled). Drives the close-arm of
     # the executor diff so each cycle reconciles current shorts against
     # `decision.hedges` instead of blindly opening new ones (.32).
@@ -504,6 +517,38 @@ def _is_open_perp(p: PerpPosition) -> bool:
         return False
 
 
+# Account types Bybit uses for the unified trading account. The long
+# form `UnifiedTradingAccount` is what `/v5/asset/asset-overview`
+# echoes (.6 live capture); `UNIFIED` is the short form used in the
+# request param. Match both so the test mocks and the live snapshot
+# both populate `wallet.usdt_available_usd` correctly.
+_UNIFIED_ACCOUNT_TYPES: frozenset[str] = frozenset(
+    {"UnifiedTradingAccount", "UNIFIED"}
+)
+
+
+def _usdt_in_unified(accounts: list[dict[str, Any]]) -> Decimal:
+    """Pull the USDT balance from the UNIFIED account in an asset-overview
+    `list`. UNIFIED is where linear-perp margin lives (Spot/Funding/Earn
+    USDT doesn't count toward derivatives margin), so this is the number
+    the diff layer needs to decide whether to swap USDC → USDT before
+    opening a hedge (`.33`). Returns 0 when no UNIFIED account is present
+    or the coin list doesn't carry USDT — the diff will then plan a
+    full-notional swap, which is the correct fail-safe."""
+    for acct in accounts:
+        if acct.get("accountType") not in _UNIFIED_ACCOUNT_TYPES:
+            continue
+        for entry in acct.get("coinDetail") or []:
+            if entry.get("coin") != "USDT":
+                continue
+            raw = entry.get("equity") or entry.get("walletBalance") or "0"
+            try:
+                return Decimal(str(raw))
+            except (InvalidOperation, TypeError):
+                return Decimal(0)
+    return Decimal(0)
+
+
 async def _fetch_perp_info(
     client: BybitClient, coin: str, errors: list[str]
 ) -> tuple[str, PerpInfo | None]:
@@ -842,6 +887,7 @@ async def collect_snapshot(client: BybitClient) -> Snapshot:
     except InvalidOperation:
         total_equity = Decimal(0)
     accounts = asset_overview.get("list", []) or []
+    usdt_available = _usdt_in_unified(accounts)
 
     # Products: normalize + rank with diversification floor.
     stable_floor = lambda s: s.coin in STABLES  # noqa: E731
@@ -877,6 +923,13 @@ async def collect_snapshot(client: BybitClient) -> Snapshot:
             _advance_earn_summary(p, cat, quote_results.get((cat, str(p.get("productId", "")))))
             for p in raw_items[:TOP_K]
         ]
+    # Persist the raw quotes for executor consumption (`.35`). Keyed as
+    # `"<Category>/<ProductId>"` because pydantic dict fields can't carry
+    # tuple keys through model_dump_json round-trips.
+    advance_earn_quotes = {
+        f"{cat}/{pid}": payload
+        for (cat, pid), payload in quote_results.items()
+    }
 
     # Per-coin perp data for non-stable OnChain picks. Drives the
     # hedging-feasibility rules in the prompt (.31). We fan out fetch
@@ -916,13 +969,18 @@ async def collect_snapshot(client: BybitClient) -> Snapshot:
 
     return Snapshot(
         captured_at=captured,
-        wallet=WalletSnapshot(total_equity_usd=total_equity, accounts=accounts),
+        wallet=WalletSnapshot(
+            total_equity_usd=total_equity,
+            accounts=accounts,
+            usdt_available_usd=usdt_available,
+        ),
         earn_positions=earn_positions_dump,
         lm_positions=lm_positions,
         products=products,
         market=market,
         perp_market=perp_market,
         perp_positions=perp_positions,
+        advance_earn_quotes=advance_earn_quotes,
         usdc_peg=usdc_peg,
         errors=errors,
     )

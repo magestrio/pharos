@@ -33,6 +33,7 @@ from agent.sandbox.snapshot import (
     _rank,
     _safe_earn,
     _safe_perp_positions,
+    _usdt_in_unified,
     collect_snapshot,
 )
 
@@ -497,6 +498,149 @@ async def test_collect_snapshot_populates_perp_positions_and_filters_flat() -> N
     assert len(snap.perp_positions) == 2
     symbols = {p.symbol for p in snap.perp_positions}
     assert symbols == {"TONUSDT", "DOGEUSDT"}
+
+
+# ─── USDT margin wallet snapshot (.33) ─────────────────────────────────────
+
+
+def test_usdt_in_unified_picks_long_form_account_type() -> None:
+    """Asset-overview echoes `UnifiedTradingAccount` (long form)."""
+    accounts = [
+        {
+            "accountType": "UnifiedTradingAccount",
+            "coinDetail": [
+                {"coin": "USDC", "equity": "9.97"},
+                {"coin": "USDT", "equity": "15.50"},
+            ],
+        }
+    ]
+    assert _usdt_in_unified(accounts) == Decimal("15.50")
+
+
+def test_usdt_in_unified_picks_short_form_account_type() -> None:
+    """Some endpoints return the short `UNIFIED` form — both must work."""
+    accounts = [
+        {
+            "accountType": "UNIFIED",
+            "coinDetail": [{"coin": "USDT", "equity": "42"}],
+        }
+    ]
+    assert _usdt_in_unified(accounts) == Decimal("42")
+
+
+def test_usdt_in_unified_falls_back_to_wallet_balance() -> None:
+    """Older captures use `walletBalance` instead of `equity`."""
+    accounts = [
+        {
+            "accountType": "UNIFIED",
+            "coinDetail": [{"coin": "USDT", "walletBalance": "8.5"}],
+        }
+    ]
+    assert _usdt_in_unified(accounts) == Decimal("8.5")
+
+
+def test_usdt_in_unified_returns_zero_when_no_unified_account() -> None:
+    accounts = [
+        {
+            "accountType": "FUND",
+            "coinDetail": [{"coin": "USDT", "equity": "100"}],
+        }
+    ]
+    # USDT in FUND is not margin-eligible for linear perps → ignored.
+    assert _usdt_in_unified(accounts) == Decimal(0)
+
+
+def test_usdt_in_unified_returns_zero_when_no_usdt_entry() -> None:
+    accounts = [
+        {
+            "accountType": "UnifiedTradingAccount",
+            "coinDetail": [{"coin": "USDC", "equity": "100"}],
+        }
+    ]
+    assert _usdt_in_unified(accounts) == Decimal(0)
+
+
+@pytest.mark.asyncio
+async def test_collect_snapshot_populates_wallet_usdt_available() -> None:
+    client = _mock_client_full()
+    client.get_asset_overview.return_value = {
+        "totalEquity": "25.50",
+        "list": [
+            {
+                "accountType": "UnifiedTradingAccount",
+                "totalEquity": "25.50",
+                "coinDetail": [
+                    {"coin": "USDC", "equity": "10.00"},
+                    {"coin": "USDT", "equity": "15.50"},
+                ],
+            }
+        ],
+    }
+
+    with patch("agent.sandbox.snapshot._fetch_usdc_peg", _fake_peg_ok):
+        snap = await collect_snapshot(client)
+
+    assert snap.wallet.usdt_available_usd == Decimal("15.50")
+    assert snap.wallet.total_equity_usd == Decimal("25.50")
+
+
+# ─── advance_earn_quotes persistence (.35) ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_collect_snapshot_persists_advance_earn_quotes() -> None:
+    """Quote responses from `_quote_advance_top_k` must land on the
+    snapshot so the executor can build the per-category extra block at
+    dispatch time without re-fetching (race against expiry)."""
+    client = _mock_client_full()
+    # Surface DualAssets + DiscountBuy raw products so they go through
+    # the quote fan-out.
+    client.list_advance_earn_products.side_effect = lambda category, **_: (
+        [{"productId": "da-1", "baseCoin": "BTC", "quoteCoin": "USDT"}]
+        if category == "DualAssets"
+        else [{"productId": "db-7", "coin": "USDT"}]
+        if category == "DiscountBuy"
+        else []
+    )
+    client.get_advance_product_quote.side_effect = lambda category, product_id: (
+        {
+            "category": "DualAssets",
+            "list": [
+                {
+                    "baseCoin": "BTC",
+                    "quoteCoin": "USDT",
+                    "buyLowPrice": [{"selectPrice": "62000", "apyE8": "80000000"}],
+                    "expiredTime": "9999999999999",
+                }
+            ],
+        }
+        if category == "DualAssets"
+        else {
+            "category": "DiscountBuy",
+            "list": [
+                {
+                    "coin": "USDT",
+                    "instUid": "inst-xyz",
+                    "currentPrice": "65000",
+                    "purchasePrice": "63000",
+                    "knockoutPrice": "55000",
+                    "expiredAt": "9999999999999",
+                }
+            ],
+        }
+    )
+
+    with patch("agent.sandbox.snapshot._fetch_usdc_peg", _fake_peg_ok):
+        snap = await collect_snapshot(client)
+
+    assert "DualAssets/da-1" in snap.advance_earn_quotes
+    assert "DiscountBuy/db-7" in snap.advance_earn_quotes
+    da = snap.advance_earn_quotes["DualAssets/da-1"]
+    assert da["list"][0]["buyLowPrice"][0]["apyE8"] == "80000000"
+    # Round-trip through JSON to confirm pydantic doesn't drop the dict.
+    blob = snap.model_dump_json()
+    reparsed = Snapshot.model_validate_json(blob)
+    assert reparsed.advance_earn_quotes["DiscountBuy/db-7"]["list"][0]["instUid"] == "inst-xyz"
 
 
 @pytest.mark.asyncio

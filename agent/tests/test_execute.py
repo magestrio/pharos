@@ -46,19 +46,25 @@ from agent.sandbox.snapshot import (
 def _snapshot(
     *,
     total_equity_usd: str = "100",
+    usdt_available_usd: str = "0",
     earn_positions: list[dict] | None = None,
     perp_market: dict[str, PerpInfo] | None = None,
     perp_positions: list[PerpPosition] | None = None,
+    advance_earn_quotes: dict[str, dict] | None = None,
 ) -> Snapshot:
     return Snapshot(
         captured_at=datetime.now(UTC),
-        wallet=WalletSnapshot(total_equity_usd=Decimal(total_equity_usd)),
+        wallet=WalletSnapshot(
+            total_equity_usd=Decimal(total_equity_usd),
+            usdt_available_usd=Decimal(usdt_available_usd),
+        ),
         earn_positions=earn_positions or [],
         lm_positions=[],
         products={"FlexibleSaving": [], "OnChain": [], "LiquidityMining": []},
         market=MarketSnapshot(),
         perp_market=perp_market or {},
         perp_positions=perp_positions or [],
+        advance_earn_quotes=advance_earn_quotes or {},
         usdc_peg=UsdcPegSnapshot(
             price_usd=Decimal("1.0"),
             deviation_bps=Decimal("0"),
@@ -66,6 +72,67 @@ def _snapshot(
         ),
         errors=[],
     )
+
+
+def _dual_quote(
+    *,
+    base: str = "BTC",
+    quote_coin: str = "USDT",
+    expired_in_ms: int = 600_000,  # 10 min ahead
+    offers: list[dict] | None = None,
+) -> dict:
+    """Bybit DualAssets quote payload, trimmed to fields the diff reads."""
+    from datetime import timedelta
+
+    expired = int(
+        (datetime.now(UTC) + timedelta(milliseconds=expired_in_ms)).timestamp() * 1000
+    )
+    return {
+        "category": "DualAssets",
+        "list": [
+            {
+                "baseCoin": base,
+                "quoteCoin": quote_coin,
+                "currentPrice": "65000",
+                "expiredTime": str(expired),
+                "buyLowPrice": offers
+                or [
+                    {"selectPrice": "60000", "apyE8": "50000000"},  # 0.5 APR
+                    {"selectPrice": "62000", "apyE8": "80000000"},  # 0.8 APR (best)
+                ],
+                "sellHighPrice": [],
+            }
+        ],
+    }
+
+
+def _discount_quote(
+    *,
+    coin: str = "USDT",
+    inst_uid: str | None = "instUid-123",
+    expired_in_ms: int = 600_000,
+    purchase_price: str = "63000",
+    knockout_price: str = "55000",
+) -> dict:
+    from datetime import timedelta
+
+    expired = int(
+        (datetime.now(UTC) + timedelta(milliseconds=expired_in_ms)).timestamp() * 1000
+    )
+    return {
+        "category": "DiscountBuy",
+        "list": [
+            {
+                "coin": coin,
+                "instUid": inst_uid,
+                "currentPrice": "65000",
+                "purchasePrice": purchase_price,
+                "knockoutPrice": knockout_price,
+                "knockoutCouponE8": "100000000",
+                "expiredAt": str(expired),
+            }
+        ],
+    }
 
 
 def _short_pos(
@@ -874,6 +941,423 @@ async def test_execute_open_perp_short_dry_run(tmp_path: Path) -> None:
     assert results[0].response["leverage"] == 1
     client.place_perp_order.assert_not_called()
     client.set_leverage.assert_not_called()
+
+
+# ─── USDT margin swap (.33) ─────────────────────────────────────────────────
+
+
+def test_diff_swap_emitted_when_usdt_short_for_open_hedge() -> None:
+    """Open hedge of $50, no USDT in UNIFIED → swap $52.50 (5% buffer)."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        usdt_available_usd="0",
+        perp_market={"TON": _perp("TON", mark="2.0")},
+        perp_positions=[],
+    )
+    d = _decision_with_hedge(hedge_notional=-50.0)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    swaps = [a for a in actions if a.kind == ActionKind.SWAP_SPOT]
+    assert len(swaps) == 1
+    sw = swaps[0]
+    assert sw.product_id == "USDCUSDT"
+    assert sw.coin == "USDT"
+    assert sw.amount == Decimal("52.50")  # 50 * 1.05 buffer
+
+
+def test_diff_no_swap_when_usdt_already_sufficient() -> None:
+    """Existing $60 USDT covers the buffered $52.50 requirement."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        usdt_available_usd="60",
+        perp_market={"TON": _perp("TON", mark="2.0")},
+    )
+    d = _decision_with_hedge(hedge_notional=-50.0)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    assert not [a for a in actions if a.kind == ActionKind.SWAP_SPOT]
+
+
+def test_diff_swap_credits_margin_released_by_closes() -> None:
+    """A close releases USDT margin → reduces required swap."""
+    snap = _snapshot(
+        total_equity_usd="200",
+        usdt_available_usd="0",
+        perp_market={
+            "TON": _perp("TON", mark="2.0"),
+            "DOGE": _perp("DOGE", mark="0.10"),
+        },
+        # Current $40 TON short → will be closed (no TON in target).
+        perp_positions=[
+            _short_pos("TON", size="20", position_value="40.00"),
+        ],
+    )
+    # Decision drops TON, adds DOGE $30 hedge.
+    d = Decision(
+        thesis="switch TON hedge to DOGE.",
+        venues=[
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_onchain", 0.5, [("8", 1.0)]),
+        ],
+        hedges=[Hedge(coin="DOGE", notional_usd=-30.0)],
+        confidence=0.7,
+        risk_flags=[],
+        notes=[],
+        expected_blended_apr_pct=10.0,
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    swaps = [a for a in actions if a.kind == ActionKind.SWAP_SPOT]
+    # required = 30 * 1.05 = 31.5; available = 0 + 40 (closed) = 40 → no swap.
+    assert swaps == []
+
+
+def test_diff_no_swap_when_no_hedges_planned() -> None:
+    snap = _snapshot(total_equity_usd="100", usdt_available_usd="0")
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_flex", 0.5, [("1131", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    assert not [a for a in actions if a.kind == ActionKind.SWAP_SPOT]
+
+
+def test_diff_no_swap_when_open_skipped_due_to_missing_perp_market() -> None:
+    """Hedge requested but `perp_market` absent → OPEN downgrades to SKIP;
+    SKIP doesn't book margin → no swap needed."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        usdt_available_usd="0",
+        perp_market={},
+    )
+    d = _decision_with_hedge(hedge_notional=-50.0)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    assert not [a for a in actions if a.kind == ActionKind.SWAP_SPOT]
+
+
+def test_diff_swap_suppressed_below_min_threshold() -> None:
+    """Sub-dollar shortfall doesn't emit a SWAP — Bybit margin call won't
+    fire on pennies, and a $0.30 swap is more noise than signal."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        usdt_available_usd="52.30",  # buffered req = 52.50 → 0.20 short
+        perp_market={"TON": _perp("TON", mark="2.0")},
+    )
+    d = _decision_with_hedge(hedge_notional=-50.0)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    assert not [a for a in actions if a.kind == ActionKind.SWAP_SPOT]
+
+
+def test_diff_sequence_redeems_closes_swaps_opens_subscribes() -> None:
+    """Full pipeline order — swap must sit between closes and opens so
+    freed margin from closes is counted before the swap, and fresh USDT
+    is available before opens fire."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        usdt_available_usd="0",
+        perp_market={"TON": _perp("TON", mark="2.0")},
+        earn_positions=[_pos("FlexibleSaving", "9999", "20")],  # drop pick
+    )
+    d = Decision(
+        thesis="redeem old flex, open TON hedge with margin swap, sub flex.",
+        venues=[
+            _venue("bybit_flex", 0.5, [("1131", 1.0)]),
+            _venue("bybit_onchain", 0.5, [("8", 1.0)]),
+        ],
+        hedges=[Hedge(coin="TON", notional_usd=-50.0)],
+        confidence=0.7,
+        risk_flags=[],
+        notes=[],
+        expected_blended_apr_pct=12.0,
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    kinds = [a.kind for a in actions]
+    redeem_idx = kinds.index(ActionKind.REDEEM_EARN)
+    swap_idx = kinds.index(ActionKind.SWAP_SPOT)
+    open_idx = kinds.index(ActionKind.OPEN_PERP_SHORT)
+    sub_idx = kinds.index(ActionKind.SUBSCRIBE_EARN)
+    assert redeem_idx < swap_idx < open_idx < sub_idx
+
+
+@pytest.mark.asyncio
+async def test_execute_swap_spot_dry_run(tmp_path: Path) -> None:
+    client = AsyncMock()
+    action = Action(
+        kind=ActionKind.SWAP_SPOT,
+        category="Spot",
+        product_id="USDCUSDT",
+        coin="USDT",
+        amount=Decimal("52.50"),
+        order_link_id="sandbox-test-swap-000",
+        reason="swap for hedge margin",
+    )
+    results = await execute_actions(
+        client,
+        [action],
+        snapshot_ts="20260527T120000Z",
+        dry_run=True,
+        executions_dir=tmp_path,
+    )
+    assert results[0].status == "dry-run"
+    payload = results[0].response
+    assert payload["would_call"] == "place_spot_order"
+    assert payload["side"] == "Sell"
+    assert payload["symbol"] == "USDCUSDT"
+    assert payload["qty"] == "52.50"
+    client.place_spot_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_swap_spot_live_sells_usdc(tmp_path: Path) -> None:
+    client = AsyncMock()
+    client.place_spot_order.return_value = SpotOrderResult(orderId="swap-1")
+    action = Action(
+        kind=ActionKind.SWAP_SPOT,
+        category="Spot",
+        product_id="USDCUSDT",
+        coin="USDT",
+        amount=Decimal("52.50"),
+        order_link_id="sandbox-test-swap-001",
+        reason="margin swap",
+    )
+    results = await execute_actions(
+        client,
+        [action],
+        snapshot_ts="20260527T120000Z",
+        dry_run=False,
+        executions_dir=tmp_path,
+    )
+    assert results[0].status == "ok"
+    assert results[0].response == {"orderId": "swap-1"}
+    client.place_spot_order.assert_awaited_once()
+    kwargs = client.place_spot_order.await_args.kwargs
+    assert kwargs["symbol"] == "USDCUSDT"
+    assert kwargs["side"] == "Sell"
+    assert kwargs["qty"] == "52.50"
+    assert kwargs["order_link_id"] == "sandbox-test-swap-001"
+
+
+# ─── Advance-Earn execution (.35) ──────────────────────────────────────────
+
+
+def _advance_decision(venue_id: str, product_id: str, weight: float = 0.5) -> Decision:
+    return Decision(
+        thesis="advance-Earn pick for sandbox test.",
+        venues=[
+            _venue("cash_usdc", 1.0 - weight),
+            _venue(venue_id, weight, [(product_id, 1.0)]),
+        ],
+        hedges=[],
+        confidence=0.7,
+        risk_flags=[],
+        notes=[],
+        expected_blended_apr_pct=8.0,
+    )
+
+
+def test_diff_dual_assets_emits_subscribe_advance_earn() -> None:
+    quote = _dual_quote(base="BTC", quote_coin="USDT")
+    snap = _snapshot(
+        total_equity_usd="200",
+        advance_earn_quotes={"DualAssets/da-1": quote},
+    )
+    d = _advance_decision("bybit_dual_asset", "da-1", weight=0.2)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN]
+    assert len(subs) == 1
+    a = subs[0]
+    assert a.category == "DualAssets"
+    assert a.product_id == "da-1"
+    assert a.coin == "USDT"
+    # weight 0.2 × 200 = 40
+    assert a.amount == Decimal("40.0")
+    # Reason carries the chosen strike + APR for audit.
+    assert "DualAssets BTC/USDT buyLowPrice" in a.reason
+    # And the encoded offer for executor rebuild.
+    assert " offer=" in a.reason
+
+
+def test_diff_discount_buy_emits_subscribe_advance_earn() -> None:
+    quote = _discount_quote(coin="USDT", inst_uid="inst-xyz")
+    snap = _snapshot(
+        total_equity_usd="100",
+        advance_earn_quotes={"DiscountBuy/db-7": quote},
+    )
+    d = _advance_decision("bybit_discount_buy", "db-7", weight=0.2)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN]
+    assert len(subs) == 1
+    a = subs[0]
+    assert a.category == "DiscountBuy"
+    assert a.product_id == "db-7"
+    assert a.coin == "USDT"
+    assert "inst-xyz" in a.reason
+
+
+def test_diff_advance_earn_missing_quote_emits_skip() -> None:
+    snap = _snapshot(
+        total_equity_usd="200",
+        advance_earn_quotes={},  # quote window didn't include this product
+    )
+    d = _advance_decision("bybit_dual_asset", "da-1", weight=0.2)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    assert not [a for a in actions if a.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN]
+    skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
+    assert any("no cached quote" in s.reason for s in skips)
+
+
+def test_diff_advance_earn_expired_offer_emits_skip() -> None:
+    """Snapshot age outlived the offer window — pick must SKIP, not subscribe
+    to a stale strike that Bybit will reject."""
+    expired_quote = _dual_quote(expired_in_ms=-60_000)  # 1 min ago
+    snap = _snapshot(
+        total_equity_usd="200",
+        advance_earn_quotes={"DualAssets/da-1": expired_quote},
+    )
+    d = _advance_decision("bybit_dual_asset", "da-1", weight=0.2)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    assert not [a for a in actions if a.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN]
+    skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
+    assert any("past expiredTime" in s.reason for s in skips)
+
+
+def test_diff_discount_buy_skips_when_inst_uid_missing() -> None:
+    """instUid is required by place-order — offer without it is broken
+    on Bybit side and would 10005 / 180005 anyway. Surface as SKIP."""
+    quote = _discount_quote(inst_uid=None)
+    snap = _snapshot(
+        total_equity_usd="100",
+        advance_earn_quotes={"DiscountBuy/db-1": quote},
+    )
+    d = _advance_decision("bybit_discount_buy", "db-1", weight=0.2)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    assert not [a for a in actions if a.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN]
+    skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
+    assert any("missing instUid" in s.reason for s in skips)
+
+
+def test_diff_smart_leverage_still_skips_with_explanatory_reason() -> None:
+    """SmartLeverage / DoubleWin remain out-of-scope — `.36` will model
+    their payoff later. The skip reason must NOT mention .11 (that line
+    was tightened in `.35`)."""
+    d = _advance_decision("bybit_smart_leverage", "sl-1", weight=0.1)
+    snap = _snapshot(total_equity_usd="100")
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    skips = [
+        a
+        for a in actions
+        if a.kind == ActionKind.SKIP_OUT_OF_SCOPE and a.category == "SmartLeverage"
+    ]
+    assert len(skips) == 1
+    assert "SmartLeverage" in skips[0].reason
+
+
+@pytest.mark.asyncio
+async def test_execute_subscribe_advance_earn_dry_run(tmp_path: Path) -> None:
+    client = AsyncMock()
+    offer = {
+        "selectPrice": "62000",
+        "side": "Buy",
+        "expiredTime": "9999999999999",
+        "apyE8": "80000000",
+    }
+    action = Action(
+        kind=ActionKind.SUBSCRIBE_ADVANCE_EARN,
+        category="DualAssets",
+        product_id="da-1",
+        coin="USDT",
+        amount=Decimal("40"),
+        order_link_id="sandbox-test-adv-000",
+        reason=f"subscribe DualAssets/da-1 (USDT) $40.00: x offer={json.dumps(offer)}",
+    )
+    results = await execute_actions(
+        client,
+        [action],
+        snapshot_ts="20260527T120000Z",
+        dry_run=True,
+        executions_dir=tmp_path,
+    )
+    assert results[0].status == "dry-run"
+    payload = results[0].response
+    assert payload["would_call"] == "place_advance_earn_order"
+    assert payload["category"] == "DualAssets"
+    assert payload["coin"] == "USDT"
+    assert payload["extra"]["dualAssetsExtra"]["selectPrice"] == "62000"
+    client.place_advance_earn_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_subscribe_advance_earn_live_dual_assets(tmp_path: Path) -> None:
+    client = AsyncMock()
+    client.place_advance_earn_order.return_value = {"orderId": "adv-1"}
+    offer = {
+        "selectPrice": "62000",
+        "side": "Buy",
+        "expiredTime": "9999999999999",
+        "apyE8": "80000000",
+    }
+    action = Action(
+        kind=ActionKind.SUBSCRIBE_ADVANCE_EARN,
+        category="DualAssets",
+        product_id="da-1",
+        coin="USDT",
+        amount=Decimal("40"),
+        order_link_id="sandbox-test-adv-001",
+        reason=f"subscribe DualAssets x offer={json.dumps(offer)}",
+    )
+    results = await execute_actions(
+        client,
+        [action],
+        snapshot_ts="20260527T120000Z",
+        dry_run=False,
+        executions_dir=tmp_path,
+    )
+    assert results[0].status == "ok"
+    assert results[0].response == {"orderId": "adv-1"}
+    client.place_advance_earn_order.assert_awaited_once()
+    kwargs = client.place_advance_earn_order.await_args.kwargs
+    assert kwargs["category"] == "DualAssets"
+    assert kwargs["product_id"] == "da-1"
+    assert kwargs["side"] == "Stake"
+    assert kwargs["coin"] == "USDT"
+    assert kwargs["amount"] == "40"
+    assert kwargs["account_type"] == "UNIFIED"
+    assert kwargs["extra"]["dualAssetsExtra"]["selectPrice"] == "62000"
+    assert kwargs["extra"]["dualAssetsExtra"]["apyE8"] == "80000000"
+
+
+@pytest.mark.asyncio
+async def test_execute_subscribe_advance_earn_live_discount_buy(tmp_path: Path) -> None:
+    client = AsyncMock()
+    client.place_advance_earn_order.return_value = {"orderId": "adv-2"}
+    offer = {
+        "instUid": "inst-xyz",
+        "currentPrice": "65000",
+        "purchasePrice": "63000",
+        "knockoutPrice": "55000",
+        "knockoutCouponE8": "100000000",
+        "expiredAt": "9999999999999",
+    }
+    action = Action(
+        kind=ActionKind.SUBSCRIBE_ADVANCE_EARN,
+        category="DiscountBuy",
+        product_id="db-7",
+        coin="USDT",
+        amount=Decimal("20"),
+        order_link_id="sandbox-test-adv-002",
+        reason=f"subscribe DiscountBuy x offer={json.dumps(offer)}",
+    )
+    results = await execute_actions(
+        client,
+        [action],
+        snapshot_ts="20260527T120000Z",
+        dry_run=False,
+        executions_dir=tmp_path,
+    )
+    assert results[0].status == "ok"
+    kwargs = client.place_advance_earn_order.await_args.kwargs
+    assert kwargs["category"] == "DiscountBuy"
+    assert kwargs["extra"]["discountBuyExtra"]["instUid"] == "inst-xyz"
+    assert kwargs["extra"]["discountBuyExtra"]["purchasePrice"] == "63000"
 
 
 # ─── Approval gate (.12) ───────────────────────────────────────────────────

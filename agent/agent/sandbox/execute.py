@@ -61,10 +61,13 @@ MIN_ACTION_USDC = Decimal("0.50")
 _STABLES = STABLES
 
 # Earn account-type per category. FlexibleSaving runs on UNIFIED;
-# OnChain Earn requires the FUND wallet per Bybit V5 spec.
+# OnChain Earn requires the FUND wallet per Bybit V5 spec. Advance-Earn
+# (DualAssets, DiscountBuy) also runs on UNIFIED per V5 docs (`.35`).
 _ACCOUNT_TYPE: dict[str, str] = {
     "FlexibleSaving": "UNIFIED",
     "OnChain": "FUND",
+    "DualAssets": "UNIFIED",
+    "DiscountBuy": "UNIFIED",
 }
 
 # Bybit Earn categories the executor knows how to drive. LM + advance-
@@ -75,9 +78,18 @@ _BASIC_EARN_CATEGORIES: frozenset[str] = frozenset({"FlexibleSaving", "OnChain"}
 class ActionKind(StrEnum):
     SUBSCRIBE_EARN = "subscribe_earn"
     REDEEM_EARN = "redeem_earn"
+    SUBSCRIBE_ADVANCE_EARN = "subscribe_advance_earn"
     OPEN_PERP_SHORT = "open_perp_short"
     CLOSE_PERP = "close_perp"
+    SWAP_SPOT = "swap_spot"
     SKIP_OUT_OF_SCOPE = "skip_out_of_scope"
+
+
+# Advance-Earn categories the executor knows how to subscribe to (.35).
+# DualAssets + DiscountBuy carry a usable APR from the quote endpoint.
+# SmartLeverage + DoubleWin still SKIP — they're conditional-payoff
+# structured products without a single annualized rate (`.36`).
+_ADVANCE_EARN_CATEGORIES: frozenset[str] = frozenset({"DualAssets", "DiscountBuy"})
 
 
 # A perp hedge is considered "the same size" as a current open position
@@ -85,6 +97,17 @@ class ActionKind(StrEnum):
 # threshold we no-op; at or above, we close-and-reopen (simpler than
 # partial reduce, and avoids guessing minOrderQty steps for the residual).
 HEDGE_NOTIONAL_REBALANCE_THRESHOLD = Decimal("0.10")
+
+# Buffer multiplier on top of the raw hedge notional when sizing the
+# USDT margin reserve (`.33`). Covers Bybit's initial-margin rounding
+# + headroom for funding/fees accumulation between cycles. 5% on a $50
+# hedge = $2.5 extra — cheap insurance against retCode=110007.
+HEDGE_MARGIN_BUFFER = Decimal("1.05")
+
+# Don't swap pennies. Below this threshold the diff suppresses the
+# SWAP action and trusts that Bybit's margin call won't fire on a
+# sub-dollar gap. Mirrors `MIN_ACTION_USDC` philosophy.
+MIN_SWAP_USDC = Decimal("1.00")
 
 
 @dataclass
@@ -171,6 +194,26 @@ def diff_to_actions(
         target = targets.get(key)
         order_link_id = _order_link_id(snapshot_ts, idx)
 
+        if category in _ADVANCE_EARN_CATEGORIES:
+            # Advance-Earn subscribe path (`.35`). Redeem not wired —
+            # DualAssets / DiscountBuy settle automatically at expiry.
+            if target and target.amount_usd > MIN_ACTION_USDC:
+                action = _advance_earn_subscribe_action(
+                    snapshot,
+                    category,
+                    product_id,
+                    target.amount_usd,
+                    order_link_id,
+                )
+                # Helper returns either SUBSCRIBE_ADVANCE_EARN or a
+                # SKIP_OUT_OF_SCOPE explaining what's missing — both
+                # surface in the plan so the operator can diagnose.
+                if action.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN:
+                    subscribes.append(action)
+                else:
+                    skips.append(action)
+            continue
+
         if category not in _BASIC_EARN_CATEGORIES:
             if target and target.amount_usd > MIN_ACTION_USDC:
                 skips.append(
@@ -182,8 +225,9 @@ def diff_to_actions(
                         amount=target.amount_usd,
                         order_link_id=order_link_id,
                         reason=(
-                            f"{category} execution not wired in .11 — "
-                            "follow-up needed for LM / advance-Earn lifecycle"
+                            f"{category} execution not wired — "
+                            "follow-up needed for LM / SmartLeverage / "
+                            "DoubleWin lifecycle"
                         ),
                     )
                 )
@@ -234,17 +278,25 @@ def diff_to_actions(
     #   - current only           → CLOSE_PERP (frees margin)
     #   - both, notional matches → no-op
     #   - both, notional drifts  → CLOSE + reopen at target size
-    # Order in the returned list: redeems → closes → opens → subscribes
-    # → skips. Closes happen BEFORE opens so freed margin is available
-    # for the new shorts in the same cycle.
+    # Order in the returned list: redeems → closes → swaps → opens →
+    # subscribes → skips. Closes happen BEFORE opens so freed margin is
+    # available for the new shorts in the same cycle; swaps fill any
+    # remaining USDT-margin gap before opens (`.33`).
     hedge_closes, hedge_opens = _hedge_diff_actions(
         snapshot,
         decision,
         snapshot_ts,
         idx_offset=len(all_pids),
     )
+    swaps = _swap_actions_for_hedges(
+        snapshot,
+        hedge_opens,
+        hedge_closes,
+        snapshot_ts,
+        idx_offset=len(all_pids) + len(hedge_closes) + len(hedge_opens),
+    )
 
-    return redeems + hedge_closes + hedge_opens + subscribes + skips
+    return redeems + hedge_closes + swaps + hedge_opens + subscribes + skips
 
 
 def _coin_from_perp_symbol(symbol: str) -> str:
@@ -378,6 +430,300 @@ def _hedge_diff_actions(
     return closes, opens
 
 
+def _advance_earn_subscribe_action(
+    snapshot: Snapshot,
+    category: str,
+    product_id: str,
+    target_amount_usd: Decimal,
+    order_link_id: str,
+) -> Action:
+    """Build the SUBSCRIBE_ADVANCE_EARN action for a DualAssets or
+    DiscountBuy pick by pulling the cached quote from the snapshot and
+    selecting an active offer. Returns SKIP_OUT_OF_SCOPE when:
+
+    - the quote is missing entirely (top-K window didn't include this
+      product, or the per-product quote call failed),
+    - all offers are past `expiredAt` (snapshot too old vs settlement
+      window — Bybit offers usually rotate every few minutes for
+      DualAssets, longer for DiscountBuy),
+    - we don't recognize the category-specific offer shape.
+
+    The chosen offer is stashed in `Action.reason` (operator audit) and
+    the `coin` / `amount` fields are set so the executor branch has
+    enough to build the per-category `*Extra` block at dispatch time —
+    actually re-reading the quote then would race against expiry.
+    Instead we encode everything into the Action up front: that snapshot
+    is the source of truth for this cycle.
+    """
+    key = f"{category}/{product_id}"
+    quote = snapshot.advance_earn_quotes.get(key)
+    if not quote:
+        return Action(
+            kind=ActionKind.SKIP_OUT_OF_SCOPE,
+            category=category,
+            product_id=product_id,
+            coin="?",
+            amount=target_amount_usd,
+            order_link_id=order_link_id,
+            reason=(
+                f"{category}/{product_id}: no cached quote in snapshot — "
+                "product fell outside the top-K quote window or the quote "
+                "call failed; pick is unactionable this cycle"
+            ),
+        )
+
+    offer, coin, reason_detail = _pick_advance_offer(category, quote)
+    if offer is None:
+        return Action(
+            kind=ActionKind.SKIP_OUT_OF_SCOPE,
+            category=category,
+            product_id=product_id,
+            coin=coin or "?",
+            amount=target_amount_usd,
+            order_link_id=order_link_id,
+            reason=(
+                f"{category}/{product_id}: no usable offer "
+                f"({reason_detail})"
+            ),
+        )
+
+    # Encode the per-category offer details into the action's reason so
+    # the dispatch can rebuild the extra block without re-parsing the
+    # whole quote (and so post-mortems can see WHY this strike).
+    serialized_offer = json.dumps(offer, sort_keys=True, default=str)
+    return Action(
+        kind=ActionKind.SUBSCRIBE_ADVANCE_EARN,
+        category=category,
+        product_id=product_id,
+        coin=coin,
+        amount=target_amount_usd,
+        order_link_id=order_link_id,
+        reason=(
+            f"subscribe {category}/{product_id} ({coin}) ${target_amount_usd:.2f}: "
+            f"{reason_detail} offer={serialized_offer}"
+        ),
+    )
+
+
+def _pick_advance_offer(
+    category: str, quote: dict[str, Any]
+) -> tuple[dict[str, Any] | None, str, str]:
+    """Return `(offer_dict_or_None, subscription_coin, reason_detail)`
+    for the best actionable offer in `quote` per category-specific shape.
+
+    DualAssets quote shape (`.28`):
+        {category, list: [{currentPrice, expiredTime, baseCoin, quoteCoin,
+        buyLowPrice: [{selectPrice, apyE8, ...}], sellHighPrice: [...]}]}
+    We pick the highest-APR `buyLowPrice` offer (strike below current →
+    we commit to *buying* the base coin at a discount if price drops;
+    stake currency is the quote). High-APR strike is the one closest to
+    current price → most likely conversion, but also most yield per Bybit's
+    pricing curve.
+
+    DiscountBuy quote shape:
+        {category, list: [{purchasePrice, currentPrice, knockoutPrice,
+        knockoutCouponE8, instUid, expiredAt, ...}]}
+    Use `list[0]` (the single posted offer per product). Stake currency
+    is whatever the product's `coin` field says (typically USDT).
+
+    `expiredAt` / `expiredTime` (Bybit uses both spellings across categories)
+    is checked against the current wall clock — past = unusable.
+    """
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+
+    if category == "DualAssets":
+        items = quote.get("list") or []
+        if not items or not isinstance(items[0], dict):
+            return None, "?", "empty quote list"
+        payload = items[0]
+        base = payload.get("baseCoin", "?")
+        quote_coin = payload.get("quoteCoin", "?")
+        coin = quote_coin  # stake currency for the buyLowPrice side
+        expired = payload.get("expiredTime") or payload.get("expiredAt")
+        if _offer_expired(expired, now_ms):
+            return None, coin, f"all offers past expiredTime={expired}"
+        best: tuple[Decimal, dict[str, Any]] | None = None
+        for offer in payload.get("buyLowPrice") or []:
+            raw = offer.get("apyE8")
+            if raw is None:
+                continue
+            try:
+                apy = Decimal(str(raw)) / Decimal("1e8")
+            except (InvalidOperation, TypeError):
+                continue
+            if best is None or apy > best[0]:
+                best = (apy, offer)
+        if best is None:
+            return None, coin, "no buyLowPrice offers with apyE8"
+        apy, offer = best
+        return offer, coin, (
+            f"DualAssets {base}/{quote_coin} buyLowPrice strike="
+            f"{offer.get('selectPrice')} apy={apy:.4f}"
+        )
+
+    if category == "DiscountBuy":
+        items = quote.get("list") or []
+        if not items or not isinstance(items[0], dict):
+            return None, "?", "empty quote list"
+        offer = items[0]
+        coin = offer.get("coin") or "USDT"
+        expired = offer.get("expiredAt") or offer.get("expiredTime")
+        if _offer_expired(expired, now_ms):
+            return None, coin, f"offer past expiredAt={expired}"
+        if not offer.get("instUid"):
+            return None, coin, "offer missing instUid"
+        return offer, coin, (
+            f"DiscountBuy instUid={offer.get('instUid')} "
+            f"purchase={offer.get('purchasePrice')} "
+            f"knockout={offer.get('knockoutPrice')}"
+        )
+
+    return None, "?", f"unsupported advance-Earn category {category}"
+
+
+def _offer_expired(expired_raw: Any, now_ms: int) -> bool:
+    """True when `expired_raw` (unix-ms, string or int) is in the past
+    relative to `now_ms`. Missing / unparseable → True (fail-closed:
+    don't subscribe to an offer of unknown lifetime)."""
+    if expired_raw in (None, ""):
+        return True
+    try:
+        return int(str(expired_raw)) <= now_ms
+    except (ValueError, TypeError):
+        return True
+
+
+_OFFER_PREFIX = " offer="
+
+
+def _decode_offer_from_reason(reason: str) -> dict[str, Any]:
+    """Pull the JSON-encoded offer dict back out of the action's `reason`
+    field. We store it there at diff time so the action is self-contained
+    — no need for the dispatch layer to re-look-up the snapshot, and the
+    operator gets the same blob in plan logs and post-mortem JSONL.
+    Returns `{}` when the reason doesn't carry an offer (e.g. SKIP)."""
+    marker = _OFFER_PREFIX
+    idx = reason.find(marker)
+    if idx < 0:
+        return {}
+    try:
+        return json.loads(reason[idx + len(marker):])
+    except json.JSONDecodeError:
+        return {}
+
+
+def _build_advance_extra(category: str, offer: dict[str, Any]) -> dict[str, Any]:
+    """Translate the cached offer dict into the per-category `*Extra`
+    block `place_advance_earn_order` merges into the request body. Keys
+    mirror Bybit V5 docs verbatim — caller passes the result as `extra=`."""
+    if category == "DualAssets":
+        return {
+            "dualAssetsExtra": {
+                "selectPrice": offer.get("selectPrice"),
+                "side": offer.get("side", "Buy"),
+                "expiredTime": offer.get("expiredTime") or offer.get("expiredAt"),
+                "apyE8": offer.get("apyE8"),
+            }
+        }
+    if category == "DiscountBuy":
+        return {
+            "discountBuyExtra": {
+                "instUid": offer.get("instUid"),
+                "currentPrice": offer.get("currentPrice"),
+                "purchasePrice": offer.get("purchasePrice"),
+                "knockoutPrice": offer.get("knockoutPrice"),
+                "knockoutCouponE8": offer.get("knockoutCouponE8"),
+                "expiredAt": offer.get("expiredAt") or offer.get("expiredTime"),
+            }
+        }
+    return {}
+
+
+def _swap_actions_for_hedges(
+    snapshot: Snapshot,
+    hedge_opens: list[Action],
+    hedge_closes: list[Action],
+    snapshot_ts: str,
+    *,
+    idx_offset: int,
+) -> list[Action]:
+    """Plan a USDC → USDT spot swap when the planned `OPEN_PERP_SHORT`
+    actions need more USDT margin than UNIFIED currently holds (.33).
+
+    Net USDT needed
+        = sum(open notional × HEDGE_MARGIN_BUFFER)
+          − snapshot.wallet.usdt_available_usd
+          − sum(close notional)           # margin released by closes
+
+    A `CLOSE_PERP` releases its IM back to UNIFIED as USDT, so we credit
+    it against the requirement before sizing the swap. SKIP_OUT_OF_SCOPE
+    hedge actions don't book real margin → excluded from the open side.
+
+    The swap uses Bybit's `USDCUSDT` spot pair with `side="Sell"` — i.e.
+    sell USDC (base) for USDT (quote). `qty` is the USDC amount to sell,
+    treated 1:1 with the USDT shortfall (the spread on this stable pair
+    is bps-level; the `HEDGE_MARGIN_BUFFER` already absorbs it).
+
+    Returns an empty list when:
+      - no real OPEN actions planned (only SKIPs or none),
+      - existing USDT already covers the buffered requirement,
+      - the residual shortfall is below `MIN_SWAP_USDC`.
+    """
+    real_opens = [
+        a for a in hedge_opens if a.kind == ActionKind.OPEN_PERP_SHORT
+    ]
+    if not real_opens:
+        return []
+
+    # `Action.amount` for OPEN_PERP_SHORT is in base coin (qty); the
+    # USD notional was burned into `reason` but the cleanest source is
+    # to re-derive it: qty × mark from snapshot.perp_market.
+    open_notional = Decimal(0)
+    for a in real_opens:
+        info = snapshot.perp_market.get(a.coin) or snapshot.perp_market.get(
+            a.coin.upper()
+        )
+        if info is None or info.mark_price is None or info.mark_price <= 0:
+            # Should not happen — diff would have emitted SKIP, not OPEN.
+            # Skip silently; the OPEN itself will fail loudly at execute time.
+            continue
+        open_notional += a.amount * info.mark_price
+
+    close_notional = Decimal(0)
+    for a in hedge_closes:
+        info = snapshot.perp_market.get(a.coin) or snapshot.perp_market.get(
+            a.coin.upper()
+        )
+        if info is None or info.mark_price is None or info.mark_price <= 0:
+            continue
+        close_notional += a.amount * info.mark_price
+
+    required = open_notional * HEDGE_MARGIN_BUFFER
+    available = snapshot.wallet.usdt_available_usd + close_notional
+    shortfall = required - available
+
+    if shortfall < MIN_SWAP_USDC:
+        return []
+
+    qty = shortfall.quantize(Decimal("0.01"))
+    return [
+        Action(
+            kind=ActionKind.SWAP_SPOT,
+            category="Spot",
+            product_id="USDCUSDT",
+            coin="USDT",  # target coin of the swap
+            amount=qty,  # USDC to sell — Bybit Sell uses base-coin qty
+            order_link_id=_order_link_id(snapshot_ts, idx_offset),
+            reason=(
+                f"swap {qty} USDC → USDT: hedge margin shortfall "
+                f"(required ${required:.2f} with {HEDGE_MARGIN_BUFFER:.0%} "
+                f"buffer; have ${snapshot.wallet.usdt_available_usd:.2f} "
+                f"+ ${close_notional:.2f} from closes)"
+            ),
+        )
+    ]
+
+
 def _safe_decimal(value: str | None) -> Decimal:
     if value is None:
         return Decimal(0)
@@ -491,6 +837,37 @@ async def _execute_one(
                 order_link_id=action.order_link_id,
             )
             response = {"orderId": out.orderId}
+        elif action.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN:
+            # `.35`: dispatch DualAssets / DiscountBuy stake. Offer was
+            # pinned at diff time (encoded in action.reason) — rebuild
+            # the `*Extra` block from it instead of refetching the quote
+            # (which could rotate between diff and execute and silently
+            # change the strike we're committing to).
+            offer = _decode_offer_from_reason(action.reason)
+            extra = _build_advance_extra(action.category, offer)
+            raw = await client.place_advance_earn_order(
+                category=action.category,
+                product_id=action.product_id,
+                side="Stake",
+                coin=action.coin,
+                amount=str(action.amount),
+                account_type=_ACCOUNT_TYPE[action.category],  # type: ignore[arg-type]
+                order_link_id=action.order_link_id,
+                extra=extra,
+            )
+            response = {"orderId": raw.get("orderId")}
+        elif action.kind == ActionKind.SWAP_SPOT:
+            # USDC → USDT via the USDCUSDT spot pair. Bybit's spot
+            # Market Sell uses base-coin qty (USDC here); Market Buy
+            # would use quote, which is the asymmetry flagged in `.27`.
+            # We always swap by selling USDC, so `qty` is always base.
+            out = await client.place_spot_order(
+                symbol=action.product_id,
+                side="Sell",
+                qty=str(action.amount),
+                order_link_id=action.order_link_id,
+            )
+            response = {"orderId": out.orderId}
         else:
             side = "Stake" if action.kind == ActionKind.SUBSCRIBE_EARN else "Redeem"
             account_type = _ACCOUNT_TYPE[action.category]
@@ -549,6 +926,26 @@ def _dry_run_payload(action: Action) -> dict[str, Any]:
             "symbol": action.product_id,
             "qty": str(action.amount),
             "reduce_only": True,
+            "order_link_id": action.order_link_id,
+        }
+    if action.kind == ActionKind.SWAP_SPOT:
+        return {
+            "would_call": "place_spot_order",
+            "side": "Sell",
+            "symbol": action.product_id,
+            "qty": str(action.amount),
+            "order_link_id": action.order_link_id,
+        }
+    if action.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN:
+        offer = _decode_offer_from_reason(action.reason)
+        return {
+            "would_call": "place_advance_earn_order",
+            "side": "Stake",
+            "category": action.category,
+            "product_id": action.product_id,
+            "amount": str(action.amount),
+            "coin": action.coin,
+            "extra": _build_advance_extra(action.category, offer),
             "order_link_id": action.order_link_id,
         }
     return {
@@ -761,8 +1158,10 @@ def _render_plan_summary(actions: list[Action]) -> str:
     for kind in (
         ActionKind.REDEEM_EARN,
         ActionKind.CLOSE_PERP,
+        ActionKind.SWAP_SPOT,
         ActionKind.OPEN_PERP_SHORT,
         ActionKind.SUBSCRIBE_EARN,
+        ActionKind.SUBSCRIBE_ADVANCE_EARN,
         ActionKind.SKIP_OUT_OF_SCOPE,
     ):
         rows = by_kind.get(kind, [])
