@@ -293,18 +293,17 @@ Side = Literal["Buy", "Sell"]
 EarnSide = Literal["Stake", "Redeem"]
 AccountType = Literal["FUND", "UNIFIED"]
 EarnCategory = Literal["FlexibleSaving", "OnChain"]
-AdvanceEarnCategory = Literal[
-    "SmartLeverage", "DiscountBuy", "DualAssets", "DoubleWin", "LiquidityMining"
-]
+AdvanceEarnCategory = Literal["SmartLeverage", "DiscountBuy", "DualAssets", "DoubleWin"]
 
-# Per the V5 enum (Advanced-Earn-category, checked 2026-05-27). All five
-# share the same /v5/earn/advance/* endpoint family and discriminate by
-# `category` query/body param. The standalone `/v5/earn/liquidity-mining/
-# product-info` returns 404 — LM rides the shared advance endpoint like
-# the other categories; if Bybit doesn't recognize the name the call
-# surfaces as BybitAPIError, which is fine.
+# Per the V5 enum (Advanced-Earn-category, checked 2026-05-27).
+# All four share /v5/earn/advance/* and discriminate by `category`.
+# LiquidityMining was originally bucketed here but it lives in its own
+# namespace `/v5/earn/liquidity-mining/*` (verified .24, 2026-05-27)
+# with a different shape (baseCoin/quoteCoin LP pair instead of
+# single-coin stake) — use the dedicated `list_liquidity_mining_products`
+# family of methods instead.
 ADVANCE_EARN_CATEGORIES: frozenset[str] = frozenset(
-    {"SmartLeverage", "DiscountBuy", "DualAssets", "DoubleWin", "LiquidityMining"}
+    {"SmartLeverage", "DiscountBuy", "DualAssets", "DoubleWin"}
 )
 
 
@@ -734,6 +733,97 @@ class BybitClient:
                 f"unknown advance-Earn category {category!r}; "
                 f"valid: {sorted(cls._ADVANCE_EARN_CATEGORIES)}"
             )
+
+    # ─── Liquidity Mining (own /v5/earn/liquidity-mining/* namespace) ────
+    # LM is structurally different from the four advance-Earn categories
+    # — products are LP pairs (baseCoin + quoteCoin) with leverage, not
+    # single-coin stakes — so it gets its own endpoint family rather than
+    # riding /v5/earn/advance/*. All methods return raw dicts per the
+    # .17 / .20 Variant C decision; per-category typed models can be
+    # added later if `.6` needs them.
+
+    async def list_liquidity_mining_products(
+        self,
+        base_coin: str | None = None,
+        quote_coin: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List Liquidity Mining products via
+        `/v5/earn/liquidity-mining/product`. Each row carries an LP pair
+        (`baseCoin` + `quoteCoin`), `maxLeverage`, `apyE8` / `apy7dE8`
+        (e8 precision — divide by 1e8 for the actual rate), pool size,
+        and the slippage tier ladder. Returns the inner `products` array
+        as raw dicts.
+        """
+        params: dict[str, Any] = {}
+        if base_coin is not None:
+            params["baseCoin"] = base_coin
+        if quote_coin is not None:
+            params["quoteCoin"] = quote_coin
+        data = await self._request(
+            "GET", "/v5/earn/liquidity-mining/product", params=params
+        )
+        result = data.get("result") or {}
+        items = result.get("products", [])
+        return list(items) if isinstance(items, list) else []
+
+    async def get_liquidity_mining_positions(
+        self,
+        product_id: str | None = None,
+        base_coin: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Active Liquidity Mining positions via
+        `/v5/earn/liquidity-mining/position`. Position amounts are
+        dynamically calculated against the current market price —
+        `quoteAmount`, `baseAmount`, `currentApr` (e8 precision),
+        `liquidationPrice`, etc. all reflect snapshot-at-call.
+
+        Requires Earn permission on the API key; same sub-account
+        permission gate as `.4` — expect 10005 on sandbox until
+        unblocked.
+        """
+        params: dict[str, Any] = {}
+        if product_id is not None:
+            params["productId"] = product_id
+        if base_coin is not None:
+            params["baseCoin"] = base_coin
+        data = await self._request(
+            "GET", "/v5/earn/liquidity-mining/position", params=params
+        )
+        result = data.get("result") or {}
+        items = result.get("positions", [])
+        return list(items) if isinstance(items, list) else []
+
+    async def get_liquidity_mining_yield_records(
+        self,
+        base_coin: str | None = None,
+        quote_coin: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Yield claim history via `/v5/earn/liquidity-mining/yield-records`.
+        Includes both `Manual` claims and `RemoveLiquidity`-settled
+        yields. Same Earn-permission gate as the positions endpoint.
+        Returns the raw `{records, nextPageCursor}` envelope.
+        """
+        params: dict[str, Any] = {}
+        if base_coin is not None:
+            params["baseCoin"] = base_coin
+        if quote_coin is not None:
+            params["quoteCoin"] = quote_coin
+        if start_time is not None:
+            params["startTime"] = start_time
+        if end_time is not None:
+            params["endTime"] = end_time
+        if limit is not None:
+            params["limit"] = limit
+        if cursor is not None:
+            params["cursor"] = cursor
+        data = await self._request(
+            "GET", "/v5/earn/liquidity-mining/yield-records", params=params
+        )
+        return data.get("result") or {}
 
     async def place_earn_order(
         self,

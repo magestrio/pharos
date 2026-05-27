@@ -348,6 +348,90 @@ def asset_overview(
     asyncio.run(run())
 
 
+@cli.command(name="lm-products")
+@click.option("--base-coin", default=None, help="Filter by LP base coin (e.g. ETH).")
+@click.option("--quote-coin", default=None, help="Filter by LP quote coin (e.g. USDT).")
+@click.pass_context
+def lm_products(
+    ctx: click.Context, base_coin: str | None, quote_coin: str | None
+) -> None:
+    """List Liquidity Mining products (/v5/earn/liquidity-mining/product).
+
+    LM lives in its own /v5/earn/liquidity-mining/* namespace, NOT under
+    /v5/earn/advance/* (per .24 investigation 2026-05-27)."""
+
+    async def run() -> None:
+        async with _build_client(ctx.obj["env_file"]) as client:
+            result = await client.list_liquidity_mining_products(
+                base_coin=base_coin, quote_coin=quote_coin
+            )
+        _print(result)
+        slug = f"{base_coin or 'all'}-{quote_coin or 'all'}"
+        path = _capture(f"lm-products-{slug}", result)
+        click.secho(f"\ncaptured → {path}", fg="green")
+
+    asyncio.run(run())
+
+
+@cli.command(name="lm-positions")
+@click.option("--product-id", default=None)
+@click.option("--base-coin", default=None)
+@click.pass_context
+def lm_positions(
+    ctx: click.Context, product_id: str | None, base_coin: str | None
+) -> None:
+    """Active LM positions (/v5/earn/liquidity-mining/position).
+    Earn-permission gated; expect 10005 on sandbox per .4."""
+
+    async def run() -> None:
+        async with _build_client(ctx.obj["env_file"]) as client:
+            result = await client.get_liquidity_mining_positions(
+                product_id=product_id, base_coin=base_coin
+            )
+        _print(result)
+        path = _capture(f"lm-positions-{product_id or base_coin or 'all'}", result)
+        click.secho(f"\ncaptured → {path}", fg="green")
+
+    asyncio.run(run())
+
+
+@cli.command(name="lm-yield-records")
+@click.option("--base-coin", default=None)
+@click.option("--quote-coin", default=None)
+@click.option("--start", "start_time", type=int, default=None, help="Unix ms.")
+@click.option("--end", "end_time", type=int, default=None, help="Unix ms.")
+@click.option("--limit", type=int, default=None, help="Default 20, max 50.")
+@click.option("--cursor", default=None)
+@click.pass_context
+def lm_yield_records(
+    ctx: click.Context,
+    base_coin: str | None,
+    quote_coin: str | None,
+    start_time: int | None,
+    end_time: int | None,
+    limit: int | None,
+    cursor: str | None,
+) -> None:
+    """LM yield claim history (/v5/earn/liquidity-mining/yield-records).
+    Earn-permission gated."""
+
+    async def run() -> None:
+        async with _build_client(ctx.obj["env_file"]) as client:
+            result = await client.get_liquidity_mining_yield_records(
+                base_coin=base_coin,
+                quote_coin=quote_coin,
+                start_time=start_time,
+                end_time=end_time,
+                limit=limit,
+                cursor=cursor,
+            )
+        _print(result)
+        path = _capture(f"lm-yield-records-{base_coin or 'all'}", result)
+        click.secho(f"\ncaptured → {path}", fg="green")
+
+    asyncio.run(run())
+
+
 @cli.command()
 @click.option("--coin", default=None, help="Restrict to a single coin (default: all).")
 @click.option(

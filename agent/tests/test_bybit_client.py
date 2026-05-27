@@ -520,7 +520,10 @@ async def test_poll_redemption_credited_delegates_to_deposit_poller(captured):
 
 @pytest.mark.parametrize(
     "category",
-    ["DualAssets", "DiscountBuy", "SmartLeverage", "DoubleWin", "LiquidityMining"],
+    # LiquidityMining intentionally absent — it lives in its own
+    # /v5/earn/liquidity-mining/* namespace, not under advance-Earn
+    # (verified .24, 2026-05-27).
+    ["DualAssets", "DiscountBuy", "SmartLeverage", "DoubleWin"],
 )
 @pytest.mark.asyncio
 async def test_list_advance_earn_products_routes_to_correct_path(captured, category):
@@ -758,6 +761,126 @@ async def test_place_advance_earn_order_rejects_basic_category():
                 account_type="FUND",
                 order_link_id="lid",
             )
+
+
+# ─── liquidity-mining (own namespace, not under advance-Earn) ───────────────
+
+
+@pytest.mark.asyncio
+async def test_list_liquidity_mining_products_uses_dedicated_path(captured):
+    """LM is NOT in ADVANCE_EARN_CATEGORIES — it lives at
+    `/v5/earn/liquidity-mining/product` with baseCoin/quoteCoin filters
+    instead of the category-discriminator pattern. Result is unwrapped
+    from `result.products` (not `result.list`)."""
+    fixture = {
+        "products": [
+            {
+                "productId": "5",
+                "baseCoin": "ETH",
+                "quoteCoin": "USDT",
+                "status": "Available",
+                "maxLeverage": 3,
+                "apyE8": "13714946",
+            }
+        ]
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        items = await c.list_liquidity_mining_products(
+            base_coin="ETH", quote_coin="USDT"
+        )
+
+    req = captured[0]
+    assert req.url.path == "/v5/earn/liquidity-mining/product"
+    assert dict(req.url.params) == {"baseCoin": "ETH", "quoteCoin": "USDT"}
+    assert items == fixture["products"]
+
+
+@pytest.mark.asyncio
+async def test_list_liquidity_mining_products_omits_unset_filters(captured):
+    async with _client(captured, lambda _r: _ok({"products": []})) as c:
+        await c.list_liquidity_mining_products()
+    assert dict(captured[0].url.params) == {}
+
+
+@pytest.mark.asyncio
+async def test_list_liquidity_mining_products_handles_missing_products_key(captured):
+    """When the result envelope is empty (`{}`) the method must return
+    `[]`, not raise — Bybit returns this when no products match."""
+    async with _client(captured, lambda _r: _ok({})) as c:
+        items = await c.list_liquidity_mining_products(base_coin="DOGE")
+    assert items == []
+
+
+@pytest.mark.asyncio
+async def test_get_liquidity_mining_positions_routes_correctly(captured):
+    fixture = {
+        "positions": [
+            {
+                "positionId": "1498",
+                "productId": "5",
+                "baseCoin": "ETH",
+                "quoteCoin": "USDT",
+                "status": "Active",
+            }
+        ]
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        items = await c.get_liquidity_mining_positions(base_coin="ETH")
+
+    req = captured[0]
+    assert req.url.path == "/v5/earn/liquidity-mining/position"
+    assert dict(req.url.params) == {"baseCoin": "ETH"}
+    assert items == fixture["positions"]
+
+
+@pytest.mark.asyncio
+async def test_get_liquidity_mining_yield_records_passes_all_params(captured):
+    fixture = {
+        "records": [
+            {
+                "coin": "USDT",
+                "amount": "0.0098",
+                "baseCoin": "ETH",
+                "quoteCoin": "USDT",
+                "type": "Manual",
+                "status": "Complete",
+                "createdTime": "1775125850000",
+            }
+        ],
+        "nextPageCursor": "",
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        result = await c.get_liquidity_mining_yield_records(
+            base_coin="ETH",
+            quote_coin="USDT",
+            start_time=1_700_000_000_000,
+            end_time=1_700_500_000_000,
+            limit=50,
+            cursor="prev",
+        )
+
+    req = captured[0]
+    assert req.url.path == "/v5/earn/liquidity-mining/yield-records"
+    assert dict(req.url.params) == {
+        "baseCoin": "ETH",
+        "quoteCoin": "USDT",
+        "startTime": "1700000000000",
+        "endTime": "1700500000000",
+        "limit": "50",
+        "cursor": "prev",
+    }
+    assert result == fixture
+
+
+@pytest.mark.asyncio
+async def test_liquidity_mining_no_longer_in_advance_earn_categories():
+    """Regression guard for .24 — LM was bug-bucketed into the advance-
+    Earn category set; removing it shifts callers onto the dedicated
+    `list_liquidity_mining_products` path. ValueError ensures any stale
+    caller fails loudly instead of silently 404'ing or, worse, 180001'ing."""
+    async with _client([], lambda _r: _ok({"list": []})) as c:
+        with pytest.raises(ValueError, match="unknown advance-Earn category"):
+            await c.list_advance_earn_products(category="LiquidityMining")
 
 
 # ─── hourly-yield ───────────────────────────────────────────────────────────
