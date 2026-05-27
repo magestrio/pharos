@@ -20,12 +20,12 @@ import time
 import urllib.parse
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Generic, Literal, TypeVar
+from typing import Annotated, Any, Generic, Literal, TypeVar, Union
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from .config import OracleSettings, settings
 from .structured_log import get_logger
@@ -69,24 +69,18 @@ class BonusEvent(BaseModel):
     announcement: str | None = None
 
 
-class EarnProduct(BaseModel):
-    """Basic Earn product (FlexibleSaving | OnChain) per /v5/earn/product.
-
-    Field families:
-    - identity: productId, coin, category, status
-    - APR / amounts: estimateApr, min/maxStakeAmount, min/maxRedeemAmount,
-      precision, bonusEvents
-    - shape: duration ("Fixed" | "Flexible"), term (days, Fixed OnChain),
-      rewardDistributionType, rewardIntervalMinute, redeemProcessingMinute
-    - LST-only (OnChain): swapCoin, swapCoinPrecision, stakeExchangeRate,
-      redeemExchangeRate, stakeTime, interestCalculationTime
+class _BaseEarnProduct(BaseModel):
+    """Shared fields across FlexibleSaving + OnChain legacy Earn products.
+    Not exported on its own — use the per-category subclasses
+    (`FlexibleEarnProduct`, `OnChainEarnProduct`) or parse a raw payload
+    via `parse_earn_product()` (or directly the `EarnProduct` union
+    annotation in another pydantic model).
     """
 
     model_config = ConfigDict(extra="ignore")
 
     productId: str
     coin: str
-    category: str
     status: str | None = None  # Available | NotAvailable
     estimateApr: str | None = None
     minStakeAmount: str | None = None
@@ -95,17 +89,73 @@ class EarnProduct(BaseModel):
     bonusEvents: list[BonusEvent] = Field(default_factory=list)
     minRedeemAmount: str | None = None
     maxRedeemAmount: str | None = None
-    duration: str | None = None  # Fixed | Flexible; empty string for some products
-    term: int | None = None  # in days; non-zero only for OnChain Fixed
+    rewardDistributionType: str | None = None  # Simple | Compound | Other
+    rewardIntervalMinute: int | None = None
+    # Bybit V5 returns this inconsistently — `"0"` for some products,
+    # raw int `0` for others (observed live 2026-05-27 on `list_earn_
+    # products(FlexibleSaving, USDC)`). Accept both.
+    redeemProcessingMinute: int | str | None = None
+
+
+class FlexibleEarnProduct(_BaseEarnProduct):
+    """`/v5/earn/product?category=FlexibleSaving` row. No lockup —
+    `duration` is always `"Flexible"` (or empty string for legacy
+    products); there is no `term` field server-side.
+    """
+
+    category: Literal["FlexibleSaving"]
+    duration: str | None = None  # Flexible | "" (legacy)
+
+
+class OnChainEarnProduct(_BaseEarnProduct):
+    """`/v5/earn/product?category=OnChain` row. Carries the Fixed-vs-
+    Flexible discriminator on `duration` + `term`:
+
+    - `duration == "Fixed"` AND `term > 0`  →  lockup window in days,
+      `stakeTime` + `term` give the settlement deadline. Validator
+      (`.9`) must reject staking when `settlementTime < now + rebalance
+      interval`.
+    - `duration == "Flexible"` AND `term == 0`  →  instant redeem,
+      same shape as `FlexibleEarnProduct` semantically.
+
+    LST products (cmETH-like wrappers) populate the `swapCoin` /
+    `*ExchangeRate` fields — orchestrator swaps `coin` → `swapCoin`
+    at `stakeExchangeRate`.
+    """
+
+    category: Literal["OnChain"]
+    duration: str | None = None  # Fixed | Flexible | "" (legacy)
+    term: int | None = None  # in days; non-zero only for Fixed
     swapCoin: str | None = None
     swapCoinPrecision: str | None = None
     stakeExchangeRate: str | None = None
     redeemExchangeRate: str | None = None
-    rewardDistributionType: str | None = None  # Simple | Compound | Other
-    rewardIntervalMinute: int | None = None
-    redeemProcessingMinute: str | None = None
     stakeTime: str | None = None  # unix ms as string
     interestCalculationTime: str | None = None  # unix ms as string
+
+
+# Discriminated union for legacy `/v5/earn/product`. Use as a type
+# annotation inside other pydantic models (pydantic resolves the
+# discriminator natively when the field is `list[EarnProduct]` or
+# `EarnProduct`). For ad-hoc parsing from a raw dict, call
+# `parse_earn_product()`.
+EarnProduct = Annotated[
+    Union[FlexibleEarnProduct, OnChainEarnProduct],
+    Field(discriminator="category"),
+]
+
+_EARN_PRODUCT_ADAPTER: TypeAdapter[Union[FlexibleEarnProduct, OnChainEarnProduct]] = (
+    TypeAdapter(EarnProduct)
+)
+
+
+def parse_earn_product(data: dict[str, Any]) -> FlexibleEarnProduct | OnChainEarnProduct:
+    """Parse one raw `/v5/earn/product` item into the matching typed
+    subclass, discriminated by `category`. Use this in test fixtures and
+    one-off parsing; inside other pydantic models prefer annotating the
+    field with `EarnProduct` directly so pydantic does the dispatch.
+    """
+    return _EARN_PRODUCT_ADAPTER.validate_python(data)
 
 
 class EarnProductList(BaseModel):
@@ -439,7 +489,7 @@ class BybitClient:
 
     async def list_earn_products(
         self, category: str | None = None, coin: str | None = None
-    ) -> list[EarnProduct]:
+    ) -> list[FlexibleEarnProduct | OnChainEarnProduct]:
         """List Earn products via the legacy `/v5/earn/product` endpoint.
         `category` accepts `FlexibleSaving` (default) and `OnChain`. Other
         Earn families live on different paths — use

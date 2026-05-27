@@ -13,7 +13,8 @@ from agent.bybit_oracle.bybit_client import (
     BybitClient,
     BybitOrderError,
     DepositChain,
-    EarnProduct,
+    FlexibleEarnProduct,
+    OnChainEarnProduct,
 )
 from agent.bybit_oracle.bybit_client import (  # noqa: E501 — keep typed-model surface explicit
     BonusEvent,
@@ -64,7 +65,7 @@ async def test_get_signs_query_string_correctly(captured):
         products = await c.list_earn_products(category="FlexibleSaving", coin="USDC")
 
     assert len(products) == 1
-    assert isinstance(products[0], EarnProduct)
+    assert isinstance(products[0], FlexibleEarnProduct)
     assert products[0].productId == "p1"
 
     req = captured[0]
@@ -950,8 +951,10 @@ async def test_get_asset_overview_omits_unset_params(captured):
 
 @pytest.mark.asyncio
 async def test_earn_product_parses_full_flexible_saving_payload(captured):
-    """Verbatim Flexible BTC sample from the V5 spec — must not drop any
-    documented field."""
+    """Verbatim Flexible BTC sample from the V5 spec — shared/Flexible
+    fields must round-trip; OnChain-only fields (term, swap*) are
+    correctly absent on the typed FlexibleEarnProduct subclass after
+    the .20 discriminated-union split."""
     fixture = {
         "list": [
             {
@@ -985,13 +988,47 @@ async def test_earn_product_parses_full_flexible_saving_payload(captured):
 
     assert len(products) == 1
     p = products[0]
+    assert isinstance(p, FlexibleEarnProduct)
     assert p.productId == "430"
     assert p.status == "Available"
     assert p.precision == "8"
     assert p.duration == ""
-    assert p.term == 0
     assert p.bonusEvents == []
     assert p.rewardIntervalMinute == 0
+    assert p.redeemProcessingMinute == "0"
+    assert not hasattr(p, "term")
+    assert not hasattr(p, "swapCoin")
+
+
+@pytest.mark.asyncio
+async def test_earn_product_accepts_int_redeem_processing_minute(captured):
+    """Bybit V5 returns `redeemProcessingMinute` inconsistently — `"0"`
+    string for some products, raw int `0` for others (live-observed
+    2026-05-27 on FlexibleSaving USDC). Both must parse without error.
+    """
+    fixture = {
+        "list": [
+            {
+                "productId": "int-rpm",
+                "coin": "USDC",
+                "category": "FlexibleSaving",
+                "redeemProcessingMinute": 0,
+            },
+            {
+                "productId": "str-rpm",
+                "coin": "USDC",
+                "category": "FlexibleSaving",
+                "redeemProcessingMinute": "30",
+            },
+        ]
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        products = await c.list_earn_products(category="FlexibleSaving", coin="USDC")
+
+    int_rpm = next(p for p in products if p.productId == "int-rpm")
+    str_rpm = next(p for p in products if p.productId == "str-rpm")
+    assert int_rpm.redeemProcessingMinute == 0
+    assert str_rpm.redeemProcessingMinute == "30"
 
 
 @pytest.mark.asyncio

@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent.bybit_oracle.bybit_client import EarnProduct
+from agent.bybit_oracle.bybit_client import FlexibleEarnProduct
 from agent.bybit_oracle.product_picker import (
     FlexibleUsdcPicker,
     NoProductAvailable,
@@ -11,7 +11,9 @@ from agent.bybit_oracle.product_picker import (
 )
 
 
-def _product(pid: str, apr: str | None = "1.0", coin: str = "USDC") -> EarnProduct:
+def _product(
+    pid: str, apr: str | None = "1.0", coin: str = "USDC"
+) -> FlexibleEarnProduct:
     data: dict[str, object] = {
         "productId": pid,
         "coin": coin,
@@ -19,10 +21,10 @@ def _product(pid: str, apr: str | None = "1.0", coin: str = "USDC") -> EarnProdu
     }
     if apr is not None:
         data["estimateApr"] = apr
-    return EarnProduct.model_validate(data)
+    return FlexibleEarnProduct.model_validate(data)
 
 
-def _client_returning(products: list[EarnProduct]) -> AsyncMock:
+def _client_returning(products: list[FlexibleEarnProduct]) -> AsyncMock:
     client = AsyncMock()
     client.list_earn_products.return_value = products
     return client
