@@ -3,7 +3,8 @@
 import { useState } from "react";
 
 import { CONTRACTS, TICKER_ITEMS } from "@/lib/data";
-import { HashChip, Icon, LiveDot, Ticker } from "@/components/ui";
+import { HashChip, Icon, LiveDot } from "@/components/ui";
+import { LiveTicker } from "@/components/live-ticker";
 import { DecisionLog } from "@/components/screens/decision-log";
 import { HumanVsAi } from "@/components/screens/human-vs-ai";
 import { VaultCard } from "@/components/screens/vault-card";
@@ -90,7 +91,7 @@ export function Shell() {
         </div>
       </header>
 
-      <Ticker items={TICKER_ITEMS} />
+      <LiveTicker fallback={TICKER_ITEMS} />
 
       <main className="relative flex-1 max-w-[1440px] mx-auto w-full px-4 sm:px-6 lg:px-8 py-8 sm:py-10">
         {tab === "vault" && <VaultCard />}
