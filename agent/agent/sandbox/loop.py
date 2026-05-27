@@ -83,6 +83,8 @@ async def run_one_cycle(
     live: bool,
     yes: bool,
     min_confidence: float,
+    mantle_rpc_url: str | None = None,
+    mantle_vault_address: str | None = None,
 ) -> dict[str, Any]:
     """Execute one full snapshot→decide→validate→approval→execute pass.
 
@@ -105,7 +107,11 @@ async def run_one_cycle(
 
     try:
         # 1. Snapshot
-        snap = await collect_snapshot(bybit_client)
+        snap = await collect_snapshot(
+            bybit_client,
+            mantle_rpc_url=mantle_rpc_url,
+            mantle_vault_address=mantle_vault_address,
+        )
         snap_path = write_snapshot(snap)
         outcome["snapshot_filename"] = snap_path.name
         outcome["stages"].append("snapshot")
@@ -191,6 +197,8 @@ async def run_loop(
     once: bool = False,
     cycle_log_path: Path = CYCLE_LOG,
     stop_event: asyncio.Event | None = None,
+    mantle_rpc_url: str | None = None,
+    mantle_vault_address: str | None = None,
 ) -> None:
     """Run cycles indefinitely (or once) at `interval_seconds` apart.
 
@@ -241,6 +249,8 @@ async def run_loop(
                 live=live,
                 yes=yes,
                 min_confidence=min_confidence,
+                mantle_rpc_url=mantle_rpc_url,
+                mantle_vault_address=mantle_vault_address,
             )
             with cycle_log_path.open("a") as f:
                 f.write(json.dumps(outcome) + "\n")
@@ -327,6 +337,14 @@ def _main() -> None:
         stream=sys.stderr,
     )
 
+    # Read Mantle on-chain config after env load so `.37a` Aave fetch
+    # picks up the freshly-set values. Empty strings = on-chain leg off
+    # (snapshot collector logs a warning and `on_chain_state` stays None).
+    from agent.bybit_oracle.config import OracleSettings
+    oracle_cfg = OracleSettings()
+    mantle_rpc_url = oracle_cfg.MANTLE_RPC_URL or None
+    mantle_vault_address = oracle_cfg.MANTLE_VAULT_ADDRESS or None
+
     asyncio.run(
         run_loop(
             interval_seconds=args.interval,
@@ -334,6 +352,8 @@ def _main() -> None:
             yes=args.yes,
             min_confidence=args.min_confidence,
             once=args.once,
+            mantle_rpc_url=mantle_rpc_url,
+            mantle_vault_address=mantle_vault_address,
         )
     )
 
