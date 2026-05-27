@@ -42,6 +42,13 @@ from agent.bybit_oracle.bybit_client import (
     PerpPosition,
 )
 from agent.bybit_oracle.promo_whitelist import get_promo_effective_apr
+from agent.sandbox.on_chain import (
+    AAVE_V3_POOL_ADDRESS,
+    AaveV3UsdcState,
+    fetch_aave_v3_usdc_state,
+    make_mantle_client,
+    micro_to_usd,
+)
 
 SCHEMA_VERSION = 1
 TOP_K = 20
@@ -112,6 +119,31 @@ class MarketSnapshot(BaseModel):
     eth_funding_rate: Decimal | None = None
 
 
+class AaveV3UsdcSnapshot(BaseModel):
+    """Aave V3 USDC pool state + vault balances on Mantle (`.37a`).
+
+    `supply_apr` is fractional (0.0345 = 3.45% APY). Vault balances are
+    USD-equivalent (USDC at 1:1) — the raw micro-units stay in the
+    on_chain layer; here we surface the dollars-per-the-LLM."""
+
+    model_config = ConfigDict(extra="ignore")
+    block_number: int
+    fetched_at: datetime
+    pool_address: str
+    supply_apr: Decimal
+    vault_usdc_usd: Decimal
+    vault_ausdc_usd: Decimal
+
+
+class OnChainState(BaseModel):
+    """Mantle on-chain context for the LLM. Currently scoped to Aave V3
+    USDC (`.37a`); future venues (Lendle, Pendle, etc.) attach as
+    sibling fields."""
+
+    model_config = ConfigDict(extra="ignore")
+    aave_v3_usdc: AaveV3UsdcSnapshot | None = None
+
+
 class UsdcPegSnapshot(BaseModel):
     model_config = ConfigDict(extra="ignore")
     price_usd: Decimal | None = None
@@ -167,6 +199,11 @@ class Snapshot(BaseModel):
     # LLM doesn't see this — it consumes the normalized APR via
     # `products[Category][i].effective_apr` instead.
     advance_earn_quotes: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    # Mantle on-chain context (`.37a`). Carries Aave V3 USDC pool APR
+    # + vault balances so the LLM can compare CEX vs DeFi rates in one
+    # snapshot. None when the RPC fetch fails (Mantle outage, missing
+    # vault address config) — Bybit side of the snapshot stays usable.
+    on_chain_state: OnChainState | None = None
     # Open linear-perp positions (USDT-settled). Drives the close-arm of
     # the executor diff so each cycle reconciles current shorts against
     # `decision.hedges` instead of blindly opening new ones (.32).
@@ -488,6 +525,25 @@ async def _safe_earn(
         raise
 
 
+def _safe_fetch_aave_v3(
+    rpc_url: str,
+    vault_address: str,
+    errors: list[str],
+) -> AaveV3UsdcState | None:
+    """Synchronous Aave V3 fetch wrapped for the snapshot's thread-pool
+    leg (`.37a`). Any RPC or contract error degrades the on-chain block
+    to `None` with a warning so the Bybit side of the snapshot survives
+    a Mantle outage — same fail-soft contract as `_safe_earn` /
+    `_safe_perp_positions`.
+    """
+    try:
+        w3 = make_mantle_client(rpc_url)
+        return fetch_aave_v3_usdc_state(w3, vault_address)
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"on_chain_state[aave_v3_usdc]: {type(e).__name__}: {e}")
+        return None
+
+
 async def _safe_perp_positions(
     coro, errors: list[str], label: str
 ) -> list[PerpPosition]:
@@ -781,9 +837,19 @@ async def _fetch_usdc_peg(timeout: float = 5.0) -> UsdcPegSnapshot:
         return UsdcPegSnapshot(price_usd=None, deviation_bps=None, fetched_at=fetched)
 
 
-async def collect_snapshot(client: BybitClient) -> Snapshot:
+async def collect_snapshot(
+    client: BybitClient,
+    *,
+    mantle_rpc_url: str | None = None,
+    mantle_vault_address: str | None = None,
+) -> Snapshot:
     """Build a full sandbox snapshot. All independent calls run
     concurrently — wall-clock ~= max individual latency (~300ms typ).
+
+    `mantle_rpc_url` + `mantle_vault_address` opt into the on-chain leg
+    (`.37a`). When either is omitted, the on-chain block is skipped (a
+    warning lands in `errors` and `Snapshot.on_chain_state` stays None),
+    so tests + Bybit-only deployments still work without RPC.
     """
     errors: list[str] = []
     captured = datetime.now(UTC)
@@ -854,6 +920,26 @@ async def collect_snapshot(client: BybitClient) -> Snapshot:
             "perp_positions[linear]",
         )
     )
+    # Mantle on-chain leg (`.37a`). web3.py is synchronous; wrap in a
+    # thread so it joins the fan-out without blocking the event loop.
+    # When config is missing, skip with a warning and leave on_chain_state
+    # null — the Bybit half of the snapshot is still useful.
+    on_chain_task: asyncio.Task[AaveV3UsdcState | None] | None
+    if mantle_rpc_url and mantle_vault_address:
+        on_chain_task = asyncio.create_task(
+            asyncio.to_thread(
+                _safe_fetch_aave_v3,
+                mantle_rpc_url,
+                mantle_vault_address,
+                errors,
+            )
+        )
+    else:
+        on_chain_task = None
+        errors.append(
+            "on_chain_state: skipped — MANTLE_RPC_URL and MANTLE_VAULT_ADDRESS "
+            "required to fetch Aave V3 USDC pool state"
+        )
 
     asset_overview = await asset_task
     flex_products = await flex_task
@@ -867,6 +953,7 @@ async def collect_snapshot(client: BybitClient) -> Snapshot:
     earn_onchain_positions = await earn_onchain_pos_task
     lm_positions = await lm_pos_task
     perp_positions_raw = await perp_pos_task
+    aave_state = await on_chain_task if on_chain_task is not None else None
     # Filter out zero-size rows Bybit may echo for recently-traded symbols
     # (`side="None", size="0"`). What we want here is the set of *open*
     # hedges the executor needs to reconcile against.
@@ -931,6 +1018,38 @@ async def collect_snapshot(client: BybitClient) -> Snapshot:
         for (cat, pid), payload in quote_results.items()
     }
 
+    # Aave V3 USDC surface (`.37a`). When the on-chain fetch succeeded,
+    # publish the pool's supply APR as a single ProductSummary so the
+    # ranker sees CEX vs DeFi rates side-by-side. The venue is enabled
+    # but capped at 0 weight until execute lands (`.37b`).
+    on_chain_state: OnChainState | None = None
+    if aave_state is not None:
+        products["AaveV3"] = [
+            ProductSummary(
+                category="AaveV3",
+                product_id="usdc-supply",
+                coin="USDC",
+                effective_apr=aave_state.supply_apr,
+                apr_source="aave_pool",
+                base_apr_string=str(aave_state.supply_apr),
+                redeem_lockup_minutes=0,
+                notes=[
+                    f"pool={aave_state.pool_address}",
+                    f"block={aave_state.block_number}",
+                ],
+            )
+        ]
+        on_chain_state = OnChainState(
+            aave_v3_usdc=AaveV3UsdcSnapshot(
+                block_number=aave_state.block_number,
+                fetched_at=aave_state.fetched_at,
+                pool_address=aave_state.pool_address,
+                supply_apr=aave_state.supply_apr,
+                vault_usdc_usd=micro_to_usd(aave_state.vault_usdc_micro),
+                vault_ausdc_usd=micro_to_usd(aave_state.vault_ausdc_micro),
+            )
+        )
+
     # Per-coin perp data for non-stable OnChain picks. Drives the
     # hedging-feasibility rules in the prompt (.31). We fan out fetch
     # only for coins surfaced in the OnChain top-K that are NOT stables
@@ -981,6 +1100,7 @@ async def collect_snapshot(client: BybitClient) -> Snapshot:
         perp_market=perp_market,
         perp_positions=perp_positions,
         advance_earn_quotes=advance_earn_quotes,
+        on_chain_state=on_chain_state,
         usdc_peg=usdc_peg,
         errors=errors,
     )

@@ -55,6 +55,13 @@ class OracleSettings(BaseSettings):
     # USDC from attestor wallet to the Bybit deposit address).
     MANTLE_USDC_ADDRESS: str = "0x09Bc4E0D864854c6aFB6eB9A9cdF58aC190D0dF9"
 
+    # Vault SAFE address — holds USDC + aUSDC on Mantle. Read-only by the
+    # sandbox snapshot collector (`.37a`) to surface the on-chain USDC
+    # position alongside Bybit balances. Empty string disables the
+    # on-chain leg of the snapshot (collector logs a warning and
+    # `Snapshot.on_chain_state` stays None).
+    MANTLE_VAULT_ADDRESS: str = ""
+
     # Balance-update cron (.14). Poll Bybit positions, push `updateBalance`
     # when computed USDC equivalent drifts >threshold from on-chain attested,
     # or when more than `max_age` seconds since the last push.

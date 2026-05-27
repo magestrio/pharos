@@ -73,16 +73,19 @@ VENUE_REGISTRY: dict[str, VenueMeta] = {
     ),
     "aave_v3_usdc": VenueMeta(
         venue_id="aave_v3_usdc",
-        enabled=False,
+        enabled=True,
         max_weight=0.0,
         min_weight=0.0,
         requires_picks=False,
+        snapshot_category="AaveV3",
         notes=(
             "Aave V3 USDC supply on Mantle (single pool, variable APY, "
             "withdrawable any time unless utilization is near 100%). "
-            "DISABLED in the current phase — non-zero allocation is "
-            "rejected. Will flip to enabled with cap >0 when on-chain "
-            "execute path lights up."
+            "Read-only surface (`.37a`): pool APR + vault balances are "
+            "in snapshot, but `max_weight=0` so the validator rejects "
+            "any non-zero pick — execute path lands in `.37b` once the "
+            "CapitalManager contract deploys. LLM should treat the APR "
+            "as a DeFi benchmark when reasoning about Bybit allocations."
         ),
     ),
     "bybit_flex": VenueMeta(

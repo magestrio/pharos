@@ -9,6 +9,7 @@ Focus:
 
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
@@ -324,9 +325,12 @@ async def test_collect_snapshot_full_shape_and_promo_override():
     # Positions (10005 swallowed, warnings recorded)
     assert snap.earn_positions == []
     assert snap.lm_positions == []
-    # 3 entries: earn_positions[FlexibleSaving], earn_positions[OnChain], lm_positions
-    assert len(snap.errors) == 3
-    assert all("Earn permission denied" in e for e in snap.errors)
+    # 3 Earn entries: FlexibleSaving + OnChain + lm_positions.
+    # Plus one on_chain_state warning because Mantle RPC/vault unconfigured.
+    earn_errors = [e for e in snap.errors if "Earn permission denied" in e]
+    assert len(earn_errors) == 3
+    assert any("on_chain_state: skipped" in e for e in snap.errors)
+    assert snap.on_chain_state is None
     # Products: per-category, ranked, USD1 uses promo whitelist
     assert set(snap.products) == {"FlexibleSaving", "OnChain", "LiquidityMining"}
     flex = snap.products["FlexibleSaving"]
@@ -582,6 +586,83 @@ async def test_collect_snapshot_populates_wallet_usdt_available() -> None:
 
     assert snap.wallet.usdt_available_usd == Decimal("15.50")
     assert snap.wallet.total_equity_usd == Decimal("25.50")
+
+
+# ─── on_chain_state (.37a) ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_collect_snapshot_skips_on_chain_when_unconfigured() -> None:
+    """Default call (no Mantle RPC/vault args) → on_chain_state stays None,
+    warning lands in errors — Bybit half of the snapshot is unaffected."""
+    client = _mock_client_full()
+    with patch("agent.sandbox.snapshot._fetch_usdc_peg", _fake_peg_ok):
+        snap = await collect_snapshot(client)
+    assert snap.on_chain_state is None
+    assert "AaveV3" not in snap.products
+    assert any("on_chain_state: skipped" in e for e in snap.errors)
+
+
+@pytest.mark.asyncio
+async def test_collect_snapshot_populates_on_chain_when_fetch_succeeds() -> None:
+    """When the fetcher returns a state, AaveV3 lands in `products` AND
+    `on_chain_state` carries the pool details."""
+    from agent.sandbox.on_chain import AaveV3UsdcState
+
+    fake_state = AaveV3UsdcState(
+        block_number=99_000_000,
+        fetched_at=datetime.fromisoformat("2026-05-27T12:00:00+00:00"),
+        pool_address="0x458F293454fE0d67EC0655f3672301301DD51422",
+        supply_apr=Decimal("0.0421"),
+        vault_usdc_micro=12_345_678,  # $12.345678
+        vault_ausdc_micro=50_000_000,  # $50.00
+    )
+
+    client = _mock_client_full()
+    with patch("agent.sandbox.snapshot._fetch_usdc_peg", _fake_peg_ok), patch(
+        "agent.sandbox.snapshot._safe_fetch_aave_v3", return_value=fake_state
+    ):
+        snap = await collect_snapshot(
+            client,
+            mantle_rpc_url="https://rpc.mantle.xyz",
+            mantle_vault_address="0x4dc4a70Ae02d7ca2F3A06b1231b3A9312d82a037",
+        )
+
+    # AaveV3 surfaced as a product with apr_source="aave_pool".
+    aave = snap.products["AaveV3"]
+    assert len(aave) == 1
+    assert aave[0].coin == "USDC"
+    assert aave[0].effective_apr == Decimal("0.0421")
+    assert aave[0].apr_source == "aave_pool"
+    assert "pool=0x458F293454fE0d67EC0655f3672301301DD51422" in aave[0].notes
+
+    # on_chain_state mirrors the same numbers in USD-equivalent form.
+    assert snap.on_chain_state is not None
+    a = snap.on_chain_state.aave_v3_usdc
+    assert a is not None
+    assert a.supply_apr == Decimal("0.0421")
+    assert a.vault_usdc_usd == Decimal("12.345678")
+    assert a.vault_ausdc_usd == Decimal("50")
+    assert a.block_number == 99_000_000
+
+
+@pytest.mark.asyncio
+async def test_collect_snapshot_degrades_when_on_chain_fetch_fails() -> None:
+    """RPC error → state=None, warning in errors, Bybit side unaffected."""
+    client = _mock_client_full()
+    with patch("agent.sandbox.snapshot._fetch_usdc_peg", _fake_peg_ok), patch(
+        "agent.sandbox.snapshot._safe_fetch_aave_v3", return_value=None
+    ):
+        # _safe_fetch_aave_v3 itself appends the warning in production; the
+        # mock skips that, so we just verify on_chain_state stays None and
+        # AaveV3 doesn't land in products.
+        snap = await collect_snapshot(
+            client,
+            mantle_rpc_url="https://rpc.mantle.xyz",
+            mantle_vault_address="0x4dc4a70Ae02d7ca2F3A06b1231b3A9312d82a037",
+        )
+    assert snap.on_chain_state is None
+    assert "AaveV3" not in snap.products
 
 
 # ─── advance_earn_quotes persistence (.35) ─────────────────────────────────

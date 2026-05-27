@@ -174,13 +174,21 @@ def _decision(
 # ─── Decision-only checks ───────────────────────────────────────────────────
 
 
-def test_check_disabled_venues_passes_with_zero_or_absent() -> None:
-    # aave_v3_usdc disabled by default; absent from venues is OK.
+def test_check_disabled_venues_passes_when_no_disabled_venues_used() -> None:
+    """Safety net for future flips — no venue is currently `enabled=False`,
+    but the check must still pass on a clean decision."""
     d = _decision()
     assert check_disabled_venues(d) == (True, None)
 
 
-def test_check_disabled_venues_fails_with_aave_non_zero() -> None:
+def test_check_disabled_venues_safety_when_a_venue_is_flagged_off(monkeypatch) -> None:
+    """Temporarily flip a venue to disabled to exercise the rule —
+    keeps the safety net under test even with all venues currently
+    enabled in production config."""
+    from agent.reason.venues import VENUE_REGISTRY
+    monkeypatch.setattr(
+        VENUE_REGISTRY["aave_v3_usdc"], "enabled", False, raising=False
+    )
     d = _decision(
         venues=[
             _venue("cash_usdc", 0.5),
@@ -188,6 +196,22 @@ def test_check_disabled_venues_fails_with_aave_non_zero() -> None:
         ]
     )
     ok, msg = check_disabled_venues(d)
+    assert ok is False
+    assert "aave_v3_usdc" in (msg or "")
+
+
+def test_aave_v3_usdc_with_nonzero_weight_fails_via_zero_cap() -> None:
+    """`.37a`: aave_v3_usdc is `enabled=True` but `max_weight=0` until
+    `.37b` wires execute. Any non-zero pick must be rejected by
+    `check_venue_caps`, not `check_disabled_venues`."""
+    from agent.validate.rules import check_venue_caps
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.5),
+            _venue("aave_v3_usdc", 0.5),
+        ]
+    )
+    ok, msg = check_venue_caps(d)
     assert ok is False
     assert "aave_v3_usdc" in (msg or "")
 
