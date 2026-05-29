@@ -640,6 +640,14 @@ function AttestorAndHedgesSection() {
         eyebrow="Off-Chain Trust Surface"
         title="Attestor health & active hedges"
         subtitle="The Bybit-side balance enters on-chain accounting through a 2-of-3 Gnosis Safe attestor. Below: liveness status of that push, plus every delta-neutral position currently open so anyone can verify the hedge is real, not asserted."
+        right={
+          <Link
+            href="/verify"
+            className="text-[12px] font-mono text-elec hover:text-elec-soft inline-flex items-center gap-1.5"
+          >
+            Verify on-chain <Icon.Arrow />
+          </Link>
+        }
       />
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
         <div className="lg:col-span-2">
