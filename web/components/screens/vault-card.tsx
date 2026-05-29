@@ -19,6 +19,7 @@ import { useCycles, usePortfolio, useRecentEvents } from "@/lib/agent-store-cont
 import type { CycleSummary, EventRow, PositionRow } from "@/lib/agent-api";
 import {
   REPUTATION_ORACLE_ADDRESS,
+  VAULT_AGENT_ID,
   VUSDC_CHAIN_ID,
   reputationOracleContract,
 } from "@/lib/contracts";
@@ -313,19 +314,24 @@ function ReputationNFTCard() {
           </div>
 
           <div className="flex items-center justify-between pt-1 border-t border-ink-600/60 -mx-4 px-4 -mb-4 pb-4 text-[11px] font-mono">
-            <a
+            <Link
+              href={`/reputation/${VAULT_AGENT_ID.toString()}`}
               className="text-dim-400 hover:text-white inline-flex items-center gap-1.5 transition-colors"
-              href={
-                rep.isLive
-                  ? mantleExplorerAddress(REPUTATION_ORACLE_ADDRESS)
-                  : "#"
-              }
-              target={rep.isLive ? "_blank" : undefined}
-              rel={rep.isLive ? "noopener noreferrer" : undefined}
             >
-              View NFT on Mantle Explorer <Icon.Ext />
-            </a>
-            <span className="text-dim-600">v1.0.4</span>
+              Reputation history <Icon.Arrow />
+            </Link>
+            {rep.isLive ? (
+              <a
+                href={mantleExplorerAddress(REPUTATION_ORACLE_ADDRESS)}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-dim-400 hover:text-white inline-flex items-center gap-1.5"
+              >
+                Explorer <Icon.Ext />
+              </a>
+            ) : (
+              <span className="text-dim-600">v1.0.4</span>
+            )}
           </div>
         </div>
       </div>

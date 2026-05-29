@@ -56,6 +56,20 @@ export const REPUTATION_ORACLE_ADDRESS = pickAddress(
   "NEXT_PUBLIC_REPUTATION_ORACLE_ADDRESS",
   M.reputationOracle,
 );
+// ERC-8004 registries — already deployed on Mantle Mainnet, no env
+// override needed (immutable canonical addresses per CLAUDE.md).
+export const IDENTITY_REGISTRY_ADDRESS = M.erc8004IdentityRegistry;
+export const REPUTATION_REGISTRY_ADDRESS = M.erc8004ReputationRegistry;
+
+export const VAULT_AGENT_ID: bigint = (() => {
+  const raw = process.env.NEXT_PUBLIC_VAULT_AGENT_ID;
+  if (!raw) return 99n;
+  try {
+    return BigInt(raw);
+  } catch {
+    return 99n;
+  }
+})();
 
 export const VUSDC_CHAIN_ID = mantle.id;
 export const VUSDC_ABI = VUSDCABI;
