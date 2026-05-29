@@ -27,6 +27,10 @@ import { mantleExplorerAddress, mantleExplorerTx } from "@/lib/explorer";
 import { useActiveHedges } from "@/lib/hooks/use-active-hedges";
 import { useAllocationStats, type AllocationStats } from "@/lib/hooks/use-allocation-stats";
 import {
+  formatHeartbeatShort,
+  useAttestorHealth,
+} from "@/lib/hooks/use-attestor-health";
+import {
   formatBpsAsPct,
   formatCountdown,
   useReputation,
@@ -650,6 +654,37 @@ function AttestorAndHedgesSection() {
 }
 
 function AttestorHealthCard() {
+  const health = useAttestorHealth();
+
+  // Derived display strings — prefer live values, fall back to mock.
+  const lagMin = health.isLive ? Math.floor(health.lagSec / 60) : ATTESTOR.lastPushMin;
+  const lagSubMin = health.isLive && health.lagSec < 60;
+  const warnMin = Math.floor(health.warnThresholdSec / 60);
+  const criticalMin = Math.floor(health.criticalThresholdSec / 60);
+  const pushStreak = health.isLive ? (health.pushCount ?? "—") : ATTESTOR.consecutivePushes;
+  const attestorAddr = health.attestorAddress ?? ATTESTOR.safeAddress;
+  const cadence = health.isLive
+    ? formatHeartbeatShort(health.heartbeatSec)
+    : ATTESTOR.pushFrequency;
+  const status = health.isLive ? health.status : ATTESTOR.status;
+  const statusTone =
+    status === "HEALTHY"
+      ? "text-neon"
+      : status === "DEGRADED"
+        ? "text-warn"
+        : status === "CRITICAL"
+          ? "text-danger"
+          : "text-dim-300";
+  const barTone =
+    status === "HEALTHY"
+      ? "bg-neon"
+      : status === "DEGRADED"
+        ? "bg-warn"
+        : status === "CRITICAL"
+          ? "bg-danger"
+          : "bg-dim-500";
+  const lagPct = Math.min(100, (health.lagSec / health.criticalThresholdSec) * 100);
+
   return (
     <div className="bg-ink-900 border border-ink-600/70 rounded-md overflow-hidden h-full flex flex-col">
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-ink-600/70 bg-ink-850">
@@ -657,49 +692,58 @@ function AttestorHealthCard() {
           <span className="w-1.5 h-1.5 rounded-sm bg-elec"></span>
           Bybit Attestor Health
         </div>
-        <span className="inline-flex items-center gap-1.5 text-[10px] font-mono text-neon">
-          <LiveDot size={6} /> {ATTESTOR.status}
+        <span className={`inline-flex items-center gap-1.5 text-[10px] font-mono ${statusTone}`}>
+          <LiveDot size={6} /> {status}
         </span>
       </div>
       <div className="p-5 space-y-4 flex-1">
         <div>
           <div className="text-[10.5px] font-mono uppercase tracking-[0.18em] text-dim-500">Last attestation</div>
           <div className="flex items-baseline gap-2 mt-1">
-            <div className="font-mono text-4xl text-white tabular leading-none">{ATTESTOR.lastPushMin}</div>
-            <div className="text-dim-400 font-mono text-sm">min ago</div>
+            <div className="font-mono text-4xl text-white tabular leading-none">
+              {lagSubMin ? health.lagSec : lagMin}
+            </div>
+            <div className="text-dim-400 font-mono text-sm">
+              {lagSubMin ? "sec ago" : "min ago"}
+            </div>
           </div>
           <div className="mt-3 relative">
             <div className="h-1.5 bg-ink-700 rounded-sm overflow-hidden">
               <div
-                className="h-full bg-neon transition-all"
+                className={`h-full transition-all ${barTone}`}
                 style={{
-                  width: Math.min(100, (ATTESTOR.lastPushMin / ATTESTOR.criticalThreshold) * 100) + "%",
+                  width:
+                    (health.isLive
+                      ? lagPct
+                      : Math.min(100, (ATTESTOR.lastPushMin / ATTESTOR.criticalThreshold) * 100)) + "%",
                 }}
               />
             </div>
             <div className="flex items-center justify-between mt-1.5 text-[9.5px] font-mono">
               <span className="text-dim-600">0m</span>
-              <span className="text-warn">{ATTESTOR.warningThreshold}m warn</span>
-              <span className="text-danger">{ATTESTOR.criticalThreshold}m halt</span>
+              <span className="text-warn">{warnMin}m warn</span>
+              <span className="text-danger">{criticalMin}m halt</span>
             </div>
           </div>
         </div>
 
         <div className="grid grid-cols-2 gap-px bg-ink-600/40 border border-ink-600/60 rounded-sm overflow-hidden">
           <div className="bg-ink-900 px-3 py-2.5">
-            <div className="text-[9.5px] font-mono uppercase tracking-[0.16em] text-dim-500">Push streak</div>
-            <div className="font-mono text-base text-white tabular mt-1">{ATTESTOR.consecutivePushes}</div>
+            <div className="text-[9.5px] font-mono uppercase tracking-[0.16em] text-dim-500">Push count</div>
+            <div className="font-mono text-base text-white tabular mt-1">{pushStreak}</div>
           </div>
           <div className="bg-ink-900 px-3 py-2.5">
             <div className="text-[9.5px] font-mono uppercase tracking-[0.16em] text-dim-500">Lagged 24h</div>
-            <div className="font-mono text-base text-neon tabular mt-1">{ATTESTOR.laggedPushesLast24h}</div>
+            <div className="font-mono text-base text-neon tabular mt-1">
+              {health.isLive ? "—" : ATTESTOR.laggedPushesLast24h}
+            </div>
           </div>
         </div>
 
         <div className="space-y-2 text-[11px] font-mono pt-1">
           <div className="flex items-center justify-between">
             <span className="text-dim-500 uppercase tracking-[0.14em] text-[9.5px]">Attestor</span>
-            <HashChip hash={ATTESTOR.safeAddress} head={6} tail={4} />
+            <HashChip hash={attestorAddr} head={6} tail={4} />
           </div>
           <div className="flex items-center justify-between">
             <span className="text-dim-500 uppercase tracking-[0.14em] text-[9.5px]">Control</span>
@@ -707,12 +751,17 @@ function AttestorHealthCard() {
           </div>
           <div className="flex items-center justify-between">
             <span className="text-dim-500 uppercase tracking-[0.14em] text-[9.5px]">Cadence</span>
-            <span className="text-dim-300">{ATTESTOR.pushFrequency}</span>
+            <span className="text-dim-300">{cadence}</span>
           </div>
         </div>
       </div>
       <div className="border-t border-ink-600/70 bg-ink-850 px-4 py-2.5 flex items-center justify-between text-[11px] font-mono">
-        <a href="#" className="text-elec hover:text-elec-soft inline-flex items-center gap-1.5">
+        <a
+          href={mantleExplorerAddress(attestorAddr)}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-elec hover:text-elec-soft inline-flex items-center gap-1.5"
+        >
           View Safe <Icon.Ext />
         </a>
         <span className="text-dim-500">If lag &gt; 60m, vault freezes new allocations.</span>
