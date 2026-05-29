@@ -19,6 +19,7 @@ import type { CycleSummary, EventRow, PositionRow } from "@/lib/agent-api";
 import { useActiveHedges } from "@/lib/hooks/use-active-hedges";
 import { useAllocationStats, type AllocationStats } from "@/lib/hooks/use-allocation-stats";
 import { useVaultStats, type VaultStats } from "@/lib/hooks/use-vault-stats";
+import { MINT_REDEEM_ANCHOR, MintRedeemPanel } from "@/components/mint-redeem-panel";
 import {
   Card,
   DonutChart,
@@ -38,6 +39,7 @@ export function VaultCard() {
     <div className="space-y-10 sm:space-y-12">
       <HeroBlock stats={stats} />
       <StatsRow stats={stats} />
+      <MintRedeemPanel />
       <ExchangeRateSection stats={stats} />
       <AllocationSection stats={stats} allocation={allocation} />
       <AttestorAndHedgesSection />
@@ -66,13 +68,19 @@ function HeroBlock({ stats }: { stats: VaultStats }) {
             positions. Every decision logged on-chain. Reputation verifiable through ERC-8004.
           </p>
           <div className="flex flex-wrap items-center gap-3 pt-2">
-            <button className="group inline-flex items-center gap-2 bg-neon text-black px-4 h-10 rounded-sm text-[13px] font-medium hover:bg-neon-soft transition-colors">
+            <a
+              href={MINT_REDEEM_ANCHOR}
+              className="group inline-flex items-center gap-2 bg-neon text-black px-4 h-10 rounded-sm text-[13px] font-medium hover:bg-neon-soft transition-colors"
+            >
               Mint vUSDC
               <Icon.Arrow className="-mr-1 transition-transform group-hover:translate-x-0.5" />
-            </button>
-            <button className="inline-flex items-center gap-2 bg-transparent border border-ink-500 text-white px-4 h-10 rounded-sm text-[13px] font-medium hover:border-ink-400 hover:bg-ink-800 transition-colors">
+            </a>
+            <a
+              href={MINT_REDEEM_ANCHOR}
+              className="inline-flex items-center gap-2 bg-transparent border border-ink-500 text-white px-4 h-10 rounded-sm text-[13px] font-medium hover:border-ink-400 hover:bg-ink-800 transition-colors"
+            >
               <Icon.Block /> View Live Vault
-            </button>
+            </a>
             <div className="hidden md:flex items-center gap-2 ml-2 pl-3 border-l border-ink-600 text-[11px] text-dim-400 font-mono">
               <span>Deployed</span>
               <span className="text-white">{VAULT.inception}</span>

@@ -109,8 +109,10 @@ export const decisionLogContract = {
   chainId: VUSDC_CHAIN_ID,
 } as const;
 
-// Minimal ERC-20 fragment — read-only balanceOf for the cash venue.
-export const ERC20_BALANCE_ABI = [
+// ERC-20 fragment — covers everything the mint/redeem flow + cash
+// venue allocation need: balanceOf (cash + user), allowance + approve
+// (mint approval path), decimals (display formatting).
+export const ERC20_ABI = [
   {
     type: "function",
     name: "balanceOf",
@@ -118,10 +120,41 @@ export const ERC20_BALANCE_ABI = [
     outputs: [{ name: "", type: "uint256" }],
     stateMutability: "view",
   },
+  {
+    type: "function",
+    name: "allowance",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "spender", type: "address" },
+    ],
+    outputs: [{ name: "", type: "uint256" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "approve",
+    inputs: [
+      { name: "spender", type: "address" },
+      { name: "value", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "decimals",
+    inputs: [],
+    outputs: [{ name: "", type: "uint8" }],
+    stateMutability: "view",
+  },
 ] as const;
+
+// Kept as alias for back-compat with the allocation hook that only
+// needs balanceOf. New call sites should prefer `ERC20_ABI`.
+export const ERC20_BALANCE_ABI = ERC20_ABI;
 
 export const usdcContract = {
   address: USDC_ADDRESS,
-  abi: ERC20_BALANCE_ABI,
+  abi: ERC20_ABI,
   chainId: VUSDC_CHAIN_ID,
 } as const;
