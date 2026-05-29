@@ -13,8 +13,9 @@ import {
   VAULT,
   type Allocation,
 } from "@/lib/data";
-import { usePortfolio } from "@/lib/agent-store-context";
-import type { PositionRow } from "@/lib/agent-api";
+import Link from "next/link";
+import { useCycles, usePortfolio } from "@/lib/agent-store-context";
+import type { CycleSummary, PositionRow } from "@/lib/agent-api";
 import { useAllocationStats, type AllocationStats } from "@/lib/hooks/use-allocation-stats";
 import { useVaultStats, type VaultStats } from "@/lib/hooks/use-vault-stats";
 import {
@@ -708,40 +709,112 @@ function HedgeTransparencyCard() {
   );
 }
 
+type RecentRow = {
+  key: string;
+  href: string | null;
+  ago: string;
+  summary: string;
+  risk: "LOW" | "MED" | "HIGH";
+  confidence: number;
+};
+
+function formatAgoSec(unixSec: number, nowMs: number = Date.now()): string {
+  const diffSec = Math.max(0, Math.floor(nowMs / 1000 - unixSec));
+  if (diffSec < 60) return `${diffSec}s ago`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffH = Math.floor(diffMin / 60);
+  if (diffH < 24) return `${diffH}h ago`;
+  const diffD = Math.floor(diffH / 24);
+  const remH = diffH - diffD * 24;
+  return remH > 0 ? `${diffD}d ${remH}h ago` : `${diffD}d ago`;
+}
+
+function cycleToRecentRow(cycle: CycleSummary): RecentRow {
+  const startedSec = Math.floor(new Date(cycle.started_at).getTime() / 1000);
+  const acted = cycle.actions_executed ?? 0;
+  const summary = cycle.error
+    ? `Cycle errored: ${cycle.error.slice(0, 80)}`
+    : acted === 0 || cycle.result === "no_change"
+      ? `Held — ${cycle.wake_reason}`
+      : `${acted} action${acted === 1 ? "" : "s"} executed (${cycle.wake_reason})`;
+  const risk: "LOW" | "MED" | "HIGH" = cycle.error
+    ? "HIGH"
+    : (cycle.confidence ?? 1) < 0.6
+      ? "MED"
+      : "LOW";
+  return {
+    key: cycle.cycle_ts,
+    href: `/history/${encodeURIComponent(cycle.cycle_ts)}`,
+    ago: formatAgoSec(startedSec),
+    summary,
+    risk,
+    confidence: cycle.confidence ?? 0,
+  };
+}
+
+function mockToRecentRow(d: (typeof DECISIONS)[number]): RecentRow {
+  return {
+    key: d.id,
+    href: null,
+    ago: d.ago,
+    summary: d.summary,
+    risk: d.risk,
+    confidence: d.confidence,
+  };
+}
+
 function RecentDecisionsPreview() {
-  const recent = DECISIONS.slice(0, 4);
+  const cyclesQuery = useCycles({ limit: 5 });
+  const cycles = cyclesQuery.data ?? [];
+  const recent: RecentRow[] =
+    cycles.length > 0
+      ? cycles.slice(0, 5).map(cycleToRecentRow)
+      : DECISIONS.slice(0, 5).map(mockToRecentRow);
+
   return (
     <section>
       <SectionHead
         eyebrow="Latest Agent Activity"
         title="Recent decisions"
-        subtitle="Last 4 actions from the live log. Every entry includes rationale, Allora signals used, IPFS proof, and on-chain transaction."
+        subtitle="Last 5 cycles from the live agent. Click through for the full off-chain rationale, validator outcome, and watcher events."
         right={
-          <a href="#" className="text-[12px] font-mono text-elec hover:text-elec-soft inline-flex items-center gap-1.5">
+          <Link
+            href="/history"
+            className="text-[12px] font-mono text-elec hover:text-elec-soft inline-flex items-center gap-1.5"
+          >
             View full log <Icon.Arrow />
-          </a>
+          </Link>
         }
       />
       <Card className="overflow-hidden">
-        {recent.map((d, i) => (
-          <div
-            key={d.id}
-            className={`flex items-center gap-4 px-4 sm:px-5 py-3.5 ${
-              i !== recent.length - 1 ? "border-b border-ink-600/40" : ""
-            }`}
-          >
-            <div className="font-mono text-[11px] text-dim-500 tabular w-20 hidden sm:block">{d.ago}</div>
-            <HashChip hash={d.full} className="hidden md:inline-flex w-28" />
-            <div className="flex-1 text-sm text-white min-w-0 truncate">{d.summary}</div>
-            <Tag tone={d.risk === "LOW" ? "green" : d.risk === "MED" ? "warn" : "red"}>
-              RISK: {d.risk}
-            </Tag>
-            <span className="font-mono text-[11px] text-dim-400 hidden lg:inline tabular">
-              conf {d.confidence.toFixed(2)}
-            </span>
-            <Icon.Chev className="text-dim-500" />
-          </div>
-        ))}
+        {recent.map((r, i) => {
+          const className = `flex items-center gap-4 px-4 sm:px-5 py-3.5 ${
+            i !== recent.length - 1 ? "border-b border-ink-600/40" : ""
+          } ${r.href ? "hover:bg-ink-850/60 transition-colors" : ""}`;
+          const inner = (
+            <>
+              <div className="font-mono text-[11px] text-dim-500 tabular w-20 hidden sm:block">{r.ago}</div>
+              <div className="flex-1 text-sm text-white min-w-0 truncate">{r.summary}</div>
+              <Tag tone={r.risk === "LOW" ? "green" : r.risk === "MED" ? "warn" : "red"}>
+                RISK: {r.risk}
+              </Tag>
+              <span className="font-mono text-[11px] text-dim-400 hidden lg:inline tabular">
+                conf {r.confidence.toFixed(2)}
+              </span>
+              <Icon.Chev className="text-dim-500" />
+            </>
+          );
+          return r.href ? (
+            <Link key={r.key} href={r.href} className={className}>
+              {inner}
+            </Link>
+          ) : (
+            <div key={r.key} className={className}>
+              {inner}
+            </div>
+          );
+        })}
       </Card>
     </section>
   );
