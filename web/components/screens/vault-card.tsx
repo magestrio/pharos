@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useWaitForTransactionReceipt, useWriteContract } from "wagmi";
 
 import {
   ACTIVE_HEDGES,
@@ -16,8 +17,19 @@ import {
 import Link from "next/link";
 import { useCycles, usePortfolio, useRecentEvents } from "@/lib/agent-store-context";
 import type { CycleSummary, EventRow, PositionRow } from "@/lib/agent-api";
+import {
+  REPUTATION_ORACLE_ADDRESS,
+  VUSDC_CHAIN_ID,
+  reputationOracleContract,
+} from "@/lib/contracts";
+import { mantleExplorerAddress, mantleExplorerTx } from "@/lib/explorer";
 import { useActiveHedges } from "@/lib/hooks/use-active-hedges";
 import { useAllocationStats, type AllocationStats } from "@/lib/hooks/use-allocation-stats";
+import {
+  formatBpsAsPct,
+  formatCountdown,
+  useReputation,
+} from "@/lib/hooks/use-reputation";
 import { useVaultStats, type VaultStats } from "@/lib/hooks/use-vault-stats";
 import { MINT_REDEEM_ANCHOR, MintRedeemPanel } from "@/components/mint-redeem-panel";
 import {
@@ -121,29 +133,39 @@ function HeroBadgeLine() {
   );
 }
 
-type Phase = "idle" | "pulling" | "computing" | "success";
-
 function ReputationNFTCard() {
-  const [score, setScore] = useState(VAULT.reputation);
-  const [phase, setPhase] = useState<Phase>("idle");
-  const [lastTx, setLastTx] = useState<string | null>(null);
+  const rep = useReputation();
+  const update = useWriteContract();
+  const updateReceipt = useWaitForTransactionReceipt({
+    hash: update.data,
+    chainId: VUSDC_CHAIN_ID,
+  });
+
+  // Score for the big number: live bps when configured, else mock.
+  // VAULT.reputation is in the legacy 0-1000 range; map to a comparable
+  // visual using `pct` so the bar fills sensibly in both modes.
+  const liveScoreBps = rep.lastScoreBps;
+  const liveScoreLabel = liveScoreBps !== null ? formatBpsAsPct(liveScoreBps) : null;
+  const mockPct = (VAULT.reputation / VAULT.reputationMax) * 100;
+  // Cap live bar at +50% APR (5000 bps) for visual scaling; anything
+  // above pegs. Clamp at 0 for negative (underwater) scores.
+  const livePct =
+    liveScoreBps !== null ? Math.max(0, Math.min(100, (liveScoreBps / 5000) * 100)) : null;
+  const pct = livePct ?? mockPct;
+
+  const previewBps = rep.previewScoreBps;
+  const previewLabel = previewBps !== null ? formatBpsAsPct(previewBps) : null;
 
   const onUpdate = () => {
-    if (phase !== "idle") return;
-    setPhase("pulling");
-    setTimeout(() => setPhase("computing"), 900);
-    setTimeout(() => {
-      const bump = 1 + Math.floor(Math.random() * 4);
-      setScore((s) => Math.min(1000, s + bump));
-      const rand = () => Math.floor(Math.random() * 16).toString(16);
-      const hex = Array.from({ length: 40 }, rand).join("");
-      setLastTx("0x" + hex);
-      setPhase("success");
-      setTimeout(() => setPhase("idle"), 4500);
-    }, 2100);
+    update.writeContract({
+      ...reputationOracleContract,
+      functionName: "updateReputation",
+    });
   };
 
-  const pct = (score / VAULT.reputationMax) * 100;
+  const isSubmitting = update.isPending || updateReceipt.isLoading;
+  const buttonDisabled =
+    !rep.isLive || !rep.canUpdate || isSubmitting || rep.secondsUntilNext > 0;
 
   return (
     <div className="relative">
@@ -161,19 +183,27 @@ function ReputationNFTCard() {
         </div>
 
         <div className="p-5 pb-4 bg-dots">
-          <div className="text-[10.5px] font-mono uppercase tracking-[0.18em] text-dim-500 mb-3">Score</div>
+          <div className="text-[10.5px] font-mono uppercase tracking-[0.18em] text-dim-500 mb-3">
+            {rep.isLive ? "Annualized APR" : "Score"}
+          </div>
           <div className="flex items-baseline gap-2">
-            <div className="font-mono text-[64px] leading-none font-semibold text-white tabular tracking-tight">
-              {score}
+            <div className="font-mono text-[56px] leading-none font-semibold text-white tabular tracking-tight">
+              {liveScoreLabel ?? VAULT.reputation}
             </div>
-            <div className="text-dim-500 font-mono text-lg tabular">/ 1000</div>
+            <div className="text-dim-500 font-mono text-lg tabular">
+              {rep.isLive ? "ERC-8004" : "/ 1000"}
+            </div>
           </div>
           <div className="mt-4 h-[3px] bg-ink-700 overflow-hidden rounded-sm">
             <div className="h-full bg-neon transition-all duration-700" style={{ width: pct + "%" }} />
           </div>
           <div className="mt-2 flex items-center justify-between text-[10.5px] font-mono">
-            <span className="text-dim-500">Decile rank</span>
-            <span className="text-neon">TOP 16%</span>
+            <span className="text-dim-500">
+              {rep.isLive ? "Updates" : "Decile rank"}
+            </span>
+            <span className="text-neon">
+              {rep.isLive ? (rep.updateCount ?? 0) : "TOP 16%"}
+            </span>
           </div>
         </div>
 
@@ -187,24 +217,34 @@ function ReputationNFTCard() {
         <div className="border-t border-ink-600/70 bg-ink-850 p-4 space-y-3">
           <button
             onClick={onUpdate}
-            disabled={phase !== "idle"}
+            disabled={buttonDisabled}
             className={`w-full inline-flex items-center justify-center gap-2 px-3 h-10 rounded-sm text-[12.5px] font-mono tracking-[0.08em] uppercase font-medium transition-all
               ${
-                phase === "idle"
-                  ? "bg-neon/10 border border-neon/40 text-neon hover:bg-neon/20"
-                  : phase === "success"
-                    ? "bg-neon text-black border border-neon"
-                    : "bg-ink-700 border border-ink-500 text-dim-300 cursor-wait"
+                updateReceipt.isSuccess
+                  ? "bg-neon text-black border border-neon"
+                  : buttonDisabled
+                    ? "bg-ink-700 border border-ink-500 text-dim-300 cursor-not-allowed"
+                    : "bg-neon/10 border border-neon/40 text-neon hover:bg-neon/20"
               }`}
           >
-            {phase === "idle" && <>[ Update Reputation ]</>}
-            {(phase === "pulling" || phase === "computing") && (
+            {!rep.isLive && <>[ Update Reputation ]</>}
+            {rep.isLive && !isSubmitting && !updateReceipt.isSuccess && rep.canUpdate && (
+              <>[ Update Reputation ]</>
+            )}
+            {rep.isLive && !isSubmitting && !updateReceipt.isSuccess && !rep.canUpdate && (
+              <>Next update in {formatCountdown(rep.secondsUntilNext)}</>
+            )}
+            {update.isPending && (
               <>
-                <Icon.Spinner className="animate-spin" />
-                {phase === "pulling" ? "Pulling vault.totalAssets()…" : "Computing Sharpe + signing…"}
+                <Icon.Spinner className="animate-spin" /> Confirm in wallet…
               </>
             )}
-            {phase === "success" && (
+            {updateReceipt.isLoading && (
+              <>
+                <Icon.Spinner className="animate-spin" /> Waiting for confirmation…
+              </>
+            )}
+            {updateReceipt.isSuccess && (
               <>
                 <Icon.Check /> Score updated on-chain
               </>
@@ -212,43 +252,77 @@ function ReputationNFTCard() {
           </button>
 
           <div className="min-h-[42px] text-[11px] font-mono">
-            {phase === "idle" && !lastTx && (
+            {!rep.isLive && (
+              <div className="text-warn leading-relaxed">
+                ReputationOracle not deployed yet — wire `NEXT_PUBLIC_REPUTATION_ORACLE_ADDRESS` after the mainnet-deploy epic.
+              </div>
+            )}
+            {rep.isLive && !update.data && previewLabel && rep.canUpdate && (
+              <div className="text-dim-300 leading-relaxed">
+                Next call sets score to <span className="text-neon">{previewLabel}</span>{" "}
+                from {liveScoreLabel ?? "—"} (annualized over {Math.round((rep.previewElapsedSec ?? 0) / 86400)}d).
+              </div>
+            )}
+            {rep.isLive && !update.data && !rep.canUpdate && (
               <div className="text-dim-500 leading-relaxed">
-                Recomputes Sharpe, max-DD, win-rate from on-chain history. Updates token URI. Gas ≈ 0.012 MNT.
+                Throttle: 1 update / hour. Last call was{" "}
+                {rep.lastUpdateTimestamp
+                  ? formatCountdown(rep.minIntervalSec - rep.secondsUntilNext)
+                  : "—"}{" "}
+                ago.
               </div>
             )}
-            {phase === "pulling" && (
-              <div className="space-y-1.5 fade-up">
-                <ProgressLine label="vault.totalAssets()" />
-                <div className="text-dim-500">Reading state from block #4,219,847…</div>
+            {update.error && !update.data && (
+              <div className="text-danger">
+                {update.error.message?.slice(0, 120) ?? "transaction failed"}
               </div>
             )}
-            {phase === "computing" && (
-              <div className="space-y-1.5 fade-up">
-                <ProgressLine label="computeSharpe(returns[])" />
-                <div className="text-dim-500">Hashing metrics, signing tx…</div>
+            {update.data && updateReceipt.isLoading && (
+              <div className="space-y-1 fade-up">
+                <div className="flex items-center gap-2 text-elec">
+                  <LiveDot /> Submitted to Mantle
+                </div>
+                <a
+                  href={mantleExplorerTx(update.data)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-elec hover:text-elec-soft inline-flex items-center gap-1"
+                >
+                  <HashChip hash={update.data} label="tx:" />
+                </a>
               </div>
             )}
-            {phase === "success" && lastTx && (
+            {updateReceipt.isSuccess && update.data && (
               <div className="space-y-1 fade-up">
                 <div className="flex items-center gap-2 text-neon">
-                  <LiveDot /> Confirmed in 2 blocks
+                  <LiveDot /> Confirmed
                 </div>
                 <div className="text-dim-400">
-                  Score {VAULT.reputation} → <span className="text-white">{score}</span>
+                  Score → <span className="text-white">{liveScoreLabel ?? "—"}</span>
                 </div>
-                <HashChip hash={lastTx} label="tx:" />
-              </div>
-            )}
-            {phase === "idle" && lastTx && (
-              <div className="text-dim-500">
-                Last update: <HashChip hash={lastTx} label="tx:" className="!text-[11px]" />
+                <a
+                  href={mantleExplorerTx(update.data)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-elec hover:text-elec-soft inline-flex items-center gap-1"
+                >
+                  <HashChip hash={update.data} label="tx:" />
+                </a>
               </div>
             )}
           </div>
 
           <div className="flex items-center justify-between pt-1 border-t border-ink-600/60 -mx-4 px-4 -mb-4 pb-4 text-[11px] font-mono">
-            <a className="text-dim-400 hover:text-white inline-flex items-center gap-1.5 transition-colors" href="#">
+            <a
+              className="text-dim-400 hover:text-white inline-flex items-center gap-1.5 transition-colors"
+              href={
+                rep.isLive
+                  ? mantleExplorerAddress(REPUTATION_ORACLE_ADDRESS)
+                  : "#"
+              }
+              target={rep.isLive ? "_blank" : undefined}
+              rel={rep.isLive ? "noopener noreferrer" : undefined}
+            >
               View NFT on Mantle Explorer <Icon.Ext />
             </a>
             <span className="text-dim-600">v1.0.4</span>

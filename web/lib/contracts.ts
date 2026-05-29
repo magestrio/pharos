@@ -5,6 +5,7 @@ import {
   BybitAttestorABI,
   CapitalManagerABI,
   DecisionLogABI,
+  ReputationOracleABI,
   VUSDCABI,
 } from "@vault8004/abi";
 import { mantle } from "wagmi/chains";
@@ -18,7 +19,8 @@ type EnvKey =
   | "NEXT_PUBLIC_AAVE_WETH_ADAPTER_ADDRESS"
   | "NEXT_PUBLIC_BYBIT_ATTESTOR_ADDRESS"
   | "NEXT_PUBLIC_USDC_ADDRESS"
-  | "NEXT_PUBLIC_DECISION_LOG_ADDRESS";
+  | "NEXT_PUBLIC_DECISION_LOG_ADDRESS"
+  | "NEXT_PUBLIC_REPUTATION_ORACLE_ADDRESS";
 
 function pickAddress(envKey: EnvKey, fallback: `0x${string}`): `0x${string}` {
   const override = process.env[envKey] as `0x${string}` | undefined;
@@ -50,6 +52,10 @@ export const DECISION_LOG_ADDRESS = pickAddress(
   "NEXT_PUBLIC_DECISION_LOG_ADDRESS",
   M.decisionLog,
 );
+export const REPUTATION_ORACLE_ADDRESS = pickAddress(
+  "NEXT_PUBLIC_REPUTATION_ORACLE_ADDRESS",
+  M.reputationOracle,
+);
 
 export const VUSDC_CHAIN_ID = mantle.id;
 export const VUSDC_ABI = VUSDCABI;
@@ -62,6 +68,7 @@ export const isAllocationConfigured =
   BYBIT_ATTESTOR_ADDRESS !== ZERO_ADDRESS &&
   USDC_ADDRESS !== ZERO_ADDRESS;
 export const isDecisionLogConfigured = DECISION_LOG_ADDRESS !== ZERO_ADDRESS;
+export const isReputationOracleConfigured = REPUTATION_ORACLE_ADDRESS !== ZERO_ADDRESS;
 
 export const DECISION_LOG_DEPLOY_BLOCK: bigint = (() => {
   const raw = process.env.NEXT_PUBLIC_DECISION_LOG_DEPLOY_BLOCK;
@@ -106,6 +113,12 @@ export const bybitAttestorContract = {
 export const decisionLogContract = {
   address: DECISION_LOG_ADDRESS,
   abi: DecisionLogABI,
+  chainId: VUSDC_CHAIN_ID,
+} as const;
+
+export const reputationOracleContract = {
+  address: REPUTATION_ORACLE_ADDRESS,
+  abi: ReputationOracleABI,
   chainId: VUSDC_CHAIN_ID,
 } as const;
 
