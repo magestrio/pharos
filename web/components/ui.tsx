@@ -127,6 +127,57 @@ export function Card({
   );
 }
 
+/**
+ * Pulsing rectangle used as a content placeholder while a query is in
+ * flight. Caller controls the geometry via className/style; this keeps
+ * the primitive lightweight + theme-consistent.
+ */
+export function SkeletonBox({
+  className = "",
+  style,
+}: {
+  className?: string;
+  style?: React.CSSProperties;
+}) {
+  return <div className={`bg-ink-700/60 animate-pulse rounded-sm ${className}`} style={style} />;
+}
+
+/**
+ * One-line skeleton row matching the typography of a typical data row.
+ * Used for list previews while React Query is still resolving.
+ */
+export function SkeletonRow({ width = "100%" }: { width?: string | number }) {
+  return <SkeletonBox className="h-4" style={{ width }} />;
+}
+
+/**
+ * Inline panel rendered when a query has failed. Keeps a warn-tinted
+ * border + plain-text message so the app never crashes on a transient
+ * fetch error; callers pass a short label + the raw message.
+ */
+export function ErrorPanel({
+  label,
+  message,
+  className = "",
+}: {
+  label: string;
+  message?: string;
+  className?: string;
+}) {
+  return (
+    <div
+      className={`border border-danger/40 bg-danger/5 rounded-sm px-3 py-2.5 ${className}`}
+    >
+      <div className="font-mono text-[12px] text-danger">{label}</div>
+      {message && (
+        <div className="mt-1 font-mono text-[11px] text-dim-400 leading-snug break-words">
+          {message}
+        </div>
+      )}
+    </div>
+  );
+}
+
 type StatTone = "neutral" | "green" | "blue" | "red";
 
 export function StatCard({

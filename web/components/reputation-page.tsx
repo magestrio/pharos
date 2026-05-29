@@ -1,5 +1,6 @@
 "use client";
 
+import { ErrorPanel, SkeletonBox } from "@/components/ui";
 import {
   IDENTITY_REGISTRY_ADDRESS,
   REPUTATION_ORACLE_ADDRESS,
@@ -29,7 +30,12 @@ export function ReputationPage({ tokenId }: { tokenId: bigint }) {
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <CurrentScoreCard />
-        <HistorySparklineCard points={history.points} isLive={history.isLive} />
+        <HistorySparklineCard
+          points={history.points}
+          isLive={history.isLive}
+          isLoading={history.isLoading}
+          isError={history.isError}
+        />
       </div>
 
       <RegistryLinksCard tokenId={tokenId} />
@@ -114,15 +120,37 @@ function CurrentScoreCard() {
 function HistorySparklineCard({
   points,
   isLive,
+  isLoading,
+  isError,
 }: {
   points: ReputationHistoryPoint[];
   isLive: boolean;
+  isLoading: boolean;
+  isError: boolean;
 }) {
   if (!isLive) {
     return (
       <Card title="Score History" wide>
         <div className="text-warn text-[12px] font-mono">
           ReputationOracle not deployed yet — history will populate as updates accumulate.
+        </div>
+      </Card>
+    );
+  }
+  if (isError && points.length === 0) {
+    return (
+      <Card title="Score History" wide>
+        <ErrorPanel label="Couldn't fetch ReputationUpdated events from Mantle RPC." />
+      </Card>
+    );
+  }
+  if (isLoading && points.length === 0) {
+    return (
+      <Card title="Score History" wide>
+        <SkeletonBox className="h-32" />
+        <div className="mt-3 flex items-center justify-between gap-3">
+          <SkeletonBox className="h-3 w-1/3" />
+          <SkeletonBox className="h-3 w-1/4" />
         </div>
       </Card>
     );

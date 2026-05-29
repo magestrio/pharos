@@ -15,6 +15,7 @@ import {
   VAULT_AGENT_ID,
   VUSDC_ADDRESS,
 } from "@/lib/contracts";
+import { ErrorPanel, SkeletonBox, SkeletonRow } from "@/components/ui";
 import { ipfsGateway, mantleExplorerAddress, mantleExplorerTx } from "@/lib/explorer";
 import { useAttestorHealth } from "@/lib/hooks/use-attestor-health";
 import { useDecisionEvents } from "@/lib/hooks/use-decision-events";
@@ -176,7 +177,7 @@ function ContractsSection() {
 }
 
 function DecisionsSection() {
-  const { events, isLive, isLoading } = useDecisionEvents();
+  const { events, isLive, isLoading, isError } = useDecisionEvents();
   const top = events.slice(0, 10);
   return (
     <SectionCard
@@ -184,10 +185,17 @@ function DecisionsSection() {
       subtitle="Each entry links the on-chain transaction to the IPFS-pinned rationale CID."
     >
       {!isLive && <DeployNotice what="DecisionLog" />}
-      {isLive && isLoading && (
-        <div className="text-[11px] font-mono text-dim-500">loading events…</div>
+      {isLive && isError && events.length === 0 && (
+        <ErrorPanel label="Couldn't fetch DecisionRecorded events from Mantle RPC." />
       )}
-      {isLive && !isLoading && top.length === 0 && (
+      {isLive && isLoading && events.length === 0 && !isError && (
+        <div className="space-y-2">
+          <SkeletonRow width="80%" />
+          <SkeletonRow width="65%" />
+          <SkeletonRow width="72%" />
+        </div>
+      )}
+      {isLive && !isLoading && !isError && top.length === 0 && (
         <div className="text-[12px] text-dim-300 font-mono">
           No DecisionRecorded events emitted yet. First agent cycle seeds this list.
         </div>
@@ -245,7 +253,8 @@ function DecisionsSection() {
 
 function ReputationSection() {
   const rep = useReputation();
-  const { points } = useReputationHistory();
+  const history = useReputationHistory();
+  const { points } = history;
   const latest = points.length > 0 ? points[points.length - 1] : null;
 
   return (
@@ -262,7 +271,18 @@ function ReputationSection() {
       }
     >
       {!rep.isLive && <DeployNotice what="ReputationOracle" />}
-      {rep.isLive && !latest && (
+      {rep.isLive && history.isError && !latest && (
+        <ErrorPanel label="Couldn't fetch ReputationUpdated history from Mantle RPC." />
+      )}
+      {rep.isLive && history.isLoading && !latest && !history.isError && (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <SkeletonBox className="h-14" />
+          <SkeletonBox className="h-14" />
+          <SkeletonBox className="h-14" />
+          <SkeletonBox className="h-14" />
+        </div>
+      )}
+      {rep.isLive && !history.isLoading && !history.isError && !latest && (
         <div className="text-[12px] text-dim-300 font-mono">
           No ReputationUpdated events yet — current value:{" "}
           <span className="text-white">{formatBpsAsPct(rep.lastScoreBps)}</span>.

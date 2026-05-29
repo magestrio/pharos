@@ -40,11 +40,13 @@ import { MINT_REDEEM_ANCHOR, MintRedeemPanel } from "@/components/mint-redeem-pa
 import {
   Card,
   DonutChart,
+  ErrorPanel,
   HashChip,
   Icon,
   LineChart,
   LiveDot,
   SectionHead,
+  SkeletonRow,
   StatCard,
   Tag,
 } from "@/components/ui";
@@ -961,7 +963,10 @@ function eventRowInner(ev: EventRow): React.ReactNode {
 function RecentWatcherEventsWidget() {
   const eventsQuery = useRecentEvents(5);
   const events = eventsQuery.data ?? [];
-  if (events.length === 0 && !eventsQuery.isLoading) {
+  // No data + not loading + no error → nothing to surface (pre-deploy
+  // FastAPI or empty stream); collapsing the section keeps the homepage
+  // tight rather than showing an always-empty box.
+  if (events.length === 0 && !eventsQuery.isLoading && !eventsQuery.isError) {
     return null;
   }
   return (
@@ -979,11 +984,21 @@ function RecentWatcherEventsWidget() {
           </Link>
         }
       />
-      <Card className="overflow-hidden">
-        {eventsQuery.isLoading && events.length === 0 && (
-          <div className="px-4 py-4 text-[11px] font-mono text-dim-500">loading watcher events…</div>
-        )}
-        {events.map((ev, i) => {
+      {eventsQuery.isError && events.length === 0 ? (
+        <ErrorPanel
+          label="Couldn't reach the agent watcher feed."
+          message={eventsQuery.error?.message}
+        />
+      ) : (
+        <Card className="overflow-hidden">
+          {eventsQuery.isLoading && events.length === 0 && (
+            <div className="px-4 py-3 space-y-2">
+              <SkeletonRow width="70%" />
+              <SkeletonRow width="55%" />
+              <SkeletonRow width="65%" />
+            </div>
+          )}
+          {events.map((ev, i) => {
           const className = `flex items-center gap-3 px-4 sm:px-5 py-3 font-mono ${
             i !== events.length - 1 ? "border-b border-ink-600/40" : ""
           } ${eventToneClasses(ev.severity)} ${ev.triggered_cycle_ts ? "hover:bg-ink-850/60 transition-colors" : ""}`;
@@ -1001,7 +1016,8 @@ function RecentWatcherEventsWidget() {
             </div>
           );
         })}
-      </Card>
+        </Card>
+      )}
     </section>
   );
 }
@@ -1013,6 +1029,7 @@ function RecentDecisionsPreview() {
     cycles.length > 0
       ? cycles.slice(0, 5).map(cycleToRecentRow)
       : DECISIONS.slice(0, 5).map(mockToRecentRow);
+  const showError = cyclesQuery.isError && cycles.length === 0;
 
   return (
     <section>
@@ -1029,6 +1046,13 @@ function RecentDecisionsPreview() {
           </Link>
         }
       />
+      {showError && (
+        <ErrorPanel
+          label="Couldn't reach the agent cycle store."
+          message={cyclesQuery.error?.message}
+          className="mb-3"
+        />
+      )}
       <Card className="overflow-hidden">
         {recent.map((r, i) => {
           const className = `flex items-center gap-4 px-4 sm:px-5 py-3.5 ${
