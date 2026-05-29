@@ -11,7 +11,11 @@ import {
   EXCHANGE_RATE_SERIES,
   HEDGE_LIFETIME_FUNDING,
   VAULT,
+  type Allocation,
 } from "@/lib/data";
+import { usePortfolio } from "@/lib/agent-store-context";
+import type { PositionRow } from "@/lib/agent-api";
+import { useAllocationStats, type AllocationStats } from "@/lib/hooks/use-allocation-stats";
 import { useVaultStats, type VaultStats } from "@/lib/hooks/use-vault-stats";
 import {
   Card,
@@ -27,12 +31,13 @@ import {
 
 export function VaultCard() {
   const stats = useVaultStats();
+  const allocation = useAllocationStats();
   return (
     <div className="space-y-10 sm:space-y-12">
       <HeroBlock stats={stats} />
       <StatsRow stats={stats} />
       <ExchangeRateSection stats={stats} />
-      <AllocationSection stats={stats} />
+      <AllocationSection stats={stats} allocation={allocation} />
       <AttestorAndHedgesSection />
       <RecentDecisionsPreview />
     </div>
@@ -345,10 +350,45 @@ function ExchangeRateSection({ stats }: { stats: VaultStats }) {
   );
 }
 
-function AllocationSection({ stats }: { stats: VaultStats }) {
+const BYBIT_SUB_PALETTE = ["#5B8FF9", "#7AA5FB", "#A6BEFC", "#345FC2"] as const;
+
+function portfolioToBybitSubRows(positions: PositionRow[]): Allocation[] {
+  const filtered = positions.filter((p) => p.venue.startsWith("bybit_"));
+  if (filtered.length === 0) return [];
+  const totals = filtered.map((p) => Number(p.amount_usd ?? "0"));
+  const total = totals.reduce((s, v) => s + v, 0);
+  if (total === 0) return [];
+  return filtered.map((p, i) => {
+    const notional = totals[i];
+    const venueLabel = p.venue.replace(/^bybit_/, "Bybit ");
+    return {
+      key: `${p.venue}/${p.product_id}`,
+      label: p.product_id || venueLabel,
+      sub: p.coin ? `${venueLabel} · ${p.coin}` : venueLabel,
+      pct: Math.round((notional / total) * 1000) / 10,
+      apy: 0,
+      color: BYBIT_SUB_PALETTE[i % BYBIT_SUB_PALETTE.length],
+      notional: Math.round(notional),
+    };
+  });
+}
+
+function AllocationSection({
+  stats,
+  allocation,
+}: {
+  stats: VaultStats;
+  allocation: AllocationStats;
+}) {
   const [bybitOpen, setBybitOpen] = useState(true);
-  const weightedApy = ALLOCATIONS.reduce((s, a) => s + a.pct * a.apy, 0) / 100;
-  const tvlUsdc = stats.tvlUsdc ?? VAULT.tvlUsdc;
+  const portfolio = usePortfolio();
+  const rows = allocation.rows;
+  const weightedApy = rows.reduce((s, a) => s + a.pct * a.apy, 0) / 100;
+  // Prefer on-chain TVL when present; otherwise fall back to allocation
+  // total (mock or live), then the legacy vault stat.
+  const tvlUsdc = stats.tvlUsdc ?? allocation.totalUsdc ?? VAULT.tvlUsdc;
+  const bybitSubLive = portfolioToBybitSubRows(portfolio.data?.positions ?? []);
+  const bybitSubRows = bybitSubLive.length > 0 ? bybitSubLive : BYBIT_SUB;
 
   return (
     <section>
@@ -366,14 +406,14 @@ function AllocationSection({ stats }: { stats: VaultStats }) {
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
         <div className="lg:col-span-2 bg-ink-900 border border-ink-600/70 rounded-md p-6 flex flex-col items-center justify-center">
           <DonutChart
-            data={ALLOCATIONS.map((a) => ({ pct: a.pct, color: a.color, label: a.key }))}
+            data={rows.map((a) => ({ pct: a.pct, color: a.color, label: a.key }))}
             size={220}
             thickness={18}
             centerValue={"$" + (tvlUsdc / 1_000_000).toFixed(2) + "M"}
             centerLabel="TVL · USDC"
           />
           <div className="mt-5 grid grid-cols-2 gap-2 w-full">
-            {ALLOCATIONS.map((a) => (
+            {rows.map((a) => (
               <div key={a.key} className="flex items-center gap-2 text-[11px] font-mono">
                 <span className="w-2 h-2 rounded-sm shrink-0" style={{ background: a.color }} />
                 <span className="text-dim-300 truncate">{a.label.replace("Aave V3 ", "Aave ")}</span>
@@ -391,14 +431,14 @@ function AllocationSection({ stats }: { stats: VaultStats }) {
             <div className="col-span-3 text-right">Notional</div>
             <div className="col-span-1 text-right">Tx</div>
           </div>
-          {ALLOCATIONS.map((a, i) => {
+          {rows.map((a, i) => {
             const isBybit = a.key === "BYBIT";
             return (
               <div key={a.key} style={{ display: "contents" }}>
                 <div
                   className={`grid grid-cols-12 items-center px-4 py-3.5 ${
                     isBybit ? "cursor-pointer hover:bg-ink-850/60" : ""
-                  } ${i !== ALLOCATIONS.length - 1 || (isBybit && bybitOpen) ? "border-b border-ink-600/40" : ""}`}
+                  } ${i !== rows.length - 1 || (isBybit && bybitOpen) ? "border-b border-ink-600/40" : ""}`}
                   onClick={isBybit ? () => setBybitOpen((o) => !o) : undefined}
                 >
                   <div className="col-span-4 flex items-center gap-3">
@@ -447,7 +487,7 @@ function AllocationSection({ stats }: { stats: VaultStats }) {
                 {isBybit && bybitOpen && (
                   <div
                     className={`bg-ink-850/40 border-l-2 border-elec/40 ${
-                      i !== ALLOCATIONS.length - 1 ? "border-b border-ink-600/40" : ""
+                      i !== rows.length - 1 ? "border-b border-ink-600/40" : ""
                     }`}
                   >
                     <div className="px-4 py-2 text-[9.5px] uppercase tracking-[0.18em] font-mono text-elec/80 flex items-center gap-2">
@@ -455,11 +495,11 @@ function AllocationSection({ stats }: { stats: VaultStats }) {
                       <span className="text-dim-600">·</span>
                       <span className="text-dim-500">via 0x4dc4…a037 (2-of-3 Safe)</span>
                     </div>
-                    {BYBIT_SUB.map((b, j) => (
+                    {bybitSubRows.map((b, j) => (
                       <div
                         key={b.key}
                         className={`grid grid-cols-12 items-center px-4 py-2.5 ${
-                          j !== BYBIT_SUB.length - 1 ? "border-b border-ink-600/30" : ""
+                          j !== bybitSubRows.length - 1 ? "border-b border-ink-600/30" : ""
                         }`}
                       >
                         <div className="col-span-4 flex items-center gap-3 pl-6">
