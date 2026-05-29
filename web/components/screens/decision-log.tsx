@@ -4,6 +4,8 @@ import { useMemo, useState } from "react";
 
 import { RISK_FLAGS, type Decision } from "@/lib/data";
 import { useDecisions } from "@/lib/hooks/use-decisions";
+import { useCycleDetail } from "@/lib/agent-store-context";
+import type { CycleDetail, EventRow, ExecutionRow } from "@/lib/agent-api";
 import { ipfsGateway, mantleExplorerTx } from "@/lib/explorer";
 import { HashChip, Icon, SectionHead, Tag } from "@/components/ui";
 
@@ -183,6 +185,9 @@ function DecisionItem({
 }) {
   const riskTone: "green" | "warn" | "red" = d.risk === "LOW" ? "green" : d.risk === "MED" ? "warn" : "red";
   const summaryHasNoOp = /held|no-op/i.test(d.summary);
+  // Off-chain rich detail fetched lazily — only when the row is open
+  // and the join produced a cycle_ts (live row, not a mock fallback).
+  const detailQuery = useCycleDetail(open && d.cycleTs ? d.cycleTs : null);
   return (
     <div className="relative flex gap-3 sm:gap-5">
       <div className="w-[42px] sm:w-[156px] shrink-0 pt-3.5 relative">
@@ -234,7 +239,13 @@ function DecisionItem({
           </div>
         </button>
 
-        {open && <DecisionThesis d={d} />}
+        {open && (
+          <DecisionThesis
+            d={d}
+            detail={detailQuery.data ?? null}
+            detailLoading={detailQuery.isLoading}
+          />
+        )}
       </div>
     </div>
   );
@@ -256,15 +267,56 @@ function ConfidenceBadge({ value }: { value: number }) {
   );
 }
 
-function DecisionThesis({ d }: { d: Decision }) {
-  const flagsMeta = (d.flags || [])
+type DecisionBlob = {
+  thesis?: string;
+  venues?: Array<{
+    venue_id?: string;
+    weight?: number;
+    picks?: Array<{ product_id?: string; weight?: number; notes?: string[] }>;
+  }>;
+  risk_flags?: string[];
+  notes?: string[];
+  _meta?: { _validator?: { ok?: boolean; errors?: string[] } };
+};
+
+function asDecisionBlob(value: Record<string, unknown> | null | undefined): DecisionBlob | null {
+  if (!value || typeof value !== "object") return null;
+  return value as DecisionBlob;
+}
+
+function DecisionThesis({
+  d,
+  detail,
+  detailLoading,
+}: {
+  d: Decision;
+  detail?: CycleDetail | null;
+  detailLoading?: boolean;
+}) {
+  // On-chain rows expose `cycleTs`; mock rows don't. The rich-detail
+  // sections only render when we expected a cycle (`cycleTs`) and the
+  // detail has either arrived or is on its way.
+  const expectsDetail = Boolean(d.cycleTs);
+  const blob = asDecisionBlob(detail?.decision);
+  const venueRows = (blob?.venues ?? []).filter((v) => v.venue_id);
+  const validator = blob?._meta?._validator;
+  const events = detail?.events ?? [];
+  const executions = detail?.executions ?? [];
+
+  // Prefer the real on-chain rationale once it's loaded; otherwise fall
+  // back to the row-derived placeholder / mock thesis.
+  const thesisBody = blob?.thesis ?? d.thesis;
+
+  // Risk flags: prefer the structured list from the decision blob.
+  const flagKeys = blob?.risk_flags && blob.risk_flags.length > 0 ? blob.risk_flags : d.flags || [];
+  const flagsMeta = flagKeys
     .map((k) => RISK_FLAGS.find((r) => r.key === k))
     .filter((f): f is NonNullable<typeof f> => Boolean(f));
   return (
     <div className="border-t border-ink-600/40 bg-ink-850/60 rounded-b-md fade-up">
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-px bg-ink-600/40">
         <div className="lg:col-span-2 bg-ink-900 p-5 sm:p-6">
-          <ThesisBlock title="Thesis" body={d.thesis} accent="white" />
+          <ThesisBlock title="Thesis" body={thesisBody} accent="white" />
           <div className="mt-5">
             <ThesisBlock
               title="Risk flags"
@@ -288,6 +340,18 @@ function DecisionThesis({ d }: { d: Decision }) {
           <div className="mt-5">
             <ThesisBlock title="Allora signal used" body={d.allora} accent="elec" />
           </div>
+
+          {expectsDetail && (
+            <div className="mt-6 space-y-5">
+              {detailLoading && !detail && (
+                <div className="text-[11px] font-mono text-dim-500">loading off-chain detail…</div>
+              )}
+              {venueRows.length > 0 && <VenueAllocationsBlock venues={venueRows} />}
+              {executions.length > 0 && <ExecutionsBlock executions={executions} />}
+              {events.length > 0 && <WatcherEventsBlock events={events.slice(0, 5)} />}
+              {validator && <ValidatorStatusBlock validator={validator} />}
+            </div>
+          )}
         </div>
         <div className="bg-ink-900 p-5 sm:p-6 space-y-4">
           <div>
@@ -324,6 +388,176 @@ function DecisionThesis({ d }: { d: Decision }) {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+const VENUE_LABELS: Record<string, string> = {
+  cash_usdc: "Cash USDC",
+  aave_usdc: "Aave V3 USDC",
+  aave_weth: "Aave V3 WETH",
+  bybit_flex: "Bybit Flex",
+  bybit_onchain: "Bybit OnChain",
+  bybit_lm: "Bybit LM",
+  bybit_dual_asset: "Bybit DualAsset",
+  bybit_discount_buy: "Bybit DiscountBuy",
+  bybit_hold_to_earn: "Bybit Hold-to-Earn",
+};
+
+function venueLabel(id: string): string {
+  return VENUE_LABELS[id] ?? id;
+}
+
+function VenueAllocationsBlock({
+  venues,
+}: {
+  venues: NonNullable<DecisionBlob["venues"]>;
+}) {
+  return (
+    <div>
+      <SubBlockTitle>Venue allocation + picks</SubBlockTitle>
+      <div className="space-y-3">
+        {venues.map((v, i) => {
+          const id = v.venue_id ?? `venue-${i}`;
+          const weight = typeof v.weight === "number" ? v.weight : 0;
+          const picks = v.picks ?? [];
+          return (
+            <div key={id} className="bg-ink-850/60 border border-ink-600/40 rounded-sm overflow-hidden">
+              <div className="flex items-center justify-between px-3 py-2 bg-ink-900/40 border-b border-ink-600/40">
+                <span className="text-[12.5px] text-white">{venueLabel(id)}</span>
+                <span className="font-mono text-[11px] text-neon tabular">
+                  {(weight * 100).toFixed(1)}%
+                </span>
+              </div>
+              {picks.length > 0 ? (
+                <div className="px-3 py-2 space-y-1.5">
+                  {picks.map((p, pi) => {
+                    const pickWeight = typeof p.weight === "number" ? p.weight : 0;
+                    const note = p.notes?.[0];
+                    return (
+                      <div key={`${id}/${p.product_id ?? pi}`} className="text-[11.5px]">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-mono text-dim-300">
+                            #{p.product_id ?? "?"}
+                          </span>
+                          <span className="font-mono text-[10.5px] text-dim-400 tabular">
+                            w={pickWeight.toFixed(2)}
+                          </span>
+                        </div>
+                        {note && (
+                          <div className="text-[11px] text-dim-400 leading-snug mt-0.5">{note}</div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="px-3 py-2 text-[11px] text-dim-500 font-mono">no picks</div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function ExecutionsBlock({ executions }: { executions: ExecutionRow[] }) {
+  return (
+    <div>
+      <SubBlockTitle>Executions</SubBlockTitle>
+      <div className="space-y-1.5">
+        {executions.map((e) => {
+          const tone =
+            e.status === "success" ? "text-neon" : e.status === "error" ? "text-danger" : "text-dim-300";
+          const kind =
+            typeof e.action === "object" && e.action !== null && "kind" in e.action
+              ? String((e.action as { kind?: unknown }).kind ?? "action")
+              : "action";
+          return (
+            <div
+              key={e.idx}
+              className="flex items-start gap-3 text-[12px] font-mono bg-ink-850/40 border border-ink-600/30 rounded-sm px-3 py-1.5"
+            >
+              <span className="text-dim-500 tabular w-5 text-right">{e.idx}</span>
+              <span className="text-dim-300 flex-1 min-w-0 truncate">{kind}</span>
+              <span className={`uppercase text-[10.5px] tracking-[0.14em] ${tone}`}>{e.status}</span>
+              {e.error && (
+                <span className="text-[10.5px] text-danger/80 max-w-[40%] truncate" title={e.error}>
+                  {e.error}
+                </span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function WatcherEventsBlock({ events }: { events: EventRow[] }) {
+  return (
+    <div>
+      <SubBlockTitle>Watcher events that triggered this cycle</SubBlockTitle>
+      <div className="space-y-1.5">
+        {events.map((ev) => {
+          const tone =
+            ev.severity === "red"
+              ? "text-danger border-danger/30 bg-danger/5"
+              : ev.severity === "warn"
+                ? "text-warn border-warn/30 bg-warn/5"
+                : "text-dim-300 border-ink-600/40 bg-ink-850/40";
+          return (
+            <div
+              key={ev.id}
+              className={`flex items-center gap-3 text-[12px] font-mono border rounded-sm px-3 py-1.5 ${tone}`}
+            >
+              <span className="text-[10.5px] uppercase tracking-[0.14em] opacity-80">{ev.kind}</span>
+              {ev.coin && <span className="text-[10.5px] opacity-80">{ev.coin}</span>}
+              <span className="text-[10.5px] tabular text-dim-500 ml-auto">
+                {new Date(ev.event_ts).toISOString().slice(11, 19)} UTC
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function ValidatorStatusBlock({
+  validator,
+}: {
+  validator: NonNullable<NonNullable<DecisionBlob["_meta"]>["_validator"]>;
+}) {
+  const ok = validator.ok === true;
+  const errors = validator.errors ?? [];
+  return (
+    <div>
+      <SubBlockTitle>Validator</SubBlockTitle>
+      {ok ? (
+        <div className="text-[12px] font-mono text-neon">validator passed — all hard caps respected</div>
+      ) : (
+        <div className="space-y-1.5">
+          <div className="text-[12px] font-mono text-danger">validator rejected · {errors.length} issue(s)</div>
+          {errors.map((err, i) => (
+            <div
+              key={i}
+              className="text-[11.5px] text-danger/80 bg-danger/5 border border-danger/30 rounded-sm px-3 py-1.5 leading-snug"
+            >
+              {err}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SubBlockTitle({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="text-[10.5px] font-mono uppercase tracking-[0.18em] text-dim-500 mb-2">
+      {children}
     </div>
   );
 }

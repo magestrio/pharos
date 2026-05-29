@@ -116,6 +116,7 @@ function buildDecision(
     flags: [],
     ipfs: event.ipfsCid,
     tx: event.txHash,
+    cycleTs: cycle?.cycle_ts,
   };
 }
 

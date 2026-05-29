@@ -31,6 +31,9 @@ export type Decision = {
   flags: string[];
   ipfs: string;
   tx: string;
+  // Off-chain cycle key for rich-detail expand (.9). Mock rows leave
+  // this undefined so the expand falls back to the canned thesis.
+  cycleTs?: string;
 };
 
 export type ActiveHedge = {
