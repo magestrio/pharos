@@ -28,6 +28,7 @@ VenueId = Literal[
     "bybit_discount_buy",
     "bybit_smart_leverage",
     "bybit_double_win",
+    "bybit_alpha",
 ]
 
 
@@ -91,13 +92,16 @@ VENUE_REGISTRY: dict[str, VenueMeta] = {
     "bybit_flex": VenueMeta(
         venue_id="bybit_flex",
         enabled=True,
-        max_weight=0.90,  # .14 smoke test — bumped from 0.70 for 2-venue small-vault concentration; revert after
+        max_weight=0.70,
         requires_picks=True,
         snapshot_category="FlexibleSaving",
         notes=(
             "Bybit Earn FlexibleSaving — instant / near-instant redeem, "
             "variable APR. Pick products from the snapshot's top-20 "
-            "ranking by effective APR. Most USDC-stable picks live here."
+            "ranking by effective APR. Stables AND non-stables are equally "
+            "eligible; non-stable picks (ID, IO, AGIX, etc.) get auto-hedged "
+            "by the executor just like OnChain non-stables. DO NOT bias "
+            "toward stables — operator hard rule 2026-05-29."
         ),
     ),
     "bybit_onchain": VenueMeta(
@@ -171,8 +175,12 @@ VENUE_REGISTRY: dict[str, VenueMeta] = {
             "Bybit Advance-Earn Smart Leverage — leveraged directional spot "
             "(Long or Short) with explicit `leverage`, `duration`, settlement. "
             "Higher risk than Earn or LM; 10% concentration cap by design. "
-            "Quote endpoint required for APR — picks rejected by validator "
-            "until then. Surfaced for visibility."
+            "`.55` adds a trailing-momentum APR proxy from the underlying's "
+            "7d K-line: `annualized_return × direction × leverage × 0.3`, "
+            "clamped to ±50% APR. Picks become real when momentum is "
+            "available (`apr_source=\"momentum\"`); else `missing` and "
+            "validator rejects. Momentum is a low-confidence signal — size "
+            "well below 10% cap and justify the directional view in thesis."
         ),
     ),
     "bybit_double_win": VenueMeta(
@@ -187,6 +195,30 @@ VENUE_REGISTRY: dict[str, VenueMeta] = {
             "yield if price stays in range until settlement, else settle at "
             "boundary. Quote endpoint required for APR — picks rejected by "
             "validator until then. Surfaced for visibility."
+        ),
+    ),
+    "bybit_alpha": VenueMeta(
+        venue_id="bybit_alpha",
+        enabled=True,
+        max_weight=0.10,
+        requires_picks=True,
+        snapshot_category="AlphaFarm",
+        notes=(
+            "Bybit Alpha Farm — purchase on-chain (DEX) alpha tokens with CEX "
+            "payment tokens via `/v5/alpha/trade/{quote,purchase,redeem}`. "
+            "Directional exposure on an alpha token: no settlement, no accrual "
+            "— 'return' is the price change of the alpha token vs the payment "
+            "token over the holding period. Snapshot surfaces the top-K tokens "
+            "by `liquidity` with rich metadata in `notes` (chain, riskFlag, "
+            "min/max_order, price_usd, change_24h, vol_24h_usd, liquidity_usd, "
+            "market_cap_usd, holders, pay_tokens). `.55` adds a trailing-"
+            "momentum APR proxy from `change24h × 365 × 0.5`, clamped to "
+            "±50% APR (`apr_source=\"momentum\"`). 24h is a noisy window — "
+            "treat as directional speculation, NOT yield. Cap is 10% but "
+            "any single momentum pick should sit well below 5%. Hedging: "
+            "alpha tokens almost never have a linear perp pair, so this "
+            "venue is declared hedge-exempt as a small directional bucket "
+            "once `.54` execute ships."
         ),
     ),
 }

@@ -24,12 +24,19 @@ from agent.bybit_oracle.bybit_client import (
     PerpPosition,
 )
 from agent.sandbox.snapshot import (
+    ALPHA_MOMENTUM_HAIRCUT,
+    MOMENTUM_APR_CAP,
+    SMART_LEVERAGE_MOMENTUM_HAIRCUT,
     ProductSummary,
     Snapshot,
     UsdcPegSnapshot,
+    _advance_earn_summary,
+    _alpha_summary,
     _flex_or_onchain_summary,
     _is_open_perp,
+    _kline_period_return,
     _lm_summary,
+    _momentum_apr,
     _parse_percent,
     _rank,
     _safe_earn,
@@ -157,6 +164,198 @@ def test_lm_summary_handles_missing_apy_e8():
     # apyE8 default "0" parses cleanly, so this is apy_e8 not missing —
     # the "missing" branch is only for non-numeric / invalid values
     assert s.apr_source == "apy_e8"
+
+
+# ─── _momentum_apr / _kline_period_return (`.55`) ─────────────────────────
+
+
+def test_momentum_apr_annualizes_period_return():
+    """24h move of +0.5% with no haircut, no leverage = 0.005 × 365 = 1.825 raw,
+    but clamped to MOMENTUM_APR_CAP = 0.50."""
+    apr = _momentum_apr(Decimal("0.005"), 1)
+    assert apr == MOMENTUM_APR_CAP
+
+
+def test_momentum_apr_applies_alpha_haircut_and_clamps():
+    """Alpha haircut 0.5. A +20% 24h pump: 0.20 × 365 × 0.5 = 36.5, clamped to 0.50."""
+    apr = _momentum_apr(Decimal("0.20"), 1, haircut=ALPHA_MOMENTUM_HAIRCUT)
+    assert apr == MOMENTUM_APR_CAP
+
+
+def test_momentum_apr_short_direction_flips_sign():
+    """Up underlying + Short direction = negative APR (LLM should avoid)."""
+    apr = _momentum_apr(
+        Decimal("0.05"), 7,
+        direction_sign=-1,
+        haircut=SMART_LEVERAGE_MOMENTUM_HAIRCUT,
+    )
+    # raw = 0.05 × (365/7) × -1 × 0.3 = -0.7821… clamped to -0.50
+    assert apr == -MOMENTUM_APR_CAP
+
+
+def test_momentum_apr_leverage_multiplies_then_haircut_then_clamp():
+    """+1% 7d × 3x leverage × 0.3 haircut = 0.01 × 52.14 × 3 × 0.3 ≈ 0.47 (under cap)."""
+    apr = _momentum_apr(
+        Decimal("0.01"), 7,
+        leverage=3,
+        haircut=SMART_LEVERAGE_MOMENTUM_HAIRCUT,
+    )
+    assert apr is not None
+    # under the cap, not at it
+    assert apr < MOMENTUM_APR_CAP
+    assert apr > Decimal("0.40")
+
+
+def test_momentum_apr_zero_period_returns_none():
+    assert _momentum_apr(Decimal("0.05"), 0) is None
+    assert _momentum_apr(Decimal("0.05"), Decimal("-1")) is None
+
+
+def test_kline_period_return_uses_oldest_open_and_newest_close():
+    """Bybit returns most-recent-first. 8 daily candles span a 7d window —
+    oldest open ($100) vs newest close ($107) = +7% over 7d."""
+    candles = [
+        {"open": "107.5", "close": "107"},   # latest (day 7)
+        {"open": "106", "close": "107.5"},
+        {"open": "105", "close": "106"},
+        {"open": "104", "close": "105"},
+        {"open": "103", "close": "104"},
+        {"open": "102", "close": "103"},
+        {"open": "101", "close": "102"},
+        {"open": "100", "close": "101"},     # oldest (day 0)
+    ]
+    period = _kline_period_return(candles)
+    assert period == Decimal("0.07")
+
+
+def test_kline_period_return_handles_empty_window():
+    assert _kline_period_return([]) is None
+    assert _kline_period_return([{"open": "1", "close": "1"}]) is None
+
+
+def test_kline_period_return_handles_bad_prices():
+    """Non-numeric prices or zero start price → None (fail-soft)."""
+    assert _kline_period_return([{"open": "x", "close": "1"}] * 2) is None
+    assert _kline_period_return([{"open": "0", "close": "1"}] * 2) is None
+
+
+# ─── _alpha_summary (`.53` + `.55`) ────────────────────────────────────────
+
+
+def _biz_token(token_code: str = "DEX_123", symbol: str = "PEPE", **overrides):
+    return {
+        "tokenCode": token_code,
+        "symbol": symbol,
+        "chainCode": "ETH",
+        "tokenAddress": "0xabc",
+        "tokenDecimals": 18,
+        "riskFlag": 0,
+        "minOrderQuantity": 1,
+        "maxOrderQuantity": 50000,
+        "payTokenCodes": ["CEX_1", "CEX_2"],
+        **overrides,
+    }
+
+
+def test_alpha_summary_returns_none_without_token_code():
+    assert _alpha_summary({"symbol": "FOO"}) is None
+
+
+def test_alpha_summary_missing_when_no_price_info():
+    s = _alpha_summary(_biz_token())
+    assert s is not None
+    assert s.apr_source == "missing"
+    assert s.effective_apr == Decimal(0)
+    assert s.product_id == "DEX_123"
+    assert s.coin == "PEPE"
+    assert "chain=ETH" in s.notes
+    assert "pay_tokens=CEX_1,CEX_2" in s.notes
+
+
+def test_alpha_summary_uses_change24h_for_momentum_apr():
+    """+10% 24h = 0.10 × 365 × 0.5 = 18.25 → clamped to 0.50."""
+    price = {"tokenCode": "DEX_123", "change24h": "0.10", "liquidity": "50000"}
+    s = _alpha_summary(_biz_token(), price)
+    assert s is not None
+    assert s.apr_source == "momentum"
+    assert s.effective_apr == MOMENTUM_APR_CAP
+    assert s.base_apr_string == "change_24h=0.10"
+    assert "change_24h=0.10" in s.notes
+    assert "liquidity_usd=50000" in s.notes
+
+
+def test_alpha_summary_negative_change_yields_negative_capped_apr():
+    """-10% 24h = -0.50 (clamped negative cap). LLM should avoid."""
+    price = {"tokenCode": "DEX_123", "change24h": "-0.10"}
+    s = _alpha_summary(_biz_token(), price)
+    assert s is not None
+    assert s.apr_source == "momentum"
+    assert s.effective_apr == -MOMENTUM_APR_CAP
+
+
+def test_alpha_summary_flags_risk_warning():
+    s = _alpha_summary(_biz_token(riskFlag=1))
+    assert s is not None
+    assert "risk_flag=warn" in s.notes
+
+
+# ─── _advance_earn_summary SmartLeverage momentum (`.55`) ──────────────────
+
+
+def _smart_leverage(
+    underlying: str = "BTC", direction: str = "Long", leverage: int = 3, duration: str = "7d"
+) -> dict:
+    return {
+        "productId": "sl-1",
+        "underlyingAsset": underlying,
+        "direction": direction,
+        "leverage": leverage,
+        "duration": duration,
+        "coin": "USDT",
+    }
+
+
+def test_smart_leverage_missing_when_no_kline_data():
+    s = _advance_earn_summary(_smart_leverage(), "SmartLeverage")
+    assert s.apr_source == "missing"
+    assert s.effective_apr == Decimal(0)
+
+
+def test_smart_leverage_long_uses_momentum_with_haircut():
+    """BTC +2% 7d, Long, 3x leverage: 0.02 × 52.14 × 3 × 0.3 ≈ 0.939 → clamped 0.50."""
+    s = _advance_earn_summary(
+        _smart_leverage(),
+        "SmartLeverage",
+        underlying_period_return=Decimal("0.02"),
+    )
+    assert s.apr_source == "momentum"
+    assert s.effective_apr == MOMENTUM_APR_CAP
+    assert "underlying_7d=0.02" in s.base_apr_string
+    assert "direction=Long" in s.base_apr_string
+    assert "leverage=3" in s.base_apr_string
+
+
+def test_smart_leverage_short_flips_sign():
+    """Up underlying + Short = negative APR (correct: shorting an uptrend hurts)."""
+    s = _advance_earn_summary(
+        _smart_leverage(direction="Short"),
+        "SmartLeverage",
+        underlying_period_return=Decimal("0.02"),
+    )
+    assert s.apr_source == "momentum"
+    assert s.effective_apr == -MOMENTUM_APR_CAP
+
+
+def test_smart_leverage_does_not_use_underlying_return_for_other_categories():
+    """Passing `underlying_period_return` to non-SmartLeverage is a no-op —
+    DualAssets etc. only get their quote-derived APR. Prevents accidental
+    misuse of the new kwarg."""
+    p = {"productId": "x", "baseCoin": "BTC", "quoteCoin": "USDT", "duration": "7d"}
+    s = _advance_earn_summary(
+        p, "DualAssets",
+        underlying_period_return=Decimal("0.10"),
+    )
+    assert s.apr_source == "missing"  # no quote was supplied
 
 
 # ─── _rank ──────────────────────────────────────────────────────────────────

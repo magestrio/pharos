@@ -209,6 +209,13 @@ class Snapshot(BaseModel):
     wallet: WalletSnapshot
     earn_positions: list[dict[str, Any]] = Field(default_factory=list)
     lm_positions: list[dict[str, Any]] = Field(default_factory=list)
+    # Current Bybit Alpha holdings (`.54`). Each row carries `tokenCode`
+    # (DEX_<id>), `tokenSymbol`, `chainCode`, `tokenAmount` (native
+    # units), `tokenAmountUsd`, `costPrice`, `lastPrice`, `pnl`,
+    # `pnlRatio`, `tradeFlag`, `assetStatus`. Empty when the sub-account
+    # has no alpha positions or the `/v5/alpha/asset` call failed (which
+    # is degraded silently per `_safe_alpha`).
+    alpha_positions: list[dict[str, Any]] = Field(default_factory=list)
     products: dict[str, list[ProductSummary]] = Field(default_factory=dict)
     market: MarketSnapshot
     # Per-coin perp market context, indexed by the BASE coin (e.g. "TON").
@@ -392,9 +399,82 @@ def _parse_duration_days(duration: str | None) -> int | None:
     return None
 
 
+# `.55` — trailing-momentum proxy for venues with no native APR
+# (Alpha Farm, SmartLeverage). Annualized realized return on the
+# underlying, scaled by leverage and direction, then haircut, then
+# clamped to ±MOMENTUM_APR_CAP. The clamp is load-bearing: without it
+# a single hot week gets extrapolated to absurd APRs (a 30% 7d move on
+# 5x leverage = +780% raw) which the LLM would naively trust as if it
+# were a measured-yield rate. The cap converts "huge directional move"
+# into a soft "this is the best signal we have, it's maxed out" — and
+# the LLM is told in the prompt that `apr_source="momentum"` means
+# low-confidence and to size below half the venue cap.
+MOMENTUM_APR_CAP = Decimal("0.50")
+ALPHA_MOMENTUM_HAIRCUT = Decimal("0.50")
+SMART_LEVERAGE_MOMENTUM_HAIRCUT = Decimal("0.30")
+
+
+def _momentum_apr(
+    period_return: Decimal,
+    period_days: Decimal | int,
+    *,
+    leverage: Decimal | int = 1,
+    direction_sign: int = 1,
+    haircut: Decimal = Decimal("1"),
+) -> Decimal | None:
+    """Annualize a realized period return into an APR signal.
+
+    `period_return` is a signed fraction (`+0.05` = +5% over the period).
+    `direction_sign` flips for Short positions (so a positive momentum
+    on the underlying becomes a negative APR for a Short pick — exactly
+    what we want: the LLM avoids shorting an uptrend). `leverage` scales
+    the raw signal (a 2x leveraged long doubles both gain and loss).
+    `haircut` damps the final number (Alpha 0.5, SmartLeverage 0.3)
+    to discourage momentum-chasing.
+
+    Returns `None` for non-positive `period_days` so callers can fall
+    back to `apr_source="missing"` rather than crash on bad input.
+    """
+    days = Decimal(str(period_days))
+    if days <= 0:
+        return None
+    annualized = period_return * (Decimal(365) / days)
+    scaled = annualized * Decimal(direction_sign) * Decimal(str(leverage)) * haircut
+    if scaled > MOMENTUM_APR_CAP:
+        return MOMENTUM_APR_CAP
+    if scaled < -MOMENTUM_APR_CAP:
+        return -MOMENTUM_APR_CAP
+    return scaled
+
+
+def _kline_period_return(candles: list[dict[str, Any]]) -> Decimal | None:
+    """Realized log-ish return across a K-line window.
+
+    Bybit returns candles most-recent-first. We use the oldest
+    candle's `open` as the start price and the newest `close` as the
+    end price — a simple period return: `(end - start) / start`. Days
+    in the window are inferred from row count minus 1 (8 daily candles
+    span a 7-day window between candle 0 open and candle 7 close).
+
+    Returns `None` when the window has fewer than 2 candles or when
+    price parsing fails — caller drops the momentum signal.
+    """
+    if not candles or len(candles) < 2:
+        return None
+    try:
+        end_price = Decimal(str(candles[0].get("close", "")))
+        start_price = Decimal(str(candles[-1].get("open", "")))
+    except (InvalidOperation, TypeError):
+        return None
+    if start_price <= 0:
+        return None
+    return (end_price - start_price) / start_price
+
+
 def _advance_earn_summary(
     p: dict[str, Any], category: str,
     quote: dict[str, Any] | None = None,
+    underlying_period_return: Decimal | None = None,
 ) -> ProductSummary:
     """Normalize one advance-Earn product (DualAssets, DiscountBuy,
     SmartLeverage, DoubleWin) for snapshot surface.
@@ -457,11 +537,13 @@ def _advance_earn_summary(
         if lb is not None and ub is not None:
             notes.append(f"range_buffer=±{lb}/{ub}")
 
-    # Quote-derived APR (.28). Only DualAssets and DiscountBuy yield a
-    # meaningful per-product rate from the quote endpoint. SmartLeverage
-    # and DoubleWin are structured directional / range bets — they get
-    # a conditional, not an APR — so we leave them `missing` until a
-    # follow-up task models the conditional payoff (.29 territory).
+    # Quote-derived APR (.28) for DualAssets + DiscountBuy.
+    # SmartLeverage gets a trailing-momentum proxy (`.55`) from the 7d
+    # K-line of `underlyingAsset` — annualized × direction × leverage ×
+    # haircut, clamped to ±MOMENTUM_APR_CAP. DoubleWin stays `missing`:
+    # momentum is the wrong signal for a range-bound payoff (high
+    # momentum → breakout → loss), and modeling that needs implied
+    # volatility (.56 deferred).
     effective_apr: Decimal = Decimal(0)
     apr_source: str = "missing"
     base_apr_string: str | None = None
@@ -476,6 +558,30 @@ def _advance_earn_summary(
             if apr is not None:
                 effective_apr, apr_source = apr, "quote_discount"
                 base_apr_string = raw
+    if (
+        category == "SmartLeverage"
+        and underlying_period_return is not None
+    ):
+        direction_str = str(p.get("direction") or "Long")
+        direction_sign = -1 if direction_str.lower() == "short" else 1
+        try:
+            lev = Decimal(str(p.get("leverage") or "1"))
+        except InvalidOperation:
+            lev = Decimal(1)
+        momentum = _momentum_apr(
+            underlying_period_return,
+            7,
+            leverage=lev,
+            direction_sign=direction_sign,
+            haircut=SMART_LEVERAGE_MOMENTUM_HAIRCUT,
+        )
+        if momentum is not None:
+            effective_apr = momentum
+            apr_source = "momentum"
+            base_apr_string = (
+                f"underlying_7d={underlying_period_return} "
+                f"direction={direction_str} leverage={lev}"
+            )
 
     return ProductSummary(
         category=category,
@@ -485,6 +591,120 @@ def _advance_earn_summary(
         apr_source=apr_source,
         base_apr_string=base_apr_string,
         redeem_lockup_minutes=None,
+        notes=notes,
+    )
+
+
+def _alpha_summary(
+    p: dict[str, Any],
+    price_info: dict[str, Any] | None = None,
+) -> ProductSummary | None:
+    """Normalize one Bybit Alpha token entry for snapshot surface.
+
+    `.52` shipped a list-only surface with the wrong endpoint guessed
+    from a third-party SDK reference. `.53` corrects it against the
+    official docs (via context7):
+
+    - Listing: `POST /v5/alpha/trade/biz-token-list` returns
+      `tokenCode` (DEX_<id>), `symbol`, `chainCode`, `tokenAddress`,
+      `tokenDecimals`, `riskFlag` (0=clean, 1=warn), `minOrderQuantity`,
+      `maxOrderQuantity`, `payTokenCodes`, `tokenTags`.
+    - Price feed: `POST /v5/alpha/trade/biz-token-price-list` returns
+      `price`, `change24h`, `vol24h`, `marketCap`, `liquidity`, `holders`
+      per token — the primary directional/risk signal feed.
+
+    `.55` adds a trailing-momentum APR proxy: `apr_source="momentum"`
+    from `change24h × 365 × ALPHA_MOMENTUM_HAIRCUT (0.5)`, clamped to
+    ±MOMENTUM_APR_CAP (50%). 24h is the only window the price-list
+    endpoint provides without a separate fetch; the clamp + haircut
+    prevent a single hot 24h move from masquerading as a real APR.
+    Picks remain low-confidence by construction — the prompt instructs
+    the LLM to size momentum-sourced picks well below the venue cap and
+    justify the directional thesis explicitly. Tokens without a
+    `change24h` price-info row keep `apr_source="missing"` (validator
+    rejects) — surface-only.
+
+    Returns `None` when `tokenCode` is missing so the row is silently
+    dropped — defends against an unexpected `result` shape mutation.
+    """
+    token_code = p.get("tokenCode")
+    if not token_code:
+        return None
+    symbol = p.get("symbol") or "?"
+
+    notes: list[str] = []
+    chain = p.get("chainCode")
+    if chain:
+        notes.append(f"chain={chain}")
+    risk = p.get("riskFlag")
+    if risk == 1:
+        notes.append("risk_flag=warn")
+    min_q = p.get("minOrderQuantity")
+    max_q = p.get("maxOrderQuantity")
+    if min_q is not None:
+        notes.append(f"min_order={min_q}")
+    if max_q is not None:
+        notes.append(f"max_order={max_q}")
+    pay_codes = p.get("payTokenCodes")
+    if isinstance(pay_codes, list) and pay_codes:
+        notes.append(f"pay_tokens={','.join(str(c) for c in pay_codes)}")
+
+    if price_info:
+        price = price_info.get("price")
+        if price is not None:
+            notes.append(f"price_usd={price}")
+        change_24h = price_info.get("change24h")
+        if change_24h is not None:
+            notes.append(f"change_24h={change_24h}")
+        vol_24h = price_info.get("vol24h")
+        if vol_24h is not None:
+            notes.append(f"vol_24h_usd={vol_24h}")
+        liquidity = price_info.get("liquidity")
+        if liquidity is not None:
+            notes.append(f"liquidity_usd={liquidity}")
+        market_cap = price_info.get("marketCap")
+        if market_cap is not None:
+            notes.append(f"market_cap_usd={market_cap}")
+        holders = price_info.get("holders")
+        if holders is not None:
+            notes.append(f"holders={holders}")
+
+    min_subscribe: Decimal | None
+    try:
+        min_subscribe = Decimal(str(min_q)) if min_q is not None else None
+    except (InvalidOperation, TypeError):
+        min_subscribe = None
+
+    effective_apr: Decimal = Decimal(0)
+    apr_source: str = "missing"
+    base_apr_string: str | None = None
+    if price_info is not None:
+        change_24h_raw = price_info.get("change24h")
+        if change_24h_raw is not None:
+            try:
+                change_24h = Decimal(str(change_24h_raw))
+            except InvalidOperation:
+                change_24h = None
+            if change_24h is not None:
+                momentum = _momentum_apr(
+                    change_24h,
+                    1,
+                    haircut=ALPHA_MOMENTUM_HAIRCUT,
+                )
+                if momentum is not None:
+                    effective_apr = momentum
+                    apr_source = "momentum"
+                    base_apr_string = f"change_24h={change_24h}"
+
+    return ProductSummary(
+        category="AlphaFarm",
+        product_id=str(token_code),
+        coin=str(symbol),
+        effective_apr=effective_apr,
+        apr_source=apr_source,
+        base_apr_string=base_apr_string,
+        redeem_lockup_minutes=None,
+        min_subscribe_usd=min_subscribe,
         notes=notes,
     )
 
@@ -930,6 +1150,53 @@ async def _quote_advance_top_k(
     return out
 
 
+async def _kline_smart_leverage_underlyings(
+    client: BybitClient,
+    advance_products: dict[str, list[dict[str, Any]]],
+    errors: list[str],
+) -> dict[str, Decimal]:
+    """Fan out 7d K-line fetch for every unique SmartLeverage underlying
+    surfaced in this cycle (`.55`). Returns `{underlying: period_return}`
+    — the realized fractional return across the 7-day window. Used by
+    `_advance_earn_summary` to derive `apr_source="momentum"` for
+    SmartLeverage picks.
+
+    Symbol mapping: SmartLeverage's `underlyingAsset` is the bare coin
+    (e.g. "BTC"); the matching linear perp is `{underlying}USDT`.
+    Underlyings without a corresponding USDT-perp listing fail K-line
+    fetch and the snapshot degrades to `apr_source="missing"` for that
+    pick — same fail-soft contract as advance-Earn quote fetch.
+    """
+    items = advance_products.get("SmartLeverage") or []
+    underlyings: list[str] = []
+    seen: set[str] = set()
+    for p in items[:ADVANCE_QUOTE_TOP_K]:
+        u = p.get("underlyingAsset")
+        if not u:
+            continue
+        u_up = str(u).upper()
+        if u_up in seen:
+            continue
+        seen.add(u_up)
+        underlyings.append(u_up)
+    if not underlyings:
+        return {}
+    coros = [
+        client.get_kline(symbol=f"{u}USDT", interval="D", limit=8)
+        for u in underlyings
+    ]
+    results = await asyncio.gather(*coros, return_exceptions=True)
+    out: dict[str, Decimal] = {}
+    for u, res in zip(underlyings, results):
+        if isinstance(res, BaseException):
+            errors.append(f"smart_leverage_kline[{u}]: {type(res).__name__}: {res}")
+            continue
+        period = _kline_period_return(res)
+        if period is not None:
+            out[u] = period
+    return out
+
+
 async def _safe_advance(
     coro, errors: list[str], label: str, default: Any
 ) -> Any:
@@ -946,6 +1213,25 @@ async def _safe_advance(
             errors.append(f"{label}: retCode={e.ret_code} {e.ret_msg}")
             return default
         raise
+
+
+async def _safe_alpha(
+    coro, errors: list[str], label: str, default: Any
+) -> Any:
+    """Swallow any Bybit error from the Alpha listing call (`.52`).
+
+    The `/v5/alpha/*` namespace was only discovered via the third-party
+    SDK reference — endpoint availability and per-sub-account permission
+    requirements aren't fully mapped yet. Treat any `BybitAPIError` as
+    "Alpha unavailable this cycle" and degrade to `default` so the rest
+    of the snapshot still builds. Real ret-codes observed in the wild
+    will narrow this in `.53`.
+    """
+    try:
+        return await coro
+    except BybitAPIError as e:
+        errors.append(f"{label}: retCode={e.ret_code} {e.ret_msg}")
+        return default
 
 
 def _ticker_24h(ticker: LinearTicker | None) -> Decimal | None:
@@ -1039,6 +1325,38 @@ async def collect_snapshot(
         )
         for cat in ("DualAssets", "DiscountBuy", "SmartLeverage", "DoubleWin")
     }
+    # Bybit Alpha Farm — on-chain DEX tokens purchased with CEX payment
+    # tokens via `/v5/alpha/trade/{quote,purchase,redeem}`. Two listing
+    # fans-out: biz-token list (universe + per-token metadata like
+    # `riskFlag`, `minOrderQuantity`, `payTokenCodes`) and price-list
+    # (`change24h`, `liquidity`, `marketCap`, `vol24h`, `holders`). Both
+    # are POST endpoints (.53 correction over .52's SDK-guessed GET).
+    # Tolerate any Bybit error (per-account Alpha enablement not yet
+    # mapped); rest of the snapshot still builds with `AlphaFarm` empty.
+    alpha_list_task = asyncio.create_task(
+        _safe_alpha(
+            client.list_alpha_products(),
+            errors,
+            "alpha_farm[list]",
+            [],
+        )
+    )
+    # Note (`.54` live-probe 2026-05-29): the price-list endpoint requires
+    # an explicit `tokenAddressInfo` array — we don't have one until the
+    # biz-token listing returns. Price-list fetch happens AFTER
+    # `alpha_list_task` resolves; see `_alpha_price_for_listing` below.
+    # Pay-token-list moved to execute time (it's per-token, not global).
+    # Current alpha holdings (`.54`). Mirrors `lm_positions` shape: the
+    # executor diff folds these into the (category, product_id) keyset so
+    # tokens we hold but the LLM dropped get redeemed back to USDT.
+    alpha_pos_task = asyncio.create_task(
+        _safe_alpha(
+            client.get_alpha_positions(),
+            errors,
+            "alpha_farm[positions]",
+            {},
+        )
+    )
     btc_task = asyncio.create_task(
         client.get_tickers(category="linear", symbol="BTCUSDT")
     )
@@ -1110,6 +1428,41 @@ async def collect_snapshot(
     onchain_products = await onchain_task
     lm_products = await lm_products_task
     advance_products = {cat: await task for cat, task in advance_tasks.items()}
+    alpha_products = await alpha_list_task
+    alpha_pos_payload = await alpha_pos_task
+    alpha_positions_raw = (
+        alpha_pos_payload.get("assetList") or []
+        if isinstance(alpha_pos_payload, dict)
+        else []
+    )
+    # Price-list fan-out (`.54` live-probe 2026-05-29). Bybit's
+    # /v5/alpha/trade/biz-token-price-list requires `tokenAddressInfo: [
+    # {chainCode, tokenAddress}, ...]` (max 20 per request). We rank the
+    # `alpha_products` listing top-TOP_K, build the {chainCode,
+    # tokenAddress} batch from those, and fetch one call's worth of
+    # price metadata to feed into `_alpha_summary` for the momentum APR.
+    # Failures degrade to empty price-info — venue stays surfaced with
+    # `apr_source="missing"`.
+    alpha_price_info: list[dict[str, Any]] = []
+    if alpha_products:
+        top_alpha = alpha_products[:TOP_K]
+        token_addr_info = [
+            {
+                "chainCode": p.get("chainCode", ""),
+                "tokenAddress": p.get("tokenAddress", ""),
+            }
+            for p in top_alpha
+            if p.get("chainCode") and p.get("tokenAddress")
+        ]
+        if token_addr_info:
+            try:
+                alpha_price_info = await client.list_alpha_price_info(
+                    token_address_info=token_addr_info
+                )
+            except BybitAPIError as e:
+                errors.append(
+                    f"alpha_farm[price_list]: retCode={e.ret_code} {e.ret_msg}"
+                )
     btc_tickers = await btc_task
     eth_tickers = await eth_task
     usdc_peg = await peg_task
@@ -1217,13 +1570,62 @@ async def collect_snapshot(
     quote_results = await _quote_advance_top_k(
         client, advance_products, errors
     )
+    smart_leverage_momentum = await _kline_smart_leverage_underlyings(
+        client, advance_products, errors
+    )
     for cat, raw_items in advance_products.items():
         if not raw_items:
             continue
         products[cat] = [
-            _advance_earn_summary(p, cat, quote_results.get((cat, str(p.get("productId", "")))))
+            _advance_earn_summary(
+                p,
+                cat,
+                quote_results.get((cat, str(p.get("productId", "")))),
+                underlying_period_return=(
+                    smart_leverage_momentum.get(str(p.get("underlyingAsset", "")).upper())
+                    if cat == "SmartLeverage"
+                    else None
+                ),
+            )
             for p in raw_items[:TOP_K]
         ]
+    # Alpha Farm (`.52` shipped list-only; `.53` corrects endpoints + adds
+    # price-list metadata; `.55` momentum APR; `.54` live-probe fixed the
+    # price-list contract — keyed by `(chainCode, tokenAddress)`, not
+    # `tokenCode`). Rank by `liquidity` (USD) desc, tiebreak `vol24h`.
+    # Tokens without a price-info row sink to the bottom.
+    if alpha_products:
+        price_info_by_addr = {
+            (row.get("chainCode"), row.get("tokenAddress")): row
+            for row in alpha_price_info
+            if isinstance(row, dict)
+            and row.get("chainCode")
+            and row.get("tokenAddress")
+        }
+        def _alpha_info(p: dict[str, Any]) -> dict[str, Any] | None:
+            return price_info_by_addr.get(
+                (p.get("chainCode"), p.get("tokenAddress"))
+            )
+        def _alpha_rank_key(p: dict[str, Any]) -> tuple[Decimal, Decimal]:
+            info = _alpha_info(p) or {}
+            try:
+                liq = Decimal(str(info.get("liquidity") or "0"))
+            except (InvalidOperation, TypeError):
+                liq = Decimal(0)
+            try:
+                vol = Decimal(str(info.get("vol24h") or "0"))
+            except (InvalidOperation, TypeError):
+                vol = Decimal(0)
+            return (liq, vol)
+
+        sorted_alpha = sorted(alpha_products, key=_alpha_rank_key, reverse=True)
+        alpha_rows = [
+            row
+            for p in sorted_alpha[:TOP_K]
+            if (row := _alpha_summary(p, _alpha_info(p))) is not None
+        ]
+        if alpha_rows:
+            products["AlphaFarm"] = alpha_rows
     # Persist the raw quotes for executor consumption (`.35`). Keyed as
     # `"<Category>/<ProductId>"` because pydantic dict fields can't carry
     # tuple keys through model_dump_json round-trips.
@@ -1312,6 +1714,7 @@ async def collect_snapshot(
         ),
         earn_positions=earn_positions_dump,
         lm_positions=lm_positions,
+        alpha_positions=alpha_positions_raw,
         products=products,
         market=market,
         perp_market=perp_market,

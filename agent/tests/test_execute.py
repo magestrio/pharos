@@ -57,6 +57,8 @@ def _snapshot(
     advance_products: dict[str, list[ProductSummary]] | None = None,
     onchain_products: list[ProductSummary] | None = None,
     flex_products: list[ProductSummary] | None = None,
+    alpha_products: list[ProductSummary] | None = None,
+    alpha_positions: list[dict] | None = None,
 ) -> Snapshot:
     products: dict[str, list[ProductSummary]] = {
         "FlexibleSaving": flex_products or [],
@@ -66,6 +68,8 @@ def _snapshot(
     if advance_products:
         for cat, items in advance_products.items():
             products[cat] = items
+    if alpha_products:
+        products["AlphaFarm"] = alpha_products
     return Snapshot(
         captured_at=datetime.now(UTC),
         wallet=WalletSnapshot(
@@ -74,6 +78,7 @@ def _snapshot(
         ),
         earn_positions=earn_positions or [],
         lm_positions=lm_positions or [],
+        alpha_positions=alpha_positions or [],
         products=products,
         market=MarketSnapshot(),
         perp_market=perp_market or {},
@@ -758,6 +763,163 @@ def test_diff_advance_pick_emits_skip() -> None:
     )
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
     assert any(a.kind == ActionKind.SKIP_OUT_OF_SCOPE for a in actions)
+
+
+# ─── Alpha Farm diff + dispatch (`.54`) ────────────────────────────────────
+
+
+def _alpha_summary_row(token_code: str = "DEX_123", symbol: str = "PEPE") -> ProductSummary:
+    return ProductSummary(
+        category="AlphaFarm",
+        product_id=token_code,
+        coin=symbol,
+        effective_apr=Decimal("0.10"),
+        apr_source="momentum",
+    )
+
+
+def _alpha_position(
+    token_code: str = "DEX_123", symbol: str = "PEPE",
+    amount_usd: str = "10", amount_native: str = "1000000",
+) -> dict:
+    return {
+        "tokenCode": token_code,
+        "tokenSymbol": symbol,
+        "tokenAmount": amount_native,
+        "tokenAmountUsd": amount_usd,
+        "chainCode": "ETH",
+    }
+
+
+def test_diff_alpha_pick_emits_skip_when_gate_off(monkeypatch) -> None:
+    """Default state: VAULT_ALPHA_EXEC_ENABLED unset → gate is False →
+    Alpha picks should NOT fire live API calls during the `.14` smoke."""
+    monkeypatch.setattr("agent.sandbox.execute.ALPHA_EXEC_ENABLED", False)
+    snap = _snapshot(
+        total_equity_usd="100",
+        alpha_products=[_alpha_summary_row()],
+    )
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.95),
+            _venue("bybit_alpha", 0.05, [("DEX_123", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
+    assert any(
+        a.category == "AlphaFarm" and "VAULT_ALPHA_EXEC_ENABLED" in a.reason
+        for a in skips
+    ), f"expected gate SKIP, got: {[a.reason for a in skips]}"
+    assert not any(
+        a.kind in (ActionKind.ALPHA_PURCHASE, ActionKind.ALPHA_REDEEM)
+        for a in actions
+    ), "no alpha live actions should be emitted when gate is off"
+
+
+def test_diff_alpha_purchase_when_gate_on(monkeypatch) -> None:
+    monkeypatch.setattr("agent.sandbox.execute.ALPHA_EXEC_ENABLED", True)
+    snap = _snapshot(
+        total_equity_usd="100",
+        alpha_products=[_alpha_summary_row()],
+    )
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.95),
+            _venue("bybit_alpha", 0.05, [("DEX_123", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    purchases = [a for a in actions if a.kind == ActionKind.ALPHA_PURCHASE]
+    assert len(purchases) == 1
+    a = purchases[0]
+    assert a.category == "AlphaFarm"
+    assert a.product_id == "DEX_123"
+    assert a.coin == "PEPE"
+    assert a.amount == Decimal("5.00")
+    assert "alpha_purchase DEX_123" in a.reason
+    assert "CEX_1" in a.reason  # pay token surfaced for log readability
+
+
+def test_diff_alpha_full_exit_when_position_dropped(monkeypatch) -> None:
+    """Holding PEPE, LLM no longer picks Alpha — full exit via REDEEM
+    with native token amount carried in extra."""
+    monkeypatch.setattr("agent.sandbox.execute.ALPHA_EXEC_ENABLED", True)
+    snap = _snapshot(
+        total_equity_usd="100",
+        alpha_positions=[_alpha_position(amount_usd="10", amount_native="1000000")],
+    )
+    d = _decision([_venue("cash_usdc", 1.0)])  # no Alpha pick this cycle
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    redeems = [a for a in actions if a.kind == ActionKind.ALPHA_REDEEM]
+    assert len(redeems) == 1
+    r = redeems[0]
+    assert r.product_id == "DEX_123"
+    assert r.coin == "PEPE"
+    assert r.amount == Decimal("10")
+    assert r.extra.get("token_amount_native") == "1000000"
+
+
+def test_diff_alpha_partial_reduction_emits_skip(monkeypatch) -> None:
+    """MVP: only full exits — partial scale-down SKIPs with reason."""
+    monkeypatch.setattr("agent.sandbox.execute.ALPHA_EXEC_ENABLED", True)
+    snap = _snapshot(
+        total_equity_usd="100",
+        alpha_products=[_alpha_summary_row()],
+        alpha_positions=[_alpha_position(amount_usd="10")],
+    )
+    # Currently $10, target $3 (drop of $7 > MIN_ACTION_USDC)
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.97),
+            _venue("bybit_alpha", 0.03, [("DEX_123", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    skips = [
+        a for a in actions
+        if a.kind == ActionKind.SKIP_OUT_OF_SCOPE and a.category == "AlphaFarm"
+    ]
+    assert any("partial reduction not wired" in a.reason for a in skips)
+
+
+def test_diff_alpha_no_op_when_target_matches_current(monkeypatch) -> None:
+    """Current ≈ target → no action (within MIN_ACTION_USDC)."""
+    monkeypatch.setattr("agent.sandbox.execute.ALPHA_EXEC_ENABLED", True)
+    snap = _snapshot(
+        total_equity_usd="100",
+        alpha_products=[_alpha_summary_row()],
+        alpha_positions=[_alpha_position(amount_usd="5")],
+    )
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.95),
+            _venue("bybit_alpha", 0.05, [("DEX_123", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    assert not any(
+        a.category == "AlphaFarm" for a in actions
+    ), f"expected no alpha action when target≈current, got: {actions}"
+
+
+def test_diff_alpha_redeem_skips_when_no_native_amount(monkeypatch) -> None:
+    """Position present but tokenAmount missing (degraded fetch) →
+    SKIP rather than redeem with garbage."""
+    monkeypatch.setattr("agent.sandbox.execute.ALPHA_EXEC_ENABLED", True)
+    snap = _snapshot(
+        total_equity_usd="100",
+        alpha_positions=[
+            {"tokenCode": "DEX_999", "tokenSymbol": "X", "tokenAmountUsd": "5"}
+        ],
+    )
+    d = _decision([_venue("cash_usdc", 1.0)])
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    skips = [
+        a for a in actions
+        if a.kind == ActionKind.SKIP_OUT_OF_SCOPE and a.category == "AlphaFarm"
+    ]
+    assert any("no tokenAmount" in a.reason for a in skips)
 
 
 # ─── Idempotency keys ───────────────────────────────────────────────────────

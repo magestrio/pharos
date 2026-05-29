@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -99,6 +100,37 @@ _LM_CATEGORY: str = "LiquidityMining"
 # rule (2026-05-27) applies to LM same as Earn — see `_STABLES` comment.
 _LM_QUOTE_ACCOUNT_TYPE: str = "UNIFIED"
 
+# Snapshot category string for Bybit Alpha Farm picks (`.52` / `.54`).
+_ALPHA_CATEGORY: str = "AlphaFarm"
+
+# Bybit Alpha purchases pay in USDT by convention — Alpha's pay-token-list
+# returns USDT as `CEX_1` (verified against docs 2026-05-29). We hardcode
+# this for the diff/dispatch path: when a USDC-denominated target weight
+# lands on Alpha, the executor needs to swap USDC → USDT first then
+# `alpha_purchase` from USDT. The swap leg piggybacks on existing
+# `_USDC_USDT_SPOT_SYMBOL` logic from `.33`. The CEX_<id> mapping is
+# environment-dependent — if Bybit ever reassigns IDs, `list_alpha_pay_tokens`
+# resolves the right code at runtime (deferred; hardcoded MVP).
+_ALPHA_PAY_TOKEN_CODE: str = "CEX_1"  # USDT
+
+# Default slippage tolerance for alpha purchases. 0.01 = 1%; tight enough
+# that we don't take a haircut on calm tokens, loose enough that mid-vol
+# tokens don't fail with `slippage too tight` rejections. The user can
+# override via `VAULT_ALPHA_SLIPPAGE` env var if Bybit's `slippage` field
+# in the quote response suggests a different floor for a specific token.
+_ALPHA_DEFAULT_SLIPPAGE: str = os.getenv("VAULT_ALPHA_SLIPPAGE", "0.01")
+
+# Alpha execute gate (`.54`). Off by default — `.14` smoke test is the
+# blocking guard, AND the Alpha endpoints have NOT been live-probed
+# against the sandbox sub-account as of 2026-05-29. When False, the diff
+# emits SKIP_OUT_OF_SCOPE for any AlphaFarm target so the live loop
+# stays clean. Flip via env `VAULT_ALPHA_EXEC_ENABLED=1` once you've
+# (a) closed `.14`, (b) live-probed `/v5/alpha/trade/biz-token-list` +
+# `/v5/alpha/trade/biz-token-price-list` + `/v5/alpha/asset`, (c)
+# confirmed the sub-account has Alpha permission and at least one
+# pickable token surfaces in the snapshot.
+ALPHA_EXEC_ENABLED: bool = os.getenv("VAULT_ALPHA_EXEC_ENABLED", "0") == "1"
+
 
 class ActionKind(StrEnum):
     SUBSCRIBE_EARN = "subscribe_earn"
@@ -110,6 +142,8 @@ class ActionKind(StrEnum):
     OPEN_PERP_SHORT = "open_perp_short"
     CLOSE_PERP = "close_perp"
     SWAP_SPOT = "swap_spot"
+    ALPHA_PURCHASE = "alpha_purchase"
+    ALPHA_REDEEM = "alpha_redeem"
     SKIP_OUT_OF_SCOPE = "skip_out_of_scope"
 
 
@@ -218,6 +252,9 @@ def diff_to_actions(
     current = _current_positions_by_pid(
         snapshot.earn_positions, snapshot.perp_market
     )
+    # Merge in current Alpha holdings (`.54`) — same (category, product_id)
+    # keyspace so the diff loop sees them as "current" for REDEEM logic.
+    current.update(_alpha_current_positions(snapshot.alpha_positions))
     targets = _target_usd_by_pid(decision, total_book_usd, snapshot)
 
     redeems: list[Action] = []
@@ -235,6 +272,13 @@ def diff_to_actions(
         lm_pid = str(lm_pos.get("productId") or "")
         if lm_pid:
             all_pids.add((_LM_CATEGORY, lm_pid))
+    # Same treatment for Alpha holdings (`.54`): tokens we currently hold
+    # but the LLM dropped from picks need redeeming. Alpha positions
+    # carry `tokenCode` (DEX_<id>) as the product id.
+    for alpha_pos in snapshot.alpha_positions:
+        alpha_pid = str(alpha_pos.get("tokenCode") or "")
+        if alpha_pid:
+            all_pids.add((_ALPHA_CATEGORY, alpha_pid))
 
     for idx, key in enumerate(sorted(all_pids)):
         category, product_id = key
@@ -283,6 +327,33 @@ def diff_to_actions(
                 redeems.append(lm_action)
             else:
                 skips.append(lm_action)
+            continue
+
+        if category == _ALPHA_CATEGORY:
+            # Alpha Farm lifecycle (`.54`). Distinct from Earn: every
+            # purchase/redeem requires a fresh quote (`quoteData` +
+            # `correctingCode` + `gas`) — we don't carry quote into the
+            # diff-time action (would be stale by execute time given
+            # `expireTime` is ~5 minutes). Dispatch re-quotes immediately
+            # before sending.
+            alpha_action = _alpha_action_for_target(
+                snapshot,
+                product_id,
+                target,
+                current_pos,
+                order_link_id,
+            )
+            if alpha_action is None:
+                continue
+            if alpha_action.kind in (
+                ActionKind.ALPHA_PURCHASE, ActionKind.ALPHA_REDEEM
+            ):
+                if alpha_action.kind == ActionKind.ALPHA_REDEEM:
+                    redeems.append(alpha_action)
+                else:
+                    subscribes.append(alpha_action)
+            else:
+                skips.append(alpha_action)
             continue
 
         if category not in _BASIC_EARN_CATEGORIES:
@@ -823,6 +894,147 @@ def _lm_principal_usd(pos: dict[str, Any]) -> Decimal:
     except (InvalidOperation, TypeError):
         return Decimal(0)
     return quote + base * price
+
+
+def _alpha_action_for_target(
+    snapshot: Snapshot,
+    token_code: str,
+    target: "_TargetPos | None",
+    current_pos: "_CurrentPos | None",
+    order_link_id: str,
+) -> Action | None:
+    """Plan one Alpha Farm action: PURCHASE on net-new or top-up,
+    REDEEM on dropped pick, SKIP when the gate is off (`.14` safety) or
+    the venue isn't actionable this cycle.
+
+    Decision matrix (no quote fetched here — execute time re-quotes):
+      - No current, no target          → no-op (returns None)
+      - No current, target > MIN_ACTION_USDC, GATE on → ALPHA_PURCHASE
+      - Current, no target             → ALPHA_REDEEM (full exit)
+      - Current, target ≈ current      → no-op (within MIN_ACTION_USDC)
+      - Anything else with GATE off    → SKIP_OUT_OF_SCOPE
+
+    `current_pos.amount_usd` comes from `snapshot.alpha_positions[*]
+    .tokenAmountUsd` (set by `_current_positions_by_pid`). Native-coin
+    `amount` for REDEEM is reconstructed from the alpha-position row's
+    `tokenAmount` so we pass Bybit the exact base-units it expects in
+    `fromTokenAmount` — the USD figure is informational only.
+
+    `coin` on the action carries the alpha token's `tokenSymbol` for log
+    readability; the dispatch always uses `token_code` (DEX_<id>) on the
+    wire.
+    """
+    target_usd = target.amount_usd if target else Decimal(0)
+    current_usd = current_pos.amount_usd if current_pos else Decimal(0)
+    symbol = (
+        (target.coin if target else None)
+        or (current_pos.coin if current_pos else None)
+        or token_code
+    )
+
+    delta = target_usd - current_usd
+    if abs(delta) < MIN_ACTION_USDC:
+        return None
+
+    if not ALPHA_EXEC_ENABLED:
+        # Gate is off — emit SKIP so the plan shows the intent without
+        # firing a live API call. Operator flips VAULT_ALPHA_EXEC_ENABLED
+        # to enable. Per `.54` safety: this guards the `.14` smoke test.
+        verb = "purchase" if delta > 0 else "redeem"
+        return Action(
+            kind=ActionKind.SKIP_OUT_OF_SCOPE,
+            category=_ALPHA_CATEGORY,
+            product_id=token_code,
+            coin=symbol,
+            amount=abs(delta),
+            order_link_id=order_link_id,
+            reason=(
+                f"AlphaFarm/{token_code}: would {verb} ${abs(delta):.2f} "
+                f"(current ${current_usd:.2f} → target ${target_usd:.2f}); "
+                "skipped because VAULT_ALPHA_EXEC_ENABLED is off (`.54` "
+                "safety: live-probe + `.14` smoke close required first)"
+            ),
+        )
+
+    if delta > 0:
+        # Purchase. `amount` carries the USD-equivalent payment size; the
+        # dispatch translates this into `fromTokenAmount` (USDT base
+        # units) after fetching a fresh quote. We do NOT carry quote
+        # data through the action — `expireTime` is short enough that
+        # diff-time → dispatch-time delay would frequently invalidate.
+        return Action(
+            kind=ActionKind.ALPHA_PURCHASE,
+            category=_ALPHA_CATEGORY,
+            product_id=token_code,
+            coin=symbol,
+            amount=delta,
+            order_link_id=order_link_id,
+            reason=(
+                f"alpha_purchase {token_code} ({symbol}) "
+                f"${delta:.2f} via {_ALPHA_PAY_TOKEN_CODE}: "
+                f"current ${current_usd:.2f} → target ${target_usd:.2f}"
+            ),
+        )
+
+    # REDEEM. For partial reductions Bybit Alpha would require keeping
+    # the position open at a smaller size, but `tokenAmount` precision
+    # doesn't always permit clean fractional exits. MVP: only full exits
+    # (current → 0). Partial scaling SKIPs with a reason.
+    if target_usd > MIN_ACTION_USDC:
+        return Action(
+            kind=ActionKind.SKIP_OUT_OF_SCOPE,
+            category=_ALPHA_CATEGORY,
+            product_id=token_code,
+            coin=symbol,
+            amount=target_usd,
+            order_link_id=order_link_id,
+            reason=(
+                f"AlphaFarm/{token_code}: partial reduction not wired "
+                f"(current ${current_usd:.2f}, target ${target_usd:.2f}); "
+                "Alpha MVP only supports full exit on dropped picks. "
+                "If Claude wants a smaller size, drop the pick this cycle "
+                "and resubscribe at the new size next cycle."
+            ),
+        )
+
+    # Full exit. We need the native token amount, not USD — Bybit's
+    # `/v5/alpha/trade/redeem` takes `fromTokenAmount` in base units.
+    # Pull from the alpha-position row by `tokenCode` match.
+    token_amount_native = "0"
+    for pos in snapshot.alpha_positions:
+        if str(pos.get("tokenCode") or "") == token_code:
+            raw = pos.get("tokenAmount")
+            if raw is not None:
+                token_amount_native = str(raw)
+            break
+    if token_amount_native == "0":
+        return Action(
+            kind=ActionKind.SKIP_OUT_OF_SCOPE,
+            category=_ALPHA_CATEGORY,
+            product_id=token_code,
+            coin=symbol,
+            amount=current_usd,
+            order_link_id=order_link_id,
+            reason=(
+                f"AlphaFarm/{token_code}: redeem requested but no "
+                "tokenAmount in snapshot.alpha_positions — degraded "
+                "position fetch this cycle"
+            ),
+        )
+    return Action(
+        kind=ActionKind.ALPHA_REDEEM,
+        category=_ALPHA_CATEGORY,
+        product_id=token_code,
+        coin=symbol,
+        amount=current_usd,  # USD-equivalent for log readability
+        order_link_id=order_link_id,
+        reason=(
+            f"alpha_redeem {token_code} ({symbol}) "
+            f"${current_usd:.2f} → {_ALPHA_PAY_TOKEN_CODE}: "
+            f"full exit (dropped pick)"
+        ),
+        extra={"token_amount_native": token_amount_native},
+    )
 
 
 def _advance_earn_subscribe_action(
@@ -1530,6 +1742,85 @@ async def _execute_one(
             # response payload to capture; we just record the call.
             await client.claim_lm_interest(product_id=action.product_id)
             response = {"claimed": True}
+        elif action.kind == ActionKind.ALPHA_PURCHASE:
+            # `.54` — fetch a fresh quote and execute the buy. We don't
+            # carry quote data from the diff (it would be stale by the
+            # time we get here; Bybit's `expireTime` is ~5min). USD
+            # `amount` from the diff becomes `fromTokenAmount` in
+            # USDT base units (USDT ≈ $1, 6 decimals).
+            quote = await client.get_alpha_quote(
+                trade_type=1,
+                from_token_code=_ALPHA_PAY_TOKEN_CODE,
+                from_token_amount=str(action.amount),
+                to_token_code=action.product_id,
+            )
+            quote_data = quote.get("quoteData")
+            correcting = quote.get("correctingCode")
+            gas = quote.get("gas")
+            if not quote_data or not correcting or gas is None:
+                raise BybitAPIError(
+                    0,
+                    "alpha quote missing quoteData / correctingCode / gas",
+                    "/v5/alpha/trade/quote",
+                )
+            raw = await client.alpha_purchase(
+                from_token_code=_ALPHA_PAY_TOKEN_CODE,
+                from_token_amount=str(action.amount),
+                to_token_code=action.product_id,
+                slippage=_ALPHA_DEFAULT_SLIPPAGE,
+                quote_data=quote_data,
+                gas=str(gas),
+                correcting_code=correcting,
+            )
+            response = {
+                "orderNo": raw.get("orderNo"),
+                "quoteDataId": quote.get("quoteDataId"),
+                "expectedToTokenAmount": quote.get("toTokenAmount"),
+                "slippage": _ALPHA_DEFAULT_SLIPPAGE,
+            }
+        elif action.kind == ActionKind.ALPHA_REDEEM:
+            # `.54` — fetch a fresh quote and execute the sell. Unlike
+            # purchase, `fromTokenAmount` is in the alpha token's native
+            # base units (carried through `action.extra
+            # ["token_amount_native"]` from the diff layer's
+            # `snapshot.alpha_positions` lookup). `action.amount` here
+            # is USD-equivalent for log readability only.
+            native = action.extra.get("token_amount_native")
+            if not native:
+                raise RuntimeError(
+                    f"ALPHA_REDEEM action {action.order_link_id} missing "
+                    "extra.token_amount_native — diff layer must populate"
+                )
+            quote = await client.get_alpha_quote(
+                trade_type=2,
+                from_token_code=action.product_id,
+                from_token_amount=str(native),
+                to_token_code=_ALPHA_PAY_TOKEN_CODE,
+            )
+            quote_data = quote.get("quoteData")
+            correcting = quote.get("correctingCode")
+            gas = quote.get("gas")
+            if not quote_data or not correcting or gas is None:
+                raise BybitAPIError(
+                    0,
+                    "alpha quote missing quoteData / correctingCode / gas",
+                    "/v5/alpha/trade/quote",
+                )
+            raw = await client.alpha_redeem(
+                from_token_code=action.product_id,
+                from_token_amount=str(native),
+                to_token_code=_ALPHA_PAY_TOKEN_CODE,
+                slippage=_ALPHA_DEFAULT_SLIPPAGE,
+                quote_data=quote_data,
+                gas=str(gas),
+                correcting_code=correcting,
+            )
+            response = {
+                "orderNo": raw.get("orderNo"),
+                "quoteDataId": quote.get("quoteDataId"),
+                "expectedToTokenAmount": quote.get("toTokenAmount"),
+                "slippage": _ALPHA_DEFAULT_SLIPPAGE,
+            }
         elif action.kind == ActionKind.SWAP_SPOT:
             # USDC → USDT via the USDCUSDT spot pair. Bybit's spot
             # Market Sell uses base-coin qty (USDC here); Market Buy
@@ -1645,6 +1936,29 @@ def _dry_run_payload(action: Action) -> dict[str, Any]:
             "extra": _build_advance_extra(action.category, offer),
             "order_link_id": action.order_link_id,
         }
+    if action.kind == ActionKind.ALPHA_PURCHASE:
+        return {
+            "would_call": "alpha_purchase",
+            "trade_type": 1,
+            "from_token_code": _ALPHA_PAY_TOKEN_CODE,
+            "from_token_amount_usd": str(action.amount),
+            "to_token_code": action.product_id,
+            "to_token_symbol": action.coin,
+            "slippage": _ALPHA_DEFAULT_SLIPPAGE,
+            "note": "quote fetched at execute time, not dry-run",
+        }
+    if action.kind == ActionKind.ALPHA_REDEEM:
+        return {
+            "would_call": "alpha_redeem",
+            "trade_type": 2,
+            "from_token_code": action.product_id,
+            "from_token_symbol": action.coin,
+            "from_token_amount_native": action.extra.get("token_amount_native"),
+            "to_token_code": _ALPHA_PAY_TOKEN_CODE,
+            "approx_usd": str(action.amount),
+            "slippage": _ALPHA_DEFAULT_SLIPPAGE,
+            "note": "quote fetched at execute time, not dry-run",
+        }
     return {
         "would_call": "place_earn_order",
         "side": "Stake" if action.kind == ActionKind.SUBSCRIBE_EARN else "Redeem",
@@ -1663,6 +1977,32 @@ def _dry_run_payload(action: Action) -> dict[str, Any]:
 class _CurrentPos:
     coin: str
     amount_usd: Decimal
+
+
+def _alpha_current_positions(
+    alpha_positions: list[dict[str, Any]],
+) -> dict[tuple[str, str], "_CurrentPos"]:
+    """Index Bybit Alpha holdings by `(AlphaFarm, tokenCode)` with USD
+    sizing taken from `tokenAmountUsd` (Bybit's own valuation against
+    `lastPrice`). Zero-amount rows are skipped so we don't spuriously
+    emit redeems for stale entries.
+    """
+    out: dict[tuple[str, str], _CurrentPos] = {}
+    for pos in alpha_positions:
+        token_code = str(pos.get("tokenCode") or "")
+        if not token_code:
+            continue
+        try:
+            amt_usd = Decimal(str(pos.get("tokenAmountUsd") or "0"))
+        except (InvalidOperation, TypeError):
+            amt_usd = Decimal(0)
+        if amt_usd <= 0:
+            continue
+        symbol = str(pos.get("tokenSymbol") or token_code)
+        out[(_ALPHA_CATEGORY, token_code)] = _CurrentPos(
+            coin=symbol, amount_usd=amt_usd
+        )
+    return out
 
 
 @dataclass
@@ -1870,12 +2210,14 @@ def _render_plan_summary(actions: list[Action]) -> str:
         ActionKind.REDEEM_EARN,
         ActionKind.REDEEM_LM,
         ActionKind.CLAIM_LM,
+        ActionKind.ALPHA_REDEEM,
         ActionKind.CLOSE_PERP,
         ActionKind.SWAP_SPOT,
         ActionKind.OPEN_PERP_SHORT,
         ActionKind.SUBSCRIBE_EARN,
         ActionKind.SUBSCRIBE_ADVANCE_EARN,
         ActionKind.SUBSCRIBE_LM,
+        ActionKind.ALPHA_PURCHASE,
         ActionKind.SKIP_OUT_OF_SCOPE,
     ):
         rows = by_kind.get(kind, [])

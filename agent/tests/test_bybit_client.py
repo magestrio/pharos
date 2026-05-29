@@ -1659,3 +1659,108 @@ async def test_get_positions_propagates_bybit_api_error(
         with pytest.raises(BybitAPIError) as exc:
             await c.get_positions(category="linear", settle_coin="USDT")
     assert exc.value.ret_code == 10005
+
+
+# ─── Alpha Farm (`.54`) ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_alpha_quote_posts_to_trade_quote(captured) -> None:
+    fixture = {
+        "quoteData": "base64-blob",
+        "correctingCode": "md5sum",
+        "gas": "0.0001",
+        "expireTime": 1704067500000,
+        "toTokenAmount": "99.5",
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        out = await c.get_alpha_quote(
+            trade_type=1,
+            from_token_code="CEX_1",
+            from_token_amount="100",
+            to_token_code="DEX_123",
+        )
+    req = captured[0]
+    assert req.method == "POST"
+    assert req.url.path == "/v5/alpha/trade/quote"
+    body = json.loads(req.content.decode())
+    assert body == {
+        "tradeType": 1,
+        "fromTokenCode": "CEX_1",
+        "fromTokenAmount": "100",
+        "toTokenCode": "DEX_123",
+        "quoteMode": 0,
+    }
+    assert out["quoteData"] == "base64-blob"
+    assert out["correctingCode"] == "md5sum"
+
+
+@pytest.mark.asyncio
+async def test_alpha_purchase_passes_quote_fields_verbatim(captured) -> None:
+    """Bybit verifies `correctingCode` covers from/to/amount — any mutation
+    rejects with a tamper error. Test that we pass the four quote-derived
+    fields verbatim."""
+    async with _client(captured, lambda _r: _ok({"orderNo": "ORD_1"})) as c:
+        await c.alpha_purchase(
+            from_token_code="CEX_1",
+            from_token_amount="100",
+            to_token_code="DEX_123",
+            slippage="0.01",
+            quote_data="base64-blob",
+            gas="0.0001",
+            correcting_code="md5sum",
+        )
+    req = captured[0]
+    assert req.method == "POST"
+    assert req.url.path == "/v5/alpha/trade/purchase"
+    body = json.loads(req.content.decode())
+    assert body == {
+        "fromTokenCode": "CEX_1",
+        "fromTokenAmount": "100",
+        "toTokenCode": "DEX_123",
+        "slippage": "0.01",
+        "quoteData": "base64-blob",
+        "gas": "0.0001",
+        "quoteMode": 0,
+        "correctingCode": "md5sum",
+    }
+
+
+@pytest.mark.asyncio
+async def test_alpha_redeem_sends_trade_type_payload(captured) -> None:
+    async with _client(captured, lambda _r: _ok({"orderNo": "ORD_R1"})) as c:
+        await c.alpha_redeem(
+            from_token_code="DEX_123",
+            from_token_amount="1000000",
+            to_token_code="CEX_1",
+            slippage="0.01",
+            quote_data="qd",
+            gas="0.0002",
+            correcting_code="cc",
+        )
+    req = captured[0]
+    assert req.url.path == "/v5/alpha/trade/redeem"
+    body = json.loads(req.content.decode())
+    assert body["fromTokenCode"] == "DEX_123"
+    assert body["toTokenCode"] == "CEX_1"
+    assert body["correctingCode"] == "cc"
+
+
+@pytest.mark.asyncio
+async def test_get_alpha_positions_hits_asset_list_endpoint(captured) -> None:
+    fixture = {
+        "totalAssetUsd": "100.0",
+        "assetList": [
+            {"tokenCode": "DEX_123", "tokenSymbol": "PEPE",
+             "tokenAmount": "1000000", "tokenAmountUsd": "50"}
+        ],
+    }
+    async with _client(captured, lambda _r: _ok(fixture)) as c:
+        out = await c.get_alpha_positions()
+    req = captured[0]
+    assert req.method == "POST"
+    assert req.url.path == "/v5/alpha/trade/asset-list"
+    assert json.loads(req.content.decode()) == {}
+    assert out["totalAssetUsd"] == "100.0"
+    assert out["assetList"][0]["tokenCode"] == "DEX_123"
+

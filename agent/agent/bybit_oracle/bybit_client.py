@@ -979,6 +979,235 @@ class BybitClient:
             "POST", "/v5/earn/liquidity-mining/claim-interest", body=body
         )
 
+    # ─── Alpha Farm (/v5/alpha/trade/* namespace) ────────────────────────
+    # Buy on-chain (DEX) alpha tokens with CEX payment tokens. Endpoints
+    # confirmed against the official Bybit V5 docs (via context7) in `.53`:
+    #
+    #   POST /v5/alpha/trade/biz-token-list       — DEX token universe
+    #   POST /v5/alpha/trade/pay-token-list       — CEX payment-token list
+    #   POST /v5/alpha/trade/biz-token-price-list — market metadata feed
+    #   POST /v5/alpha/trade/quote                — exchange quote (TTL via expireTime)
+    #   POST /v5/alpha/trade/purchase             — execute buy
+    #   POST /v5/alpha/trade/redeem               — execute sell
+    #   GET  /v5/alpha/asset                      — current alpha holdings
+    #
+    # All listing/price endpoints return raw dicts — per-token schema is
+    # rich (chainCode, tokenAddress, riskFlag, change24h, liquidity, etc.)
+    # but consumed defensively at the snapshot layer.
+
+    async def list_alpha_products(
+        self, token_tag: int = 0
+    ) -> list[dict[str, Any]]:
+        """List Bybit Alpha biz-tokens via `POST /v5/alpha/trade/biz-token-list`.
+
+        Returns the DEX-token universe (tokenCode in `DEX_<id>` format).
+        `token_tag` filters: `0` = all (default), `1` = new-token sniping,
+        `2` = on-chain hot tokens. We use `0` so the snapshot sees the
+        full menu and ranking happens downstream.
+
+        Each row carries `tokenCode`, `symbol`, `chainCode`, `tokenAddress`,
+        `tokenDecimals`, `riskFlag` (0=clean, 1=warn), `minOrderQuantity`,
+        `maxOrderQuantity`, `payTokenCodes` (which `CEX_<id>` tokens can
+        be used as payment), and `tokenTags`.
+
+        May 401/403/10005 when the sub-account doesn't have Alpha enabled —
+        caller wraps in `_safe_alpha` to degrade to an empty list.
+        """
+        body: dict[str, Any] = {"tokenTag": token_tag}
+        data = await self._request(
+            "POST", "/v5/alpha/trade/biz-token-list", body=body
+        )
+        result = data.get("result")
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            items = result.get("list") or result.get("rows") or []
+            return list(items) if isinstance(items, list) else []
+        return []
+
+    async def list_alpha_pay_tokens(
+        self, *, chain_code: str, token_address: str
+    ) -> list[dict[str, Any]]:
+        """Payment-token list **for a specific alpha token** via
+        `POST /v5/alpha/trade/pay-token-list` (live-probed 2026-05-29).
+
+        Bybit's docs call this a "list" but it's per-token: requires
+        `chainCode` + `tokenAddress` (live-probe: empty body → 180001).
+        Returns CEX payment tokens accepted as the funding side for
+        purchasing this specific on-chain token. Each row: `tokenCode`
+        (CEX_<id>), `symbol`, `tokenDecimals`, `limit` (max trade),
+        `supportChains`.
+
+        Snapshot-time call doesn't make sense (per-token, would explode
+        rate limit). Use only at execute time when resolving
+        `fromTokenCode` for `alpha_purchase`.
+        """
+        body: dict[str, Any] = {
+            "chainCode": chain_code,
+            "tokenAddress": token_address,
+        }
+        data = await self._request(
+            "POST", "/v5/alpha/trade/pay-token-list", body=body
+        )
+        result = data.get("result")
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            items = result.get("list") or result.get("rows") or []
+            return list(items) if isinstance(items, list) else []
+        return []
+
+    async def get_alpha_quote(
+        self,
+        *,
+        trade_type: int,
+        from_token_code: str,
+        from_token_amount: str,
+        to_token_code: str,
+        quote_mode: int = 0,
+    ) -> dict[str, Any]:
+        """`POST /v5/alpha/trade/quote` — fetch a binding exchange quote
+        before executing purchase/redeem (`.54`).
+
+        `trade_type`: `1` = Purchase (CEX → DEX), `2` = Redeem (DEX → CEX).
+        `from_token_code` / `to_token_code` are Bybit's abstract IDs
+        (`CEX_<id>` for payment tokens, `DEX_<id>` for alpha tokens).
+        `quote_mode`: `0` = Auto (recommended), `1` = Price Priority,
+        `2` = Success Rate Priority. Auto lets Bybit pick the routing
+        that balances price vs fill probability.
+
+        Response carries `quoteData` (opaque base64 — pass through),
+        `correctingCode` (MD5 checksum — pass through), `gas`,
+        `slippage`, `swapRate`, `toTokenAmount`, `minToTokenAmount`,
+        `expireTime` (ms UTC — quote unusable past this timestamp),
+        `lossRate`, `platformFee`. Pass the four critical fields
+        (`quoteData`, `correctingCode`, `gas`, `quoteMode`) into
+        `alpha_purchase` / `alpha_redeem` unchanged.
+        """
+        body: dict[str, Any] = {
+            "tradeType": trade_type,
+            "fromTokenCode": from_token_code,
+            "fromTokenAmount": from_token_amount,
+            "toTokenCode": to_token_code,
+            "quoteMode": quote_mode,
+        }
+        data = await self._request("POST", "/v5/alpha/trade/quote", body=body)
+        return data.get("result") or {}
+
+    async def alpha_purchase(
+        self,
+        *,
+        from_token_code: str,
+        from_token_amount: str,
+        to_token_code: str,
+        slippage: str,
+        quote_data: str,
+        gas: str,
+        correcting_code: str,
+        quote_mode: int = 0,
+    ) -> dict[str, Any]:
+        """`POST /v5/alpha/trade/purchase` — execute the buy leg with a
+        valid quote (`.54`). Returns `{orderNo}` on success; poll order
+        status separately via `/v5/alpha/trade/order-list` (not yet wired
+        — out of scope for this iteration since the smoke flow just
+        records `orderNo` to the execution log).
+
+        All `quoteData` / `correctingCode` / `gas` / `quoteMode` values
+        MUST be passed verbatim from the matching `get_alpha_quote` call;
+        Bybit verifies the MD5 checksum (`correctingCode`) covers the
+        from/to/amount triple, so any mutation rejects with a tamper
+        error. `from_token_amount` and `to_token_code` must also match
+        the quote request.
+        """
+        body: dict[str, Any] = {
+            "fromTokenCode": from_token_code,
+            "fromTokenAmount": from_token_amount,
+            "toTokenCode": to_token_code,
+            "slippage": slippage,
+            "quoteData": quote_data,
+            "gas": gas,
+            "quoteMode": quote_mode,
+            "correctingCode": correcting_code,
+        }
+        data = await self._request("POST", "/v5/alpha/trade/purchase", body=body)
+        return data.get("result") or {}
+
+    async def alpha_redeem(
+        self,
+        *,
+        from_token_code: str,
+        from_token_amount: str,
+        to_token_code: str,
+        slippage: str,
+        quote_data: str,
+        gas: str,
+        correcting_code: str,
+        quote_mode: int = 0,
+    ) -> dict[str, Any]:
+        """`POST /v5/alpha/trade/redeem` — execute the sell leg with a
+        valid quote (`.54`). Sibling of `alpha_purchase`; same
+        passthrough discipline on quote-derived fields. Returns
+        `{orderNo}` on success.
+        """
+        body: dict[str, Any] = {
+            "fromTokenCode": from_token_code,
+            "fromTokenAmount": from_token_amount,
+            "toTokenCode": to_token_code,
+            "slippage": slippage,
+            "quoteData": quote_data,
+            "gas": gas,
+            "quoteMode": quote_mode,
+            "correctingCode": correcting_code,
+        }
+        data = await self._request("POST", "/v5/alpha/trade/redeem", body=body)
+        return data.get("result") or {}
+
+    async def get_alpha_positions(self) -> dict[str, Any]:
+        """`POST /v5/alpha/trade/asset-list` — current Alpha holdings on
+        the sub-account (`.54`, path corrected via live-probe 2026-05-29).
+        Returns `{totalAssetUsd, assetList: [...]}` where each `assetList`
+        row carries `chainCode`, `tokenCode`, `tokenSymbol`, `tokenAmount`
+        (native units), `tokenAmountUsd`, `costPrice`, `lastPrice`,
+        `pnl`, `pnlRatio`, `tradeFlag`, `assetStatus`. Empty body `{}`
+        per docs. Wraps via `_safe_alpha` at the snapshot layer.
+        """
+        data = await self._request("POST", "/v5/alpha/trade/asset-list", body={})
+        return data.get("result") or {}
+
+    async def list_alpha_price_info(
+        self, token_address_info: list[dict[str, str]]
+    ) -> list[dict[str, Any]]:
+        """Batch market metadata for biz-tokens via
+        `POST /v5/alpha/trade/biz-token-price-list` (live-probed 2026-05-29).
+
+        `token_address_info`: list of `{chainCode, tokenAddress}` dicts.
+        REQUIRED (live-probe: empty body → 180001). Max 20 per request;
+        caller batches if more needed.
+
+        Returns `tokenPriceInfoList` rows keyed by `(chainCode,
+        tokenAddress)` — NOT by `tokenCode` (the price-list endpoint
+        deliberately doesn't echo tokenCode). Each row: `price` (USD),
+        `change24h` (signed decimal), `vol24h` (USD), `marketCap` (USD),
+        `liquidity` (USD), `holders`. Primary signal feed for the
+        `.55` momentum APR proxy.
+        """
+        if not token_address_info:
+            return []
+        body: dict[str, Any] = {"tokenAddressInfo": token_address_info}
+        data = await self._request(
+            "POST", "/v5/alpha/trade/biz-token-price-list", body=body
+        )
+        result = data.get("result") or {}
+        if isinstance(result, list):
+            return result
+        items = (
+            result.get("tokenPriceInfoList")
+            or result.get("list")
+            or result.get("rows")
+            or []
+        )
+        return list(items) if isinstance(items, list) else []
+
     async def place_earn_order(
         self,
         *,
@@ -1504,6 +1733,54 @@ class BybitClient:
             except (ValueError, ArithmeticError):
                 continue
         return rates
+
+    async def get_kline(
+        self,
+        symbol: str,
+        category: str = "linear",
+        interval: str = "D",
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """`/v5/market/kline` — historical OHLCV candles for one symbol.
+
+        Each row from Bybit is `[startMs, open, high, low, close, volume,
+        turnover]` (strings). We return them as dicts with named fields
+        for readability at the caller. Most-recent-first ordering matches
+        the Bybit response — index 0 is the latest candle.
+
+        Default `interval="D", limit=8` covers a full 8-day window (the
+        latest in-progress candle plus 7 completed daily closes), used by
+        `.55` to compute a 7d realized return on SmartLeverage underlyings.
+        Public endpoint, no auth required.
+        """
+        data = await self._request(
+            "GET",
+            "/v5/market/kline",
+            params={
+                "category": category,
+                "symbol": symbol,
+                "interval": interval,
+                "limit": limit,
+            },
+        )
+        result = data.get("result") or {}
+        items = result.get("list") or []
+        out: list[dict[str, Any]] = []
+        for row in items:
+            if not isinstance(row, list) or len(row) < 5:
+                continue
+            out.append(
+                {
+                    "start_ms": row[0],
+                    "open": row[1],
+                    "high": row[2],
+                    "low": row[3],
+                    "close": row[4],
+                    "volume": row[5] if len(row) > 5 else None,
+                    "turnover": row[6] if len(row) > 6 else None,
+                }
+            )
+        return out
 
     async def get_instruments_info(
         self, category: str = "linear", symbol: str | None = None
