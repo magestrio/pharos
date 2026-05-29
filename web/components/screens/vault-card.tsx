@@ -14,8 +14,8 @@ import {
   type Allocation,
 } from "@/lib/data";
 import Link from "next/link";
-import { useCycles, usePortfolio } from "@/lib/agent-store-context";
-import type { CycleSummary, PositionRow } from "@/lib/agent-api";
+import { useCycles, usePortfolio, useRecentEvents } from "@/lib/agent-store-context";
+import type { CycleSummary, EventRow, PositionRow } from "@/lib/agent-api";
 import { useAllocationStats, type AllocationStats } from "@/lib/hooks/use-allocation-stats";
 import { useVaultStats, type VaultStats } from "@/lib/hooks/use-vault-stats";
 import {
@@ -40,6 +40,7 @@ export function VaultCard() {
       <ExchangeRateSection stats={stats} />
       <AllocationSection stats={stats} allocation={allocation} />
       <AttestorAndHedgesSection />
+      <RecentWatcherEventsWidget />
       <RecentDecisionsPreview />
     </div>
   );
@@ -762,6 +763,85 @@ function mockToRecentRow(d: (typeof DECISIONS)[number]): RecentRow {
     risk: d.risk,
     confidence: d.confidence,
   };
+}
+
+function eventToneClasses(severity: string): string {
+  switch (severity) {
+    case "red":
+    case "critical":
+      return "text-danger border-danger/30 bg-danger/5";
+    case "warn":
+    case "warning":
+      return "text-warn border-warn/30 bg-warn/10";
+    default:
+      return "text-dim-300 border-ink-600/40 bg-ink-850/40";
+  }
+}
+
+function eventRowInner(ev: EventRow): React.ReactNode {
+  return (
+    <>
+      <span className="text-[10.5px] uppercase tracking-[0.14em] opacity-80">{ev.kind}</span>
+      {ev.coin && <span className="text-[10.5px] opacity-80">{ev.coin}</span>}
+      {ev.position_id && (
+        <span className="text-[10.5px] opacity-60 hidden md:inline truncate max-w-[40%]">
+          {ev.position_id}
+        </span>
+      )}
+      <span className="text-[10.5px] tabular text-dim-500 ml-auto">
+        {new Date(ev.event_ts).toISOString().slice(0, 19).replace("T", " ")} UTC
+      </span>
+      {ev.triggered_cycle_ts && <Icon.Chev className="text-dim-500" />}
+    </>
+  );
+}
+
+function RecentWatcherEventsWidget() {
+  const eventsQuery = useRecentEvents(5);
+  const events = eventsQuery.data ?? [];
+  if (events.length === 0 && !eventsQuery.isLoading) {
+    return null;
+  }
+  return (
+    <section>
+      <SectionHead
+        eyebrow="Watcher Feed"
+        title="Recent watcher events"
+        subtitle="Position-level watchers that wake the agent off the 4h cron cadence — funding flips, attestor lag, peg deviations, pending redemptions. Each event links to the cycle it triggered."
+        right={
+          <Link
+            href="/history"
+            className="text-[12px] font-mono text-elec hover:text-elec-soft inline-flex items-center gap-1.5"
+          >
+            View all cycles <Icon.Arrow />
+          </Link>
+        }
+      />
+      <Card className="overflow-hidden">
+        {eventsQuery.isLoading && events.length === 0 && (
+          <div className="px-4 py-4 text-[11px] font-mono text-dim-500">loading watcher events…</div>
+        )}
+        {events.map((ev, i) => {
+          const className = `flex items-center gap-3 px-4 sm:px-5 py-3 font-mono ${
+            i !== events.length - 1 ? "border-b border-ink-600/40" : ""
+          } ${eventToneClasses(ev.severity)} ${ev.triggered_cycle_ts ? "hover:bg-ink-850/60 transition-colors" : ""}`;
+          return ev.triggered_cycle_ts ? (
+            <Link
+              key={ev.id}
+              href={`/history/${encodeURIComponent(ev.triggered_cycle_ts)}`}
+              className={className}
+            >
+              {eventRowInner(ev)}
+            </Link>
+          ) : (
+            <div key={ev.id} className={className}>
+              {eventRowInner(ev)}
+            </div>
+          );
+        })}
+      </Card>
+    </section>
+  );
 }
 
 function RecentDecisionsPreview() {

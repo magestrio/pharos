@@ -316,6 +316,14 @@ function DecisionThesis({
     <div className="border-t border-ink-600/40 bg-ink-850/60 rounded-b-md fade-up">
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-px bg-ink-600/40">
         <div className="lg:col-span-2 bg-ink-900 p-5 sm:p-6">
+          {expectsDetail && events.length > 0 && (
+            <div className="mb-5">
+              <WatcherEventsBlock
+                events={events.slice(0, 5)}
+                title="Events that triggered this cycle"
+              />
+            </div>
+          )}
           <ThesisBlock title="Thesis" body={thesisBody} accent="white" />
           <div className="mt-5">
             <ThesisBlock
@@ -348,7 +356,6 @@ function DecisionThesis({
               )}
               {venueRows.length > 0 && <VenueAllocationsBlock venues={venueRows} />}
               {executions.length > 0 && <ExecutionsBlock executions={executions} />}
-              {events.length > 0 && <WatcherEventsBlock events={events.slice(0, 5)} />}
               {validator && <ValidatorStatusBlock validator={validator} />}
             </div>
           )}
@@ -495,10 +502,16 @@ function ExecutionsBlock({ executions }: { executions: ExecutionRow[] }) {
   );
 }
 
-function WatcherEventsBlock({ events }: { events: EventRow[] }) {
+function WatcherEventsBlock({
+  events,
+  title = "Watcher events that triggered this cycle",
+}: {
+  events: EventRow[];
+  title?: string;
+}) {
   return (
     <div>
-      <SubBlockTitle>Watcher events that triggered this cycle</SubBlockTitle>
+      <SubBlockTitle>{title}</SubBlockTitle>
       <div className="space-y-1.5">
         {events.map((ev) => {
           const tone =
