@@ -4,6 +4,7 @@ import {
   AaveV3WethAdapterABI,
   BybitAttestorABI,
   CapitalManagerABI,
+  DecisionLogABI,
   VUSDCABI,
 } from "@vault8004/abi";
 import { mantle } from "wagmi/chains";
@@ -16,7 +17,8 @@ type EnvKey =
   | "NEXT_PUBLIC_AAVE_USDC_ADAPTER_ADDRESS"
   | "NEXT_PUBLIC_AAVE_WETH_ADAPTER_ADDRESS"
   | "NEXT_PUBLIC_BYBIT_ATTESTOR_ADDRESS"
-  | "NEXT_PUBLIC_USDC_ADDRESS";
+  | "NEXT_PUBLIC_USDC_ADDRESS"
+  | "NEXT_PUBLIC_DECISION_LOG_ADDRESS";
 
 function pickAddress(envKey: EnvKey, fallback: `0x${string}`): `0x${string}` {
   const override = process.env[envKey] as `0x${string}` | undefined;
@@ -44,6 +46,10 @@ export const BYBIT_ATTESTOR_ADDRESS = pickAddress(
   M.bybitAttestor,
 );
 export const USDC_ADDRESS = pickAddress("NEXT_PUBLIC_USDC_ADDRESS", M.usdc);
+export const DECISION_LOG_ADDRESS = pickAddress(
+  "NEXT_PUBLIC_DECISION_LOG_ADDRESS",
+  M.decisionLog,
+);
 
 export const VUSDC_CHAIN_ID = mantle.id;
 export const VUSDC_ABI = VUSDCABI;
@@ -55,6 +61,17 @@ export const isAllocationConfigured =
   AAVE_WETH_ADAPTER_ADDRESS !== ZERO_ADDRESS &&
   BYBIT_ATTESTOR_ADDRESS !== ZERO_ADDRESS &&
   USDC_ADDRESS !== ZERO_ADDRESS;
+export const isDecisionLogConfigured = DECISION_LOG_ADDRESS !== ZERO_ADDRESS;
+
+export const DECISION_LOG_DEPLOY_BLOCK: bigint = (() => {
+  const raw = process.env.NEXT_PUBLIC_DECISION_LOG_DEPLOY_BLOCK;
+  if (!raw) return 0n;
+  try {
+    return BigInt(raw);
+  } catch {
+    return 0n;
+  }
+})();
 
 export const vUsdcContract = {
   address: VUSDC_ADDRESS,
@@ -83,6 +100,12 @@ export const aaveWethAdapterContract = {
 export const bybitAttestorContract = {
   address: BYBIT_ATTESTOR_ADDRESS,
   abi: BybitAttestorABI,
+  chainId: VUSDC_CHAIN_ID,
+} as const;
+
+export const decisionLogContract = {
+  address: DECISION_LOG_ADDRESS,
+  abi: DecisionLogABI,
   chainId: VUSDC_CHAIN_ID,
 } as const;
 

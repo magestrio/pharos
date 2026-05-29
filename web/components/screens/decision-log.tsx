@@ -2,12 +2,17 @@
 
 import { useMemo, useState } from "react";
 
-import { DECISIONS, RISK_FLAGS, type Decision } from "@/lib/data";
+import { RISK_FLAGS, type Decision } from "@/lib/data";
+import { useDecisions } from "@/lib/hooks/use-decisions";
+import { ipfsGateway, mantleExplorerTx } from "@/lib/explorer";
 import { HashChip, Icon, SectionHead, Tag } from "@/components/ui";
 
 export function DecisionLog() {
+  const { decisions } = useDecisions();
   const [filter, setFilter] = useState<"all" | "week" | "conf" | "profit">("all");
-  const [openIds, setOpenIds] = useState<Set<string>>(new Set([DECISIONS[0].id]));
+  const [openIds, setOpenIds] = useState<Set<string>>(() => {
+    return decisions.length > 0 ? new Set([decisions[0].id]) : new Set();
+  });
 
   const toggle = (id: string) => {
     setOpenIds((prev) => {
@@ -19,11 +24,11 @@ export function DecisionLog() {
   };
 
   const filtered = useMemo(() => {
-    if (filter === "week") return DECISIONS.filter((d) => !d.ago.includes("d"));
-    if (filter === "conf") return DECISIONS.filter((d) => d.confidence >= 0.7);
-    if (filter === "profit") return DECISIONS.filter((d) => d.profitable);
-    return DECISIONS;
-  }, [filter]);
+    if (filter === "week") return decisions.filter((d) => !d.ago.includes("d"));
+    if (filter === "conf") return decisions.filter((d) => d.confidence >= 0.7);
+    if (filter === "profit") return decisions.filter((d) => d.profitable);
+    return decisions;
+  }, [filter, decisions]);
 
   const expandAll = () => setOpenIds(new Set(filtered.map((d) => d.id)));
   const collapseAll = () => setOpenIds(new Set());
@@ -43,14 +48,14 @@ export function DecisionLog() {
           <div className="flex flex-wrap items-center gap-1.5 bg-ink-900 border border-ink-600/70 rounded-sm p-1">
             {(
               [
-                { id: "all", label: "All", count: DECISIONS.length },
-                { id: "week", label: "This Week", count: DECISIONS.filter((d) => !d.ago.includes("d")).length },
+                { id: "all", label: "All", count: decisions.length },
+                { id: "week", label: "This Week", count: decisions.filter((d) => !d.ago.includes("d")).length },
                 {
                   id: "conf",
                   label: "High Confidence",
-                  count: DECISIONS.filter((d) => d.confidence >= 0.7).length,
+                  count: decisions.filter((d) => d.confidence >= 0.7).length,
                 },
-                { id: "profit", label: "Profitable", count: DECISIONS.filter((d) => d.profitable).length },
+                { id: "profit", label: "Profitable", count: decisions.filter((d) => d.profitable).length },
               ] as const
             ).map((t) => (
               <button
@@ -97,7 +102,7 @@ export function DecisionLog() {
         </div>
 
         <div className="grid grid-cols-2 lg:grid-cols-5 gap-px bg-ink-600/60 border border-ink-600/70 rounded-md overflow-hidden">
-          <SummaryCell label="Showing" value={`${filtered.length} / ${DECISIONS.length}`} />
+          <SummaryCell label="Showing" value={`${filtered.length} / ${decisions.length}`} />
           <SummaryCell
             label="Avg confidence"
             value={(filtered.reduce((s, d) => s + d.confidence, 0) / (filtered.length || 1)).toFixed(2)}
@@ -298,17 +303,25 @@ function DecisionThesis({ d }: { d: Decision }) {
           </div>
 
           <div className="border-t border-ink-600/40 pt-4 space-y-2.5">
-            <ProofRow label="IPFS proof" hash={d.ipfs} />
-            <ProofRow label="On-chain tx" hash={d.tx} />
+            <ProofRow label="IPFS proof" hash={d.ipfs} href={d.ipfs ? ipfsGateway(d.ipfs) : undefined} />
+            <ProofRow
+              label="On-chain tx"
+              hash={d.tx}
+              href={d.tx?.startsWith("0x") ? mantleExplorerTx(d.tx) : undefined}
+            />
             <ProofRow label="Decision ID" hash={d.full} />
           </div>
 
-          <a
-            href="#"
-            className="mt-2 inline-flex items-center gap-1.5 text-[12px] font-mono text-elec hover:text-elec-soft"
-          >
-            Verify on Mantle Explorer <Icon.Ext />
-          </a>
+          {d.tx?.startsWith("0x") && (
+            <a
+              href={mantleExplorerTx(d.tx)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="mt-2 inline-flex items-center gap-1.5 text-[12px] font-mono text-elec hover:text-elec-soft"
+            >
+              Verify on Mantle Explorer <Icon.Ext />
+            </a>
+          )}
         </div>
       </div>
     </div>
@@ -338,11 +351,22 @@ function ThesisBlock({
   );
 }
 
-function ProofRow({ label, hash }: { label: string; hash: string }) {
+function ProofRow({ label, hash, href }: { label: string; hash: string; href?: string }) {
   return (
     <div className="flex items-center justify-between">
       <span className="text-[10.5px] font-mono uppercase tracking-[0.14em] text-dim-500">{label}</span>
-      <HashChip hash={hash} head={7} tail={5} />
+      {href ? (
+        <a
+          href={href}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="hover:text-white"
+        >
+          <HashChip hash={hash} head={7} tail={5} />
+        </a>
+      ) : (
+        <HashChip hash={hash} head={7} tail={5} />
+      )}
     </div>
   );
 }
