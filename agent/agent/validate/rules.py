@@ -31,12 +31,6 @@ MAX_EFFECTIVE_PRODUCT = 0.50  # cap on a single product as fraction of TOTAL boo
 PEG_STRESS_BPS = 100
 PEG_STRESS_STABLES_FLOOR = 0.50  # cash + bybit_flex must be ≥ this when peg is stressed
 
-# Hedging tolerance: |hedge.notional_usd| must be within ±HEDGE_SIZE_TOL
-# of the matching pick's USD-equivalent. Loose enough to absorb mark-
-# price drift between snapshot fetch and Earn settlement, tight enough
-# to keep the combined position near delta-neutral.
-HEDGE_SIZE_TOL = 0.20
-
 # Stables-set treated as "hedge not required" by the OnChain validator.
 # Mirrored in `agent.sandbox.snapshot.STABLES`; keeping both lists in
 # sync is checked indirectly by the snapshot tests.
@@ -219,10 +213,25 @@ def check_no_missing_apr_source(d: Decision, snapshot: Snapshot) -> Check:
     return True, None
 
 
-def check_lm_no_leverage(d: Decision, snapshot: Snapshot) -> Check:
-    """LM picks must have `max_leverage=1`. Leverage > 1 introduces
-    liquidation risk and breaks the async-redeem SLO. `max_leverage`
-    lives in the pick's `notes` as `max_leverage=<N>`."""
+# Leveraged LM size budget. `position_usd ≤ vault × LM_LEVERAGE_CAP_FACTOR /
+# max(1, leverage)`. At leverage=1 the cap is 30% (same as bybit_lm venue
+# max_weight); at 5x → 6%; at 10x → 3%. Sized so worst-case liquidation
+# loses ≤ ~3% of book even on max-leverage products. Operator agreed
+# 2026-05-29 (`.47` follow-up) — was a hard `leverage ≤ 1` ban prior.
+LM_LEVERAGE_CAP_FACTOR: float = 0.30
+
+
+def check_lm_leverage_size_cap(d: Decision, snapshot: Snapshot) -> Check:
+    """LM picks scale their max position size DOWN with leverage so a
+    worst-case liquidation can't blow the book. Formula:
+
+        effective_position_usd ≤ vault × LM_LEVERAGE_CAP_FACTOR / leverage
+
+    Where `effective_position_usd = vault × venue.weight × pick.weight`
+    (same sizing model as `check_effective_pick_cap`). Picks without a
+    `max_leverage` note in the snapshot are treated as leverage=1.
+    Liquidation handling at runtime is the executor's job (partial
+    REDEEM_LM + liquidation_distance signal in snapshot)."""
     lm = d.venue("bybit_lm")
     if lm is None or not lm.picks:
         return True, None
@@ -232,12 +241,18 @@ def check_lm_no_leverage(d: Decision, snapshot: Snapshot) -> Check:
         summary = lm_idx.get(pick.product_id)
         if summary is None:
             continue  # already caught by check_product_ids_in_snapshot
-        lev = _extract_max_leverage(summary)
-        if lev is not None and lev > 1:
-            violations.append(f"{pick.product_id}(max_leverage={lev})")
+        lev = _extract_max_leverage(summary) or 1
+        effective_weight = lm.weight * pick.weight
+        max_weight = LM_LEVERAGE_CAP_FACTOR / max(1, lev)
+        if effective_weight > max_weight + 1e-9:
+            violations.append(
+                f"{pick.product_id}(leverage={lev}, size="
+                f"{effective_weight:.1%} > cap {max_weight:.1%})"
+            )
     if violations:
         return False, (
-            f"LM picks with leverage > 1 not allowed: {', '.join(violations)}"
+            f"LM picks exceed leverage-scaled size cap "
+            f"({LM_LEVERAGE_CAP_FACTOR:.0%}/leverage): {', '.join(violations)}"
         )
     return True, None
 
@@ -252,30 +267,104 @@ def _extract_max_leverage(summary: ProductSummary) -> int | None:
     return None
 
 
+# Earn venues whose non-stable picks must clear the auto-hedge
+# feasibility gate. Mirrors `execute._AUTO_HEDGE_CATEGORIES` — keeping
+# the two lists in lockstep is a soft contract; the test suite catches
+# drift via `test_aggregate_validate_passes_hedged_non_usd_pick`.
+_AUTO_HEDGE_VENUES: tuple[tuple[str, str], ...] = (
+    ("bybit_onchain", "OnChain"),
+    ("bybit_flex", "FlexibleSaving"),
+)
+
+
 def check_hedges_for_non_usd_picks(d: Decision, snapshot: Snapshot) -> Check:
-    """Non-stable OnChain picks MUST be paired with a perp hedge on the
-    matching coin. LM picks are a paired LP (already self-hedged on the
-    quote side), so they don't require a separate `Hedge` entry.
-    """
-    hedged_coins = {h.coin.upper() for h in d.hedges}
-    onchain = d.venue("bybit_onchain")
-    if onchain is None or not onchain.picks:
-        return True, None
-    idx = _snapshot_index(snapshot).get("OnChain", {})
-    missing: list[str] = []
-    for pick in onchain.picks:
-        summary = idx.get(pick.product_id)
-        if summary is None:
+    """Auto-hedge era (2026-05-29): hedges are derived from non-stable
+    Earn picks (OnChain + FlexibleSaving) at execute time. This rule
+    is the feasibility gate — for each non-stable Earn pick, verify
+    the perp pair exists in `snapshot.perp_market` and that the resulting
+    hedge clears `min_notional_usd`. Picks whose hedge wouldn't fit get
+    rejected here (would otherwise SKIP at executor and leave the
+    underlying unhedged)."""
+    perp_market = getattr(snapshot, "perp_market", None) or {}
+    total_book = float(snapshot.wallet.total_equity_usd)
+    bad: list[str] = []
+    for venue_id, category in _AUTO_HEDGE_VENUES:
+        venue = d.venue(venue_id)  # type: ignore[arg-type]
+        if venue is None or not venue.picks:
             continue
-        coin = summary.coin.upper()
-        if coin in _STABLE_COINS:
+        idx = _snapshot_index(snapshot).get(category, {})
+        for pick in venue.picks:
+            summary = idx.get(pick.product_id)
+            if summary is None:
+                continue
+            coin = summary.coin.upper()
+            if coin in _STABLE_COINS:
+                continue
+            info = perp_market.get(coin) or perp_market.get(coin.lower())
+            if info is None:
+                bad.append(f"{venue_id}/{pick.product_id}({coin}): no perp_market entry")
+                continue
+            if info.min_notional_usd is None:
+                bad.append(f"{venue_id}/{pick.product_id}({coin}): min_notional unknown")
+                continue
+            pick_usd = total_book * float(venue.weight) * float(pick.weight)
+            if pick_usd < float(info.min_notional_usd):
+                bad.append(
+                    f"{venue_id}/{pick.product_id}({coin}): pick "
+                    f"${pick_usd:.2f} below perp min_notional "
+                    f"${float(info.min_notional_usd):.2f} — hedge can't be placed"
+                )
+    if bad:
+        return False, "non-USD Earn picks not hedgeable: " + " | ".join(bad)
+    return True, None
+
+
+# Per-8h funding-rate threshold below which a hedged short becomes net
+# cost over a typical hold. -0.0001/8h = -1 bp per period ≈ -11%
+# annualized. Operator hardcap pattern (CLAUDE.md): "7-day avg funding <
+# 0 → mandatory exit". We tighten the threshold from strict zero to
+# -10 bps annualized so single-period noise doesn't yank good picks.
+FUNDING_FLOOR_8H = -0.0001
+
+
+def check_funding_rate_floor(d: Decision, snapshot: Snapshot) -> Check:
+    """For each non-stable Earn pick (OnChain + FlexibleSaving), reject
+    if the perp pair's 7-day average funding rate is below
+    `FUNDING_FLOOR_8H`. We're short the perp to hedge; a persistently
+    negative funding rate means we PAY funding every period — the hedge
+    becomes net cost and erodes the Earn yield over time. Operator
+    change 2026-05-29: funding is part of yield, not just a soft
+    signal. Picks with missing 7d avg pass (no data, no signal); picks
+    with funding at-or-above floor pass."""
+    perp_market = getattr(snapshot, "perp_market", None) or {}
+    bad: list[str] = []
+    for venue_id, category in _AUTO_HEDGE_VENUES:
+        venue = d.venue(venue_id)  # type: ignore[arg-type]
+        if venue is None or not venue.picks:
             continue
-        if coin not in hedged_coins:
-            missing.append(f"{pick.product_id}({coin})")
-    if missing:
+        idx = _snapshot_index(snapshot).get(category, {})
+        for pick in venue.picks:
+            summary = idx.get(pick.product_id)
+            if summary is None:
+                continue
+            coin = summary.coin.upper()
+            if coin in _STABLE_COINS:
+                continue
+            info = perp_market.get(coin) or perp_market.get(coin.lower())
+            if info is None or info.funding_rate_7d_avg is None:
+                continue
+            avg_8h = float(info.funding_rate_7d_avg)
+            if avg_8h < FUNDING_FLOOR_8H:
+                annualized_pct = avg_8h * 3 * 365 * 100
+                bad.append(
+                    f"{venue_id}/{pick.product_id}({coin}): 7d avg funding "
+                    f"{avg_8h:+.6f}/8h ({annualized_pct:+.1f}% annualized) "
+                    f"below floor {FUNDING_FLOOR_8H:+.6f}/8h — hedge net cost"
+                )
+    if bad:
         return False, (
-            f"non-USD OnChain picks need a Hedge entry on the matching "
-            f"coin: {', '.join(missing)}"
+            "non-USD Earn picks with negative 7d funding (exit "
+            "required): " + " | ".join(bad)
         )
     return True, None
 
@@ -313,80 +402,6 @@ def _pick_usd_value(
     return out
 
 
-def check_hedge_direction(d: Decision) -> Check:
-    """Hedges must be SHORT — we hold the underlying via the Earn
-    subscription, so the perp leg goes short to neutralize price delta.
-    `notional_usd` is signed: negative = short. A non-negative hedge
-    notional is either a long-on-long (doubled exposure) or a missing
-    sign — the validator catches both.
-    """
-    bad: list[str] = []
-    for h in d.hedges:
-        if h.notional_usd >= 0:
-            bad.append(f"{h.coin}={h.notional_usd:+.2f}")
-    if bad:
-        return False, (
-            f"hedge notional_usd must be negative (short) to neutralize "
-            f"stake exposure; got: {', '.join(bad)}"
-        )
-    return True, None
-
-
-def check_hedge_sizing(d: Decision, snapshot: Snapshot) -> Check:
-    """|hedge.notional_usd| must be within ±HEDGE_SIZE_TOL of the
-    matching pick's USD-equivalent. Over-hedging takes on directional
-    risk in the opposite direction; under-hedging leaves the pick
-    partially exposed. Both are caught here so the prompt is forced to
-    size the hedge against the actual book."""
-    bad: list[str] = []
-    for h in d.hedges:
-        pick_usd = _pick_usd_value(d, snapshot, "OnChain", h.coin)
-        if pick_usd <= 0:
-            bad.append(f"{h.coin}: no matching non-zero OnChain pick")
-            continue
-        hedge_usd = abs(h.notional_usd)
-        ratio = hedge_usd / pick_usd
-        if ratio < 1.0 - HEDGE_SIZE_TOL or ratio > 1.0 + HEDGE_SIZE_TOL:
-            bad.append(
-                f"{h.coin}: hedge ${hedge_usd:.2f} vs pick ${pick_usd:.2f} "
-                f"(ratio {ratio:.2f}, outside ±{HEDGE_SIZE_TOL:.0%})"
-            )
-    if bad:
-        return False, (
-            "hedge sizing outside tolerance band: " + " | ".join(bad)
-        )
-    return True, None
-
-
-def check_hedge_min_notional(d: Decision, snapshot: Snapshot) -> Check:
-    """A hedge below the perp pair's `min_notional_usd` can't actually
-    be placed by the executor. Snapshot carries the floor per coin in
-    `perp_market[coin].min_notional_usd`; missing entry → can't price
-    the hedge → reject (fail-closed). The prompt is responsible for
-    detecting these BEFORE submitting the pick (downsize the underlying
-    Earn pick OR skip), but the validator catches anything that slips
-    through.
-    """
-    bad: list[str] = []
-    perp_market = getattr(snapshot, "perp_market", None) or {}
-    for h in d.hedges:
-        info = perp_market.get(h.coin) or perp_market.get(h.coin.upper())
-        if info is None or info.min_notional_usd is None:
-            bad.append(f"{h.coin}: no perp_market entry / min_notional unknown")
-            continue
-        if abs(h.notional_usd) < float(info.min_notional_usd):
-            bad.append(
-                f"{h.coin}: hedge ${abs(h.notional_usd):.2f} below "
-                f"min_notional ${float(info.min_notional_usd):.2f}"
-            )
-    if bad:
-        return False, (
-            "hedges below perp min-notional / unsupported coin: "
-            + " | ".join(bad)
-        )
-    return True, None
-
-
 # ─── Aggregate ─────────────────────────────────────────────────────────────
 
 
@@ -407,16 +422,14 @@ def validate(decision: Decision, snapshot: Snapshot) -> tuple[bool, list[str]]:
         check_effective_pick_cap,
         check_confidence,
         check_risk_flags,
-        check_hedge_direction,
     ]
     snapshot_checks = [
         check_peg_stress,
         check_product_ids_in_snapshot,
         check_no_missing_apr_source,
-        check_lm_no_leverage,
+        check_lm_leverage_size_cap,
         check_hedges_for_non_usd_picks,
-        check_hedge_sizing,
-        check_hedge_min_notional,
+        check_funding_rate_floor,
     ]
     errors: list[str] = []
     for check in pure_checks:

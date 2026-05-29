@@ -129,9 +129,10 @@ def _build_user_message(
 
 def _summarize_prior_decision(decision: dict[str, Any]) -> str:
     """One-paragraph human-readable digest of a prior decision: the
-    allocation, the picks (id only), confidence, and the thesis. Keeps
-    the user message short while giving the model enough to detect
-    whipsaw vs informed shifts."""
+    allocation, the picks (id only), confidence, validator outcome (so
+    Claude can correct rejected decisions instead of repeating them),
+    and the thesis. Keeps the user message short while giving the model
+    enough to detect whipsaw vs informed shifts."""
     venues = decision.get("venues", [])
     if not venues:
         return ""
@@ -150,9 +151,28 @@ def _summarize_prior_decision(decision: dict[str, Any]) -> str:
     thesis = (decision.get("thesis") or "").strip()
     if len(thesis) > 400:
         thesis = thesis[:400] + "…"
+    # Validator outcome — `_meta` sidecar is the source of truth. If the
+    # prior was rejected, surface the errors prominently so Claude
+    # corrects rather than repeats. (`.47` follow-up 2026-05-29: cycles
+    # were repeating the same min_notional/funding violations because
+    # this summary hid the failure.)
+    meta = decision.get("_meta") or {}
+    validator = meta.get("_validator") or decision.get("_validator") or {}
+    validator_ok = validator.get("ok")
+    validator_errors = validator.get("errors") or []
+    validator_line = ""
+    if validator_ok is False or validator_errors:
+        validator_line = (
+            "\n  ❌ VALIDATOR REJECTED prior decision — DO NOT repeat the "
+            "same picks/sizing:\n    - "
+            + "\n    - ".join(str(e) for e in validator_errors)
+        )
+    elif validator_ok is True:
+        validator_line = "\n  ✓ validator passed"
     return (
         "\n".join(venue_lines)
         + (f"\n  confidence={conf}" if conf is not None else "")
+        + validator_line
         + (f"\n  thesis: {thesis}" if thesis else "")
     )
 

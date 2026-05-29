@@ -17,3 +17,4 @@ agent/agent/sandbox/captures/
 agent/agent/sandbox/snapshots/
 agent/agent/sandbox/decisions/
 agent/agent/sandbox/executions/
+agent/agent/sandbox/cycle_log.jsonl

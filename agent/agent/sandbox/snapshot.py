@@ -56,10 +56,15 @@ TOP_K = 20
 # calls per snapshot — bounded cost. The remaining advance products in
 # the top-K list are still surfaced for visibility, just without APR.
 ADVANCE_QUOTE_TOP_K = 10
-# Per-coin perp fetch cap for hedge data. Each coin = 3 calls (ticker +
-# orderbook + instruments-info) parallelized; 8 coins = 24 calls total
-# bounded by Bybit's public-market rate limit (no auth).
-PERP_HEDGE_TOP_K = 8
+# Per-coin perp fetch cap for hedge data. Each coin = 4 calls (ticker +
+# orderbook + instruments-info + funding-history) parallelized; 16
+# coins = 64 calls total, comfortably under Bybit's public-market rate
+# limit. Bumped from 8 (`.47` 2026-05-29 follow-up) — OnChain alone
+# routinely produces 7-8 non-stables, leaving zero budget for
+# FlexibleSaving non-stables (ID, IO, AGIX, etc.). Validator rejects
+# any non-stable Earn pick without a perp_market entry, so silent
+# under-fetch turns into a hard skipped-cycle.
+PERP_HEDGE_TOP_K = 16
 _EARN_PERMISSION_RET_CODE = 10005
 
 # Stables-set used to guarantee USDC-equivalent picks always survive the
@@ -181,6 +186,13 @@ class PerpInfo(BaseModel):
 
     symbol: str  # e.g. "TONUSDT"
     funding_rate_8h: Decimal | None = None  # signed; +0.0001 = +1 bps per 8h
+    # 7-day average funding rate (21 periods × 8h), signed. Smoother than
+    # `funding_rate_8h` for sizing decisions — single-period noise can
+    # flip sign while the regime is unchanged. Validator uses this for
+    # the "negative funding → exit pick" gate; prompt uses it for the
+    # funding-adjusted effective APR formula. None = endpoint failed or
+    # not enough history for the symbol (newly listed perp).
+    funding_rate_7d_avg: Decimal | None = None
     mark_price: Decimal | None = None
     # USD volume within ±50 bps of mark across both sides of the book.
     # Bigger → easier to enter/exit a hedge of intended size without slip.
@@ -516,6 +528,31 @@ def _lm_summary(p: dict[str, Any]) -> ProductSummary:
     )
 
 
+def _lm_liquidation_distance_pct(pos: dict[str, Any]) -> Decimal | None:
+    """Signed fractional distance from `currentPrice` to `liquidationPrice`
+    for one LM position. Positive = price has room to drop before
+    liquidation; negative = already past (Bybit would have closed).
+
+    Formula: `(currentPrice - liquidationPrice) / currentPrice`. LM
+    positions are net-long the base coin (pool buys more base as price
+    drops), so liquidation triggers below current spot. Returns None on
+    missing / unparseable fields — caller treats as "no signal" rather
+    than misleading 0%.
+    """
+    cur = pos.get("currentPrice")
+    liq = pos.get("liquidationPrice")
+    if cur is None or liq is None:
+        return None
+    try:
+        cur_d = Decimal(str(cur))
+        liq_d = Decimal(str(liq))
+    except (InvalidOperation, TypeError):
+        return None
+    if cur_d <= 0:
+        return None
+    return (cur_d - liq_d) / cur_d
+
+
 def _rank(
     products: list[ProductSummary],
     top_k: int = TOP_K,
@@ -720,17 +757,33 @@ async def _fetch_perp_info(
     """
     symbol = f"{coin.upper()}USDT"
     try:
-        tickers, book, instruments = await asyncio.gather(
+        tickers, book, instruments, funding_history = await asyncio.gather(
             client.get_tickers(category="linear", symbol=symbol),
             client.get_orderbook(symbol=symbol, category="linear", limit=50),
             client.get_instruments_info(category="linear", symbol=symbol),
+            client.get_funding_history(symbol=symbol, category="linear", limit=21),
+            return_exceptions=True,
         )
-    except BybitAPIError as e:
-        errors.append(f"perp_market[{coin}]: retCode={e.ret_code} {e.ret_msg}")
-        return coin, None
     except Exception as e:  # noqa: BLE001
         errors.append(f"perp_market[{coin}]: {type(e).__name__}: {e}")
         return coin, None
+    # Per-call error handling — funding_history failures degrade to None,
+    # critical calls (ticker/orderbook/instruments) collapse the row.
+    if isinstance(tickers, BaseException):
+        errors.append(f"perp_market[{coin}]: tickers: {type(tickers).__name__}")
+        return coin, None
+    if isinstance(book, BaseException):
+        book = None
+    if isinstance(instruments, BaseException):
+        instruments = None
+    funding_7d_avg: Decimal | None = None
+    if isinstance(funding_history, list) and funding_history:
+        funding_7d_avg = sum(funding_history, Decimal(0)) / Decimal(len(funding_history))
+    elif isinstance(funding_history, BaseException):
+        errors.append(
+            f"perp_market[{coin}]: funding_history: "
+            f"{type(funding_history).__name__}"
+        )
 
     ticker = tickers[0] if tickers else None
     if ticker is None:
@@ -775,6 +828,7 @@ async def _fetch_perp_info(
     return coin, PerpInfo(
         symbol=symbol,
         funding_rate_8h=funding,
+        funding_rate_7d_avg=funding_7d_avg,
         mark_price=mark,
         orderbook_depth_50bps_usd=depth_usd,
         min_order_qty=min_qty,
@@ -784,22 +838,27 @@ async def _fetch_perp_info(
 
 
 def _hedge_candidate_coins(
-    onchain_summaries: list[ProductSummary], cap: int
+    summaries_groups: list[list[ProductSummary]], cap: int
 ) -> list[str]:
-    """Pick the OnChain coins that actually need a perp hedge —
-    everything non-stable, deduped, capped at `cap`. Order preserves
-    `_rank` ordering (APR descending) so high-yield non-stable picks
-    are first in line for perp fan-out."""
+    """Pick the Earn coins that actually need a perp hedge —
+    everything non-stable, deduped, capped at `cap`. Walks each group
+    in order (OnChain first, then FlexibleSaving) preserving APR-desc
+    ranking from `_rank` so high-yield non-stable picks claim the fan-
+    out budget first. `.47` follow-up 2026-05-29: extended from
+    OnChain-only to cover both auto-hedge categories — non-stable
+    FlexibleSaving picks (ID, IO, AGIX, etc.) also need perp data so
+    the validator's hedge-feasibility gate has real numbers to check."""
     seen: set[str] = set()
     out: list[str] = []
-    for p in onchain_summaries:
-        coin = p.coin.upper()
-        if coin in STABLES or coin in seen:
-            continue
-        seen.add(coin)
-        out.append(coin)
-        if len(out) >= cap:
-            break
+    for summaries in summaries_groups:
+        for p in summaries:
+            coin = p.coin.upper()
+            if coin in STABLES or coin in seen:
+                continue
+            seen.add(coin)
+            out.append(coin)
+            if len(out) >= cap:
+                return out
     return out
 
 
@@ -1057,6 +1116,15 @@ async def collect_snapshot(
     earn_flex_positions = await earn_flex_pos_task
     earn_onchain_positions = await earn_onchain_pos_task
     lm_positions = await lm_pos_task
+    # Derive per-position liquidation distance so Claude sees risk
+    # proximity directly (leveraged LM `.47` follow-up, 2026-05-29).
+    # Mutating the raw dicts in place — they're forwarded into the
+    # prompt as-is and the executor reads `liquidation_distance_pct`
+    # for the de-risk trigger.
+    for pos in lm_positions:
+        dist = _lm_liquidation_distance_pct(pos)
+        if dist is not None:
+            pos["liquidation_distance_pct"] = str(dist)
     perp_positions_raw = await perp_pos_task
     aave_state = await on_chain_task if on_chain_task is not None else None
     # Filter out zero-size rows Bybit may echo for recently-traded symbols
@@ -1196,13 +1264,15 @@ async def collect_snapshot(
             )
         )
 
-    # Per-coin perp data for non-stable OnChain picks. Drives the
-    # hedging-feasibility rules in the prompt (.31). We fan out fetch
-    # only for coins surfaced in the OnChain top-K that are NOT stables
-    # — stables don't need a hedge so spending the API budget on them
-    # is pointless. Cap at PERP_HEDGE_TOP_K coins to keep snapshot
-    # latency bounded.
-    perp_coins = _hedge_candidate_coins(products["OnChain"], cap=PERP_HEDGE_TOP_K)
+    # Per-coin perp data for non-stable Earn picks (OnChain + Flexible-
+    # Saving). Drives the hedging-feasibility rules in the prompt and
+    # the validator's auto-hedge gates (`.47` follow-up 2026-05-29).
+    # OnChain is walked first so high-yield non-stable OnChain picks
+    # always claim the fan-out budget before FlexibleSaving non-stables.
+    perp_coins = _hedge_candidate_coins(
+        [products["OnChain"], products["FlexibleSaving"]],
+        cap=PERP_HEDGE_TOP_K,
+    )
     if perp_coins:
         perp_results = await asyncio.gather(
             *(_fetch_perp_info(client, c, errors) for c in perp_coins)

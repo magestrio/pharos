@@ -1472,6 +1472,39 @@ class BybitClient:
         parsed = BybitResponse[OrderbookSnapshot].model_validate(data)
         return parsed.result
 
+    async def get_funding_history(
+        self,
+        symbol: str,
+        category: str = "linear",
+        limit: int = 21,
+    ) -> list[Decimal]:
+        """`/v5/market/funding/history` — historical funding rates for a
+        linear-perp symbol. Returns the rates as signed Decimals (most-
+        recent first), ready for averaging.
+
+        Default `limit=21` covers a full 7-day window (3 periods/day × 7).
+        Public endpoint, no auth required. Failures bubble up; the snapshot
+        layer is expected to swallow them per coin so one bad symbol
+        doesn't fail the whole fan-out.
+        """
+        data = await self._request(
+            "GET",
+            "/v5/market/funding/history",
+            params={"category": category, "symbol": symbol, "limit": limit},
+        )
+        result = data.get("result") or {}
+        items = result.get("list") or []
+        rates: list[Decimal] = []
+        for row in items:
+            raw = row.get("fundingRate")
+            if raw is None:
+                continue
+            try:
+                rates.append(Decimal(str(raw)))
+            except (ValueError, ArithmeticError):
+                continue
+        return rates
+
     async def get_instruments_info(
         self, category: str = "linear", symbol: str | None = None
     ) -> list[LinearInstrument]:

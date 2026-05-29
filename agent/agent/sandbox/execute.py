@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -48,6 +49,7 @@ from agent.reason.venues import VENUE_REGISTRY
 from agent.sandbox.snapshot import SNAPSHOT_DIR, STABLES, PerpInfo, Snapshot
 
 EXECUTIONS_DIR = Path(__file__).parent / "executions"
+log = logging.getLogger(__name__)
 
 # Minimum USDC-equivalent action size. Below this, rebalances are noise:
 # fees + slippage dominate the yield uplift, and Bybit min-stake amounts
@@ -87,11 +89,14 @@ _BASIC_EARN_CATEGORIES: frozenset[str] = frozenset({"FlexibleSaving", "OnChain"}
 # venue registry uses (`bybit_lm.snapshot_category="LiquidityMining"`).
 _LM_CATEGORY: str = "LiquidityMining"
 
-# Bybit LM deposits the USDC side of a max_leverage=1 LP pair from the
-# UNIFIED wallet (where Earn redemptions also land). FUND would force a
-# manual transfer first. Hardcoded here rather than per-product because
-# every vUSDC-eligible LM pick is quoteCoin=USDC at leverage=1 — the
-# validator rejects anything else.
+# Bybit LM deposits the quote side of a max_leverage=1 LP pair from the
+# UNIFIED wallet (where Earn redemptions and spot swaps also land). FUND
+# would force a manual transfer first. Quote coin is per-product (USDC
+# for ETH/USDC and BTC/USDC; USDT for everything else) — when the wallet
+# lacks the quote stable, the diff emits a USDC→quote swap leg via
+# `_swap_actions_for_earn_picks`, same shape as the USDT-margin swap for
+# perp hedges. DO NOT restrict LM picks to USDC-quote; the operator hard
+# rule (2026-05-27) applies to LM same as Earn — see `_STABLES` comment.
 _LM_QUOTE_ACCOUNT_TYPE: str = "UNIFIED"
 
 
@@ -155,6 +160,11 @@ class Action:
     order_link_id: str
     reason: str
     position_id: str | None = None
+    # Per-action overrides for dispatch parameters that don't fit the
+    # flat field set. Currently used by REDEEM_LM to carry
+    # `remove_rate` (1-100) for partial exits; default behavior when
+    # absent is the full-exit path (remove_rate=100).
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_log(self) -> dict[str, Any]:
         d = asdict(self)
@@ -348,6 +358,7 @@ def diff_to_actions(
         decision,
         snapshot_ts,
         idx_offset=len(all_pids),
+        total_book_usd=total_book_usd,
     )
     hedge_swaps = _swap_actions_for_hedges(
         snapshot,
@@ -391,16 +402,68 @@ def _coin_from_perp_symbol(symbol: str) -> str:
     return symbol[:-4] if symbol.endswith("USDT") else symbol
 
 
+# Snapshot categories whose non-stable picks get auto-hedged. Both
+# FlexibleSaving and OnChain stake the underlying coin directly, so a
+# non-stable pick produces directional spot exposure that needs a paired
+# perp short to neutralize. LM is excluded — it's a paired LP (the quote
+# side already hedges the base on average). Advance-Earn is excluded —
+# DualAssets / DiscountBuy / SmartLeverage / DoubleWin are structured
+# conditional products, not simple directional spot stakes.
+_AUTO_HEDGE_CATEGORIES: frozenset[str] = frozenset(
+    {"OnChain", "FlexibleSaving"}
+)
+
+
+def _auto_hedge_targets(
+    decision: Decision,
+    snapshot: Snapshot,
+    total_book_usd: Decimal,
+) -> dict[str, Decimal]:
+    """Derive `{coin: notional_usd_positive}` automatically from non-stable
+    picks in `_AUTO_HEDGE_CATEGORIES` (OnChain + FlexibleSaving). Hedge
+    notional = `pick_usd_value` (positive magnitude; the executor opens a
+    short, the sign convention lives in the action).
+
+    Replaces the prior pattern of reading `decision.hedges[].notional_usd`
+    directly — Claude is bad at the arithmetic and validator rejects
+    ratios outside ±20%, churning cycles on a math problem the system can
+    solve deterministically. Operator change 2026-05-29: hedge intent is
+    implicit (any non-stable Earn pick), hedge size is system-derived,
+    `decision.hedges` is no longer authoritative for sizing.
+    """
+    targets: dict[str, Decimal] = {}
+    for v in decision.venues:
+        meta = VENUE_REGISTRY[v.venue_id]
+        cat = meta.snapshot_category
+        if cat not in _AUTO_HEDGE_CATEGORIES or not v.picks:
+            continue
+        product_coin = {
+            p.product_id: p.coin
+            for p in snapshot.products.get(cat, [])
+        }
+        for pick in v.picks:
+            coin = product_coin.get(pick.product_id, "")
+            if not coin or coin.upper() in _STABLES:
+                continue
+            pick_usd = total_book_usd * Decimal(str(v.weight)) * Decimal(str(pick.weight))
+            if pick_usd <= 0:
+                continue
+            targets[coin.upper()] = targets.get(coin.upper(), Decimal(0)) + pick_usd
+    return targets
+
+
 def _hedge_diff_actions(
     snapshot: Snapshot,
     decision: Decision,
     snapshot_ts: str,
     *,
     idx_offset: int,
+    total_book_usd: Decimal,
 ) -> tuple[list[Action], list[Action]]:
-    """Compute `(closes, opens)` for the perp hedge layer. See caller
-    for the sequencing rationale; pulled out so the surface area for
-    tests stays narrow."""
+    """Compute `(closes, opens)` for the perp hedge layer. Target hedges
+    are auto-derived from non-stable OnChain picks (see
+    `_auto_hedge_targets`) — `decision.hedges` is informational only and
+    NOT used for sizing here."""
     closes: list[Action] = []
     opens: list[Action] = []
 
@@ -418,9 +481,9 @@ def _hedge_diff_actions(
             continue
         current_by_coin[coin] = pos
 
-    targets_by_coin: dict[str, Any] = {}
-    for h in decision.hedges:
-        targets_by_coin[h.coin.upper()] = h
+    targets_by_coin: dict[str, Decimal] = _auto_hedge_targets(
+        decision, snapshot, total_book_usd
+    )
 
     all_coins = sorted(set(current_by_coin) | set(targets_by_coin))
     cursor = idx_offset
@@ -434,9 +497,7 @@ def _hedge_diff_actions(
         # derived from mark price as a fallback for the close-only path).
         current_size = _safe_decimal(pos.size) if pos else Decimal(0)
         current_notional = _position_notional_usd(pos, info)
-        target_notional = (
-            Decimal(str(abs(target.notional_usd))) if target else Decimal(0)
-        )
+        target_notional = target if target is not None else Decimal(0)
 
         # CLOSE: current exists, and either target absent OR notional
         # drift exceeds the rebalance threshold.
@@ -572,7 +633,12 @@ def _lm_action_for_target(
             ),
         )
     base_coin, quote_coin = parts
-    if quote_coin != "USDC":
+    # Non-stable quote coins (hypothetical — Bybit LM is stable-quoted in
+    # practice) aren't sized against USD reliably without mark prices on
+    # the quote side; skip with a clear reason. USDC-quote and USDT-quote
+    # both pass; USDT-quote subscribes get a USDC→USDT swap leg emitted
+    # later in `_swap_actions_for_earn_picks`.
+    if quote_coin not in _STABLES:
         return Action(
             kind=ActionKind.SKIP_OUT_OF_SCOPE,
             category=_LM_CATEGORY,
@@ -582,8 +648,8 @@ def _lm_action_for_target(
             order_link_id=order_link_id,
             reason=(
                 f"LiquidityMining/{product_id} ({base_coin}/{quote_coin}): "
-                "vault funds only USDC-quote pairs; the validator should "
-                "have rejected this pick"
+                f"quote coin {quote_coin!r} is not a recognized stable — "
+                "USD sizing not reliable without quote-side mark price"
             ),
         )
 
@@ -613,7 +679,7 @@ def _lm_action_for_target(
                     f"LiquidityMining/{product_id} ({base_coin}/{quote_coin}): "
                     f"target ${target_amount_usd:.2f} below Bybit min "
                     f"${product.min_subscribe_usd} — Bybit would reject; "
-                    "either scale up the LM allocation or top up USDC"
+                    f"either scale up the LM allocation or top up {quote_coin}"
                 ),
             )
         return Action(
@@ -625,7 +691,7 @@ def _lm_action_for_target(
             order_link_id=order_link_id,
             reason=(
                 f"subscribe LM/{product_id} ({base_coin}/{quote_coin}) "
-                f"${target_amount_usd:.2f} single-sided USDC, leverage=1; "
+                f"${target_amount_usd:.2f} single-sided {quote_coin}, leverage=1; "
                 f"Bybit pool rebalances to 50/50 internally"
             ),
         )
@@ -651,7 +717,40 @@ def _lm_action_for_target(
     delta = abs(target_amount_usd - current_usd)
     if delta < MIN_ACTION_USDC:
         return None
-    # Partial scaling not in MVP.
+    # Partial redemption when target < current (de-risk path). Bybit's
+    # `removeRate` accepts integer 1-100; we round DOWN so we never
+    # redeem more than intended. Sub-1% deltas would round to 0 and
+    # Bybit rejects — collapse to no-op for those.
+    if target_amount_usd < current_usd:
+        redeem_usd = current_usd - target_amount_usd
+        if current_usd <= 0:
+            return None
+        rate_pct = int(
+            (redeem_usd / current_usd * Decimal(100)).quantize(Decimal("1"))
+        )
+        if rate_pct < 1:
+            return None
+        rate_pct = min(rate_pct, 99)  # full exit goes through the branch above
+        return Action(
+            kind=ActionKind.REDEEM_LM,
+            category=_LM_CATEGORY,
+            product_id=product_id,
+            coin=quote_coin,
+            amount=redeem_usd,
+            order_link_id=order_link_id,
+            reason=(
+                f"redeem LM/{product_id} ({base_coin}/{quote_coin}) "
+                f"partial: current ${current_usd:.2f} → target "
+                f"${target_amount_usd:.2f} (removeRate={rate_pct}%, "
+                f"removeType=Normal)"
+            ),
+            position_id=position_id,
+            extra={"remove_rate": rate_pct},
+        )
+    # Partial INCREASE (target > current). Bybit add-liquidity opens a
+    # SECOND position on the same product rather than topping up — would
+    # leave two position_ids to track at next redeem. SKIP with a reason
+    # telling the operator to wait a cycle for full exit + resubscribe.
     return Action(
         kind=ActionKind.SKIP_OUT_OF_SCOPE,
         category=_LM_CATEGORY,
@@ -660,9 +759,11 @@ def _lm_action_for_target(
         amount=target_amount_usd,
         order_link_id=order_link_id,
         reason=(
-            f"LiquidityMining/{product_id}: partial LM scaling not wired "
+            f"LiquidityMining/{product_id}: partial increase not wired "
             f"(current ${current_usd:.2f}, target ${target_amount_usd:.2f}); "
-            "full exit or fresh subscribe only — close manually to resize"
+            "Bybit add-liquidity would open a second position. Hold this "
+            "cycle; if Claude still wants more next cycle, full-exit then "
+            "resubscribe at the new size."
         ),
     )
 
@@ -732,22 +833,26 @@ def _advance_earn_subscribe_action(
     order_link_id: str,
 ) -> Action:
     """Build the SUBSCRIBE_ADVANCE_EARN action for a DualAssets or
-    DiscountBuy pick by pulling the cached quote from the snapshot and
-    selecting an active offer. Returns SKIP_OUT_OF_SCOPE when:
+    DiscountBuy pick.
 
-    - the quote is missing entirely (top-K window didn't include this
-      product, or the per-product quote call failed),
-    - all offers are past `expiredAt` (snapshot too old vs settlement
-      window — Bybit offers usually rotate every few minutes for
-      DualAssets, longer for DiscountBuy),
-    - we don't recognize the category-specific offer shape.
+    Two layers of offer data:
+    - **Diff-time best-effort**: pick a fresh offer from the cached quote
+      and encode it in `Action.reason` as a fallback. If the cached
+      quote has no usable (non-expired) offer, encode an empty stub —
+      the execute branch will refresh anyway.
+    - **Execute-time refresh**: the executor re-fetches the quote
+      immediately before dispatch (see `_execute_one`), so the offer
+      used on the wire reflects the latest Bybit rotation rather than
+      whatever the snapshot saw 30-60s ago. The diff-time offer is the
+      last-ditch fallback when the refresh call fails.
 
-    The chosen offer is stashed in `Action.reason` (operator audit) and
-    the `coin` / `amount` fields are set so the executor branch has
-    enough to build the per-category `*Extra` block at dispatch time —
-    actually re-reading the quote then would race against expiry.
-    Instead we encode everything into the Action up front: that snapshot
-    is the source of truth for this cycle.
+    Returns SKIP_OUT_OF_SCOPE only when the pick is fundamentally
+    unactionable — quote entirely missing (product fell outside top-K
+    fan-out OR per-product call failed) OR the coin cannot be resolved
+    even from the product list. Stale-at-diff is NOT a SKIP — operator
+    change 2026-05-29: `.35` follow-up to fix DiscountBuy/DualAssets
+    silently skipping every cycle because their offers rotate faster
+    than the snapshot→decide→validate→diff path takes.
     """
     key = f"{category}/{product_id}"
     quote = snapshot.advance_earn_quotes.get(key)
@@ -769,24 +874,34 @@ def _advance_earn_subscribe_action(
     offer, coin, reason_detail = _pick_advance_offer(
         category, quote, snapshot, product_id
     )
-    if offer is None:
+    # `coin == "?"` means we couldn't even resolve the staking coin
+    # (product missing from `snapshot.products`). That's unrecoverable
+    # at execute time — SKIP. But `offer is None` with a known coin is
+    # fine — execute will refresh the quote.
+    if not coin or coin == "?":
         return Action(
             kind=ActionKind.SKIP_OUT_OF_SCOPE,
             category=category,
             product_id=product_id,
-            coin=coin or "?",
+            coin="?",
             amount=target_amount_usd,
             order_link_id=order_link_id,
             reason=(
-                f"{category}/{product_id}: no usable offer "
-                f"({reason_detail})"
+                f"{category}/{product_id}: cannot resolve stake coin "
+                f"({reason_detail}); pick is unactionable"
             ),
         )
 
     # Encode the per-category offer details into the action's reason so
-    # the dispatch can rebuild the extra block without re-parsing the
-    # whole quote (and so post-mortems can see WHY this strike).
-    serialized_offer = json.dumps(offer, sort_keys=True, default=str)
+    # the dispatch has a fallback if the execute-time refresh fails. May
+    # be empty `{}` when the diff-time quote had no fresh offers — the
+    # dispatch handles that case by erroring out cleanly if the refresh
+    # also fails.
+    serialized_offer = json.dumps(offer or {}, sort_keys=True, default=str)
+    if offer is None:
+        descriptor = f"stale-at-diff ({reason_detail}); execute will refresh"
+    else:
+        descriptor = reason_detail
     return Action(
         kind=ActionKind.SUBSCRIBE_ADVANCE_EARN,
         category=category,
@@ -796,7 +911,7 @@ def _advance_earn_subscribe_action(
         order_link_id=order_link_id,
         reason=(
             f"subscribe {category}/{product_id} ({coin}) ${target_amount_usd:.2f}: "
-            f"{reason_detail} offer={serialized_offer}"
+            f"{descriptor} offer={serialized_offer}"
         ),
     )
 
@@ -937,6 +1052,52 @@ def _advance_product_pair(
     return parts[0], parts[1]
 
 
+def _pick_offer_for_execute(
+    category: str, quote: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Pick the freshest valid offer from a quote payload at execute
+    time, returning the raw offer dict (or None). Unlike diff-time
+    `_pick_advance_offer`, this function takes no `snapshot` argument —
+    coin resolution already happened at diff time and was encoded in
+    `Action.coin`. We only need the offer for the `*Extra` block.
+
+    Mirror of the per-category logic in `_pick_advance_offer` minus the
+    coin lookup. `.35` follow-up 2026-05-29.
+    """
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    if category == "DualAssets":
+        items = quote.get("list") or []
+        if not items or not isinstance(items[0], dict):
+            return None
+        payload = items[0]
+        best: tuple[Decimal, dict[str, Any]] | None = None
+        for offer in payload.get("buyLowPrice") or []:
+            if _offer_expired(offer.get("expiredAt"), now_ms):
+                continue
+            raw_apy = offer.get("apyE8")
+            if raw_apy is None:
+                continue
+            try:
+                apy = Decimal(str(raw_apy)) / Decimal("1e8")
+            except (InvalidOperation, TypeError):
+                continue
+            if best is None or apy > best[0]:
+                best = (apy, offer)
+        return best[1] if best else None
+    if category == "DiscountBuy":
+        items = quote.get("offers") or quote.get("list") or []
+        if not items or not isinstance(items[0], dict):
+            return None
+        offer = items[0]
+        expired = offer.get("expiredAt") or offer.get("expiredTime")
+        if _offer_expired(expired, now_ms):
+            return None
+        if not offer.get("instUid"):
+            return None
+        return offer
+    return None
+
+
 def _offer_expired(expired_raw: Any, now_ms: int) -> bool:
     """True when `expired_raw` (unix-ms, string or int) is in the past
     relative to `now_ms`. Missing / unparseable → True (fail-closed:
@@ -1003,17 +1164,19 @@ def _swap_actions_for_earn_picks(
     *,
     idx_offset: int,
 ) -> list[Action]:
-    """Plan USDC → pick.coin swaps when SUBSCRIBE_EARN actions target
-    coins the wallet doesn't carry. Bybit Earn stakes the product's
-    base coin directly — there's no auto-conversion — so a USD1 pick
-    against a USDC-only wallet would 180016 "Balance not enough". We
+    """Plan USDC → pick.coin swaps when SUBSCRIBE_EARN or SUBSCRIBE_LM
+    actions target coins the wallet doesn't carry. Bybit Earn stakes the
+    product's base coin directly — there's no auto-conversion — so a
+    USD1 pick against a USDC-only wallet would 180016 "Balance not
+    enough". LM subscribes pay in the quote coin (USDT for most LM
+    pairs, USDC for ETH/USDC and BTC/USDC); same problem applies. We
     pre-emptively swap each shortfall via the `USDC<coin>` spot pair
     (Sell USDC base, receive target quote).
 
     Skips:
       - USDC picks (source coin, no swap needed),
-      - non-stable picks (this layer is for Earn stables only; perp
-        margin gets its own `_swap_actions_for_hedges`),
+      - non-stable picks (this layer is for stables only; perp margin
+        gets its own `_swap_actions_for_hedges`),
       - shortfalls below `MIN_SWAP_USDC` (Bybit pair fees > yield gain).
 
     Aggregated per coin so a 3-product split like USD1/USDT/FDUSD in
@@ -1022,7 +1185,7 @@ def _swap_actions_for_earn_picks(
     """
     required_per_coin: dict[str, Decimal] = {}
     for a in subscribe_actions:
-        if a.kind != ActionKind.SUBSCRIBE_EARN:
+        if a.kind not in (ActionKind.SUBSCRIBE_EARN, ActionKind.SUBSCRIBE_LM):
             continue
         coin = a.coin
         # Skip the source coin and anything we wouldn't recognize as
@@ -1071,7 +1234,7 @@ def _swap_actions_for_earn_picks(
                 amount=qty,  # USDC to sell — Bybit Sell uses base-coin qty
                 order_link_id=_order_link_id(snapshot_ts, cursor),
                 reason=(
-                    f"swap {qty} USDC → {coin} for Earn subscribe coverage "
+                    f"swap {qty} USDC → {coin} for Earn/LM subscribe coverage "
                     f"(need ${need:.2f}, have ${available:.2f})"
                 ),
             )
@@ -1279,12 +1442,41 @@ async def _execute_one(
             )
             response = {"orderId": out.orderId}
         elif action.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN:
-            # `.35`: dispatch DualAssets / DiscountBuy stake. Offer was
-            # pinned at diff time (encoded in action.reason) — rebuild
-            # the `*Extra` block from it instead of refetching the quote
-            # (which could rotate between diff and execute and silently
-            # change the strike we're committing to).
-            offer = _decode_offer_from_reason(action.reason)
+            # `.35` + 2026-05-29 follow-up: dispatch DualAssets /
+            # DiscountBuy stake. Refresh the quote at execute time
+            # because Bybit rotates offers every 30-60s and the diff-
+            # time offer encoded in `action.reason` may already be past
+            # `expiredAt`. If the refresh fails (network, rate limit,
+            # transient 5xx), fall back to the diff-time offer — stale
+            # is at least an attempt vs failing the whole pick.
+            fresh_offer: dict[str, Any] | None = None
+            try:
+                fresh_quote = await client.get_advance_product_quote(
+                    category=action.category, product_id=action.product_id
+                )
+                fresh_offer = _pick_offer_for_execute(
+                    action.category, fresh_quote
+                )
+            except BybitAPIError as e:
+                log.warning(
+                    "advance-Earn quote refresh failed for %s/%s: "
+                    "retCode=%s %s — falling back to diff-time offer",
+                    action.category, action.product_id, e.ret_code, e.ret_msg,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "advance-Earn quote refresh raised %s for %s/%s — "
+                    "falling back to diff-time offer",
+                    type(e).__name__, action.category, action.product_id,
+                )
+            offer = fresh_offer or _decode_offer_from_reason(action.reason)
+            if not offer:
+                raise BybitAPIError(
+                    0,
+                    "no usable offer at execute time (fresh quote rotated, "
+                    "diff-time fallback empty)",
+                    "/v5/earn/advance/place-order",
+                )
             extra = _build_advance_extra(action.category, offer)
             raw = await client.place_advance_earn_order(
                 category=action.category,
@@ -1323,11 +1515,12 @@ async def _execute_one(
                     f"REDEEM_LM action {action.order_link_id} missing "
                     "position_id — diff layer must populate this"
                 )
+            remove_rate = int(action.extra.get("remove_rate", 100))
             lm_out = await client.remove_liquidity(
                 product_id=action.product_id,
                 position_id=action.position_id,
                 order_link_id=action.order_link_id,
-                remove_rate=100,
+                remove_rate=remove_rate,
                 remove_type="Normal",
             )
             response = {"orderId": lm_out.orderId}
@@ -1431,7 +1624,7 @@ def _dry_run_payload(action: Action) -> dict[str, Any]:
             "would_call": "remove_liquidity",
             "product_id": action.product_id,
             "position_id": action.position_id,
-            "remove_rate": 100,
+            "remove_rate": int(action.extra.get("remove_rate", 100)),
             "remove_type": "Normal",
             "order_link_id": action.order_link_id,
         }

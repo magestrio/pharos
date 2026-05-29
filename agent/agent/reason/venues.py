@@ -103,7 +103,7 @@ VENUE_REGISTRY: dict[str, VenueMeta] = {
     "bybit_onchain": VenueMeta(
         venue_id="bybit_onchain",
         enabled=True,
-        max_weight=0.40,
+        max_weight=0.70,  # 2026-05-29 bumped from 0.40 after small-vault/2-venue removal — Claude needs room to size USDE + hedged non-stable picks
         requires_picks=True,
         snapshot_category="OnChain",
         notes=(

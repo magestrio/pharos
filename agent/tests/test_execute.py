@@ -55,10 +55,12 @@ def _snapshot(
     lm_products: list[ProductSummary] | None = None,
     lm_positions: list[dict] | None = None,
     advance_products: dict[str, list[ProductSummary]] | None = None,
+    onchain_products: list[ProductSummary] | None = None,
+    flex_products: list[ProductSummary] | None = None,
 ) -> Snapshot:
     products: dict[str, list[ProductSummary]] = {
-        "FlexibleSaving": [],
-        "OnChain": [],
+        "FlexibleSaving": flex_products or [],
+        "OnChain": onchain_products or [],
         "LiquidityMining": lm_products or [],
     }
     if advance_products:
@@ -600,12 +602,14 @@ def test_diff_lm_pick_missing_from_snapshot_emits_skip() -> None:
     assert "not in snapshot" in skips[0].reason
 
 
-def test_diff_lm_pick_non_usdc_quote_emits_skip() -> None:
-    """vUSDC only funds USDC-quote LM pairs. A NEAR/USDT pick must SKIP
-    — funding via auto-swap to USDT isn't in MVP scope."""
+def test_diff_lm_pick_usdt_quote_emits_subscribe_with_swap_leg() -> None:
+    """Operator hard rule (2026-05-27 + 2026-05-29): never restrict LM
+    picks to USDC-quote. A USDT-quote pair must produce SUBSCRIBE_LM +
+    a USDC→USDT swap leg sized to cover it. Mirrors the auto-swap
+    pattern Earn already uses for non-USDC stable picks."""
     snap = _snapshot(
         total_equity_usd="100",
-        lm_products=[_lm_product("16", base="NEAR", quote="USDT", max_leverage=5)],
+        lm_products=[_lm_product("16", base="NEAR", quote="USDT", max_leverage=1)],
     )
     d = _decision(
         [
@@ -614,9 +618,38 @@ def test_diff_lm_pick_non_usdc_quote_emits_skip() -> None:
         ]
     )
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_LM]
+    swaps = [a for a in actions if a.kind == ActionKind.SWAP_SPOT]
+    assert len(subs) == 1
+    assert subs[0].coin == "USDT"
+    assert subs[0].amount == Decimal("30.0")  # 100 * 0.3 * 1.0
+    assert len(swaps) == 1
+    assert swaps[0].product_id == "USDCUSDT"
+    assert swaps[0].coin == "USDT"
+    # Swap must come before the LM subscribe in the action sequence.
+    kinds = [a.kind for a in actions]
+    assert kinds.index(ActionKind.SWAP_SPOT) < kinds.index(ActionKind.SUBSCRIBE_LM)
+
+
+def test_diff_lm_pick_non_stable_quote_emits_skip() -> None:
+    """Hypothetical edge case — non-stable quote coin (e.g. BTC/ETH LP)
+    can't be sized in USD without a quote-side mark. SKIP with explicit
+    reason rather than silently mis-size. Real Bybit LM is always
+    stable-quoted; this guards against future product shape changes."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        lm_products=[_lm_product("99", base="BTC", quote="ETH", max_leverage=1)],
+    )
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.7),
+            _venue("bybit_lm", 0.3, [("99", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
     skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
     assert len(skips) == 1
-    assert "USDC-quote" in skips[0].reason
+    assert "not a recognized stable" in skips[0].reason
 
 
 def test_diff_lm_full_exit_when_target_zero_and_position_exists() -> None:
@@ -664,9 +697,10 @@ def test_diff_lm_existing_position_at_target_emits_nothing() -> None:
     assert lm_actions == []
 
 
-def test_diff_lm_partial_resize_emits_skip() -> None:
-    """Partial drawdown (target > 0 but smaller than current) is out of
-    MVP scope — emit SKIP with a reason rather than guessing a percent."""
+def test_diff_lm_partial_decrease_emits_redeem_with_remove_rate() -> None:
+    """Partial drawdown (target > 0 but smaller than current) now wires
+    REDEEM_LM with `removeRate=N%` instead of SKIP. Operator change
+    2026-05-29 to support leveraged LM de-risk path."""
     snap = _snapshot(
         total_equity_usd="100",
         lm_products=[_lm_product("24")],
@@ -681,9 +715,37 @@ def test_diff_lm_partial_resize_emits_skip() -> None:
         ]
     )
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    redeems = [a for a in actions if a.kind == ActionKind.REDEEM_LM]
+    assert len(redeems) == 1
+    r = redeems[0]
+    assert r.position_id == "9001"
+    # (30 - 10) / 30 = 66.67% → rounds to 67
+    assert r.extra["remove_rate"] == 67
+    assert r.amount == Decimal("20")  # USD amount being redeemed
+
+
+def test_diff_lm_partial_increase_emits_skip() -> None:
+    """Partial INCREASE (target > current) stays as SKIP — Bybit's
+    add-liquidity opens a second position rather than topping up the
+    existing one, which would complicate redeem tracking. Operator can
+    full-exit + resubscribe next cycle."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        lm_products=[_lm_product("24")],
+        lm_positions=[
+            _lm_position(product_id="24", position_id="9001", principal_usd="10")
+        ],
+    )
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.7),
+            _venue("bybit_lm", 0.3, [("24", 1.0)]),  # target = $30, current $10
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
     skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
     assert len(skips) == 1
-    assert "partial LM scaling" in skips[0].reason
+    assert "partial increase not wired" in skips[0].reason
 
 
 def test_diff_advance_pick_emits_skip() -> None:
@@ -892,8 +954,66 @@ async def test_execute_appends_one_line_per_action(tmp_path: Path) -> None:
 # ─── Hedge actions (.31) ────────────────────────────────────────────────────
 
 
+# OnChain TON product fixture for hedge-flow tests. Auto-hedge derives
+# the coin from `snapshot.products["OnChain"]`, so any hedge test that
+# wants TON to be picked must surface product 8 with coin=TON here.
+_TON_PRODUCT = ProductSummary(
+    category="OnChain",
+    product_id="8",
+    coin="TON",
+    effective_apr=Decimal("0.18"),
+    apr_source="estimate_apr",
+)
+
+# FlexibleSaving non-stable product for the FlexibleSaving auto-hedge
+# path (`.47` follow-up 2026-05-29). Non-stable Flex picks like ID, IO,
+# AGIX get the same auto-hedge as OnChain non-stables.
+_ID_FLEX_PRODUCT = ProductSummary(
+    category="FlexibleSaving",
+    product_id="315",
+    coin="ID",
+    effective_apr=Decimal("0.12"),
+    apr_source="estimate_apr",
+)
+
+
+def test_diff_flex_non_stable_pick_emits_auto_hedge() -> None:
+    """`.47` follow-up: a non-stable FlexibleSaving pick (e.g. ID, IO)
+    must produce an OPEN_PERP_SHORT same as OnChain non-stable picks.
+    Auto-hedge derives notional from pick USD value; no Hedge entry
+    required on the Decision."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"ID": _perp("ID", mark="0.5")},
+        flex_products=[_ID_FLEX_PRODUCT],
+    )
+    d = Decision(
+        thesis="Flex ID non-stable pick — auto-hedge derived from pick USD",
+        venues=[
+            _venue("cash_usdc", 0.6),
+            _venue("bybit_flex", 0.4, [("315", 1.0)]),
+        ],
+        hedges=[],  # auto-derived, intentionally empty
+        confidence=0.7,
+        risk_flags=[],
+        notes=[],
+        expected_blended_apr_pct=4.8,
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260529T120000Z")
+    opens = [a for a in actions if a.kind == ActionKind.OPEN_PERP_SHORT]
+    assert len(opens) == 1
+    h = opens[0]
+    assert h.product_id == "IDUSDT"
+    assert h.coin == "ID"
+    # pick_usd = 100 * 0.4 * 1.0 = $40; qty = 40 / 0.5 = 80 ID
+    assert h.amount == Decimal("80.000")
+
+
 def _decision_with_hedge(hedge_notional: float = -50.0) -> Decision:
-    """Decision with TON OnChain pick + matching TON short hedge."""
+    """Decision with TON OnChain pick + (informational) TON short hedge.
+    `hedge_notional` is informational only after 2026-05-29 — auto-hedge
+    derives size from the pick — but we keep the parameter to document
+    test intent in the venue rebalance tests."""
     return Decision(
         thesis="TON OnChain at 18% APR with paired short hedge for delta-neutral.",
         venues=[
@@ -912,6 +1032,7 @@ def test_diff_hedge_emits_open_perp_short() -> None:
     snap = _snapshot(
         total_equity_usd="100",
         perp_market={"TON": _perp("TON", mark="2.0")},
+        onchain_products=[_TON_PRODUCT],
     )
     d = _decision_with_hedge(hedge_notional=-50.0)
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
@@ -928,6 +1049,7 @@ def test_diff_hedge_sequence_is_open_before_subscribe() -> None:
     snap = _snapshot(
         total_equity_usd="100",
         perp_market={"TON": _perp("TON")},
+        onchain_products=[_TON_PRODUCT],
     )
     d = _decision_with_hedge()
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
@@ -940,7 +1062,11 @@ def test_diff_hedge_sequence_is_open_before_subscribe() -> None:
 
 def test_diff_hedge_without_perp_market_falls_to_skip() -> None:
     # No perp_market entry for TON → can't price hedge qty → skip.
-    snap = _snapshot(total_equity_usd="100", perp_market={})
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={},
+        onchain_products=[_TON_PRODUCT],
+    )
     d = _decision_with_hedge()
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
     skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
@@ -989,6 +1115,7 @@ def test_diff_hedge_open_only_when_no_current_position() -> None:
         total_equity_usd="100",
         perp_market={"TON": _perp("TON", mark="2.0")},
         perp_positions=[],
+        onchain_products=[_TON_PRODUCT],
     )
     d = _decision_with_hedge(hedge_notional=-50.0)
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
@@ -1006,6 +1133,7 @@ def test_diff_hedge_no_op_when_notional_matches() -> None:
         perp_positions=[
             _short_pos("TON", size="25", position_value="50.00"),
         ],
+        onchain_products=[_TON_PRODUCT],
     )
     d = _decision_with_hedge(hedge_notional=-50.0)
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
@@ -1018,14 +1146,30 @@ def test_diff_hedge_no_op_when_notional_matches() -> None:
 
 def test_diff_hedge_resize_emits_close_then_open() -> None:
     """Decision asks for $80 but $50 is open → close+reopen, close first."""
+    # Auto-hedge sizes from pick USD: bybit_onchain weight 0.80 × pick weight 1.0
+    # × book $100 = $80 (override default 0.50 weight in factory by re-decoding).
     snap = _snapshot(
         total_equity_usd="100",
         perp_market={"TON": _perp("TON", mark="2.0")},
         perp_positions=[
             _short_pos("TON", size="25", position_value="50.00"),
         ],
+        onchain_products=[_TON_PRODUCT],
     )
-    d = _decision_with_hedge(hedge_notional=-80.0)
+    # Build a decision that targets $80 in TON (was: $50 cash + $50 onchain;
+    # now $20 cash + $80 onchain so auto-hedge derives $80 notional).
+    d = Decision(
+        thesis="resize TON hedge: $50 -> $80",
+        venues=[
+            _venue("cash_usdc", 0.2),
+            _venue("bybit_onchain", 0.8, [("8", 1.0)]),
+        ],
+        hedges=[Hedge(coin="TON", notional_usd=-80.0)],
+        confidence=0.7,
+        risk_flags=[],
+        notes=[],
+        expected_blended_apr_pct=15.0,
+    )
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
     kinds = [a.kind for a in actions]
     close_idx = kinds.index(ActionKind.CLOSE_PERP)
@@ -1056,15 +1200,29 @@ def test_diff_hedge_close_uses_unique_order_link_ids() -> None:
 def test_diff_hedge_close_only_when_perp_market_missing() -> None:
     """Position exists but `perp_market` lost the entry between cycles —
     we can still safely close (size comes from the position, not mark),
-    but we cannot reopen at any meaningful target size → skip the open."""
+    but we cannot reopen at any meaningful target size → skip the open.
+    Pick weight set to 80% of book so auto-hedge target ($80) drifts
+    from current ($50) and forces a close+reopen attempt."""
     snap = _snapshot(
         total_equity_usd="100",
         perp_market={},  # no TON entry
         perp_positions=[
             _short_pos("TON", size="25", position_value="50.00"),
         ],
+        onchain_products=[_TON_PRODUCT],
     )
-    d = _decision_with_hedge(hedge_notional=-80.0)  # asks to resize
+    d = Decision(
+        thesis="resize TON: $50 → $80, perp market missing forces close only",
+        venues=[
+            _venue("cash_usdc", 0.2),
+            _venue("bybit_onchain", 0.8, [("8", 1.0)]),
+        ],
+        hedges=[Hedge(coin="TON", notional_usd=-80.0)],
+        confidence=0.7,
+        risk_flags=[],
+        notes=[],
+        expected_blended_apr_pct=15.0,
+    )
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
     closes = [a for a in actions if a.kind == ActionKind.CLOSE_PERP]
     opens = [a for a in actions if a.kind == ActionKind.OPEN_PERP_SHORT]
@@ -1087,6 +1245,7 @@ def test_diff_hedge_sequence_close_before_open_before_subscribe() -> None:
         perp_positions=[
             _short_pos("TON", size="40", position_value="80.00"),
         ],
+        onchain_products=[_TON_PRODUCT],
     )
     # Subscribe to a Flex product AND resize the hedge.
     d = Decision(
@@ -1203,6 +1362,7 @@ def test_diff_swap_emitted_when_usdt_short_for_open_hedge() -> None:
         usdt_available_usd="0",
         perp_market={"TON": _perp("TON", mark="2.0")},
         perp_positions=[],
+        onchain_products=[_TON_PRODUCT],
     )
     d = _decision_with_hedge(hedge_notional=-50.0)
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
@@ -1278,6 +1438,7 @@ def test_diff_no_swap_when_open_skipped_due_to_missing_perp_market() -> None:
         total_equity_usd="100",
         usdt_available_usd="0",
         perp_market={},
+        onchain_products=[_TON_PRODUCT],
     )
     d = _decision_with_hedge(hedge_notional=-50.0)
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
@@ -1291,6 +1452,7 @@ def test_diff_swap_suppressed_below_min_threshold() -> None:
         total_equity_usd="100",
         usdt_available_usd="52.30",  # buffered req = 52.50 → 0.20 short
         perp_market={"TON": _perp("TON", mark="2.0")},
+        onchain_products=[_TON_PRODUCT],
     )
     d = _decision_with_hedge(hedge_notional=-50.0)
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
@@ -1306,6 +1468,7 @@ def test_diff_sequence_redeems_closes_swaps_opens_subscribes() -> None:
         usdt_available_usd="0",
         perp_market={"TON": _perp("TON", mark="2.0")},
         earn_positions=[_pos("FlexibleSaving", "9999", "20")],  # drop pick
+        onchain_products=[_TON_PRODUCT],
     )
     d = Decision(
         thesis="redeem old flex, open TON hedge with margin swap, sub flex.",
@@ -1532,10 +1695,12 @@ def test_diff_discount_buy_uses_offers_key_not_list() -> None:
     assert "real-inst-1" in subs[0].reason
 
 
-def test_diff_advance_earn_expired_offer_emits_skip() -> None:
-    """Snapshot age outlived the offer window — pick must SKIP, not subscribe
-    to a stale strike that Bybit will reject. Per the live shape (2026-05-28),
-    `expiredAt` lives on each offer; this fixture makes ALL offers stale."""
+def test_diff_advance_earn_expired_offer_still_emits_subscribe() -> None:
+    """2026-05-29 follow-up: stale-at-diff is NOT a SKIP. Bybit advance-
+    Earn offers rotate every 30-60s; the diff-time quote may already be
+    expired by the time the executor reaches dispatch. Diff emits
+    SUBSCRIBE_ADVANCE_EARN with the stale offer encoded as fallback;
+    execute refreshes the quote on the wire."""
     expired_quote = _dual_quote(expired_in_ms=-60_000)  # 1 min ago, per offer
     snap = _snapshot(
         total_equity_usd="200",
@@ -1546,14 +1711,17 @@ def test_diff_advance_earn_expired_offer_emits_skip() -> None:
     )
     d = _advance_decision("bybit_dual_asset", "da-1", weight=0.2)
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
-    assert not [a for a in actions if a.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN]
-    skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
-    assert any("no usable buyLowPrice offers" in s.reason for s in skips)
+    subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN]
+    assert len(subs) == 1
+    assert "stale-at-diff" in subs[0].reason
+    assert "execute will refresh" in subs[0].reason
 
 
-def test_diff_discount_buy_skips_when_inst_uid_missing() -> None:
-    """instUid is required by place-order — offer without it is broken
-    on Bybit side and would 10005 / 180005 anyway. Surface as SKIP."""
+def test_diff_discount_buy_stale_offer_still_emits_subscribe() -> None:
+    """Same pattern for DiscountBuy: missing instUid at diff time
+    doesn't kill the pick — execute time refresh may surface a usable
+    offer. Diff emits SUBSCRIBE with empty fallback offer; execute
+    handles the refresh."""
     quote = _discount_quote(inst_uid=None)
     snap = _snapshot(
         total_equity_usd="100",
@@ -1564,9 +1732,9 @@ def test_diff_discount_buy_skips_when_inst_uid_missing() -> None:
     )
     d = _advance_decision("bybit_discount_buy", "db-1", weight=0.2)
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
-    assert not [a for a in actions if a.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN]
-    skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
-    assert any("missing instUid" in s.reason for s in skips)
+    subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN]
+    assert len(subs) == 1
+    assert "stale-at-diff" in subs[0].reason
 
 
 def test_diff_smart_leverage_still_skips_with_explanatory_reason() -> None:
@@ -1623,6 +1791,9 @@ async def test_execute_subscribe_advance_earn_dry_run(tmp_path: Path) -> None:
 async def test_execute_subscribe_advance_earn_live_dual_assets(tmp_path: Path) -> None:
     client = AsyncMock()
     client.place_advance_earn_order.return_value = {"orderId": "adv-1"}
+    # Refresh-at-execute returns an empty quote (no fresh offer) so the
+    # dispatch falls back to the diff-time offer encoded in `reason`.
+    client.get_advance_product_quote.return_value = {}
     offer = {
         "selectPrice": "62000",
         "side": "Buy",
@@ -1660,9 +1831,68 @@ async def test_execute_subscribe_advance_earn_live_dual_assets(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_execute_subscribe_advance_earn_uses_fresh_quote_over_stale(
+    tmp_path: Path,
+) -> None:
+    """`.35` 2026-05-29 follow-up: when the execute-time quote refresh
+    returns a fresh offer, dispatch uses THAT (with the up-to-date
+    selectPrice/apyE8), NOT the stale diff-time fallback encoded in
+    action.reason."""
+    client = AsyncMock()
+    client.place_advance_earn_order.return_value = {"orderId": "adv-fresh"}
+    fresh_quote = {
+        "category": "DualAssets",
+        "list": [
+            {
+                "productId": "da-1",
+                "buyLowPrice": [
+                    {
+                        "selectPrice": "60500",  # different from stale 62000
+                        "side": "Buy",
+                        "expiredAt": "9999999999999",
+                        "apyE8": "90000000",  # different from stale 80000000
+                    }
+                ],
+                "sellHighPrice": [],
+            }
+        ],
+    }
+    client.get_advance_product_quote.return_value = fresh_quote
+    stale_offer = {
+        "selectPrice": "62000",
+        "side": "Buy",
+        "expiredTime": "9999999999999",
+        "apyE8": "80000000",
+    }
+    action = Action(
+        kind=ActionKind.SUBSCRIBE_ADVANCE_EARN,
+        category="DualAssets",
+        product_id="da-1",
+        coin="USDT",
+        amount=Decimal("40"),
+        order_link_id="sandbox-test-adv-fresh",
+        reason=f"subscribe DualAssets x offer={json.dumps(stale_offer)}",
+    )
+    results = await execute_actions(
+        client,
+        [action],
+        snapshot_ts="20260527T120000Z",
+        dry_run=False,
+        executions_dir=tmp_path,
+    )
+    assert results[0].status == "ok"
+    kwargs = client.place_advance_earn_order.await_args.kwargs
+    # Dispatch must use the FRESH offer, not the stale one from reason.
+    assert kwargs["extra"]["dualAssetsExtra"]["selectPrice"] == "60500"
+    assert kwargs["extra"]["dualAssetsExtra"]["apyE8"] == "90000000"
+    client.get_advance_product_quote.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_execute_subscribe_advance_earn_live_discount_buy(tmp_path: Path) -> None:
     client = AsyncMock()
     client.place_advance_earn_order.return_value = {"orderId": "adv-2"}
+    client.get_advance_product_quote.return_value = {}  # see DualAssets test
     offer = {
         "instUid": "inst-xyz",
         "currentPrice": "65000",

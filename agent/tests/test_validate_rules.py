@@ -30,17 +30,15 @@ from agent.sandbox.snapshot import (
     WalletSnapshot,
 )
 from agent.validate.rules import (
-    HEDGE_SIZE_TOL,
+    FUNDING_FLOOR_8H,
     PEG_STRESS_BPS,
     PEG_STRESS_STABLES_FLOOR,
     check_confidence,
     check_disabled_venues,
     check_effective_pick_cap,
-    check_hedge_direction,
-    check_hedge_min_notional,
-    check_hedge_sizing,
+    check_funding_rate_floor,
     check_hedges_for_non_usd_picks,
-    check_lm_no_leverage,
+    check_lm_leverage_size_cap,
     check_no_missing_apr_source,
     check_peg_stress,
     check_picks_required,
@@ -122,10 +120,16 @@ def _perp(
     *,
     mark: str = "2.0",
     min_notional: str = "0.5",
+    funding_rate_7d_avg: str | None = None,
 ) -> PerpInfo:
     return PerpInfo(
         symbol=f"{coin.upper()}USDT",
         funding_rate_8h=Decimal("0.0001"),
+        funding_rate_7d_avg=(
+            Decimal(funding_rate_7d_avg)
+            if funding_rate_7d_avg is not None
+            else None
+        ),
         mark_price=Decimal(mark),
         orderbook_depth_50bps_usd=Decimal("100000"),
         min_order_qty=Decimal("0.1"),
@@ -228,11 +232,11 @@ def test_check_venue_caps_passes_at_max_weight() -> None:
 
 
 def test_check_venue_caps_fails_above_max_weight() -> None:
-    # bybit_onchain.max_weight is 0.40; pushing to 0.50 must fail.
+    # bybit_onchain.max_weight is 0.70; pushing to 0.80 must fail.
     d = _decision(
         venues=[
-            _venue("cash_usdc", 0.50),
-            _venue("bybit_onchain", 0.50, [("26", 1.0)]),
+            _venue("cash_usdc", 0.20),
+            _venue("bybit_onchain", 0.80, [("26", 1.0)]),
         ]
     )
     ok, msg = check_venue_caps(d)
@@ -404,7 +408,10 @@ def test_check_no_missing_apr_source_fails_when_pick_is_missing() -> None:
     assert "1131" in (msg or "")
 
 
-def test_check_lm_no_leverage_fails_when_pick_is_leveraged() -> None:
+def test_check_lm_leverage_size_cap_fails_when_oversize_for_leverage() -> None:
+    """5x LM pick at full bybit_lm cap (30%) → effective 30% > 0.30/5 = 6%
+    cap → reject. Operator change 2026-05-29: leveraged LM allowed but
+    size scales down with leverage."""
     s = _snapshot(
         lm_products=[
             _product("99", "LiquidityMining", coin="NEAR/USDT", apr_source="apy_e8", notes=["max_leverage=5"]),
@@ -413,18 +420,51 @@ def test_check_lm_no_leverage_fails_when_pick_is_leveraged() -> None:
     d = _decision(
         venues=[
             _venue("cash_usdc", 0.7),
-            _venue("bybit_lm", 0.30, [("99", 1.0)]),
+            _venue("bybit_lm", 0.30, [("99", 1.0)]),  # effective 30%, cap 6%
         ]
     )
-    ok, msg = check_lm_no_leverage(d, s)
+    ok, msg = check_lm_leverage_size_cap(d, s)
     assert ok is False
-    assert "max_leverage=5" in (msg or "")
+    assert "leverage=5" in (msg or "")
+    assert "cap" in (msg or "")
 
 
-def test_check_lm_no_leverage_passes_when_no_lm_picks() -> None:
+def test_check_lm_leverage_size_cap_passes_when_sized_under_leverage_cap() -> None:
+    """5x LM pick at 5% effective (within 6% cap) → pass."""
+    s = _snapshot(
+        lm_products=[
+            _product("99", "LiquidityMining", coin="NEAR/USDT", apr_source="apy_e8", notes=["max_leverage=5"]),
+        ]
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.95),
+            _venue("bybit_lm", 0.05, [("99", 1.0)]),  # effective 5%, cap 6%
+        ]
+    )
+    assert check_lm_leverage_size_cap(d, s) == (True, None)
+
+
+def test_check_lm_leverage_size_cap_passes_unleveraged_at_full_cap() -> None:
+    """1x LM pick at 30% (bybit_lm.max_weight) → effective 30%, cap 30% → pass."""
+    s = _snapshot(
+        lm_products=[
+            _product("24", "LiquidityMining", coin="ETH/USDC", apr_source="apy_e8", notes=["max_leverage=1"]),
+        ]
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.7),
+            _venue("bybit_lm", 0.30, [("24", 1.0)]),
+        ]
+    )
+    assert check_lm_leverage_size_cap(d, s) == (True, None)
+
+
+def test_check_lm_leverage_size_cap_passes_when_no_lm_picks() -> None:
     s = _snapshot()
     d = _decision()  # no LM venue used
-    assert check_lm_no_leverage(d, s) == (True, None)
+    assert check_lm_leverage_size_cap(d, s) == (True, None)
 
 
 def test_check_hedges_for_non_usd_picks_fails_without_hedge() -> None:
@@ -444,11 +484,14 @@ def test_check_hedges_for_non_usd_picks_fails_without_hedge() -> None:
     assert "TON" in (msg or "")
 
 
-def test_check_hedges_for_non_usd_picks_passes_with_matching_hedge() -> None:
+def test_check_hedges_for_non_usd_picks_passes_when_perp_feasible() -> None:
+    """Auto-hedge era: rule passes when perp pair exists AND pick_usd
+    clears `min_notional_usd`. `decision.hedges` is informational."""
     s = _snapshot(
         onchain_products=[
             _product("8", "OnChain", coin="TON", effective_apr="0.18"),
-        ]
+        ],
+        perp_market={"TON": _perp("TON", min_notional="1.0")},
     )
     d = _decision(
         venues=[
@@ -535,83 +578,76 @@ def _onchain_ton(product_id: str = "8") -> list[ProductSummary]:
     return [_product(product_id, "OnChain", coin="TON", effective_apr="0.18")]
 
 
-def test_check_hedge_direction_fails_on_positive_notional() -> None:
-    d = _hedged_decision(hedge_notional=+50.0)
-    ok, msg = check_hedge_direction(d)
-    assert ok is False
-    assert "TON" in (msg or "")
-
-
-def test_check_hedge_direction_passes_on_negative_notional() -> None:
-    d = _hedged_decision(hedge_notional=-50.0)
-    assert check_hedge_direction(d) == (True, None)
-
-
-def test_check_hedge_sizing_passes_within_tolerance() -> None:
-    s = _snapshot(
-        onchain_products=_onchain_ton(),
-        perp_market={"TON": _perp("TON")},
-    )
-    # Pick USD = 100 * 0.5 * 1.0 = 50. Hedge -50 → ratio 1.0, within ±20%.
-    d = _hedged_decision(hedge_notional=-50.0)
-    assert check_hedge_sizing(d, s) == (True, None)
-
-
-def test_check_hedge_sizing_fails_when_undersized() -> None:
-    s = _snapshot(
-        onchain_products=_onchain_ton(),
-        perp_market={"TON": _perp("TON")},
-    )
-    # Pick USD = 50. Hedge -5 → ratio 0.1, far below 1.0 - HEDGE_SIZE_TOL.
-    d = _hedged_decision(hedge_notional=-5.0)
-    ok, msg = check_hedge_sizing(d, s)
-    assert ok is False
-    assert "ratio" in (msg or "")
-    assert "TON" in (msg or "")
-
-
-def test_check_hedge_sizing_fails_when_oversized() -> None:
-    s = _snapshot(
-        onchain_products=_onchain_ton(),
-        perp_market={"TON": _perp("TON")},
-    )
-    # Pick USD = 50. Hedge -200 → ratio 4.0, well above 1.0 + HEDGE_SIZE_TOL.
-    d = _hedged_decision(hedge_notional=-200.0)
-    ok, _ = check_hedge_sizing(d, s)
-    assert ok is False
-
-
-def test_check_hedge_min_notional_passes_above_floor() -> None:
-    s = _snapshot(
-        onchain_products=_onchain_ton(),
-        perp_market={"TON": _perp("TON", min_notional="1.0")},
-    )
-    d = _hedged_decision(hedge_notional=-50.0)
-    assert check_hedge_min_notional(d, s) == (True, None)
-
-
-def test_check_hedge_min_notional_fails_below_floor() -> None:
+def test_check_hedges_for_non_usd_picks_fails_when_pick_below_perp_min_notional() -> None:
+    """Non-stable OnChain pick must clear perp `min_notional_usd` to be
+    hedgeable. After 2026-05-29: hedge size = pick USD, so the validator
+    checks `pick_usd >= min_notional_usd` instead of `hedge.notional_usd`."""
     s = _snapshot(
         onchain_products=_onchain_ton(),
         perp_market={"TON": _perp("TON", min_notional="100.0")},
     )
+    # Pick USD = 100 * 0.5 * 1.0 = 50 < 100 floor → un-hedgeable.
     d = _hedged_decision(hedge_notional=-50.0)
-    ok, msg = check_hedge_min_notional(d, s)
+    ok, msg = check_hedges_for_non_usd_picks(d, s)
     assert ok is False
-    assert "below min_notional" in (msg or "")
+    assert "below" in (msg or "")
+    assert "min_notional" in (msg or "")
 
 
-def test_check_hedge_min_notional_fails_when_perp_market_missing() -> None:
-    # Snapshot has the pick but no perp_market entry for TON — validator
-    # treats this as un-priceable hedge → fail-closed.
+def test_check_hedges_for_non_usd_picks_fails_when_perp_market_missing() -> None:
+    """No perp_market entry for the coin → can't hedge → reject pick."""
     s = _snapshot(
         onchain_products=_onchain_ton(),
-        perp_market={},  # nothing
+        perp_market={},
     )
     d = _hedged_decision(hedge_notional=-50.0)
-    ok, msg = check_hedge_min_notional(d, s)
+    ok, msg = check_hedges_for_non_usd_picks(d, s)
     assert ok is False
     assert "no perp_market" in (msg or "")
+
+
+def test_check_funding_rate_floor_fails_when_7d_avg_below_floor() -> None:
+    """Persistent negative funding → hedge is net cost → exit pick."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={"TON": _perp("TON", funding_rate_7d_avg="-0.0005")},
+    )
+    d = _hedged_decision(hedge_notional=-50.0)
+    ok, msg = check_funding_rate_floor(d, s)
+    assert ok is False
+    assert "funding" in (msg or "")
+    assert "TON" in (msg or "")
+
+
+def test_check_funding_rate_floor_passes_when_positive() -> None:
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={"TON": _perp("TON", funding_rate_7d_avg="0.00012")},
+    )
+    d = _hedged_decision(hedge_notional=-50.0)
+    assert check_funding_rate_floor(d, s) == (True, None)
+
+
+def test_check_funding_rate_floor_passes_when_missing() -> None:
+    """No 7d avg available → no signal → don't block."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={"TON": _perp("TON")},  # no funding_rate_7d_avg
+    )
+    d = _hedged_decision(hedge_notional=-50.0)
+    assert check_funding_rate_floor(d, s) == (True, None)
+
+
+def test_check_funding_rate_floor_passes_at_threshold() -> None:
+    """Exactly at the floor passes (strict-less-than comparison)."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={
+            "TON": _perp("TON", funding_rate_7d_avg=str(FUNDING_FLOOR_8H))
+        },
+    )
+    d = _hedged_decision(hedge_notional=-50.0)
+    assert check_funding_rate_floor(d, s) == (True, None)
 
 
 def test_aggregate_validate_passes_hedged_non_usd_pick() -> None:

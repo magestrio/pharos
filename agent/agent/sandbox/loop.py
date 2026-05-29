@@ -55,7 +55,12 @@ from agent.sandbox.execute import (
 from agent.sandbox.snapshot import collect_snapshot, write_snapshot
 from agent.validate.rules import validate
 
-DEFAULT_INTERVAL_SECONDS = 4 * 60 * 60  # 4h heartbeat
+# Default cycle cadence. Was 4h while LM was leverage=1 only; leveraged
+# LM (`.47` follow-up 2026-05-29) can liquidate in minutes during a fast
+# move, so the safe default tightens to 30 min. Operator can still
+# override via `--interval` for a slower heartbeat when nothing leveraged
+# is on the book.
+DEFAULT_INTERVAL_SECONDS = 30 * 60  # 30 min
 CYCLE_LOG = Path(__file__).parent / "cycle_log.jsonl"
 
 # Endpoints whose failure aborts the loop at startup. If any of these
@@ -133,6 +138,18 @@ async def run_one_cycle(
         outcome["validator_ok"] = ok
         outcome["validator_errors"] = errors
         outcome["stages"].append("validate")
+        # Persist validator outcome alongside the decision so the next
+        # cycle's `_summarize_prior_decision` can surface rejection
+        # reasons to Claude (`.47` feedback-loop fix, 2026-05-29).
+        # Without this Claude only sees the prior allocation and repeats
+        # the same min_notional / funding violations cycle after cycle.
+        try:
+            raw_decision = json.loads(decision_path.read_text())
+            meta = raw_decision.setdefault("_meta", {})
+            meta["_validator"] = {"ok": ok, "errors": list(errors)}
+            decision_path.write_text(json.dumps(raw_decision, indent=2))
+        except (OSError, json.JSONDecodeError) as e:
+            log.warning("failed to attach validator outcome to decision: %s", e)
         if not ok:
             outcome["result"] = "skipped:invalid"
             return outcome
@@ -199,6 +216,7 @@ async def run_loop(
     stop_event: asyncio.Event | None = None,
     mantle_rpc_url: str | None = None,
     mantle_vault_address: str | None = None,
+    oracle_cfg: "OracleSettings | None" = None,
 ) -> None:
     """Run cycles indefinitely (or once) at `interval_seconds` apart.
 
@@ -214,7 +232,7 @@ async def run_loop(
 
     async with (
         anthropic.AsyncAnthropic() as anthropic_client,
-        BybitClient.from_settings() as bybit_client,
+        BybitClient.from_settings(oracle_cfg) as bybit_client,
     ):
         # Startup permission probe (.26) — fail-fast if a critical
         # endpoint is denied. Don't write to cycle_log here; the probe
@@ -354,6 +372,7 @@ def _main() -> None:
             once=args.once,
             mantle_rpc_url=mantle_rpc_url,
             mantle_vault_address=mantle_vault_address,
+            oracle_cfg=oracle_cfg,
         )
     )
 
