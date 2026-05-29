@@ -979,6 +979,33 @@ class BybitClient:
             "POST", "/v5/earn/liquidity-mining/claim-interest", body=body
         )
 
+    # ─── Hold-to-Earn (/v5/earn/hold-to-earn/* namespace) ────────────────
+    # Stake-stable-receive-promo-token products. Each product takes a
+    # specific stable (USDE, USDTB, USD1) and pays yield in either the
+    # same coin OR a campaign token (USD1 → WLFI is the canonical
+    # example). Read-only surface in `.57`: subscribe/redeem endpoints
+    # aren't wired yet — venue ships `max_weight=0` so the LLM sees
+    # the rate as a benchmark but can't allocate.
+
+    async def list_hold_to_earn_products(self) -> list[dict[str, Any]]:
+        """List Hold-to-Earn products via `GET /v5/earn/hold-to-earn/product`
+        (live-probed 2026-05-29).
+
+        Returns raw dicts under `result.products`. Each carries:
+        `coinName` (the held stable), `apy` ("3.75%" string), `status`
+        ("Online" | other), `announcementUrl`, and `yields` (array of
+        `{coinName, apy}` for the earned tokens — USD1 pays out in WLFI,
+        USDE pays out in USDE, etc.).
+
+        `coin` filter param is accepted by Bybit but currently ignored
+        (returns the same 3 products regardless). We send no filter to
+        keep behavior predictable.
+        """
+        data = await self._request("GET", "/v5/earn/hold-to-earn/product")
+        result = data.get("result") or {}
+        items = result.get("products") or []
+        return list(items) if isinstance(items, list) else []
+
     # ─── Alpha Farm (/v5/alpha/trade/* namespace) ────────────────────────
     # Buy on-chain (DEX) alpha tokens with CEX payment tokens. Endpoints
     # confirmed against the official Bybit V5 docs (via context7) in `.53`:

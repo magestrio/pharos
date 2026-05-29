@@ -595,6 +595,53 @@ def _advance_earn_summary(
     )
 
 
+def _hold_to_earn_summary(p: dict[str, Any]) -> ProductSummary | None:
+    """Normalize one Hold-to-Earn product for snapshot surface (`.57`).
+
+    Bybit shape (live-probe 2026-05-29):
+        {coinName, apy: "3.75%", status, announcementUrl,
+         yields: [{coinName, apy}]}
+
+    We use `coinName` as the `product_id` since the endpoint has no
+    distinct id field — each row IS one staked-coin product. The earned
+    token from `yields[0].coinName` is appended to `notes` as
+    `earn_in=<coin>` so the LLM can see the directional exposure
+    explicitly (USD1 → earn WLFI means the realized yield is a WLFI
+    position, not USD1 cash flow).
+
+    Returns `None` if `coinName` is missing or the product is `status !=
+    "Online"` so we don't surface paused products.
+    """
+    coin_name = p.get("coinName")
+    if not coin_name:
+        return None
+    if p.get("status") and p.get("status") != "Online":
+        return None
+    apy_raw = str(p.get("apy") or "")
+    effective_apr = _parse_percent(apy_raw)
+    apr_source = "hold_to_earn" if effective_apr is not None else "missing"
+    notes: list[str] = []
+    yields = p.get("yields") or []
+    if isinstance(yields, list) and yields:
+        first = yields[0]
+        if isinstance(first, dict):
+            earn_coin = first.get("coinName") or coin_name
+            notes.append(f"earn_in={earn_coin}")
+            earn_apy = first.get("apy")
+            if earn_apy and earn_apy != apy_raw:
+                notes.append(f"earn_apy={earn_apy}")
+    return ProductSummary(
+        category="HoldToEarn",
+        product_id=str(coin_name),
+        coin=str(coin_name),
+        effective_apr=effective_apr if effective_apr is not None else Decimal(0),
+        apr_source=apr_source,
+        base_apr_string=apy_raw or None,
+        redeem_lockup_minutes=None,
+        notes=notes,
+    )
+
+
 def _alpha_summary(
     p: dict[str, Any],
     price_info: dict[str, Any] | None = None,
@@ -1325,6 +1372,19 @@ async def collect_snapshot(
         )
         for cat in ("DualAssets", "DiscountBuy", "SmartLeverage", "DoubleWin")
     }
+    # Bybit Hold-to-Earn (`.57`) — stake-stable-receive-promo-token
+    # products (USDE 3.75%, USDTB 3.4%, USD1 → WLFI 7.07%). Read-only
+    # surface — venue is `max_weight=0` so picks are rejected; LLM uses
+    # the APR as a benchmark only. Failures degrade to empty list.
+    hold_to_earn_task = asyncio.create_task(
+        _safe_earn(
+            client.list_hold_to_earn_products(),
+            errors,
+            "hold_to_earn[list]",
+            [],
+        )
+    )
+
     # Bybit Alpha Farm — on-chain DEX tokens purchased with CEX payment
     # tokens via `/v5/alpha/trade/{quote,purchase,redeem}`. Two listing
     # fans-out: biz-token list (universe + per-token metadata like
@@ -1428,6 +1488,7 @@ async def collect_snapshot(
     onchain_products = await onchain_task
     lm_products = await lm_products_task
     advance_products = {cat: await task for cat, task in advance_tasks.items()}
+    hold_to_earn_products = await hold_to_earn_task
     alpha_products = await alpha_list_task
     alpha_pos_payload = await alpha_pos_task
     alpha_positions_raw = (
@@ -1589,6 +1650,19 @@ async def collect_snapshot(
             )
             for p in raw_items[:TOP_K]
         ]
+    # Hold-to-Earn (`.57`) — surface as a category with normalized APY
+    # from the `apy` string. Read-only: venue cap is 0, so picks are
+    # rejected by validator; LLM uses these as a benchmark when reasoning
+    # about FlexibleSaving USD1 / USDE / USDTB alternatives.
+    if hold_to_earn_products:
+        h2e_rows = [
+            row
+            for p in hold_to_earn_products
+            if (row := _hold_to_earn_summary(p)) is not None
+        ]
+        if h2e_rows:
+            products["HoldToEarn"] = h2e_rows
+
     # Alpha Farm (`.52` shipped list-only; `.53` corrects endpoints + adds
     # price-list metadata; `.55` momentum APR; `.54` live-probe fixed the
     # price-list contract — keyed by `(chainCode, tokenAddress)`, not

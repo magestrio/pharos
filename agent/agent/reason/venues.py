@@ -29,6 +29,7 @@ VenueId = Literal[
     "bybit_smart_leverage",
     "bybit_double_win",
     "bybit_alpha",
+    "bybit_hold_to_earn",
 ]
 
 
@@ -135,7 +136,7 @@ VENUE_REGISTRY: dict[str, VenueMeta] = {
     "bybit_dual_asset": VenueMeta(
         venue_id="bybit_dual_asset",
         enabled=True,
-        max_weight=0.20,
+        max_weight=0.10,
         requires_picks=True,
         snapshot_category="DualAssets",
         notes=(
@@ -153,7 +154,7 @@ VENUE_REGISTRY: dict[str, VenueMeta] = {
     "bybit_discount_buy": VenueMeta(
         venue_id="bybit_discount_buy",
         enabled=True,
-        max_weight=0.20,
+        max_weight=0.10,
         requires_picks=True,
         snapshot_category="DiscountBuy",
         notes=(
@@ -197,9 +198,33 @@ VENUE_REGISTRY: dict[str, VenueMeta] = {
             "validator until then. Surfaced for visibility."
         ),
     ),
+    "bybit_hold_to_earn": VenueMeta(
+        venue_id="bybit_hold_to_earn",
+        enabled=True,
+        max_weight=0.0,
+        requires_picks=True,
+        snapshot_category="HoldToEarn",
+        notes=(
+            "Bybit Hold-to-Earn — stake a specific stable (USDE / USDTB / "
+            "USD1) and earn yield in either the same coin or a campaign "
+            "token (USD1 → WLFI is the canonical promo). Yield is paid as "
+            "the `yields[*].coinName` token, NOT in the staked coin — so "
+            "for USD1 the realized exposure is WLFI (directional), even "
+            "though the principal is dollar-pegged. Read-only surface in "
+            "`.57`: subscribe/redeem endpoints not yet wired. `max_weight=0` "
+            "so validator rejects any non-zero pick — venue exists for "
+            "benchmark visibility (LLM can compare 3.75%/3.4%/7.07% APY "
+            "vs FlexibleSaving + LM alternatives in thesis). Note: the "
+            "USD1 product's WLFI yield is the same promo `measured_yield` "
+            "already captures when USD1 is held via FlexibleSaving — "
+            "Hold-to-Earn may be a parallel subscribe path or just a "
+            "marketing view of the same position; needs live-probe before "
+            "execute wires."
+        ),
+    ),
     "bybit_alpha": VenueMeta(
         venue_id="bybit_alpha",
-        enabled=True,
+        enabled=False,
         max_weight=0.10,
         requires_picks=True,
         snapshot_category="AlphaFarm",

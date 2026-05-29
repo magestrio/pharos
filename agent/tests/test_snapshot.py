@@ -33,6 +33,7 @@ from agent.sandbox.snapshot import (
     _advance_earn_summary,
     _alpha_summary,
     _flex_or_onchain_summary,
+    _hold_to_earn_summary,
     _is_open_perp,
     _kline_period_return,
     _lm_summary,
@@ -237,6 +238,55 @@ def test_kline_period_return_handles_bad_prices():
     """Non-numeric prices or zero start price → None (fail-soft)."""
     assert _kline_period_return([{"open": "x", "close": "1"}] * 2) is None
     assert _kline_period_return([{"open": "0", "close": "1"}] * 2) is None
+
+
+# ─── _hold_to_earn_summary (`.57`) ─────────────────────────────────────────
+
+
+def _h2e(coin_name="USD1", apy="7.07%", earn_coin="WLFI", status="Online"):
+    return {
+        "coinName": coin_name,
+        "apy": apy,
+        "status": status,
+        "announcementUrl": f"https://www.bybit.com/en/earn/{coin_name.lower()}-page",
+        "yields": [{"coinName": earn_coin, "apy": apy}],
+    }
+
+
+def test_h2e_summary_parses_usd1_wlfi_promo():
+    s = _hold_to_earn_summary(_h2e())
+    assert s is not None
+    assert s.category == "HoldToEarn"
+    assert s.product_id == "USD1"
+    assert s.coin == "USD1"
+    assert s.effective_apr == Decimal("0.0707")
+    assert s.apr_source == "hold_to_earn"
+    assert "earn_in=WLFI" in s.notes
+
+
+def test_h2e_summary_same_coin_yield_no_separate_earn_apy():
+    """USDE pays USDE — earn_apy note shouldn't duplicate the headline."""
+    s = _hold_to_earn_summary(_h2e(coin_name="USDE", earn_coin="USDE", apy="3.75%"))
+    assert s is not None
+    assert "earn_in=USDE" in s.notes
+    # apy strings equal → no separate earn_apy note
+    assert not any("earn_apy=" in n for n in s.notes)
+
+
+def test_h2e_summary_drops_paused_products():
+    assert _hold_to_earn_summary(_h2e(status="Paused")) is None
+    assert _hold_to_earn_summary(_h2e(status="Offline")) is None
+
+
+def test_h2e_summary_returns_none_without_coin_name():
+    assert _hold_to_earn_summary({"apy": "3.75%"}) is None
+
+
+def test_h2e_summary_marks_missing_when_apy_unparseable():
+    s = _hold_to_earn_summary(_h2e(apy="N/A"))
+    assert s is not None
+    assert s.apr_source == "missing"
+    assert s.effective_apr == Decimal(0)
 
 
 # ─── _alpha_summary (`.53` + `.55`) ────────────────────────────────────────
