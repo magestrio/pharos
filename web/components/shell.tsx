@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
 
 import { CONTRACTS, TICKER_ITEMS } from "@/lib/data";
@@ -8,6 +9,8 @@ import { LiveTicker } from "@/components/live-ticker";
 import { DecisionLog } from "@/components/screens/decision-log";
 import { HumanVsAi } from "@/components/screens/human-vs-ai";
 import { VaultCard } from "@/components/screens/vault-card";
+import { StoreProvider } from "@/lib/agent-store-context";
+import type { CycleSummary, Portfolio } from "@/lib/agent-api";
 
 const TABS = [
   { id: "vault", label: "Vault Card", short: "Vault" },
@@ -17,9 +20,37 @@ const TABS = [
 
 type TabId = (typeof TABS)[number]["id"];
 
-export function Shell() {
+type ShellProps = {
+  /** Server-fetched cycle list (`frontend-complete.5`). When the API
+   * was unreachable at render time the parent passes `[]` — child
+   * tabs handle the empty state. */
+  initialCycles?: CycleSummary[];
+  initialPortfolio?: Portfolio | null;
+};
+
+export function Shell({
+  initialCycles = [],
+  initialPortfolio = null,
+}: ShellProps = {}) {
   const [tab, setTab] = useState<TabId>("vault");
 
+  return (
+    <StoreProvider
+      initialCycles={initialCycles}
+      initialPortfolio={initialPortfolio}
+    >
+      <ShellBody tab={tab} setTab={setTab} />
+    </StoreProvider>
+  );
+}
+
+function ShellBody({
+  tab,
+  setTab,
+}: {
+  tab: TabId;
+  setTab: (t: TabId) => void;
+}) {
   return (
     <div className="min-h-screen flex flex-col bg-ink-950 relative">
       <div
@@ -58,6 +89,13 @@ export function Shell() {
           </nav>
 
           <div className="flex items-center gap-2">
+            <Link
+              className="hidden lg:inline-flex items-center gap-1.5 px-3 h-8 border border-ink-600/70 rounded-sm bg-ink-900 text-[11.5px] font-mono text-dim-300 hover:text-white"
+              href="/history"
+            >
+              <span className="text-dim-500">HISTORY</span>
+              <Icon.Ext />
+            </Link>
             <a
               className="hidden lg:inline-flex items-center gap-1.5 px-3 h-8 border border-ink-600/70 rounded-sm bg-ink-900 text-[11.5px] font-mono text-dim-300 hover:text-white"
               href="#"

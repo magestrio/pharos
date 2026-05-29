@@ -12,6 +12,7 @@ import {
   HEDGE_LIFETIME_FUNDING,
   VAULT,
 } from "@/lib/data";
+import { useVaultStats, type VaultStats } from "@/lib/hooks/use-vault-stats";
 import {
   Card,
   DonutChart,
@@ -25,19 +26,20 @@ import {
 } from "@/components/ui";
 
 export function VaultCard() {
+  const stats = useVaultStats();
   return (
     <div className="space-y-10 sm:space-y-12">
-      <HeroBlock />
-      <StatsRow />
-      <ExchangeRateSection />
-      <AllocationSection />
+      <HeroBlock stats={stats} />
+      <StatsRow stats={stats} />
+      <ExchangeRateSection stats={stats} />
+      <AllocationSection stats={stats} />
       <AttestorAndHedgesSection />
       <RecentDecisionsPreview />
     </div>
   );
 }
 
-function HeroBlock() {
+function HeroBlock({ stats }: { stats: VaultStats }) {
   return (
     <section className="grid grid-cols-1 lg:grid-cols-3 gap-6 lg:gap-8 items-start">
       <div className="lg:col-span-2 space-y-6">
@@ -67,7 +69,7 @@ function HeroBlock() {
               <span>Deployed</span>
               <span className="text-white">{VAULT.inception}</span>
               <span className="text-dim-600">·</span>
-              <span className="text-white">{VAULT.daysLive}d live</span>
+              <span className="text-white">{stats.daysLive}d live</span>
             </div>
           </div>
         </div>
@@ -268,18 +270,21 @@ function MetricCell({ label, value, border = "" }: { label: string; value: strin
   );
 }
 
-function StatsRow() {
+function StatsRow({ stats }: { stats: VaultStats }) {
+  const exchangeRate = stats.exchangeRate ?? VAULT.exchangeRate;
+  const cumReturnPct = stats.cumReturnPct ?? (VAULT.exchangeRate / VAULT.exchangeRateStart - 1) * 100;
+  const tvlUsdc = stats.tvlUsdc ?? VAULT.tvlUsdc;
   return (
     <section className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
       <StatCard
         label="vUSDC Exchange Rate"
-        value={VAULT.exchangeRate.toFixed(5)}
+        value={exchangeRate.toFixed(5)}
         tone="green"
-        sub={<span>+{((VAULT.exchangeRate / VAULT.exchangeRateStart - 1) * 100).toFixed(3)}% since inception</span>}
+        sub={<span>+{cumReturnPct.toFixed(3)}% since inception</span>}
       />
       <StatCard
         label="Total Value Locked"
-        value={"$" + (VAULT.tvlUsdc / 1_000_000).toFixed(3) + "M"}
+        value={"$" + (tvlUsdc / 1_000_000).toFixed(3) + "M"}
         sub={<span className="text-neon">+${(VAULT.tvlDelta / 1000).toFixed(0)}k since launch</span>}
       />
       <StatCard
@@ -296,7 +301,8 @@ function StatsRow() {
   );
 }
 
-function ExchangeRateSection() {
+function ExchangeRateSection({ stats }: { stats: VaultStats }) {
+  const exchangeRate = stats.exchangeRate ?? VAULT.exchangeRate;
   return (
     <section>
       <SectionHead
@@ -314,12 +320,10 @@ function ExchangeRateSection() {
               <span className="text-dim-500 uppercase tracking-[0.14em] text-[10px]">
                 D{EXCHANGE_RATE_SERIES.length - 1}
               </span>
-              <span className="text-neon tabular">
-                {EXCHANGE_RATE_SERIES[EXCHANGE_RATE_SERIES.length - 1].toFixed(5)}
-              </span>
+              <span className="text-neon tabular">{exchangeRate.toFixed(5)}</span>
             </div>
             <span className="text-dim-600">·</span>
-            <span className="text-neon tabular">+{((VAULT.exchangeRate - 1) * 10000).toFixed(0)} bps</span>
+            <span className="text-neon tabular">+{((exchangeRate - 1) * 10000).toFixed(0)} bps</span>
           </div>
         }
       />
@@ -341,9 +345,10 @@ function ExchangeRateSection() {
   );
 }
 
-function AllocationSection() {
+function AllocationSection({ stats }: { stats: VaultStats }) {
   const [bybitOpen, setBybitOpen] = useState(true);
   const weightedApy = ALLOCATIONS.reduce((s, a) => s + a.pct * a.apy, 0) / 100;
+  const tvlUsdc = stats.tvlUsdc ?? VAULT.tvlUsdc;
 
   return (
     <section>
@@ -364,7 +369,7 @@ function AllocationSection() {
             data={ALLOCATIONS.map((a) => ({ pct: a.pct, color: a.color, label: a.key }))}
             size={220}
             thickness={18}
-            centerValue={"$" + (VAULT.tvlUsdc / 1_000_000).toFixed(2) + "M"}
+            centerValue={"$" + (tvlUsdc / 1_000_000).toFixed(2) + "M"}
             centerLabel="TVL · USDC"
           />
           <div className="mt-5 grid grid-cols-2 gap-2 w-full">
