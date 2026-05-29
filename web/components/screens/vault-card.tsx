@@ -16,6 +16,7 @@ import {
 import Link from "next/link";
 import { useCycles, usePortfolio, useRecentEvents } from "@/lib/agent-store-context";
 import type { CycleSummary, EventRow, PositionRow } from "@/lib/agent-api";
+import { useActiveHedges } from "@/lib/hooks/use-active-hedges";
 import { useAllocationStats, type AllocationStats } from "@/lib/hooks/use-allocation-stats";
 import { useVaultStats, type VaultStats } from "@/lib/hooks/use-vault-stats";
 import {
@@ -633,6 +634,8 @@ function AttestorHealthCard() {
 }
 
 function HedgeTransparencyCard() {
+  const { hedges, isLive } = useActiveHedges();
+  const dash = (live: boolean) => (live ? "—" : null);
   return (
     <div className="bg-ink-900 border border-ink-600/70 rounded-md overflow-hidden h-full flex flex-col">
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-ink-600/70 bg-ink-850">
@@ -640,67 +643,81 @@ function HedgeTransparencyCard() {
           <span className="w-1.5 h-1.5 rounded-sm bg-neon"></span>
           Active Hedges · Delta-Neutral
         </div>
-        <span className="text-[10px] font-mono text-dim-500">{ACTIVE_HEDGES.length} open positions</span>
+        <span className="text-[10px] font-mono text-dim-500">{hedges.length} open positions</span>
       </div>
       <div className="divide-y divide-ink-600/40 flex-1">
-        {ACTIVE_HEDGES.map((h) => (
-          <div key={h.key} className="p-5">
-            <div className="flex items-start justify-between gap-3 mb-3">
-              <div>
-                <div className="text-white text-[15px] font-medium">{h.label}</div>
-                <div className="text-[10.5px] text-dim-500 font-mono mt-0.5">
-                  Opened {h.openedAgo} · close trigger: {h.closeTrigger}
+        {hedges.map((h) => {
+          const neutral = Math.abs(h.netDelta) < 0.01 * Math.max(Math.abs(h.spotUsd) / 1000, 1);
+          return (
+            <div key={h.key} className="p-5">
+              <div className="flex items-start justify-between gap-3 mb-3">
+                <div>
+                  <div className="text-white text-[15px] font-medium">{h.label}</div>
+                  <div className="text-[10.5px] text-dim-500 font-mono mt-0.5">
+                    Opened {h.openedAgo} · close trigger: {h.closeTrigger}
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="text-[10px] font-mono uppercase tracking-[0.14em] text-dim-500">Blended APR</div>
+                  <div className="font-mono text-neon text-lg tabular leading-none mt-0.5">
+                    {isLive ? dash(true) : `${h.blendedApr.toFixed(1)}%`}
+                  </div>
                 </div>
               </div>
-              <div className="text-right">
-                <div className="text-[10px] font-mono uppercase tracking-[0.14em] text-dim-500">Blended APR</div>
-                <div className="font-mono text-neon text-lg tabular leading-none mt-0.5">
-                  {h.blendedApr.toFixed(1)}%
-                </div>
-              </div>
-            </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mb-3">
-              <div className="bg-ink-850/70 border border-ink-600/50 rounded-sm px-3 py-2">
-                <div className="text-[9.5px] font-mono uppercase tracking-[0.16em] text-dim-500">Spot</div>
-                <div className="text-white text-[13px] tabular font-mono mt-0.5">{h.spotQty}</div>
-                <div className="text-dim-400 text-[11px] font-mono tabular">
-                  ${h.spotUsd.toLocaleString()}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mb-3">
+                <div className="bg-ink-850/70 border border-ink-600/50 rounded-sm px-3 py-2">
+                  <div className="text-[9.5px] font-mono uppercase tracking-[0.16em] text-dim-500">Spot</div>
+                  <div className="text-white text-[13px] tabular font-mono mt-0.5">{h.spotQty}</div>
+                  <div className="text-dim-400 text-[11px] font-mono tabular">
+                    ${h.spotUsd.toLocaleString()}
+                  </div>
+                  <div className="text-[10px] text-dim-500 font-mono mt-1">{h.venueSpot}</div>
                 </div>
-                <div className="text-[10px] text-dim-500 font-mono mt-1">{h.venueSpot}</div>
-              </div>
-              <div className="bg-ink-850/70 border border-ink-600/50 rounded-sm px-3 py-2">
-                <div className="text-[9.5px] font-mono uppercase tracking-[0.16em] text-dim-500">Hedge</div>
-                <div className="text-white text-[13px] tabular font-mono mt-0.5">{h.hedgeQty}</div>
-                <div className="text-dim-400 text-[11px] font-mono tabular">
-                  ${h.hedgeUsd.toLocaleString()} notional
+                <div className="bg-ink-850/70 border border-ink-600/50 rounded-sm px-3 py-2">
+                  <div className="text-[9.5px] font-mono uppercase tracking-[0.16em] text-dim-500">Hedge</div>
+                  <div className="text-white text-[13px] tabular font-mono mt-0.5">{h.hedgeQty}</div>
+                  <div className="text-dim-400 text-[11px] font-mono tabular">
+                    ${h.hedgeUsd.toLocaleString()} notional
+                  </div>
+                  <div className="text-[10px] text-dim-500 font-mono mt-1">{h.venuePerp}</div>
                 </div>
-                <div className="text-[10px] text-dim-500 font-mono mt-1">{h.venuePerp}</div>
               </div>
-            </div>
 
-            <div className="grid grid-cols-4 gap-px bg-ink-600/40 rounded-sm overflow-hidden text-[11px] font-mono">
-              <div className="bg-ink-900 px-2.5 py-2">
-                <div className="text-[9px] uppercase tracking-[0.14em] text-dim-500">Net Δ</div>
-                <div className="text-neon tabular mt-0.5 inline-flex items-center gap-1">
-                  0 <Icon.Check className="w-3 h-3" />
+              <div className="grid grid-cols-4 gap-px bg-ink-600/40 rounded-sm overflow-hidden text-[11px] font-mono">
+                <div className="bg-ink-900 px-2.5 py-2">
+                  <div className="text-[9px] uppercase tracking-[0.14em] text-dim-500">Net Δ</div>
+                  <div
+                    className={`tabular mt-0.5 inline-flex items-center gap-1 ${
+                      neutral ? "text-neon" : "text-warn"
+                    }`}
+                  >
+                    {h.netDelta.toFixed(neutral ? 0 : 3)}{" "}
+                    {neutral && <Icon.Check className="w-3 h-3" />}
+                  </div>
+                </div>
+                <div className="bg-ink-900 px-2.5 py-2">
+                  <div className="text-[9px] uppercase tracking-[0.14em] text-dim-500">Spot APR</div>
+                  <div className="text-white tabular mt-0.5">
+                    {isLive ? dash(true) : `${h.spotApr.toFixed(1)}%`}
+                  </div>
+                </div>
+                <div className="bg-ink-900 px-2.5 py-2">
+                  <div className="text-[9px] uppercase tracking-[0.14em] text-dim-500">Funding APR</div>
+                  <div className="text-white tabular mt-0.5">
+                    {isLive ? dash(true) : `${h.fundingApr.toFixed(1)}%`}
+                  </div>
+                </div>
+                <div className="bg-ink-900 px-2.5 py-2">
+                  <div className="text-[9px] uppercase tracking-[0.14em] text-dim-500">Earned 24h</div>
+                  <div className="text-neon tabular mt-0.5">
+                    {isLive ? dash(true) : `+$${h.fundingEarned24h.toFixed(2)}`}
+                  </div>
                 </div>
               </div>
-              <div className="bg-ink-900 px-2.5 py-2">
-                <div className="text-[9px] uppercase tracking-[0.14em] text-dim-500">Spot APR</div>
-                <div className="text-white tabular mt-0.5">{h.spotApr.toFixed(1)}%</div>
-              </div>
-              <div className="bg-ink-900 px-2.5 py-2">
-                <div className="text-[9px] uppercase tracking-[0.14em] text-dim-500">Funding APR</div>
-                <div className="text-white tabular mt-0.5">{h.fundingApr.toFixed(1)}%</div>
-              </div>
-              <div className="bg-ink-900 px-2.5 py-2">
-                <div className="text-[9px] uppercase tracking-[0.14em] text-dim-500">Earned 24h</div>
-                <div className="text-neon tabular mt-0.5">+${h.fundingEarned24h.toFixed(2)}</div>
-              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
       <div className="border-t border-ink-600/70 bg-ink-850 px-4 py-2.5 flex items-center justify-between text-[11px] font-mono">
         <span className="text-dim-500 uppercase tracking-[0.14em] text-[9.5px]">Lifetime funding harvested</span>
