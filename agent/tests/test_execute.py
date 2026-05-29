@@ -34,6 +34,7 @@ from agent.sandbox.execute import (
 from agent.sandbox.snapshot import (
     MarketSnapshot,
     PerpInfo,
+    ProductSummary,
     Snapshot,
     UsdcPegSnapshot,
     WalletSnapshot,
@@ -51,7 +52,18 @@ def _snapshot(
     perp_market: dict[str, PerpInfo] | None = None,
     perp_positions: list[PerpPosition] | None = None,
     advance_earn_quotes: dict[str, dict] | None = None,
+    lm_products: list[ProductSummary] | None = None,
+    lm_positions: list[dict] | None = None,
+    advance_products: dict[str, list[ProductSummary]] | None = None,
 ) -> Snapshot:
+    products: dict[str, list[ProductSummary]] = {
+        "FlexibleSaving": [],
+        "OnChain": [],
+        "LiquidityMining": lm_products or [],
+    }
+    if advance_products:
+        for cat, items in advance_products.items():
+            products[cat] = items
     return Snapshot(
         captured_at=datetime.now(UTC),
         wallet=WalletSnapshot(
@@ -59,8 +71,8 @@ def _snapshot(
             usdt_available_usd=Decimal(usdt_available_usd),
         ),
         earn_positions=earn_positions or [],
-        lm_positions=[],
-        products={"FlexibleSaving": [], "OnChain": [], "LiquidityMining": []},
+        lm_positions=lm_positions or [],
+        products=products,
         market=MarketSnapshot(),
         perp_market=perp_market or {},
         perp_positions=perp_positions or [],
@@ -74,14 +86,77 @@ def _snapshot(
     )
 
 
+def _advance_product(
+    category: str, product_id: str, coin: str
+) -> ProductSummary:
+    """Minimal ProductSummary for an advance-Earn product. `coin` carries
+    the stake currency — for DualAssets that's `"BASE/QUOTE"`, for
+    DiscountBuy / SmartLeverage / DoubleWin it's the single stake coin
+    (typically USDT). The diff layer looks the pair up here when the
+    quote endpoint doesn't echo it."""
+    return ProductSummary(
+        category=category,
+        product_id=product_id,
+        coin=coin,
+        effective_apr=Decimal("0"),
+        apr_source="missing",
+        notes=[],
+    )
+
+
+def _lm_product(
+    product_id: str,
+    *,
+    base: str = "ETH",
+    quote: str = "USDC",
+    apr: str = "0.02",
+    max_leverage: int = 1,
+    min_subscribe_usd: str | None = None,
+) -> ProductSummary:
+    """Build an LM ProductSummary the way snapshot.py would (`_lm_summary`).
+    Defaults to ETH/USDC at 2% APR, leverage=1 — the canonical pickable
+    unleveraged pair surfaced in real snapshots via `lm_unleveraged`.
+    Set `min_subscribe_usd` to exercise the diff's min-floor check."""
+    return ProductSummary(
+        category="LiquidityMining",
+        product_id=product_id,
+        coin=f"{base}/{quote}",
+        effective_apr=Decimal(apr),
+        apr_source="apy_e8",
+        min_subscribe_usd=(
+            Decimal(min_subscribe_usd) if min_subscribe_usd is not None else None
+        ),
+        notes=[f"max_leverage={max_leverage}"],
+    )
+
+
+def _lm_position(
+    *,
+    product_id: str,
+    position_id: str,
+    principal_usd: str = "20",
+) -> dict:
+    """Build an LM position row the way Bybit echoes it. Tests use
+    `principalLiquidityValue` as the headline number — the executor
+    prefers it over reconstructing from quote/base/price."""
+    return {
+        "positionId": position_id,
+        "productId": product_id,
+        "principalLiquidityValue": principal_usd,
+        "status": "Active",
+    }
+
+
 def _dual_quote(
     *,
     base: str = "BTC",
     quote_coin: str = "USDT",
-    expired_in_ms: int = 600_000,  # 10 min ahead
+    expired_in_ms: int = 600_000,  # 10 min ahead, per offer
     offers: list[dict] | None = None,
 ) -> dict:
-    """Bybit DualAssets quote payload, trimmed to fields the diff reads."""
+    """Bybit DualAssets quote payload — matches the live shape verified
+    2026-05-28. `expiredAt` lives on each offer (not parent); base/quote
+    coins are NOT echoed in the quote (they're in the product list)."""
     from datetime import timedelta
 
     expired = int(
@@ -91,14 +166,12 @@ def _dual_quote(
         "category": "DualAssets",
         "list": [
             {
-                "baseCoin": base,
-                "quoteCoin": quote_coin,
+                "productId": "da-1",
                 "currentPrice": "65000",
-                "expiredTime": str(expired),
                 "buyLowPrice": offers
                 or [
-                    {"selectPrice": "60000", "apyE8": "50000000"},  # 0.5 APR
-                    {"selectPrice": "62000", "apyE8": "80000000"},  # 0.8 APR (best)
+                    {"selectPrice": "60000", "apyE8": "50000000", "expiredAt": str(expired)},
+                    {"selectPrice": "62000", "apyE8": "80000000", "expiredAt": str(expired)},
                 ],
                 "sellHighPrice": [],
             }
@@ -114,14 +187,19 @@ def _discount_quote(
     purchase_price: str = "63000",
     knockout_price: str = "55000",
 ) -> dict:
+    """Bybit DiscountBuy quote payload — top-level key is `offers`
+    (verified live 2026-05-28), NOT `list` like DualAssets uses. Offer
+    rows don't carry `coin` in production payloads; the diff looks the
+    stake currency up from the snapshot's product list. We still include
+    `coin` here so existing tests that exercise the offer-side fallback
+    keep working."""
     from datetime import timedelta
 
     expired = int(
         (datetime.now(UTC) + timedelta(milliseconds=expired_in_ms)).timestamp() * 1000
     )
     return {
-        "category": "DiscountBuy",
-        "list": [
+        "offers": [
             {
                 "coin": coin,
                 "instUid": inst_uid,
@@ -130,6 +208,7 @@ def _discount_quote(
                 "knockoutPrice": knockout_price,
                 "knockoutCouponE8": "100000000",
                 "expiredAt": str(expired),
+                "category": "DiscountBuy",
             }
         ],
     }
@@ -421,8 +500,13 @@ def test_diff_cash_only_produces_no_actions() -> None:
 # ─── Out-of-scope skip (LM + advance-Earn) ──────────────────────────────────
 
 
-def test_diff_lm_pick_emits_skip_not_action() -> None:
-    snap = _snapshot(total_equity_usd="100")
+def test_diff_lm_pick_emits_subscribe_lm() -> None:
+    """`.47`: an LM pick on a max_leverage=1 ETH/USDC pair turns into a
+    single-sided USDC subscribe at the venue × pick USD amount. No SKIP."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        lm_products=[_lm_product("24")],  # ETH/USDC max_leverage=1
+    )
     d = _decision(
         [
             _venue("cash_usdc", 0.7),
@@ -430,10 +514,176 @@ def test_diff_lm_pick_emits_skip_not_action() -> None:
         ]
     )
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
-    assert len(actions) == 1
-    assert actions[0].kind == ActionKind.SKIP_OUT_OF_SCOPE
-    assert "LiquidityMining" in actions[0].category
-    assert "not wired" in actions[0].reason
+    subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_LM]
+    assert len(subs) == 1
+    assert subs[0].category == "LiquidityMining"
+    assert subs[0].product_id == "24"
+    assert subs[0].coin == "USDC"
+    assert subs[0].amount == Decimal("30.0")  # 100 × 0.3 × 1.0
+    assert subs[0].position_id is None
+
+
+def test_diff_lm_subscribe_below_min_emits_skip() -> None:
+    """`.47` follow-up: Bybit enforces `minInvestmentQuote` per LM
+    product (50 USDC for ETH/USDC, BTC/USDC). A target below that floor
+    must SKIP, not produce an order Bybit will reject at execute time."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        lm_products=[_lm_product("24", min_subscribe_usd="50")],
+    )
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.9),
+            _venue("bybit_lm", 0.1, [("24", 1.0)]),  # target = $10, below $50 min
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_LM]
+    skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
+    assert subs == []
+    assert len(skips) == 1
+    assert "below Bybit min" in skips[0].reason
+    assert "$50" in skips[0].reason
+
+
+def test_diff_lm_subscribe_above_min_emits_subscribe() -> None:
+    """Sanity check the other side of the floor — a target ≥ min must
+    still emit SUBSCRIBE_LM as the no-min case does."""
+    snap = _snapshot(
+        total_equity_usd="200",
+        lm_products=[_lm_product("24", min_subscribe_usd="50")],
+    )
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.70),
+            _venue("bybit_lm", 0.30, [("24", 1.0)]),  # target = $60, above $50
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_LM]
+    assert len(subs) == 1
+    assert subs[0].amount == Decimal("60.0")
+
+
+def test_diff_lm_subscribe_no_min_surfaced_subscribes_anyway() -> None:
+    """When the snapshot lacks `min_subscribe_usd` (older snapshots
+    before .47 follow-up), the floor check must be a no-op — we don't
+    block valid subscribes just because we don't know the min."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        lm_products=[_lm_product("24")],  # min_subscribe_usd=None
+    )
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.7),
+            _venue("bybit_lm", 0.3, [("24", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_LM]
+    assert len(subs) == 1
+
+
+def test_diff_lm_pick_missing_from_snapshot_emits_skip() -> None:
+    """LLM hallucinated a product_id not in snapshot.products → SKIP,
+    not a runtime KeyError. Mirrors the advance-Earn missing-quote case."""
+    snap = _snapshot(total_equity_usd="100", lm_products=[])
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.7),
+            _venue("bybit_lm", 0.3, [("99", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
+    assert len(skips) == 1
+    assert "not in snapshot" in skips[0].reason
+
+
+def test_diff_lm_pick_non_usdc_quote_emits_skip() -> None:
+    """vUSDC only funds USDC-quote LM pairs. A NEAR/USDT pick must SKIP
+    — funding via auto-swap to USDT isn't in MVP scope."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        lm_products=[_lm_product("16", base="NEAR", quote="USDT", max_leverage=5)],
+    )
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.7),
+            _venue("bybit_lm", 0.3, [("16", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
+    assert len(skips) == 1
+    assert "USDC-quote" in skips[0].reason
+
+
+def test_diff_lm_full_exit_when_target_zero_and_position_exists() -> None:
+    """Position open + LLM drops LM from the plan → REDEEM_LM full exit
+    with `position_id` populated for the executor's remove-liquidity call."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        lm_products=[_lm_product("24")],
+        lm_positions=[
+            _lm_position(product_id="24", position_id="9001", principal_usd="20")
+        ],
+    )
+    # cash_usdc=1.0 — LM dropped entirely.
+    d = _decision([_venue("cash_usdc", 1.0)])
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    redeems = [a for a in actions if a.kind == ActionKind.REDEEM_LM]
+    assert len(redeems) == 1
+    assert redeems[0].position_id == "9001"
+    assert redeems[0].product_id == "24"
+    assert redeems[0].amount == Decimal("20")
+
+
+def test_diff_lm_existing_position_at_target_emits_nothing() -> None:
+    """Position size matches the LLM's target within MIN_ACTION_USDC →
+    no-op. Avoids churn from re-subscribing the same position."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        lm_products=[_lm_product("24")],
+        lm_positions=[
+            _lm_position(product_id="24", position_id="9001", principal_usd="30")
+        ],
+    )
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.7),
+            _venue("bybit_lm", 0.3, [("24", 1.0)]),  # target = $30
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    lm_actions = [
+        a
+        for a in actions
+        if a.kind in (ActionKind.SUBSCRIBE_LM, ActionKind.REDEEM_LM)
+    ]
+    assert lm_actions == []
+
+
+def test_diff_lm_partial_resize_emits_skip() -> None:
+    """Partial drawdown (target > 0 but smaller than current) is out of
+    MVP scope — emit SKIP with a reason rather than guessing a percent."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        lm_products=[_lm_product("24")],
+        lm_positions=[
+            _lm_position(product_id="24", position_id="9001", principal_usd="30")
+        ],
+    )
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.9),
+            _venue("bybit_lm", 0.1, [("24", 1.0)]),  # target = $10, current $30
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
+    assert len(skips) == 1
+    assert "partial LM scaling" in skips[0].reason
 
 
 def test_diff_advance_pick_emits_skip() -> None:
@@ -1159,6 +1409,9 @@ def test_diff_dual_assets_emits_subscribe_advance_earn() -> None:
     snap = _snapshot(
         total_equity_usd="200",
         advance_earn_quotes={"DualAssets/da-1": quote},
+        advance_products={
+            "DualAssets": [_advance_product("DualAssets", "da-1", "BTC/USDT")]
+        },
     )
     d = _advance_decision("bybit_dual_asset", "da-1", weight=0.2)
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
@@ -1181,6 +1434,9 @@ def test_diff_discount_buy_emits_subscribe_advance_earn() -> None:
     snap = _snapshot(
         total_equity_usd="100",
         advance_earn_quotes={"DiscountBuy/db-7": quote},
+        advance_products={
+            "DiscountBuy": [_advance_product("DiscountBuy", "db-7", "USDT")]
+        },
     )
     d = _advance_decision("bybit_discount_buy", "db-7", weight=0.2)
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
@@ -1205,19 +1461,94 @@ def test_diff_advance_earn_missing_quote_emits_skip() -> None:
     assert any("no cached quote" in s.reason for s in skips)
 
 
+def test_diff_dual_assets_picks_only_non_expired_offer() -> None:
+    """`.35` follow-up: when DualAssets returns a multi-offer payload
+    with some rows already past their per-offer `expiredAt`, the diff
+    must skip the stale ones and pick from the remaining set rather
+    than emitting SKIP because the headline row happened to be old."""
+    from datetime import timedelta
+
+    now = datetime.now(UTC)
+    fresh_ms = int((now + timedelta(seconds=600)).timestamp() * 1000)
+    stale_ms = int((now - timedelta(seconds=60)).timestamp() * 1000)
+    quote = _dual_quote(
+        offers=[
+            # Higher APR but expired → must be skipped
+            {"selectPrice": "62000", "apyE8": "100000000", "expiredAt": str(stale_ms)},
+            # Lower APR but fresh → this is the one we pick
+            {"selectPrice": "60000", "apyE8": "50000000", "expiredAt": str(fresh_ms)},
+        ]
+    )
+    snap = _snapshot(
+        total_equity_usd="200",
+        advance_earn_quotes={"DualAssets/da-1": quote},
+        advance_products={
+            "DualAssets": [_advance_product("DualAssets", "da-1", "BTC/USDT")]
+        },
+    )
+    d = _advance_decision("bybit_dual_asset", "da-1", weight=0.2)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN]
+    assert len(subs) == 1
+    # selectPrice=60000 is the fresh one despite its lower apyE8
+    assert "60000" in subs[0].reason
+    assert "62000" not in subs[0].reason
+
+
+def test_diff_dual_assets_missing_from_snapshot_emits_skip() -> None:
+    """When the product isn't in `snapshot.products["DualAssets"]`, we
+    can't determine the stake coin → SKIP rather than guessing."""
+    quote = _dual_quote()
+    snap = _snapshot(
+        total_equity_usd="200",
+        advance_earn_quotes={"DualAssets/da-1": quote},
+        advance_products={"DualAssets": []},  # product missing
+    )
+    d = _advance_decision("bybit_dual_asset", "da-1", weight=0.2)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
+    assert any("product missing from snapshot" in s.reason for s in skips)
+
+
+def test_diff_discount_buy_uses_offers_key_not_list() -> None:
+    """Regression guard for the `.35` shape bug: live DiscountBuy quote
+    payload has `offers` at top-level, not `list`. The diff must read
+    from `offers` so picks subscribe instead of silently SKIP-ing with
+    'empty quote list'."""
+    quote = _discount_quote(coin="USDT", inst_uid="real-inst-1")
+    # Sanity check on fixture itself — make sure we're testing the right shape.
+    assert "offers" in quote and "list" not in quote
+    snap = _snapshot(
+        total_equity_usd="100",
+        advance_earn_quotes={"DiscountBuy/db-7": quote},
+        advance_products={
+            "DiscountBuy": [_advance_product("DiscountBuy", "db-7", "USDT")]
+        },
+    )
+    d = _advance_decision("bybit_discount_buy", "db-7", weight=0.2)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN]
+    assert len(subs) == 1
+    assert "real-inst-1" in subs[0].reason
+
+
 def test_diff_advance_earn_expired_offer_emits_skip() -> None:
     """Snapshot age outlived the offer window — pick must SKIP, not subscribe
-    to a stale strike that Bybit will reject."""
-    expired_quote = _dual_quote(expired_in_ms=-60_000)  # 1 min ago
+    to a stale strike that Bybit will reject. Per the live shape (2026-05-28),
+    `expiredAt` lives on each offer; this fixture makes ALL offers stale."""
+    expired_quote = _dual_quote(expired_in_ms=-60_000)  # 1 min ago, per offer
     snap = _snapshot(
         total_equity_usd="200",
         advance_earn_quotes={"DualAssets/da-1": expired_quote},
+        advance_products={
+            "DualAssets": [_advance_product("DualAssets", "da-1", "BTC/USDT")]
+        },
     )
     d = _advance_decision("bybit_dual_asset", "da-1", weight=0.2)
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
     assert not [a for a in actions if a.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN]
     skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
-    assert any("past expiredTime" in s.reason for s in skips)
+    assert any("no usable buyLowPrice offers" in s.reason for s in skips)
 
 
 def test_diff_discount_buy_skips_when_inst_uid_missing() -> None:
@@ -1227,6 +1558,9 @@ def test_diff_discount_buy_skips_when_inst_uid_missing() -> None:
     snap = _snapshot(
         total_equity_usd="100",
         advance_earn_quotes={"DiscountBuy/db-1": quote},
+        advance_products={
+            "DiscountBuy": [_advance_product("DiscountBuy", "db-1", "USDT")]
+        },
     )
     d = _advance_decision("bybit_discount_buy", "db-1", weight=0.2)
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
@@ -1538,3 +1872,147 @@ async def test_execute_open_perp_short_live_sets_leverage_then_places(tmp_path: 
     assert kwargs["side"] == "Sell"
     assert kwargs["qty"] == "25.0"
     assert kwargs["order_link_id"] == "sandbox-test-hedge-001"
+
+
+# ─── LM execute dispatch (.47) ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_execute_subscribe_lm_dry_run(tmp_path: Path) -> None:
+    """Dry-run shows the planned add_liquidity call shape — single-sided
+    USDC quote_amount, leverage=1, no live client invocation."""
+    client = AsyncMock()
+    action = Action(
+        kind=ActionKind.SUBSCRIBE_LM,
+        category="LiquidityMining",
+        product_id="24",
+        coin="USDC",
+        amount=Decimal("5"),
+        order_link_id="sandbox-lm-000",
+        reason="subscribe LM/24",
+    )
+    results = await execute_actions(
+        client, [action], snapshot_ts="20260527T120000Z",
+        dry_run=True, executions_dir=tmp_path,
+    )
+    assert results[0].status == "dry-run"
+    payload = results[0].response
+    assert payload["would_call"] == "add_liquidity"
+    assert payload["quote_amount"] == "5"
+    assert payload["quote_account_type"] == "UNIFIED"
+    assert payload["leverage"] == "1"
+    client.add_liquidity.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_subscribe_lm_live_calls_add_liquidity(tmp_path: Path) -> None:
+    """Live SUBSCRIBE_LM dispatches to BybitClient.add_liquidity with the
+    single-sided USDC body the diff layer encoded."""
+    from agent.bybit_oracle.bybit_client import LMOrderResult
+
+    client = AsyncMock()
+    client.add_liquidity.return_value = LMOrderResult(
+        orderId="lm-abc", orderLinkId="sandbox-lm-001"
+    )
+    action = Action(
+        kind=ActionKind.SUBSCRIBE_LM,
+        category="LiquidityMining",
+        product_id="24",
+        coin="USDC",
+        amount=Decimal("5"),
+        order_link_id="sandbox-lm-001",
+        reason="subscribe",
+    )
+    results = await execute_actions(
+        client, [action], snapshot_ts="20260527T120000Z",
+        dry_run=False, executions_dir=tmp_path,
+    )
+    assert results[0].status == "ok"
+    assert results[0].response == {"orderId": "lm-abc"}
+    client.add_liquidity.assert_awaited_once()
+    kwargs = client.add_liquidity.await_args.kwargs
+    assert kwargs["product_id"] == "24"
+    assert kwargs["quote_amount"] == "5"
+    assert kwargs["quote_account_type"] == "UNIFIED"
+    assert kwargs["leverage"] == "1"
+    assert kwargs["order_link_id"] == "sandbox-lm-001"
+
+
+@pytest.mark.asyncio
+async def test_execute_redeem_lm_live_calls_remove_liquidity(tmp_path: Path) -> None:
+    """REDEEM_LM full exit uses position_id from the action, removeRate=100,
+    removeType=Normal (returns both coins pro-rata)."""
+    from agent.bybit_oracle.bybit_client import LMOrderResult
+
+    client = AsyncMock()
+    client.remove_liquidity.return_value = LMOrderResult(orderId="rm-1")
+    action = Action(
+        kind=ActionKind.REDEEM_LM,
+        category="LiquidityMining",
+        product_id="24",
+        coin="USDC",
+        amount=Decimal("20"),
+        order_link_id="sandbox-lm-002",
+        reason="full exit",
+        position_id="9001",
+    )
+    results = await execute_actions(
+        client, [action], snapshot_ts="20260527T120000Z",
+        dry_run=False, executions_dir=tmp_path,
+    )
+    assert results[0].status == "ok"
+    client.remove_liquidity.assert_awaited_once()
+    kwargs = client.remove_liquidity.await_args.kwargs
+    assert kwargs["product_id"] == "24"
+    assert kwargs["position_id"] == "9001"
+    assert kwargs["remove_rate"] == 100
+    assert kwargs["remove_type"] == "Normal"
+
+
+@pytest.mark.asyncio
+async def test_execute_redeem_lm_missing_position_id_raises(tmp_path: Path) -> None:
+    """A REDEEM_LM action without position_id is a programming error in
+    the diff layer — surface loudly as RuntimeError rather than silently
+    sending a malformed body to Bybit."""
+    client = AsyncMock()
+    action = Action(
+        kind=ActionKind.REDEEM_LM,
+        category="LiquidityMining",
+        product_id="24",
+        coin="USDC",
+        amount=Decimal("20"),
+        order_link_id="sandbox-lm-003",
+        reason="missing pid",
+        position_id=None,
+    )
+    results = await execute_actions(
+        client, [action], snapshot_ts="20260527T120000Z",
+        dry_run=False, executions_dir=tmp_path,
+    )
+    assert results[0].status == "error"
+    assert "position_id" in (results[0].error or "")
+    client.remove_liquidity.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_claim_lm_live_calls_claim_interest(tmp_path: Path) -> None:
+    """CLAIM_LM dispatches to claim_lm_interest with the product_id from
+    the action — `"-1"` claims every active position in one round-trip."""
+    client = AsyncMock()
+    client.claim_lm_interest.return_value = None
+    action = Action(
+        kind=ActionKind.CLAIM_LM,
+        category="LiquidityMining",
+        product_id="-1",
+        coin="USDC",
+        amount=Decimal("0"),
+        order_link_id="sandbox-lm-004",
+        reason="claim all",
+    )
+    results = await execute_actions(
+        client, [action], snapshot_ts="20260527T120000Z",
+        dry_run=False, executions_dir=tmp_path,
+    )
+    assert results[0].status == "ok"
+    assert results[0].response == {"claimed": True}
+    client.claim_lm_interest.assert_awaited_once_with(product_id="-1")

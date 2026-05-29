@@ -4,11 +4,13 @@ Closes the `.10` decide-only loop:
 
     snapshot → decide → validate → execute
 
-Scope of `.11`:
+Scope of `.11` + `.35` + `.47`:
 - FlexibleSaving + OnChain subscribe/redeem via `BybitClient.place_earn_order`.
-- LM + advance-Earn picks are surfaced as `SKIP_OUT_OF_SCOPE` actions —
-  their lifecycle (LP add/remove, settlement windows, quote-extra-info
-  reservations) differs structurally and lands in a follow-up.
+- DualAssets + DiscountBuy via `place_advance_earn_order` (`.35`).
+- Liquidity Mining via `add_liquidity` / `remove_liquidity` (`.47`).
+- SmartLeverage + DoubleWin remain `SKIP_OUT_OF_SCOPE` — they're
+  conditional-payoff structured products without a single annualized
+  rate (`.36`).
 - Cash venue produces no action (it is residual — whatever isn't
   deployed elsewhere).
 
@@ -80,11 +82,26 @@ _ACCOUNT_TYPE: dict[str, str] = {
 # Earn are surfaced as out-of-scope skip actions.
 _BASIC_EARN_CATEGORIES: frozenset[str] = frozenset({"FlexibleSaving", "OnChain"})
 
+# Snapshot category string for Liquidity Mining picks (`.47`). Held as a
+# constant so the diff and dispatch arms refer to the same string the
+# venue registry uses (`bybit_lm.snapshot_category="LiquidityMining"`).
+_LM_CATEGORY: str = "LiquidityMining"
+
+# Bybit LM deposits the USDC side of a max_leverage=1 LP pair from the
+# UNIFIED wallet (where Earn redemptions also land). FUND would force a
+# manual transfer first. Hardcoded here rather than per-product because
+# every vUSDC-eligible LM pick is quoteCoin=USDC at leverage=1 — the
+# validator rejects anything else.
+_LM_QUOTE_ACCOUNT_TYPE: str = "UNIFIED"
+
 
 class ActionKind(StrEnum):
     SUBSCRIBE_EARN = "subscribe_earn"
     REDEEM_EARN = "redeem_earn"
     SUBSCRIBE_ADVANCE_EARN = "subscribe_advance_earn"
+    SUBSCRIBE_LM = "subscribe_lm"
+    REDEEM_LM = "redeem_lm"
+    CLAIM_LM = "claim_lm"
     OPEN_PERP_SHORT = "open_perp_short"
     CLOSE_PERP = "close_perp"
     SWAP_SPOT = "swap_spot"
@@ -122,6 +139,12 @@ class Action:
     (treated as USD-equivalent under `_STABLES`); `order_link_id`
     encodes the snapshot timestamp + sequence index for Bybit-side
     idempotency.
+
+    `position_id` is populated only for REDEEM_LM actions — Bybit's
+    remove-liquidity endpoint addresses a specific LP position by its
+    server-side id (`/v5/earn/liquidity-mining/position.positionId`),
+    not by product, since one product can host multiple positions
+    (e.g. opened in different cycles). Other kinds leave it `None`.
     """
 
     kind: ActionKind
@@ -131,6 +154,7 @@ class Action:
     amount: Decimal
     order_link_id: str
     reason: str
+    position_id: str | None = None
 
     def to_log(self) -> dict[str, Any]:
         d = asdict(self)
@@ -193,6 +217,14 @@ def diff_to_actions(
     # All product_ids touched by current OR target — both sides matter:
     # currents not in target should be fully redeemed.
     all_pids: set[tuple[str, str]] = set(current.keys()) | set(targets.keys())
+    # LM positions don't live in `current` (which only tracks Earn
+    # positions) — fold them in so dropped LM picks trigger REDEEM_LM
+    # via the LM branch. Without this, a position the LLM stopped picking
+    # would silently stay open and accrue IL without supervision.
+    for lm_pos in snapshot.lm_positions:
+        lm_pid = str(lm_pos.get("productId") or "")
+        if lm_pid:
+            all_pids.add((_LM_CATEGORY, lm_pid))
 
     for idx, key in enumerate(sorted(all_pids)):
         category, product_id = key
@@ -218,6 +250,29 @@ def diff_to_actions(
                     subscribes.append(action)
                 else:
                     skips.append(action)
+            continue
+
+        if category == _LM_CATEGORY:
+            # Liquidity Mining lifecycle (`.47`). Single-sided deposit on
+            # the USDC (quote) side; pool internally rebalances to 50/50
+            # at leverage=1. Three branches mirror Earn subscribe/redeem,
+            # but address LP positions by `positionId` rather than
+            # productId on the redeem path (one product may carry many
+            # positions across cycles).
+            lm_action = _lm_action_for_target(
+                snapshot,
+                product_id,
+                target.amount_usd if target else Decimal(0),
+                order_link_id,
+            )
+            if lm_action is None:
+                continue
+            if lm_action.kind == ActionKind.SUBSCRIBE_LM:
+                subscribes.append(lm_action)
+            elif lm_action.kind == ActionKind.REDEEM_LM:
+                redeems.append(lm_action)
+            else:
+                skips.append(lm_action)
             continue
 
         if category not in _BASIC_EARN_CATEGORIES:
@@ -459,6 +514,216 @@ def _hedge_diff_actions(
     return closes, opens
 
 
+def _lm_action_for_target(
+    snapshot: Snapshot,
+    product_id: str,
+    target_amount_usd: Decimal,
+    order_link_id: str,
+) -> Action | None:
+    """Plan one LM action for a `(product_id, target_usd)` pair (`.47`).
+
+    Returns:
+      - `SUBSCRIBE_LM` when target > MIN_ACTION_USDC and the wallet has
+        no open position on this product. The action's `amount` is the
+        USDC (quote) deposit size; Bybit auto-balances to 50/50 at spot.
+      - `REDEEM_LM` when there's an existing position and the target
+        dropped to ~zero. Full exit (removeRate=100, removeType=Normal).
+      - `SKIP_OUT_OF_SCOPE` when:
+          * the LM product isn't in the snapshot (LLM hallucinated id)
+          * the pair isn't quoteCoin=USDC (we only know how to fund
+            single-sided USDC deposits)
+          * the existing position resists targeting (e.g. rebalance-to-
+            non-zero — partial scaling not modeled in MVP)
+      - `None` when no action is needed (target ≈ current, both > 0
+        but within threshold).
+
+    MVP scope: subscribe and full exit only. Partial drawdown (target >
+    0 but smaller than current) emits SKIP with a reason — Bybit's LM
+    `removeRate` accepts percent but the diff would need to convert
+    USD delta → percent against `principalLiquidityValue`, which adds
+    rounding edge cases not worth tackling before `.14` smoke.
+    """
+    product = _lm_product_from_snapshot(snapshot, product_id)
+    if product is None:
+        return Action(
+            kind=ActionKind.SKIP_OUT_OF_SCOPE,
+            category=_LM_CATEGORY,
+            product_id=product_id,
+            coin="?",
+            amount=target_amount_usd,
+            order_link_id=order_link_id,
+            reason=(
+                f"LiquidityMining/{product_id}: product not in snapshot — "
+                "LLM may have hallucinated the id; pick is unactionable"
+            ),
+        )
+    parts = product.coin.split("/", 1)
+    if len(parts) != 2:
+        return Action(
+            kind=ActionKind.SKIP_OUT_OF_SCOPE,
+            category=_LM_CATEGORY,
+            product_id=product_id,
+            coin=product.coin,
+            amount=target_amount_usd,
+            order_link_id=order_link_id,
+            reason=(
+                f"LiquidityMining/{product_id}: malformed pair {product.coin!r} "
+                "(expected `BASE/QUOTE`)"
+            ),
+        )
+    base_coin, quote_coin = parts
+    if quote_coin != "USDC":
+        return Action(
+            kind=ActionKind.SKIP_OUT_OF_SCOPE,
+            category=_LM_CATEGORY,
+            product_id=product_id,
+            coin=quote_coin,
+            amount=target_amount_usd,
+            order_link_id=order_link_id,
+            reason=(
+                f"LiquidityMining/{product_id} ({base_coin}/{quote_coin}): "
+                "vault funds only USDC-quote pairs; the validator should "
+                "have rejected this pick"
+            ),
+        )
+
+    current = _current_lm_position(snapshot.lm_positions, product_id)
+    current_usd = current[1] if current else Decimal(0)
+
+    # Fresh subscribe path.
+    if current is None:
+        if target_amount_usd <= MIN_ACTION_USDC:
+            return None
+        # Bybit enforces a per-product floor (e.g. 50 USDC for ETH/USDC).
+        # Trying to subscribe below it returns `retCode=180005` / similar;
+        # SKIP at diff time with a clear message so the operator can
+        # either scale up the LLM's allocation or top up the wallet.
+        if (
+            product.min_subscribe_usd is not None
+            and target_amount_usd < product.min_subscribe_usd
+        ):
+            return Action(
+                kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                category=_LM_CATEGORY,
+                product_id=product_id,
+                coin=quote_coin,
+                amount=target_amount_usd,
+                order_link_id=order_link_id,
+                reason=(
+                    f"LiquidityMining/{product_id} ({base_coin}/{quote_coin}): "
+                    f"target ${target_amount_usd:.2f} below Bybit min "
+                    f"${product.min_subscribe_usd} — Bybit would reject; "
+                    "either scale up the LM allocation or top up USDC"
+                ),
+            )
+        return Action(
+            kind=ActionKind.SUBSCRIBE_LM,
+            category=_LM_CATEGORY,
+            product_id=product_id,
+            coin=quote_coin,
+            amount=target_amount_usd,
+            order_link_id=order_link_id,
+            reason=(
+                f"subscribe LM/{product_id} ({base_coin}/{quote_coin}) "
+                f"${target_amount_usd:.2f} single-sided USDC, leverage=1; "
+                f"Bybit pool rebalances to 50/50 internally"
+            ),
+        )
+
+    position_id, _ = current
+    # Existing position. Full exit when LLM dropped below threshold.
+    if target_amount_usd <= MIN_ACTION_USDC:
+        return Action(
+            kind=ActionKind.REDEEM_LM,
+            category=_LM_CATEGORY,
+            product_id=product_id,
+            coin=quote_coin,
+            amount=current_usd,
+            order_link_id=order_link_id,
+            reason=(
+                f"redeem LM/{product_id} ({base_coin}/{quote_coin}): "
+                f"current ${current_usd:.2f} → target $0 (full exit, "
+                f"removeRate=100, removeType=Normal)"
+            ),
+            position_id=position_id,
+        )
+    # Position roughly matches target — no-op.
+    delta = abs(target_amount_usd - current_usd)
+    if delta < MIN_ACTION_USDC:
+        return None
+    # Partial scaling not in MVP.
+    return Action(
+        kind=ActionKind.SKIP_OUT_OF_SCOPE,
+        category=_LM_CATEGORY,
+        product_id=product_id,
+        coin=quote_coin,
+        amount=target_amount_usd,
+        order_link_id=order_link_id,
+        reason=(
+            f"LiquidityMining/{product_id}: partial LM scaling not wired "
+            f"(current ${current_usd:.2f}, target ${target_amount_usd:.2f}); "
+            "full exit or fresh subscribe only — close manually to resize"
+        ),
+    )
+
+
+def _lm_product_from_snapshot(
+    snapshot: Snapshot, product_id: str
+):
+    """Look up the LM `ProductSummary` for `product_id`. Returns the
+    whole row (not just the pair) so the diff can also check
+    `min_subscribe_usd` without a second pass through the list."""
+    for p in snapshot.products.get(_LM_CATEGORY, []):
+        if p.product_id == product_id:
+            return p
+    return None
+
+
+def _current_lm_position(
+    positions: list[dict[str, Any]], product_id: str
+) -> tuple[str, Decimal] | None:
+    """Return `(positionId, principal_usd)` for the active position on
+    `product_id`, or `None` when no such position exists.
+
+    Bybit's LM position payload carries `principalLiquidityValue` in the
+    quote coin (USD-equivalent for USDC pairs). Fall back to summing
+    `principalQuoteAmount + principalBaseAmount × currentPrice` when the
+    consolidated field is absent. Zero principals collapse to None so
+    the diff treats them as no-position rather than a $0 exit no-op.
+    """
+    for pos in positions:
+        if str(pos.get("productId", "")) != product_id:
+            continue
+        pid = str(pos.get("positionId") or "")
+        if not pid:
+            continue
+        principal = _lm_principal_usd(pos)
+        if principal <= 0:
+            return None
+        return pid, principal
+    return None
+
+
+def _lm_principal_usd(pos: dict[str, Any]) -> Decimal:
+    """Extract principal USD-equivalent from one LM position row. Prefers
+    `principalLiquidityValue` (Bybit's server-side consolidation) when
+    present; otherwise sums quote + base × currentPrice. Returns 0 on
+    parse failure — caller treats as "not a real position"."""
+    raw = pos.get("principalLiquidityValue")
+    if raw is not None:
+        try:
+            return Decimal(str(raw))
+        except (InvalidOperation, TypeError):
+            pass
+    try:
+        quote = Decimal(str(pos.get("principalQuoteAmount", "0")))
+        base = Decimal(str(pos.get("principalBaseAmount", "0")))
+        price = Decimal(str(pos.get("currentPrice", "0")))
+    except (InvalidOperation, TypeError):
+        return Decimal(0)
+    return quote + base * price
+
+
 def _advance_earn_subscribe_action(
     snapshot: Snapshot,
     category: str,
@@ -501,7 +766,9 @@ def _advance_earn_subscribe_action(
             ),
         )
 
-    offer, coin, reason_detail = _pick_advance_offer(category, quote)
+    offer, coin, reason_detail = _pick_advance_offer(
+        category, quote, snapshot, product_id
+    )
     if offer is None:
         return Action(
             kind=ActionKind.SKIP_OUT_OF_SCOPE,
@@ -535,28 +802,43 @@ def _advance_earn_subscribe_action(
 
 
 def _pick_advance_offer(
-    category: str, quote: dict[str, Any]
+    category: str,
+    quote: dict[str, Any],
+    snapshot: Snapshot,
+    product_id: str,
 ) -> tuple[dict[str, Any] | None, str, str]:
     """Return `(offer_dict_or_None, subscription_coin, reason_detail)`
     for the best actionable offer in `quote` per category-specific shape.
 
-    DualAssets quote shape (`.28`):
-        {category, list: [{currentPrice, expiredTime, baseCoin, quoteCoin,
-        buyLowPrice: [{selectPrice, apyE8, ...}], sellHighPrice: [...]}]}
-    We pick the highest-APR `buyLowPrice` offer (strike below current →
-    we commit to *buying* the base coin at a discount if price drops;
-    stake currency is the quote). High-APR strike is the one closest to
-    current price → most likely conversion, but also most yield per Bybit's
-    pricing curve.
+    DualAssets quote shape (verified against live capture 2026-05-28):
+        {category, list: [{productId, currentPrice,
+            buyLowPrice:  [{selectPrice, apyE8, maxInvestmentAmount, expiredAt}, ...],
+            sellHighPrice:[{...}, ...]}]}
 
-    DiscountBuy quote shape:
-        {category, list: [{purchasePrice, currentPrice, knockoutPrice,
-        knockoutCouponE8, instUid, expiredAt, ...}]}
-    Use `list[0]` (the single posted offer per product). Stake currency
-    is whatever the product's `coin` field says (typically USDT).
+    Notes vs original docs:
+      - `expiredAt` lives on EACH offer row, not at the parent payload.
+      - `baseCoin`/`quoteCoin` are NOT echoed in the quote — they only
+        live in `/v5/earn/advance/product` (cached as
+        `snapshot.products["DualAssets"][i].coin = "BASE/QUOTE"`), so we
+        pull the pair from the snapshot's product list to know the
+        stake currency.
 
-    `expiredAt` / `expiredTime` (Bybit uses both spellings across categories)
-    is checked against the current wall clock — past = unusable.
+    We pick the highest-APR non-expired `buyLowPrice` offer (strike
+    below current → commits us to *buying* the base coin at a discount
+    if price drops; stake is the quote coin).
+
+    DiscountBuy quote shape (verified against live capture 2026-05-28):
+        {offers: [{productId, currentPrice, purchasePrice, knockoutPrice,
+                   knockoutCouponE8, maxInvestmentAmount, instUid,
+                   expiredAt, category}]}
+
+    Notes vs original docs:
+      - Top-level key is `offers`, NOT `list` — different from DualAssets.
+      - The offer row doesn't carry `coin`; stake currency is on the
+        product list (`snapshot.products["DiscountBuy"][i].coin`),
+        usually USDT.
+
+    `expiredAt` is unix-ms; past = unusable.
     """
     now_ms = int(datetime.now(UTC).timestamp() * 1000)
 
@@ -565,14 +847,23 @@ def _pick_advance_offer(
         if not items or not isinstance(items[0], dict):
             return None, "?", "empty quote list"
         payload = items[0]
-        base = payload.get("baseCoin", "?")
-        quote_coin = payload.get("quoteCoin", "?")
-        coin = quote_coin  # stake currency for the buyLowPrice side
-        expired = payload.get("expiredTime") or payload.get("expiredAt")
-        if _offer_expired(expired, now_ms):
-            return None, coin, f"all offers past expiredTime={expired}"
+        pair = _advance_product_pair(snapshot, "DualAssets", product_id)
+        if pair is None:
+            return None, "?", (
+                "DualAssets product missing from snapshot.products "
+                "(can't determine stake coin)"
+            )
+        base, quote_coin = pair
+        coin = quote_coin  # buyLowPrice stake currency is the quote coin
         best: tuple[Decimal, dict[str, Any]] | None = None
+        expired_count = 0
         for offer in payload.get("buyLowPrice") or []:
+            # Per-offer expiry — Bybit's quote endpoint rotates offers
+            # roughly every cycle, so some rows in a multi-offer payload
+            # may already be past their TTL while others are fresh.
+            if _offer_expired(offer.get("expiredAt"), now_ms):
+                expired_count += 1
+                continue
             raw = offer.get("apyE8")
             if raw is None:
                 continue
@@ -583,7 +874,10 @@ def _pick_advance_offer(
             if best is None or apy > best[0]:
                 best = (apy, offer)
         if best is None:
-            return None, coin, "no buyLowPrice offers with apyE8"
+            return None, coin, (
+                f"no usable buyLowPrice offers "
+                f"(expired={expired_count}, missing/invalid apyE8 on rest)"
+            )
         apy, offer = best
         return offer, coin, (
             f"DualAssets {base}/{quote_coin} buyLowPrice strike="
@@ -591,11 +885,17 @@ def _pick_advance_offer(
         )
 
     if category == "DiscountBuy":
-        items = quote.get("list") or []
+        # NB: live shape uses `offers` at top-level (verified 2026-05-28),
+        # not `list` as the changelog implied.
+        items = quote.get("offers") or quote.get("list") or []
         if not items or not isinstance(items[0], dict):
-            return None, "?", "empty quote list"
+            return None, "?", "empty offers list"
         offer = items[0]
-        coin = offer.get("coin") or "USDT"
+        coin = (
+            offer.get("coin")
+            or _advance_product_coin(snapshot, "DiscountBuy", product_id)
+            or "USDT"
+        )
         expired = offer.get("expiredAt") or offer.get("expiredTime")
         if _offer_expired(expired, now_ms):
             return None, coin, f"offer past expiredAt={expired}"
@@ -608,6 +908,33 @@ def _pick_advance_offer(
         )
 
     return None, "?", f"unsupported advance-Earn category {category}"
+
+
+def _advance_product_coin(
+    snapshot: Snapshot, category: str, product_id: str
+) -> str | None:
+    """Return the `ProductSummary.coin` field for the advance-Earn
+    product matching `(category, product_id)`. Used as a stake-coin
+    source when the quote endpoint doesn't echo it (DiscountBuy)."""
+    for p in snapshot.products.get(category, []):
+        if p.product_id == product_id:
+            return p.coin
+    return None
+
+
+def _advance_product_pair(
+    snapshot: Snapshot, category: str, product_id: str
+) -> tuple[str, str] | None:
+    """For DualAssets, the snapshot stores `coin="BASE/QUOTE"`. Split
+    and return `(base, quote)`. Returns None when product missing or
+    the coin field doesn't carry a pair."""
+    coin = _advance_product_coin(snapshot, category, product_id)
+    if coin is None:
+        return None
+    parts = coin.split("/", 1)
+    if len(parts) != 2:
+        return None
+    return parts[0], parts[1]
 
 
 def _offer_expired(expired_raw: Any, now_ms: int) -> bool:
@@ -970,6 +1297,46 @@ async def _execute_one(
                 extra=extra,
             )
             response = {"orderId": raw.get("orderId")}
+        elif action.kind == ActionKind.SUBSCRIBE_LM:
+            # `.47`: single-sided USDC deposit into an LM LP pair at
+            # leverage=1. Bybit's CPMM pool rebalances 50/50 to base
+            # internally at spot — we don't supply baseAmount. Validator
+            # forbids leverage>1 picks; hardcoded "1" here mirrors the
+            # _LM_QUOTE_ACCOUNT_TYPE constant choice (UNIFIED, where
+            # USDC sits post-Earn-redeem).
+            lm_out = await client.add_liquidity(
+                product_id=action.product_id,
+                order_link_id=action.order_link_id,
+                quote_amount=str(action.amount),
+                quote_account_type=_LM_QUOTE_ACCOUNT_TYPE,  # type: ignore[arg-type]
+                leverage="1",
+            )
+            response = {"orderId": lm_out.orderId}
+        elif action.kind == ActionKind.REDEEM_LM:
+            # Full exit by default (removeRate=100, removeType=Normal —
+            # returns both coins pro-rata). The diff guarantees we
+            # only reach here with a valid `position_id` from the
+            # snapshot's lm_positions; missing id would be a programming
+            # error, not a recoverable runtime state.
+            if not action.position_id:
+                raise RuntimeError(
+                    f"REDEEM_LM action {action.order_link_id} missing "
+                    "position_id — diff layer must populate this"
+                )
+            lm_out = await client.remove_liquidity(
+                product_id=action.product_id,
+                position_id=action.position_id,
+                order_link_id=action.order_link_id,
+                remove_rate=100,
+                remove_type="Normal",
+            )
+            response = {"orderId": lm_out.orderId}
+        elif action.kind == ActionKind.CLAIM_LM:
+            # `productId="-1"` claims yield across every active LM
+            # position in one round-trip. Yield lands in Funding. No
+            # response payload to capture; we just record the call.
+            await client.claim_lm_interest(product_id=action.product_id)
+            response = {"claimed": True}
         elif action.kind == ActionKind.SWAP_SPOT:
             # USDC → USDT via the USDCUSDT spot pair. Bybit's spot
             # Market Sell uses base-coin qty (USDC here); Market Buy
@@ -1049,6 +1416,29 @@ def _dry_run_payload(action: Action) -> dict[str, Any]:
             "symbol": action.product_id,
             "qty": str(action.amount),
             "order_link_id": action.order_link_id,
+        }
+    if action.kind == ActionKind.SUBSCRIBE_LM:
+        return {
+            "would_call": "add_liquidity",
+            "product_id": action.product_id,
+            "quote_amount": str(action.amount),
+            "quote_account_type": _LM_QUOTE_ACCOUNT_TYPE,
+            "leverage": "1",
+            "order_link_id": action.order_link_id,
+        }
+    if action.kind == ActionKind.REDEEM_LM:
+        return {
+            "would_call": "remove_liquidity",
+            "product_id": action.product_id,
+            "position_id": action.position_id,
+            "remove_rate": 100,
+            "remove_type": "Normal",
+            "order_link_id": action.order_link_id,
+        }
+    if action.kind == ActionKind.CLAIM_LM:
+        return {
+            "would_call": "claim_lm_interest",
+            "product_id": action.product_id,
         }
     if action.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN:
         offer = _decode_offer_from_reason(action.reason)
@@ -1285,11 +1675,14 @@ def _render_plan_summary(actions: list[Action]) -> str:
         by_kind.setdefault(a.kind, []).append(a)
     for kind in (
         ActionKind.REDEEM_EARN,
+        ActionKind.REDEEM_LM,
+        ActionKind.CLAIM_LM,
         ActionKind.CLOSE_PERP,
         ActionKind.SWAP_SPOT,
         ActionKind.OPEN_PERP_SHORT,
         ActionKind.SUBSCRIBE_EARN,
         ActionKind.SUBSCRIBE_ADVANCE_EARN,
+        ActionKind.SUBSCRIBE_LM,
         ActionKind.SKIP_OUT_OF_SCOPE,
     ):
         rows = by_kind.get(kind, [])

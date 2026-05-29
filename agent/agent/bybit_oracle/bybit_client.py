@@ -215,6 +215,19 @@ class EarnOrderResult(BaseModel):
     orderId: str
 
 
+class LMOrderResult(BaseModel):
+    """Result for `/v5/earn/liquidity-mining/{add,remove}-liquidity`.
+
+    Bybit echoes the client-supplied `orderLinkId` alongside the server-
+    assigned `orderId` so callers can correlate without re-fetching the
+    order history.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    orderId: str
+    orderLinkId: str | None = None
+
+
 class WalletCoin(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -856,6 +869,115 @@ class BybitClient:
             "GET", "/v5/earn/liquidity-mining/yield-records", params=params
         )
         return data.get("result") or {}
+
+    async def add_liquidity(
+        self,
+        *,
+        product_id: str,
+        order_link_id: str,
+        quote_amount: str | None = None,
+        quote_account_type: AccountType | None = None,
+        base_amount: str | None = None,
+        base_account_type: AccountType | None = None,
+        leverage: str = "1",
+    ) -> LMOrderResult:
+        """Open a Liquidity Mining LP position via
+        `POST /v5/earn/liquidity-mining/add-liquidity` (`.47`).
+
+        At least one of `quote_amount`/`base_amount` is required. When
+        only one side is supplied at `leverage="1"`, Bybit's CPMM pool
+        rebalances to a 50/50 USD-value split at spot internally — same
+        flow the Bybit app uses for single-sided deposits. Supplying both
+        sides locks in the exact ratio without server-side rebalancing.
+
+        Each `*_amount` field requires its matching `*_account_type`
+        (`FUND` or `UNIFIED`); the method raises locally on mismatched
+        pairings to keep the error close to the caller instead of letting
+        Bybit echo a generic 10001.
+        """
+        if quote_amount is None and base_amount is None:
+            raise ValueError(
+                "at least one of quote_amount / base_amount is required"
+            )
+        if quote_amount is not None and quote_account_type is None:
+            raise ValueError(
+                "quote_account_type is required when quote_amount is set"
+            )
+        if base_amount is not None and base_account_type is None:
+            raise ValueError(
+                "base_account_type is required when base_amount is set"
+            )
+        body: dict[str, Any] = {
+            "productId": product_id,
+            "orderLinkId": order_link_id,
+            "leverage": leverage,
+        }
+        if quote_amount is not None:
+            body["quoteAmount"] = quote_amount
+            body["quoteAccountType"] = quote_account_type
+        if base_amount is not None:
+            body["baseAmount"] = base_amount
+            body["baseAccountType"] = base_account_type
+        data = await self._request(
+            "POST", "/v5/earn/liquidity-mining/add-liquidity", body=body
+        )
+        return BybitResponse[LMOrderResult].model_validate(data).result  # type: ignore[return-value]
+
+    async def remove_liquidity(
+        self,
+        *,
+        product_id: str,
+        position_id: str,
+        order_link_id: str,
+        remove_rate: int = 100,
+        remove_type: str = "Normal",
+    ) -> LMOrderResult:
+        """Close (full or partial) an LP position via
+        `POST /v5/earn/liquidity-mining/remove-liquidity` (`.47`).
+
+        `remove_rate` is the percent of the position to redeem (1-100,
+        default 100 = full exit). `remove_type` controls how Bybit
+        settles the withdrawal:
+
+        - `Normal` — both coins returned pro-rata to the pool ratio
+        - `SingleQuoteCoin` — quote coin only (Bybit swaps base→quote
+          internally at exit spot)
+        - `SingleBaseCoin` — base coin only (mirror of above)
+
+        Returns immediately with `orderId`; actual settlement happens
+        asynchronously and is observable via `get_liquidity_mining_positions`.
+        """
+        body: dict[str, Any] = {
+            "productId": product_id,
+            "positionId": position_id,
+            "orderLinkId": order_link_id,
+            "removeRate": remove_rate,
+            "removeType": remove_type,
+        }
+        data = await self._request(
+            "POST", "/v5/earn/liquidity-mining/remove-liquidity", body=body
+        )
+        return BybitResponse[LMOrderResult].model_validate(data).result  # type: ignore[return-value]
+
+    async def claim_lm_interest(
+        self,
+        product_id: str = "-1",
+    ) -> None:
+        """Claim accrued LP yield via
+        `POST /v5/earn/liquidity-mining/claim-interest` (`.47`).
+
+        `productId="-1"` is the Bybit-native semantics for "claim every
+        active LM position in one round-trip" — preferred over per-product
+        calls. Yield is credited to the Funding account by default; result
+        envelope is `{}` (we discard it).
+
+        Same Earn-permission gate as the read endpoints; expect 10005 on
+        sub-accounts where Earn is locked.
+        """
+        body: dict[str, Any] = {"productId": product_id}
+        await self._request(
+            "POST", "/v5/earn/liquidity-mining/claim-interest", body=body
+        )
 
     async def place_earn_order(
         self,

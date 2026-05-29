@@ -884,6 +884,169 @@ async def test_liquidity_mining_no_longer_in_advance_earn_categories():
             await c.list_advance_earn_products(category="LiquidityMining")
 
 
+# ─── LM mutating endpoints (.47) ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_add_liquidity_quote_only_single_sided(captured):
+    """Single-sided USDC deposit at leverage=1 — Bybit auto-balances to
+    50/50 internally. Body must include `quoteAmount` + matching
+    `quoteAccountType`, omit base-side keys, and signed via POST."""
+    async with _client(
+        captured, lambda _r: _ok({"orderId": "lm-1", "orderLinkId": "lk-1"})
+    ) as c:
+        out = await c.add_liquidity(
+            product_id="24",
+            order_link_id="lk-1",
+            quote_amount="10",
+            quote_account_type="UNIFIED",
+        )
+
+    assert out.orderId == "lm-1"
+    assert out.orderLinkId == "lk-1"
+
+    req = captured[0]
+    assert req.method == "POST"
+    assert req.url.path == "/v5/earn/liquidity-mining/add-liquidity"
+    body = json.loads(req.content.decode())
+    assert body == {
+        "productId": "24",
+        "orderLinkId": "lk-1",
+        "leverage": "1",
+        "quoteAmount": "10",
+        "quoteAccountType": "UNIFIED",
+    }
+
+
+@pytest.mark.asyncio
+async def test_add_liquidity_dual_sided_locks_ratio(captured):
+    """When both sides are supplied, server skips internal rebalancing
+    and uses the exact ratio. Both `*_amount` + `*_account_type` keys
+    must appear in the body."""
+    async with _client(
+        captured, lambda _r: _ok({"orderId": "lm-2"})
+    ) as c:
+        await c.add_liquidity(
+            product_id="23",
+            order_link_id="lk-2",
+            quote_amount="50",
+            quote_account_type="UNIFIED",
+            base_amount="0.0008",
+            base_account_type="UNIFIED",
+            leverage="1",
+        )
+
+    body = json.loads(captured[0].content.decode())
+    assert body["quoteAmount"] == "50"
+    assert body["baseAmount"] == "0.0008"
+    assert body["quoteAccountType"] == "UNIFIED"
+    assert body["baseAccountType"] == "UNIFIED"
+
+
+@pytest.mark.asyncio
+async def test_add_liquidity_rejects_no_amount():
+    """Caller MUST supply at least one of `quote_amount` / `base_amount`.
+    Local ValueError saves an unsignable round-trip and surfaces the
+    contract violation at the call site, not as a Bybit retCode."""
+    async with _client([], lambda _r: _ok({})) as c:
+        with pytest.raises(ValueError, match="at least one of"):
+            await c.add_liquidity(
+                product_id="24", order_link_id="lk-x"
+            )
+
+
+@pytest.mark.asyncio
+async def test_add_liquidity_requires_account_type_for_quote():
+    async with _client([], lambda _r: _ok({})) as c:
+        with pytest.raises(ValueError, match="quote_account_type is required"):
+            await c.add_liquidity(
+                product_id="24",
+                order_link_id="lk-x",
+                quote_amount="10",
+            )
+
+
+@pytest.mark.asyncio
+async def test_add_liquidity_requires_account_type_for_base():
+    async with _client([], lambda _r: _ok({})) as c:
+        with pytest.raises(ValueError, match="base_account_type is required"):
+            await c.add_liquidity(
+                product_id="24",
+                order_link_id="lk-x",
+                base_amount="0.001",
+            )
+
+
+@pytest.mark.asyncio
+async def test_remove_liquidity_full_exit_defaults(captured):
+    """Default `remove_rate=100` + `remove_type="Normal"` is a full exit
+    that returns both coins pro-rata — the standard close path."""
+    async with _client(
+        captured, lambda _r: _ok({"orderId": "rm-1", "orderLinkId": "lk-r"})
+    ) as c:
+        out = await c.remove_liquidity(
+            product_id="24",
+            position_id="9001",
+            order_link_id="lk-r",
+        )
+
+    assert out.orderId == "rm-1"
+    req = captured[0]
+    assert req.method == "POST"
+    assert req.url.path == "/v5/earn/liquidity-mining/remove-liquidity"
+    body = json.loads(req.content.decode())
+    assert body == {
+        "productId": "24",
+        "positionId": "9001",
+        "orderLinkId": "lk-r",
+        "removeRate": 100,
+        "removeType": "Normal",
+    }
+
+
+@pytest.mark.asyncio
+async def test_remove_liquidity_partial_with_single_quote(captured):
+    """Partial exit returning quote coin only — convenient when the
+    strategy wants to recover USDC without re-swapping the base side."""
+    async with _client(
+        captured, lambda _r: _ok({"orderId": "rm-2"})
+    ) as c:
+        await c.remove_liquidity(
+            product_id="24",
+            position_id="9001",
+            order_link_id="lk-r2",
+            remove_rate=50,
+            remove_type="SingleQuoteCoin",
+        )
+
+    body = json.loads(captured[0].content.decode())
+    assert body["removeRate"] == 50
+    assert body["removeType"] == "SingleQuoteCoin"
+
+
+@pytest.mark.asyncio
+async def test_claim_lm_interest_defaults_to_claim_all(captured):
+    """`productId="-1"` is Bybit-native shorthand for "every active LM
+    position" — preferred over per-product calls to save round-trips."""
+    async with _client(captured, lambda _r: _ok({})) as c:
+        await c.claim_lm_interest()
+
+    req = captured[0]
+    assert req.method == "POST"
+    assert req.url.path == "/v5/earn/liquidity-mining/claim-interest"
+    body = json.loads(req.content.decode())
+    assert body == {"productId": "-1"}
+
+
+@pytest.mark.asyncio
+async def test_claim_lm_interest_with_specific_product(captured):
+    async with _client(captured, lambda _r: _ok({})) as c:
+        await c.claim_lm_interest(product_id="24")
+
+    body = json.loads(captured[0].content.decode())
+    assert body == {"productId": "24"}
+
+
 # ─── hourly-yield ───────────────────────────────────────────────────────────
 
 

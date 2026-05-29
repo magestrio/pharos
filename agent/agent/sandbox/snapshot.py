@@ -91,6 +91,13 @@ class ProductSummary(BaseModel):
     apr_source: str  # measured_yield | estimate_apr | apy_e8 | aave_pool | quote_dual_offer | quote_discount | missing
     base_apr_string: str | None = None  # raw Bybit value (debug / audit)
     redeem_lockup_minutes: int | None = None
+    # Minimum USD-equivalent the product accepts on a single subscribe.
+    # Surfaced from Bybit's raw product fields (`minInvestmentQuote` for
+    # LM, future: `minPurchaseAmount` for basic Earn) so the diff layer
+    # can SKIP any pick whose `target_amount_usd` is below the product's
+    # floor — avoiding live-side `180005` / `180016` rejections.
+    # None = unknown / no floor surfaced for this product family.
+    min_subscribe_usd: Decimal | None = None
     notes: list[str] = Field(default_factory=list)
 
 
@@ -485,6 +492,17 @@ def _lm_summary(p: dict[str, Any]) -> ProductSummary:
     if lev is not None:
         notes.append(f"max_leverage={lev}")
 
+    # `minInvestmentQuote` is Bybit's per-product floor in the quote
+    # coin (e.g. 50 USDC for BTC/USDC). The diff layer SKIPs any subscribe
+    # below this — going through avoids a live `180005` rejection. None
+    # when the field is missing from the raw product (older snapshots).
+    min_q: Decimal | None
+    try:
+        raw_min = p.get("minInvestmentQuote")
+        min_q = Decimal(str(raw_min)) if raw_min is not None else None
+    except (InvalidOperation, TypeError):
+        min_q = None
+
     return ProductSummary(
         category="LiquidityMining",
         product_id=str(p["productId"]),
@@ -493,6 +511,7 @@ def _lm_summary(p: dict[str, Any]) -> ProductSummary:
         apr_source=src,
         base_apr_string=None,
         redeem_lockup_minutes=None,
+        min_subscribe_usd=min_q,
         notes=notes,
     )
 
