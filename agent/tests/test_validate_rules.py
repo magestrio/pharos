@@ -39,6 +39,7 @@ from agent.validate.rules import (
     check_funding_rate_floor,
     check_hedges_for_non_usd_picks,
     check_lm_leverage_size_cap,
+    check_lockup_cap,
     check_no_missing_apr_source,
     check_peg_stress,
     check_picks_required,
@@ -68,6 +69,7 @@ def _product(
     effective_apr: str = "0.05",
     apr_source: str = "estimate_apr",
     notes: list[str] | None = None,
+    redeem_lockup_minutes: int | None = None,
 ) -> ProductSummary:
     return ProductSummary(
         category=category,
@@ -76,7 +78,7 @@ def _product(
         effective_apr=Decimal(effective_apr),
         apr_source=apr_source,
         base_apr_string=None,
-        redeem_lockup_minutes=None,
+        redeem_lockup_minutes=redeem_lockup_minutes,
         notes=notes or [],
     )
 
@@ -389,6 +391,68 @@ def test_check_product_ids_in_snapshot_fails_on_hallucinated_id() -> None:
     ok, msg = check_product_ids_in_snapshot(d, s)
     assert ok is False
     assert "9999" in (msg or "")
+
+
+def test_check_lockup_cap_rejects_pick_above_7_days() -> None:
+    """ATOM OnChain product 9 has 36000 min ≈ 25-day lockup. Picker
+    occasionally selects it despite the prompt rule — validator
+    enforces 7-day hard cap so live execute can't lock funds long."""
+    s = _snapshot(
+        onchain_products=[
+            _product("9", "OnChain", coin="ATOM",
+                     effective_apr="0.17",
+                     redeem_lockup_minutes=36000),  # 25 days
+        ]
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_onchain", 0.5, [("9", 1.0)]),
+        ]
+    )
+    ok, msg = check_lockup_cap(d, s)
+    assert ok is False
+    assert "9" in (msg or "")
+    assert "25" in (msg or "") or "36000" in (msg or "")
+
+
+def test_check_lockup_cap_passes_for_4_day_lockup() -> None:
+    """TON OnChain 4 days (5760 min) is within cap — allowed."""
+    s = _snapshot(
+        onchain_products=[
+            _product("8", "OnChain", coin="TON",
+                     effective_apr="0.18",
+                     redeem_lockup_minutes=5760),  # 4 days
+        ]
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_onchain", 0.5, [("8", 1.0)]),
+        ]
+    )
+    ok, _ = check_lockup_cap(d, s)
+    assert ok is True
+
+
+def test_check_lockup_cap_passes_when_no_lockup_field() -> None:
+    """FlexibleSaving rows typically have redeem_lockup_minutes=None →
+    treated as instant-redeem and allowed through."""
+    s = _snapshot(
+        flex_products=[
+            _product("1131", "FlexibleSaving", coin="USD1",
+                     effective_apr="0.07",
+                     redeem_lockup_minutes=None),
+        ]
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_flex", 0.5, [("1131", 1.0)]),
+        ]
+    )
+    ok, _ = check_lockup_cap(d, s)
+    assert ok is True
 
 
 def test_check_no_missing_apr_source_fails_when_pick_is_missing() -> None:

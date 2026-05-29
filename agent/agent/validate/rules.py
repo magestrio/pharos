@@ -189,6 +189,46 @@ def check_product_ids_in_snapshot(d: Decision, snapshot: Snapshot) -> Check:
     return True, None
 
 
+# Maximum effective lockup the vault tolerates. Picks whose snapshot
+# `redeem_lockup_minutes` exceeds this get rejected — the vault
+# reallocates on a weekly horizon and can't price the opportunity-cost
+# of being stuck longer. Mirrors the prompt's `# Hard caps` rule but
+# enforced at code level since the LLM occasionally ignores the soft
+# guidance (e.g. ATOM OnChain 36000-min lockup picked despite rule).
+MAX_LOCKUP_MINUTES: int = 7 * 24 * 60  # 10080 = 7 days
+
+
+def check_lockup_cap(d: Decision, snapshot: Snapshot) -> Check:
+    """Reject any pick whose `redeem_lockup_minutes` (from snapshot)
+    exceeds `MAX_LOCKUP_MINUTES`. Picks without surfaced lockup are
+    treated as instant-redeem and allowed through (e.g. FlexibleSaving
+    products typically have `redeem_lockup_minutes=None`)."""
+    idx = _snapshot_index(snapshot)
+    violations: list[str] = []
+    for v in d.venues:
+        meta = VENUE_REGISTRY[v.venue_id]
+        if not meta.requires_picks or not meta.snapshot_category:
+            continue
+        category_idx = idx.get(meta.snapshot_category, {})
+        for pick in v.picks:
+            summary = category_idx.get(pick.product_id)
+            if summary is None:
+                continue
+            lockup = summary.redeem_lockup_minutes
+            if lockup is not None and lockup > MAX_LOCKUP_MINUTES:
+                days = lockup // 1440
+                violations.append(
+                    f"{v.venue_id}/{pick.product_id} "
+                    f"({lockup} min ≈ {days}d, cap 7d)"
+                )
+    if violations:
+        return False, (
+            f"picks exceed {MAX_LOCKUP_MINUTES}-minute (7-day) lockup cap: "
+            f"{', '.join(violations)}"
+        )
+    return True, None
+
+
 def check_no_missing_apr_source(d: Decision, snapshot: Snapshot) -> Check:
     """A pick whose snapshot entry has `apr_source == "missing"` cannot
     be priced (yield = 0) — allowing it through would mean ranking on a
@@ -427,6 +467,7 @@ def validate(decision: Decision, snapshot: Snapshot) -> tuple[bool, list[str]]:
         check_peg_stress,
         check_product_ids_in_snapshot,
         check_no_missing_apr_source,
+        check_lockup_cap,
         check_lm_leverage_size_cap,
         check_hedges_for_non_usd_picks,
         check_funding_rate_floor,

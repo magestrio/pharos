@@ -105,10 +105,33 @@ _DECISION_TOOL = {
 }
 
 
+def _trim_snapshot_for_llm(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Strip fields the LLM has no use for to shrink the input token bill.
+
+    Snapshot on disk stays full-shape (for replay / debugging) — trimming
+    happens only at the LLM serialization boundary. Current trims:
+    - `usdc_peg.source` (always "coingecko" — static)
+    - `usdc_peg.fetched_at` (redundant — top-level `captured_at` exists)
+    Both are operational metadata; peg-stress logic in the prompt only
+    reads `deviation_bps`. Token saving: ~15 per cycle.
+
+    Future trim targets — products top-K downsize, perp_market subset for
+    disabled venues, wallet account raw-array compaction — plug in here.
+    """
+    trimmed = {**snapshot}
+    peg = trimmed.get("usdc_peg")
+    if isinstance(peg, dict):
+        trimmed["usdc_peg"] = {
+            k: v for k, v in peg.items() if k not in ("source", "fetched_at")
+        }
+    return trimmed
+
+
 def _build_user_message(
     snapshot: dict[str, Any],
     prior_decision: dict[str, Any] | None = None,
 ) -> str:
+    snapshot = _trim_snapshot_for_llm(snapshot)
     payload = json.dumps(snapshot, indent=2, sort_keys=True, default=str)
     parts = [
         "Allocate the vault for the next cycle. The current snapshot follows "

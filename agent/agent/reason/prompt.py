@@ -56,6 +56,8 @@ For venues with `requires_picks=True` (Bybit Earn categories), pickable `product
 - Stables-set `{{USDC, USD1, USDT, FDUSD, DAI, USDE}}` does NOT need a hedge (no auto-hedge emitted).
 - LM picks are LP pairs (base/quote) — quote side already hedges base on average. No separate hedge needed.
 - The same `funding_rate_7d_avg` floor and `min_notional_usd` feasibility checks apply to every non-stable Earn pick, regardless of whether it lives in OnChain or FlexibleSaving.
+- **Stables are the base layer, not the residual.** Stable picks require no hedge, no funding-cost discount, no swap leg, no exit-coordination overhead — they are always eligible regardless of how exciting the non-stable headline APRs look. A non-stable pick has to BEAT the best available stable APR by a meaningful margin (after the funding-adjusted formula AND ~10-20 bps friction for swap/hedge entry+exit) to be worth taking. If your best non-stable comes in at ~equal or only slightly better than the best stable, take the stable — the realized yield distribution is tighter and the executor path is single-step. Ignoring stables in Flex / OnChain because alts have higher headline numbers is a recurring failure mode; don't repeat it.
+- **Pre-check `perp_market[coin]` exists BEFORE picking any non-stable Earn product.** If a coin doesn't appear in `perp_market`, the executor cannot hedge it and the validator will reject the entire decision. Coins with eye-popping Flex APRs but no `{{COIN}}USDT` linear perp listing (small alts, memecoins) are un-hedgeable — silently skip them. Only non-stables with a populated `perp_market[coin]` entry are pickable in Flex / OnChain.
 
 ## Hedge feasibility (read `perp_market[coin]` before sizing)
 
