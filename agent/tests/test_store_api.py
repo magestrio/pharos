@@ -1,0 +1,297 @@
+"""Tests for the read-only FastAPI app (`data-store.5`).
+
+Uses `httpx.AsyncClient` against the FastAPI app with an injected
+test pool, so each test gets a fresh DB + a real Postgres backend
+through testcontainers. Lifespan startup sees `app.state.pool`
+pre-populated and skips opening its own.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+
+import httpx
+import pytest
+import pytest_asyncio
+from asgi_lifespan import LifespanManager
+
+from agent.api.server import build_app
+from agent.sandbox.store.pool import open_pool
+from agent.sandbox.store.schema import apply_migrations
+from agent.sandbox.store.writer import record_cycle, record_event
+
+# ───────────────── helpers ────────────────────────────────────────────
+
+
+def _outcome(
+    ts_stem: str = "20260529T160211Z",
+    *,
+    result: str = "executed",
+    wake_reason: str = "heartbeat",
+    confidence: float = 0.7,
+) -> dict:
+    return {
+        "started_at": f"2026-05-29T{ts_stem[9:11]}:{ts_stem[11:13]}:{ts_stem[13:15]}+00:00",
+        "finished_at": "2026-05-29T16:02:14.500000+00:00",
+        "snapshot_filename": f"{ts_stem}.json",
+        "decision_filename": f"{ts_stem}.json",
+        "result": result,
+        "wake_reason": wake_reason,
+        "confidence": confidence,
+        "expected_apr_pct": 4.5,
+        "actions_planned": 1,
+        "actions_executed": 1,
+        "actions": [
+            {
+                "kind": "subscribe_earn",
+                "category": "FlexibleSaving",
+                "product_id": "1131",
+                "coin": "USD1",
+                "amount": "50",
+                "status": "ok",
+                "error": None,
+            }
+        ],
+    }
+
+
+def _snapshot() -> dict:
+    return {
+        "captured_at": "2026-05-29T16:02:11+00:00",
+        "wallet": {"total_equity_usd": "200"},
+        "earn_positions": [
+            {"productId": "1131", "coin": "USD1", "amount": "100",
+             "category": "FlexibleSaving"},
+        ],
+        "lm_positions": [],
+        "alpha_positions": [],
+        "perp_positions": [],
+        "products": {},
+    }
+
+
+def _decision() -> dict:
+    return {
+        "thesis": "test",
+        "venues": [{"venue_id": "cash_usdc", "weight": 1.0}],
+        "hedges": [],
+        "confidence": 0.7,
+        "risk_flags": [],
+        "notes": [],
+        "expected_blended_apr_pct": 4.5,
+    }
+
+
+def _event(
+    kind: str = "price_drift",
+    severity: str = "P0",
+    ts: str = "2026-05-29T16:01:00+00:00",
+) -> dict:
+    return {
+        "ts": ts,
+        "kind": kind,
+        "severity": severity,
+        "position_id": "perp:TONUSDT",
+        "coin": "TON",
+        "baseline": {},
+        "current": {},
+        "threshold": {},
+        "message": f"{kind} fired",
+    }
+
+
+@pytest_asyncio.fixture
+async def api_client(fresh_db_dsn: str) -> AsyncIterator[httpx.AsyncClient]:
+    """FastAPI app wired to a fresh Postgres DB (migrations applied),
+    served via `httpx.AsyncClient` with ASGI transport. Lifespan runs
+    via `asgi-lifespan` so startup/shutdown fire properly."""
+    async with open_pool(fresh_db_dsn) as pool:
+        await apply_migrations(pool)
+        app = build_app(pool=pool)
+        async with LifespanManager(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                # Stash the pool so tests can seed data directly.
+                client._test_pool = pool  # type: ignore[attr-defined]
+                yield client
+
+
+# ───────────────── tests ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_healthz_reports_pool_open(api_client: httpx.AsyncClient) -> None:
+    resp = await api_client.get("/healthz")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {"ok": True, "pool": "open"}
+
+
+@pytest.mark.asyncio
+async def test_cycles_endpoint_returns_seeded_data(
+    api_client: httpx.AsyncClient,
+) -> None:
+    pool = api_client._test_pool  # type: ignore[attr-defined]
+    # Seed two cycles
+    await record_cycle(
+        pool,
+        outcome=_outcome("20260529T160211Z"),
+        raw_snapshot=_snapshot(),
+        raw_decision=_decision(),
+    )
+    await record_cycle(
+        pool,
+        outcome=_outcome("20260529T170000Z", result="ok"),
+        raw_snapshot=_snapshot(),
+        raw_decision=_decision(),
+    )
+    resp = await api_client.get("/cycles", params={"limit": 10})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 2
+    # DESC by started_at → 17:00 first
+    assert body[0]["cycle_ts"].startswith("2026-05-29T17:00")
+    assert body[1]["cycle_ts"].startswith("2026-05-29T16:02")
+    assert body[0]["result"] in ("executed", "ok")
+    # Payloads NOT included in the list view
+    assert "snapshot" not in body[0]
+    assert "decision" not in body[0]
+
+
+@pytest.mark.asyncio
+async def test_cycles_endpoint_wake_reason_filter(
+    api_client: httpx.AsyncClient,
+) -> None:
+    pool = api_client._test_pool  # type: ignore[attr-defined]
+    await record_cycle(
+        pool, outcome=_outcome("20260529T160000Z"),
+        raw_snapshot=_snapshot(), raw_decision=_decision(),
+    )
+    await record_cycle(
+        pool,
+        outcome=_outcome("20260529T170000Z", wake_reason="event:price_drift"),
+        raw_snapshot=_snapshot(), raw_decision=_decision(),
+    )
+    resp = await api_client.get(
+        "/cycles", params={"wake_reason_prefix": "event:"}
+    )
+    body = resp.json()
+    assert len(body) == 1
+    assert body[0]["wake_reason"] == "event:price_drift"
+
+
+@pytest.mark.asyncio
+async def test_cycle_detail_returns_snapshot_decision_positions(
+    api_client: httpx.AsyncClient,
+) -> None:
+    pool = api_client._test_pool  # type: ignore[attr-defined]
+    await record_cycle(
+        pool, outcome=_outcome("20260529T160211Z"),
+        raw_snapshot=_snapshot(), raw_decision=_decision(),
+    )
+    resp = await api_client.get("/cycles/2026-05-29T16:02:11+00:00")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["snapshot"]["wallet"]["total_equity_usd"] == "200"
+    assert body["decision"]["confidence"] == 0.7
+    assert len(body["positions"]) == 1
+    assert body["positions"][0]["coin"] == "USD1"
+    assert len(body["executions"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_cycle_detail_404_for_unknown_ts(
+    api_client: httpx.AsyncClient,
+) -> None:
+    resp = await api_client.get("/cycles/2099-01-01T00:00:00+00:00")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_events_endpoint_lists_and_filters(
+    api_client: httpx.AsyncClient,
+) -> None:
+    pool = api_client._test_pool  # type: ignore[attr-defined]
+    await record_event(pool, _event(kind="price_drift", severity="P0"))
+    await record_event(
+        pool,
+        _event(kind="funding_flip", severity="P0",
+               ts="2026-05-29T16:01:30+00:00"),
+    )
+    await record_event(
+        pool,
+        _event(kind="peg_drift", severity="P1",
+               ts="2026-05-29T16:01:45+00:00"),
+    )
+    # All events
+    resp = await api_client.get("/events")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 3
+    # Filter by kind
+    resp = await api_client.get("/events", params={"kind": "price_drift"})
+    body = resp.json()
+    assert len(body) == 1 and body[0]["kind"] == "price_drift"
+    # Filter by severity
+    resp = await api_client.get("/events", params={"severity": "P1"})
+    body = resp.json()
+    assert len(body) == 1 and body[0]["severity"] == "P1"
+
+
+@pytest.mark.asyncio
+async def test_portfolio_current_returns_latest_positions(
+    api_client: httpx.AsyncClient,
+) -> None:
+    pool = api_client._test_pool  # type: ignore[attr-defined]
+    await record_cycle(
+        pool, outcome=_outcome("20260529T160000Z"),
+        raw_snapshot=_snapshot(), raw_decision=_decision(),
+    )
+    resp = await api_client.get("/portfolio/current")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["wallet"]["total_equity_usd"] == "200"
+    assert len(body["positions"]) == 1
+    assert body["positions"][0]["coin"] == "USD1"
+
+
+@pytest.mark.asyncio
+async def test_portfolio_current_404_when_no_cycles(
+    api_client: httpx.AsyncClient,
+) -> None:
+    resp = await api_client.get("/portfolio/current")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_healthz_reports_missing_pool_when_no_db(
+    fresh_db_dsn: str,
+) -> None:
+    """An app started without an injected pool AND without
+    DATABASE_URL should still serve /healthz (degraded mode), but
+    report pool=missing — the read endpoints would 503."""
+    import os
+
+    saved = os.environ.pop("DATABASE_URL", None)
+    try:
+        app = build_app()  # no pool injected
+        async with LifespanManager(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                resp = await client.get("/healthz")
+                assert resp.status_code == 200
+                assert resp.json()["pool"] == "missing"
+                resp2 = await client.get("/cycles")
+                assert resp2.status_code == 503
+    finally:
+        if saved is not None:
+            os.environ["DATABASE_URL"] = saved
+
+
+assert datetime is not None  # silence ruff on the date helpers above
+assert UTC is not None
