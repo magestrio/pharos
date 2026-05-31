@@ -127,17 +127,45 @@ def _trim_snapshot_for_llm(snapshot: dict[str, Any]) -> dict[str, Any]:
     return trimmed
 
 
+def _format_wake_events(events: list[dict[str, Any]]) -> str:
+    """Render the watcher-fired events that triggered this cycle as the
+    "## Wake reason" section of the user message. Caller passes the raw
+    `EventRecord.model_dump()` dicts — we surface `severity`, `kind`,
+    `message` for each (the per-event `message` field is built in
+    `agent.sandbox.watcher` and already explains what crossed the
+    threshold)."""
+    lines = ["## Wake reason", ""]
+    lines.append(
+        "This cycle was triggered by the event watcher (not the heartbeat). "
+        "The following thresholds crossed since the last decided cycle — "
+        "re-evaluate the affected positions:"
+    )
+    for ev in events:
+        severity = ev.get("severity", "?")
+        kind = ev.get("kind", "?")
+        message = ev.get("message", "")
+        lines.append(f"- [{severity} {kind}] {message}")
+    return "\n".join(lines)
+
+
 def _build_user_message(
     snapshot: dict[str, Any],
     prior_decision: dict[str, Any] | None = None,
+    wake_events: list[dict[str, Any]] | None = None,
 ) -> str:
     snapshot = _trim_snapshot_for_llm(snapshot)
     payload = json.dumps(snapshot, indent=2, sort_keys=True, default=str)
-    parts = [
+    parts: list[str] = []
+    # Wake reason goes FIRST when present — we want Claude to see why
+    # this cycle exists before reading the snapshot, so the re-decide
+    # context frames the rest of the input.
+    if wake_events:
+        parts.append(_format_wake_events(wake_events))
+    parts.append(
         "Allocate the vault for the next cycle. The current snapshot follows "
         f"as JSON. Submit your decision via the `{TOOL_NAME}` tool — do not "
-        "output free text outside the tool call.",
-    ]
+        "output free text outside the tool call."
+    )
     if prior_decision is not None:
         prior_summary = _summarize_prior_decision(prior_decision)
         if prior_summary:
@@ -238,6 +266,7 @@ async def decide(
     client: anthropic.AsyncAnthropic | None = None,
     system_prompt: str | None = None,
     prior_decision: dict[str, Any] | None = None,
+    wake_events: list[dict[str, Any]] | None = None,
 ) -> Decision:
     """Run one decision cycle. Returns a validated Decision.
 
@@ -245,6 +274,10 @@ async def decide(
     user message so the model can detect whipsaw and respect the "move
     slowly" discipline in the prompt. Pass `None` to skip (first cycle
     or intentional cold start).
+
+    `wake_events`, when present, signals that this cycle was triggered
+    by the event watcher (`event-driven-rebalance.2`) rather than the
+    heartbeat. Plumbed in `.3`; rendered in the user message in `.4`.
     """
     client = client or anthropic.AsyncAnthropic()
     system_prompt = system_prompt or build_system_prompt()
@@ -264,7 +297,9 @@ async def decide(
         messages=[
             {
                 "role": "user",
-                "content": _build_user_message(snapshot, prior_decision),
+                "content": _build_user_message(
+                    snapshot, prior_decision, wake_events=wake_events
+                ),
             }
         ],
     )
@@ -281,10 +316,15 @@ def write_decision(
     captured_at: datetime | None = None,
     decisions_dir: Path = DECISION_DIR,
     prompt_version: str = "reason.prompt",
+    wake_events: list[dict[str, Any]] | None = None,
 ) -> Path:
     """Persist the decision (and its validator outcome, if known) next to
     the snapshot. File naming pairs decision↔snapshot via shared UTC
     timestamp: `decisions/<snapshot-ts>.json`.
+
+    `wake_events`, when provided, stamps the wake reason into `_meta` so
+    a downstream operator (and `.8` cost tracking) can attribute the
+    cycle to "event:<kind>" vs "heartbeat".
     """
     decisions_dir.mkdir(parents=True, exist_ok=True)
     ts = (captured_at or datetime.now(UTC)).strftime("%Y%m%dT%H%M%SZ")
@@ -296,6 +336,13 @@ def write_decision(
         "model": MODEL,
         "prompt_version": prompt_version,
     }
+    if wake_events:
+        payload["_meta"]["wake_events"] = wake_events
+        payload["_meta"]["wake_reason"] = (
+            "event:" + ",".join(sorted({e.get("kind", "?") for e in wake_events}))
+        )
+    else:
+        payload["_meta"]["wake_reason"] = "heartbeat"
     if validator_result is not None:
         ok, errors = validator_result
         payload["_validator"] = {"ok": ok, "errors": errors}

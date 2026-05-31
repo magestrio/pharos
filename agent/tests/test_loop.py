@@ -13,7 +13,7 @@ import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -27,6 +27,19 @@ from agent.sandbox.snapshot import (
     UsdcPegSnapshot,
     WalletSnapshot,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stub_watcher_baseline_update():
+    """`event-driven-rebalance.3` plumbed an `update_baseline_from_snapshot`
+    call inside `run_one_cycle` (writes `state/watcher-baseline.json`).
+    Stub it out across this file so existing cycle/loop tests don't
+    pollute the on-disk state."""
+    with patch(
+        "agent.sandbox.loop.update_baseline_from_snapshot",
+        lambda *_a, **_kw: None,
+    ):
+        yield
 
 
 def _snapshot(total_equity_usd: str = "100") -> Snapshot:
@@ -115,7 +128,7 @@ async def test_run_one_cycle_happy_path_dry_run(tmp_path: Path) -> None:
         ),
         patch(
             "agent.sandbox.loop.write_decision",
-            lambda d, sp: tmp_path / "decision.json",
+            lambda d, sp, **_kw: tmp_path / "decision.json",
         ),
     ):
         # write a placeholder snapshot json so `snap_path.read_text()` succeeds
@@ -149,7 +162,7 @@ async def test_run_one_cycle_validator_failure_short_circuits(tmp_path: Path) ->
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=bad_decision)),
         patch(
             "agent.sandbox.loop.write_decision",
-            lambda d, sp: tmp_path / "decision.json",
+            lambda d, sp, **_kw: tmp_path / "decision.json",
         ),
     ):
         (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
@@ -179,7 +192,7 @@ async def test_run_one_cycle_no_actions_when_book_zero(tmp_path: Path) -> None:
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=decision)),
         patch(
             "agent.sandbox.loop.write_decision",
-            lambda d, sp: tmp_path / "decision.json",
+            lambda d, sp, **_kw: tmp_path / "decision.json",
         ),
     ):
         (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
@@ -226,7 +239,7 @@ async def test_run_one_cycle_live_without_approval_downgrades(tmp_path: Path) ->
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=decision)),
         patch(
             "agent.sandbox.loop.write_decision",
-            lambda d, sp: tmp_path / "decision.json",
+            lambda d, sp, **_kw: tmp_path / "decision.json",
         ),
         patch(
             "agent.sandbox.loop.request_approval",
@@ -288,7 +301,7 @@ async def test_run_loop_once_executes_single_cycle(tmp_path: Path) -> None:
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=decision)),
         patch(
             "agent.sandbox.loop.write_decision",
-            lambda d, sp: tmp_path / "decision.json",
+            lambda d, sp, **_kw: tmp_path / "decision.json",
         ),
     ):
         (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
@@ -364,17 +377,16 @@ async def test_run_loop_aborts_on_critical_permission_denied(tmp_path: Path) -> 
         patch(
             "agent.sandbox.loop.BybitClient.from_settings",
             return_value=bybit_client,
-        ),
+        ),pytest.raises(SystemExit) as excinfo
     ):
-        with pytest.raises(SystemExit) as excinfo:
-            await run_loop(
-                interval_seconds=60.0,
-                live=False,
-                yes=False,
-                min_confidence=0.6,
-                once=True,
-                cycle_log_path=log_path,
-            )
+        await run_loop(
+            interval_seconds=60.0,
+            live=False,
+            yes=False,
+            min_confidence=0.6,
+            once=True,
+            cycle_log_path=log_path,
+        )
     assert "wallet_balance" in str(excinfo.value)
     # No cycle should have run — log either absent or empty.
     assert not log_path.exists() or log_path.read_text().strip() == ""
@@ -411,7 +423,7 @@ async def test_run_loop_continues_on_informational_probe_failure(tmp_path: Path)
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=decision)),
         patch(
             "agent.sandbox.loop.write_decision",
-            lambda d, sp: tmp_path / "decision.json",
+            lambda d, sp, **_kw: tmp_path / "decision.json",
         ),
     ):
         (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
@@ -426,3 +438,594 @@ async def test_run_loop_continues_on_informational_probe_failure(tmp_path: Path)
         )
     assert log_path.is_file()
     assert len(log_path.read_text().strip().splitlines()) == 1
+
+
+# ───────────────── event-driven-rebalance.3 plumbing ──────────────────
+
+
+def test_format_wake_events_renders_severity_kind_message() -> None:
+    from agent.sandbox.decide import _format_wake_events
+
+    events = [
+        {"severity": "P0", "kind": "price_drift",
+         "message": "TON mark drifted -7.30%"},
+        {"severity": "P0", "kind": "funding_flip",
+         "message": "TON funding flipped 0.0005 → -0.0003"},
+    ]
+    out = _format_wake_events(events)
+    assert out.startswith("## Wake reason")
+    assert "[P0 price_drift] TON mark drifted -7.30%" in out
+    assert "[P0 funding_flip] TON funding flipped" in out
+
+
+def test_build_user_message_includes_wake_section_first() -> None:
+    """When wake_events present, the section is the FIRST block of the
+    user message — Claude reads it before the snapshot JSON."""
+    from agent.sandbox.decide import _build_user_message
+
+    events = [
+        {"severity": "P0", "kind": "price_drift", "message": "TON -7%"}
+    ]
+    msg = _build_user_message({"foo": "bar"}, wake_events=events)
+    wake_idx = msg.find("## Wake reason")
+    allocate_idx = msg.find("Allocate the vault")
+    assert wake_idx == 0
+    assert wake_idx < allocate_idx
+    assert "[P0 price_drift] TON -7%" in msg
+
+
+def test_build_user_message_no_wake_section_when_empty() -> None:
+    from agent.sandbox.decide import _build_user_message
+
+    msg_none = _build_user_message({"foo": "bar"}, wake_events=None)
+    msg_empty = _build_user_message({"foo": "bar"}, wake_events=[])
+    assert "## Wake reason" not in msg_none
+    assert "## Wake reason" not in msg_empty
+    # Standard prompt still comes first
+    assert msg_none.startswith("Allocate the vault")
+    assert msg_empty.startswith("Allocate the vault")
+
+
+def test_write_decision_persists_wake_events(tmp_path: Path) -> None:
+    """write_decision stamps wake_events + wake_reason into `_meta` so
+    `.8` cost tracking can attribute the cycle."""
+    from agent.sandbox.decide import write_decision
+
+    decision = _decision_clean()
+    snap_path = tmp_path / "snap.json"
+    snap_path.write_text("{}")
+    events = [
+        {"kind": "price_drift", "severity": "P0", "message": "x"},
+        {"kind": "funding_flip", "severity": "P0", "message": "y"},
+    ]
+    out = write_decision(
+        decision,
+        snap_path,
+        decisions_dir=tmp_path,
+        wake_events=events,
+    )
+    payload = json.loads(out.read_text())
+    assert payload["_meta"]["wake_events"] == events
+    assert payload["_meta"]["wake_reason"] == "event:funding_flip,price_drift"
+
+
+def test_write_decision_defaults_wake_reason_heartbeat(tmp_path: Path) -> None:
+    from agent.sandbox.decide import write_decision
+
+    decision = _decision_clean()
+    snap_path = tmp_path / "snap.json"
+    snap_path.write_text("{}")
+    out = write_decision(decision, snap_path, decisions_dir=tmp_path)
+    payload = json.loads(out.read_text())
+    assert payload["_meta"]["wake_reason"] == "heartbeat"
+    assert "wake_events" not in payload["_meta"]
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_stamps_wake_reason_heartbeat(tmp_path: Path) -> None:
+    """Default cycle (no wake_events) → wake_reason='heartbeat' in outcome."""
+    bybit = AsyncMock()
+    anthropic_client = AsyncMock()
+    snap = _snapshot()
+    decision = _decision_clean()
+    with (
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=decision)),
+        patch(
+            "agent.sandbox.loop.write_decision",
+            lambda d, sp, **_kw: tmp_path / "decision.json",
+        ),
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        outcome = await run_one_cycle(
+            bybit, anthropic_client, live=False, yes=False, min_confidence=0.6
+        )
+    assert outcome["wake_reason"] == "heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_passes_wake_events_through(tmp_path: Path) -> None:
+    """wake_events passed in → decide() called with them + outcome
+    wake_reason="event:price_drift"."""
+    bybit = AsyncMock()
+    anthropic_client = AsyncMock()
+    snap = _snapshot()
+    decision = _decision_clean()
+    decide_mock = AsyncMock(return_value=decision)
+    write_decision_mock = MagicMock(
+        side_effect=lambda d, sp, **_kw: tmp_path / "decision.json"
+    )
+
+    fake_events = [
+        {"kind": "price_drift", "severity": "P0", "message": "TON -7%"}
+    ]
+    with (
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop.decide", decide_mock),
+        patch(
+            "agent.sandbox.loop.write_decision",
+            write_decision_mock,
+        ),
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        outcome = await run_one_cycle(
+            bybit,
+            anthropic_client,
+            live=False,
+            yes=False,
+            min_confidence=0.6,
+            wake_events=fake_events,
+        )
+    assert outcome["wake_reason"] == "event:price_drift"
+    # decide called with wake_events kwarg
+    assert decide_mock.call_args.kwargs.get("wake_events") == fake_events
+    # write_decision called with wake_events kwarg
+    assert write_decision_mock.call_args.kwargs.get("wake_events") == fake_events
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_updates_watcher_baseline(tmp_path: Path) -> None:
+    """run_one_cycle MUST call update_baseline_from_snapshot after the
+    snapshot writes, even when validator later rejects. Critical for
+    keeping the watcher in sync with real Bybit holdings (`.3` design).
+    """
+    bybit = AsyncMock()
+    anthropic_client = AsyncMock()
+    snap = _snapshot()
+    bad_decision = _decision_with_risk_flag()
+    baseline_path = tmp_path / "baseline.json"
+    baseline_mock = MagicMock(side_effect=lambda *a, **kw: None)
+
+    with (
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=bad_decision)),
+        patch(
+            "agent.sandbox.loop.write_decision",
+            lambda d, sp, **_kw: tmp_path / "decision.json",
+        ),
+        patch("agent.sandbox.loop.update_baseline_from_snapshot", baseline_mock),
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"earn_positions": []}))
+        outcome = await run_one_cycle(
+            bybit,
+            anthropic_client,
+            live=False,
+            yes=False,
+            min_confidence=0.6,
+            watcher_baseline_path=baseline_path,
+        )
+    assert outcome["result"] == "skipped:invalid"
+    # Baseline updated even on rejection
+    baseline_mock.assert_called_once()
+    assert baseline_mock.call_args.kwargs["path"] == baseline_path
+
+
+@pytest.mark.asyncio
+async def test_run_loop_watcher_wakes_early_on_p0_event(tmp_path: Path) -> None:
+    """With --enable-watcher, the watcher task setting wake_event short-
+    circuits the inter-cycle sleep and a second cycle fires within ms,
+    NOT after `interval_seconds`."""
+    from agent.sandbox.watcher import EventRecord
+
+    log_path = tmp_path / "cycle_log.jsonl"
+    snap = _snapshot()
+    decision = _decision_clean()
+
+    bybit_client = AsyncMock()
+    bybit_client.__aenter__.return_value = bybit_client
+    bybit_client.permission_probe = AsyncMock(return_value=_ok_probe())
+    anthropic_client = AsyncMock()
+    anthropic_client.__aenter__.return_value = anthropic_client
+
+    # Watcher fakery: first poll returns one P0 event then stops firing
+    poll_calls = {"n": 0}
+
+    async def _fake_poll(_client, _baseline):
+        poll_calls["n"] += 1
+        if poll_calls["n"] == 1:
+            return [
+                EventRecord(
+                    ts=datetime.now(UTC),
+                    kind="price_drift",
+                    severity="P0",
+                    coin="TON",
+                    message="TON drifted",
+                )
+            ]
+        return []
+
+    # Stop after the second cycle finishes — set stop_event from inside
+    # `decide` so we have deterministic control.
+    cycles = {"n": 0}
+    stop_event = asyncio.Event()
+
+    async def _decide(*_a, **_kw):
+        cycles["n"] += 1
+        if cycles["n"] >= 2:
+            stop_event.set()
+        return decision
+
+    with (
+        patch(
+            "agent.sandbox.loop.anthropic.AsyncAnthropic",
+            return_value=anthropic_client,
+        ),
+        patch(
+            "agent.sandbox.loop.BybitClient.from_settings",
+            return_value=bybit_client,
+        ),
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop.decide", _decide),
+        patch(
+            "agent.sandbox.loop.write_decision",
+            lambda d, sp, **_kw: tmp_path / "decision.json",
+        ),
+        patch("agent.sandbox.loop.watcher_poll_once", _fake_poll),
+        patch(
+            "agent.sandbox.loop.read_watcher_baseline",
+            lambda _p: __import__(
+                "agent.sandbox.watcher", fromlist=["WatcherBaseline"]
+            ).WatcherBaseline(captured_at=datetime.now(UTC)),
+        ),
+        patch("agent.sandbox.loop.write_watcher_events", lambda *a, **kw: None),
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        # interval_seconds=60 is intentional — if the wake path failed,
+        # this test would hang for 60s. Pytest's default timeout would
+        # then kill it. With wake_event firing, second cycle should
+        # start within ~100ms of first cycle finishing.
+        await asyncio.wait_for(
+            run_loop(
+                interval_seconds=60.0,
+                live=False,
+                yes=False,
+                min_confidence=0.6,
+                once=False,
+                cycle_log_path=log_path,
+                stop_event=stop_event,
+                enable_watcher=True,
+                watcher_interval_seconds=0.01,
+                watcher_baseline_path=tmp_path / "baseline.json",
+                watcher_events_dir=tmp_path / "events",
+            ),
+            timeout=5.0,
+        )
+
+    lines = log_path.read_text().strip().splitlines()
+    assert len(lines) >= 2, "watcher wake should have driven a second cycle"
+    # Second cycle's wake_reason reflects the event
+    second = json.loads(lines[1])
+    assert second["wake_reason"].startswith("event:")
+
+
+@pytest.mark.asyncio
+async def test_run_loop_watcher_disabled_by_default(tmp_path: Path) -> None:
+    """Without --enable-watcher, no watcher task spawns: a wake_event
+    set externally has no observable effect on cadence."""
+    log_path = tmp_path / "cycle_log.jsonl"
+    snap = _snapshot()
+    decision = _decision_clean()
+
+    bybit_client = AsyncMock()
+    bybit_client.__aenter__.return_value = bybit_client
+    bybit_client.permission_probe = AsyncMock(return_value=_ok_probe())
+    anthropic_client = AsyncMock()
+    anthropic_client.__aenter__.return_value = anthropic_client
+
+    poll_calls = {"n": 0}
+
+    async def _fake_poll(_client, _baseline):
+        poll_calls["n"] += 1
+        return []
+
+    with (
+        patch(
+            "agent.sandbox.loop.anthropic.AsyncAnthropic",
+            return_value=anthropic_client,
+        ),
+        patch(
+            "agent.sandbox.loop.BybitClient.from_settings",
+            return_value=bybit_client,
+        ),
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=decision)),
+        patch(
+            "agent.sandbox.loop.write_decision",
+            lambda d, sp, **_kw: tmp_path / "decision.json",
+        ),
+        patch("agent.sandbox.loop.watcher_poll_once", _fake_poll),
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        await run_loop(
+            interval_seconds=60.0,
+            live=False,
+            yes=False,
+            min_confidence=0.6,
+            once=True,
+            cycle_log_path=log_path,
+            # default enable_watcher=False
+        )
+    # Watcher should NOT have polled even once
+    assert poll_calls["n"] == 0
+
+
+# ─────────── event-driven-rebalance.7 — end-to-end integration ────────
+
+
+@pytest.mark.asyncio
+async def test_e2e_price_drop_drives_event_driven_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: baseline has a TON perp at $1.78 → tickers come back
+    at $1.65 → real `watcher_poll_once` detects price_drift (P0) →
+    `wake_event` set → main loop wakes early → second cycle's outcome
+    carries `wake_reason="event:price_drift"` and `decide()` got the
+    event payload.
+
+    Differs from `.3` test_run_loop_watcher_wakes_early_on_p0_event:
+    that one stubs `watcher_poll_once` directly. This one exercises the
+    full path through the actual watcher logic — checker functions,
+    ticker fan-out, event emission to JSONL.
+    """
+    from agent.sandbox import watcher as watcher_module
+    from agent.sandbox.watcher import HeldPosition, WatcherBaseline, write_baseline
+
+    log_path = tmp_path / "cycle_log.jsonl"
+    baseline_path = tmp_path / "watcher-baseline.json"
+    events_dir = tmp_path / "events"
+
+    # Seed baseline ON DISK before run_loop starts — the watcher reads
+    # from this path on every poll.
+    write_baseline(
+        WatcherBaseline(
+            captured_at=datetime.now(UTC),
+            positions=[
+                HeldPosition(
+                    position_id="perp:TONUSDT",
+                    venue="perp",
+                    coin="TON",
+                    entry_mark_price=Decimal("1.78"),
+                    last_funding_rate=Decimal("0.0002"),
+                )
+            ],
+            known_h2e_product_ids=[],
+        ),
+        baseline_path,
+    )
+
+    snap = _snapshot()
+    decision = _decision_clean()
+
+    class _FakeTicker:
+        # `poll_once` reads `t.symbol` via getattr() THEN falls back to
+        # `t.model_dump()` for the rest. Need both surfaces.
+        def __init__(self, symbol: str, mark: str, funding: str):
+            self.symbol = symbol
+            self.markPrice = mark
+            self.fundingRate = funding
+
+        def model_dump(self) -> dict[str, str]:
+            return {
+                "symbol": self.symbol,
+                "markPrice": self.markPrice,
+                "fundingRate": self.fundingRate,
+            }
+
+    bybit_client = AsyncMock()
+    bybit_client.__aenter__.return_value = bybit_client
+    bybit_client.permission_probe = AsyncMock(return_value=_ok_probe())
+    # Ticker fan-out: mark dropped from 1.78 → 1.65 (-7.3% > 5% threshold);
+    # funding unchanged so only price_drift fires.
+    bybit_client.get_tickers = AsyncMock(
+        return_value=[_FakeTicker("TONUSDT", "1.65", "0.0002")]
+    )
+    bybit_client.list_hold_to_earn_products = AsyncMock(return_value=[])
+    anthropic_client = AsyncMock()
+    anthropic_client.__aenter__.return_value = anthropic_client
+
+    # Stop after the second cycle fires — captured via decide hook.
+    cycles = {"n": 0, "calls": []}
+    stop_event = asyncio.Event()
+
+    async def _decide(*_a, **kw):
+        cycles["n"] += 1
+        cycles["calls"].append(kw.get("wake_events"))
+        if cycles["n"] >= 2:
+            stop_event.set()
+        return decision
+
+    # No-op peg fetch so we don't spam CoinGecko in CI and so peg_drift
+    # doesn't also fire and mask the assertions.
+    async def _peg_stub() -> Decimal:
+        return Decimal("1.0")
+
+    monkeypatch.setattr(watcher_module, "_fetch_peg_usd", _peg_stub)
+
+    with (
+        patch(
+            "agent.sandbox.loop.anthropic.AsyncAnthropic",
+            return_value=anthropic_client,
+        ),
+        patch(
+            "agent.sandbox.loop.BybitClient.from_settings",
+            return_value=bybit_client,
+        ),
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop.decide", _decide),
+        patch(
+            "agent.sandbox.loop.write_decision",
+            lambda d, sp, **_kw: tmp_path / "decision.json",
+        ),
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        await asyncio.wait_for(
+            run_loop(
+                interval_seconds=60.0,
+                live=False,
+                yes=False,
+                min_confidence=0.6,
+                once=False,
+                cycle_log_path=log_path,
+                stop_event=stop_event,
+                enable_watcher=True,
+                watcher_interval_seconds=0.01,
+                watcher_baseline_path=baseline_path,
+                watcher_events_dir=events_dir,
+            ),
+            timeout=5.0,
+        )
+
+    # ── Assertions on the cycle log ────────────────────────────────
+    lines = log_path.read_text().strip().splitlines()
+    assert len(lines) >= 2, "watcher wake should have driven a second cycle"
+    second = json.loads(lines[1])
+    assert second["wake_reason"] == "event:price_drift", (
+        f"expected event-driven second cycle, got {second.get('wake_reason')!r}"
+    )
+
+    # ── decide() received the wake_events ─────────────────────────
+    # First call = heartbeat (None); second = wake (non-empty list with
+    # price_drift kind).
+    second_call_events = cycles["calls"][1]
+    assert second_call_events, "decide() did not receive wake_events on cycle 2"
+    kinds = {e.get("kind") for e in second_call_events}
+    assert "price_drift" in kinds
+
+    # ── Event was persisted to JSONL ──────────────────────────────
+    jsonl_files = list(events_dir.glob("*.jsonl"))
+    assert jsonl_files, "watcher did not write any event JSONL"
+    raw_events = jsonl_files[0].read_text().strip().splitlines()
+    assert raw_events
+    parsed = json.loads(raw_events[0])
+    assert parsed["kind"] == "price_drift"
+    assert parsed["severity"] == "P0"
+    assert parsed["coin"] == "TON"
+
+
+# ─────────── data-store.9 — DB writer failure isolation ────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_loop_continues_when_db_record_cycle_raises(
+    tmp_path: Path,
+) -> None:
+    """If the cycle store throws (Postgres down, schema mismatch, etc.)
+    the file-based path MUST stay intact: cycle_log.jsonl still gets
+    the row, the loop does not crash. Files are source of truth; DB
+    is a derived view.
+
+    Patches `_record_cycle_from_outcome` to raise on first call so we
+    don't need a real Postgres fixture — the contract being tested is
+    the run_loop try/except, not the writer."""
+    log_path = tmp_path / "cycle_log.jsonl"
+    snap = _snapshot()
+    decision = _decision_clean()
+
+    bybit_client = AsyncMock()
+    bybit_client.__aenter__.return_value = bybit_client
+    bybit_client.permission_probe = AsyncMock(return_value=_ok_probe())
+    anthropic_client = AsyncMock()
+    anthropic_client.__aenter__.return_value = anthropic_client
+
+    # Pretend the pool is live (truthy) so the `if store_pool is not None`
+    # branch runs and our patched record_cycle_from_outcome fires.
+    fake_pool = MagicMock()
+
+    record_calls = {"n": 0}
+
+    async def _exploding_record(*_a, **_kw):
+        record_calls["n"] += 1
+        raise RuntimeError("simulated DB outage")
+
+    with (
+        patch(
+            "agent.sandbox.loop.anthropic.AsyncAnthropic",
+            return_value=anthropic_client,
+        ),
+        patch(
+            "agent.sandbox.loop.BybitClient.from_settings",
+            return_value=bybit_client,
+        ),
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=decision)),
+        patch(
+            "agent.sandbox.loop.write_decision",
+            lambda d, sp, **_kw: tmp_path / "decision.json",
+        ),
+        patch("agent.sandbox.loop._record_cycle_from_outcome", _exploding_record),
+        # Inject the fake pool by intercepting open_pool so the
+        # `if enable_store` branch in run_loop produces a non-None
+        # store_pool without needing a real DB.
+        patch(
+            "agent.sandbox.loop.open_pool",
+            lambda *_a, **_kw: _async_cm_yielding(fake_pool),
+        ),
+        patch(
+            "agent.sandbox.loop.apply_migrations",
+            AsyncMock(return_value=[]),
+        ),
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        await run_loop(
+            interval_seconds=60.0,
+            live=False,
+            yes=False,
+            min_confidence=0.6,
+            once=True,
+            cycle_log_path=log_path,
+            enable_store=True,
+            database_url="postgres://fake/none",
+        )
+
+    # The DB raised → but cycle still ran + cycle_log written
+    assert record_calls["n"] == 1
+    assert log_path.is_file()
+    line = log_path.read_text().strip().splitlines()[0]
+    entry = json.loads(line)
+    assert entry["result"] in ("ok", "no_actions")
+
+
+def _async_cm_yielding(value):
+    """Tiny helper: async context manager that yields a fixed value.
+    Used to mock `open_pool` without spinning up a real Postgres."""
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _cm():
+        yield value
+
+    return _cm()

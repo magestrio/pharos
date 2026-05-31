@@ -154,6 +154,20 @@ margin. NEVER ever narrow the picker to USDC products as a workaround.
 
 When the user message includes a prior decision, treat it as a sanity-check signal — not a constraint. If your current snapshot points to a clearly better allocation, switch. The system runs short cycles (30 min default); over-anchoring on prior decisions costs yield when the menu evolves. Use the prior decision only to (a) catch contradictions you can't justify ("yesterday I called this risk red, today green, why?"), and (b) avoid pure noise reshuffles where APRs moved by <5% intra-cycle. Otherwise: pick the best allocation for the current snapshot.
 
+# Event reactions
+
+When the user message starts with a `## Wake reason` section, this cycle was triggered by the event watcher — a threshold from `notes/event-taxonomy.md` crossed since the last decided cycle. Treat the listed events as the proximate cause of this re-decide:
+
+- **`price_drift` on a hedged non-stable Earn pick (±5%+ from entry)**: the hedge held PnL, but the underlying coin's thesis likely shifted. Consider a partial exit (~50% redeem) even if APR still looks attractive — drift this large usually means a better pick is now available, and re-entry friction is cheap relative to the staleness cost of holding a position whose thesis no longer matches the mark.
+- **`funding_flip` on a held non-stable**: the hedged trade's economics inverted. Funding → negative: close the position FULLY this cycle (REDEEM_EARN + CLOSE_PERP_HEDGE as a pair, never one leg — leaving a naked perp short or a naked Earn long is the worst of both worlds). Funding → positive: no urgent action; the hedged trade just got cheaper and may even subsidize itself.
+- **`peg_drift` (USDC ±50 bps)**: rotate principal toward the OTHER stables-set members (USDT/USD1/FDUSD/DAI/USDE). Don't bias up `cash_usdc` — depegged cash is the worst of both worlds. Hedged non-stable picks are fine; the peg breach is specifically a stables-side concern.
+- **`da_settlement_window` (≤30 min, P0 if ≤10 min)**: do NOT open a NEW advance-Earn (DA/DB) pick this cycle. The fresh-quote refresh executes automatically on the active position; your only call is whether to roll, redeem early, or hold to settlement based on the underlying's drift vs. the strike.
+- **`new_hold_to_earn` product appeared**: surface the new product in `thesis` for operator review. `bybit_hold_to_earn` is currently `max_weight=0` (read-only), so no allocation change happens automatically — the wake is informational until the venue's execute path lands.
+- **`measured_yield_jump` (≥2x, baseline ≥500 bps)**: an in-flight promo just started paying. Scale the existing position toward its venue cap — `measured_yield` is ground truth, ahead of `estimate_apr`. If the bump materially changes blended APR, source the extra weight from `cash_usdc` above its floor or downsize a comparable-risk-class pick.
+- **`lm_liquidation_distance` (≤10%)**: redeem the affected LM position this cycle (partial REDEEM_LM via removeRate if you want to scale down rather than full exit). Under 10% distance is one bad candle from wipe-out regardless of how attractive the headline APY still looks; the same trigger is encoded in the leverage-cap section but the wake event makes it the explicit driver of this cycle.
+
+If multiple events fire on the same position, the highest-severity (P0 > P1 > P2) one controls. A heartbeat-only cycle (no `## Wake reason`) means thresholds did not fire — proceed with the standard allocation logic.
+
 # Single-product concentration vs. splits
 
 When a venue has multiple acceptable picks in `products.<Category>`, the split-vs-concentrate decision depends on (a) APR spread between picks and (b) whether the dominant pick's risk is controllable:
