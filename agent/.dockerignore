@@ -1,0 +1,26 @@
+# Cycle data — written at runtime, mounted as named volumes.
+agent/sandbox/snapshots/
+agent/sandbox/decisions/
+agent/sandbox/executions/
+agent/sandbox/captures/
+agent/sandbox/state/
+agent/sandbox/events/
+agent/sandbox/cycle_log.jsonl
+agent/sandbox/sandbox-loop.log
+sandbox-loop.log
+
+# Python + tooling.
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Tests + dev scratch — keep image lean, agent runs prod code only.
+tests/
+scripts/
+
+# IDE / editor.
+.vscode/
+.idea/

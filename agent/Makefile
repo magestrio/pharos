@@ -1,5 +1,5 @@
 run:
-	uv run python -m agent.main
+	uv run python -m agent.sandbox.loop --enable-store --enable-watcher
 
 api:
 	uv run uvicorn agent.api.server:app --reload

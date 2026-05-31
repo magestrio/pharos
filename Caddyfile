@@ -1,0 +1,27 @@
+# Auto-TLS via Let's Encrypt. Domain + email come from env (compose.yml).
+# Tighten CORS later if the web frontend ever moves off vercel.app.
+
+{
+	email {$CADDY_EMAIL}
+}
+
+{$AGENT_API_DOMAIN} {
+	encode zstd gzip
+
+	# Open CORS — API is read-only history + portfolio, no secrets.
+	header {
+		Access-Control-Allow-Origin "*"
+		Access-Control-Allow-Methods "GET, OPTIONS"
+		Access-Control-Allow-Headers "Content-Type"
+	}
+
+	@options method OPTIONS
+	respond @options 204
+
+	reverse_proxy api:8000
+
+	log {
+		output stdout
+		format console
+	}
+}

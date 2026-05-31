@@ -1,0 +1,113 @@
+# Hetzner deploy: postgres + agent loop + read-only API + Caddy TLS.
+#
+# Bring up:
+#   docker compose up -d --build
+#
+# Tail agent logs:
+#   docker compose logs -f agent
+#
+# One-shot backfill from files into Postgres (after wiping db):
+#   docker compose run --rm agent python -m agent.sandbox.store.backfill
+#
+# `--live` execution: switch the agent command from `--live false` (default
+# dry-run, omitted) to `--live --yes`. NEVER flip live on without a manual
+# audit of the latest cycle.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vault8004
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required in .env}
+      POSTGRES_DB: vault8004
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # 127.0.0.1 binding: host-only, never reachable from the public IP.
+    # Lets local dev (agent/api running natively via uv) and host psql
+    # talk to the DB; the agent/api compose services still use the
+    # internal `postgres` hostname over the docker network.
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vault8004 -d vault8004"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  agent:
+    build:
+      context: ./agent
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://vault8004:${POSTGRES_PASSWORD}@postgres:5432/vault8004
+    command: >
+      python -m agent.sandbox.loop
+      --interval 14400
+      --enable-store
+      --enable-watcher
+      --watcher-interval 120
+    volumes:
+      - sandbox_snapshots:/app/agent/sandbox/snapshots
+      - sandbox_decisions:/app/agent/sandbox/decisions
+      - sandbox_executions:/app/agent/sandbox/executions
+      - sandbox_captures:/app/agent/sandbox/captures
+      - sandbox_state:/app/agent/sandbox/state
+      - sandbox_events:/app/agent/sandbox/events
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ./agent
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://vault8004:${POSTGRES_PASSWORD}@postgres:5432/vault8004
+    command: >
+      uvicorn agent.api.server:app
+      --host 0.0.0.0
+      --port 8000
+      --proxy-headers
+      --forwarded-allow-ips=*
+    expose:
+      - "8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      AGENT_API_DOMAIN: ${AGENT_API_DOMAIN:?AGENT_API_DOMAIN required in .env (e.g. api.vault8004.xyz)}
+      CADDY_EMAIL: ${CADDY_EMAIL:?CADDY_EMAIL required in .env for Let'\''s Encrypt}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  sandbox_snapshots:
+  sandbox_decisions:
+  sandbox_executions:
+  sandbox_captures:
+  sandbox_state:
+  sandbox_events:
+  caddy_data:
+  caddy_config:
