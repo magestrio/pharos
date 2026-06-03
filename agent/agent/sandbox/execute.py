@@ -514,27 +514,42 @@ def diff_to_actions(
         idx_offset=len(all_pids),
         total_book_usd=total_book_usd,
     )
+    # Earn swaps planned FIRST so the hedge-swap sizer can see total
+    # USDT demand (perp margin + non-stable Buy demand) and produce a
+    # single USDC→USDT swap that funds BOTH. Pre-fix the hedge swap
+    # covered only perp margin shortfall against UNIFIED USDT, leaving
+    # Buy swaps to find USDT on their own — when none was left in
+    # UNIFIED, the USDT budget cap dropped the Buy and cascaded the
+    # whole non-stable pick.
+    #
+    # NB: the FINAL action list still runs `hedge_swaps → earn_swaps →
+    # hedge_opens`, so the planning order swap here doesn't change the
+    # dispatch contract. We size earn_swaps at a provisional offset
+    # block and let hedge_swaps slot in after when we know its count.
+    earn_swaps = _swap_actions_for_earn_picks(
+        snapshot,
+        subscribes,
+        redeems,
+        snapshot_ts,
+        # Provisional offset; we reserve a count-of-1 hedge swap slot
+        # at the front of the swap block. Hedge swaps in practice are
+        # always 0 or 1 (single USDC→USDT consolidation), so this
+        # avoids any orderLinkId collision.
+        idx_offset=(
+            len(all_pids) + len(hedge_closes) + len(hedge_opens) + 1
+        ),
+    )
+    buy_usdt_demand = sum(
+        (a.amount for a in earn_swaps if a.side == "Buy"),
+        Decimal(0),
+    )
     hedge_swaps = _swap_actions_for_hedges(
         snapshot,
         hedge_opens,
         hedge_closes,
         snapshot_ts,
         idx_offset=len(all_pids) + len(hedge_closes) + len(hedge_opens),
-    )
-    # Earn-pick coin swaps run AFTER hedge swaps so the cursor doesn't
-    # collide on orderLinkId and so subscribes coming next see the
-    # wallet already topped up with their target coins.
-    earn_swaps = _swap_actions_for_earn_picks(
-        snapshot,
-        subscribes,
-        redeems,
-        snapshot_ts,
-        idx_offset=(
-            len(all_pids)
-            + len(hedge_closes)
-            + len(hedge_opens)
-            + len(hedge_swaps)
-        ),
+        extra_usdt_demand=buy_usdt_demand,
     )
     # USDC budget enforcement (2026-06-03). Hedge swaps and earn swaps
     # are planned independently — both spend USDC. On a small vault
@@ -609,12 +624,19 @@ def diff_to_actions(
             else:
                 new_hedge_opens.append(a)
         hedge_opens = new_hedge_opens
+        # Re-size the consolidated USDT swap after the cascade — Buy
+        # swaps may have been dropped, perp opens too, so demand changed.
+        buy_usdt_demand = sum(
+            (a.amount for a in earn_swaps if a.side == "Buy"),
+            Decimal(0),
+        )
         hedge_swaps = _swap_actions_for_hedges(
             snapshot,
             hedge_opens,
             hedge_closes,
             snapshot_ts,
             idx_offset=len(all_pids) + len(hedge_closes) + len(hedge_opens),
+            extra_usdt_demand=buy_usdt_demand,
         )
 
     # USDT budget enforcement (2026-06-03). Mirror of the USDC pass but
@@ -684,12 +706,19 @@ def diff_to_actions(
             else:
                 new_hedge_opens.append(a)
         hedge_opens = new_hedge_opens
+        # Re-size the consolidated USDT swap after the cascade — Buy
+        # swaps may have been dropped, perp opens too, so demand changed.
+        buy_usdt_demand = sum(
+            (a.amount for a in earn_swaps if a.side == "Buy"),
+            Decimal(0),
+        )
         hedge_swaps = _swap_actions_for_hedges(
             snapshot,
             hedge_opens,
             hedge_closes,
             snapshot_ts,
             idx_offset=len(all_pids) + len(hedge_closes) + len(hedge_opens),
+            extra_usdt_demand=buy_usdt_demand,
         )
 
     return (
@@ -2209,33 +2238,47 @@ def _swap_actions_for_hedges(
     snapshot_ts: str,
     *,
     idx_offset: int,
+    extra_usdt_demand: Decimal = Decimal(0),
 ) -> list[Action]:
-    """Plan a USDC → USDT spot swap when the planned `OPEN_PERP_SHORT`
-    actions need more USDT margin than UNIFIED currently holds (.33).
+    """Plan a USDC → USDT spot swap to fund the cycle's USDT consumers
+    (.33, extended 2026-06-03 to include non-stable Buy demand).
 
     Net USDT needed
         = sum(open notional × HEDGE_MARGIN_BUFFER)
-          − snapshot.wallet.usdt_available_usd
-          − sum(close notional)           # margin released by closes
+          + extra_usdt_demand               # planned Buy swaps on {coin}USDT
+          − snapshot.wallet.liquid_usdt_usd # UNIFIED + FUND (auto-transfer
+                                            # at execute time)
+          − sum(close notional)             # margin released by closes
 
     A `CLOSE_PERP` releases its IM back to UNIFIED as USDT, so we credit
     it against the requirement before sizing the swap. SKIP_OUT_OF_SCOPE
     hedge actions don't book real margin → excluded from the open side.
 
-    The swap uses Bybit's `USDCUSDT` spot pair with `side="Sell"` — i.e.
-    sell USDC (base) for USDT (quote). `qty` is the USDC amount to sell,
-    treated 1:1 with the USDT shortfall (the spread on this stable pair
-    is bps-level; the `HEDGE_MARGIN_BUFFER` already absorbs it).
+    `extra_usdt_demand` lets the planner consolidate perp margin and
+    non-stable Buy swap demand into a single USDCUSDT conversion. Before
+    this, each Buy swap relied on UNIFIED USDT being topped up
+    incidentally by the perp-only hedge swap — but the perp consumed
+    it before Buy ran, draining UNIFIED and triggering 170131.
+
+    `liquid_usdt_usd` is used (vs the pre-fix `usdt_available_usd`
+    UNIFIED-only) because `_ensure_unified_balance` auto-transfers
+    FUND→UNIFIED at OPEN_PERP_SHORT and Buy SWAP_SPOT dispatch time, so
+    FUND USDT is functionally available for both consumers.
+
+    The swap uses Bybit's `USDCUSDT` spot pair with `side="Sell"` —
+    sell USDC (base) for USDT (quote). `qty` is the USDC amount to
+    sell, treated 1:1 with the USDT shortfall (stable pair, bps-level
+    spread).
 
     Returns an empty list when:
-      - no real OPEN actions planned (only SKIPs or none),
-      - existing USDT already covers the buffered requirement,
+      - no real OPEN actions AND no extra_usdt_demand,
+      - existing USDT already covers the combined requirement,
       - the residual shortfall is below `MIN_SWAP_USDC`.
     """
     real_opens = [
         a for a in hedge_opens if a.kind == ActionKind.OPEN_PERP_SHORT
     ]
-    if not real_opens:
+    if not real_opens and extra_usdt_demand <= 0:
         return []
 
     # `Action.amount` for OPEN_PERP_SHORT is in base coin (qty); the
@@ -2261,14 +2304,19 @@ def _swap_actions_for_hedges(
             continue
         close_notional += a.amount * info.mark_price
 
-    required = open_notional * HEDGE_MARGIN_BUFFER
-    available = snapshot.wallet.usdt_available_usd + close_notional
+    required = open_notional * HEDGE_MARGIN_BUFFER + extra_usdt_demand
+    # `liquid_usdt_usd` (UNIFIED + FUND) replaces the pre-fix UNIFIED-only
+    # `usdt_available_usd`. FUND USDT is functionally available since
+    # `_ensure_unified_balance` auto-transfers FUND→UNIFIED at dispatch
+    # for both OPEN_PERP_SHORT (margin) and SWAP_SPOT Buy (quote spend).
+    available = snapshot.wallet.liquid_usdt_usd + close_notional
     shortfall = required - available
 
     if shortfall < MIN_SWAP_USDC:
         return []
 
     qty = shortfall.quantize(Decimal("0.01"))
+    perp_part = open_notional * HEDGE_MARGIN_BUFFER
     return [
         Action(
             kind=ActionKind.SWAP_SPOT,
@@ -2278,10 +2326,12 @@ def _swap_actions_for_hedges(
             amount=qty,  # USDC to sell — Bybit Sell uses base-coin qty
             order_link_id=_order_link_id(snapshot_ts, idx_offset),
             reason=(
-                f"swap {qty} USDC → USDT: hedge margin shortfall "
-                f"(required ${required:.2f} with {HEDGE_MARGIN_BUFFER:.0%} "
-                f"buffer; have ${snapshot.wallet.usdt_available_usd:.2f} "
-                f"+ ${close_notional:.2f} from closes)"
+                f"swap {qty} USDC → USDT: USDT demand "
+                f"${required:.2f} (perp margin ${perp_part:.2f} with "
+                f"{HEDGE_MARGIN_BUFFER:.0%} buffer + non-stable Buy "
+                f"${extra_usdt_demand:.2f}) - liquid USDT "
+                f"${snapshot.wallet.liquid_usdt_usd:.2f} - closes "
+                f"${close_notional:.2f}"
             ),
         )
     ]

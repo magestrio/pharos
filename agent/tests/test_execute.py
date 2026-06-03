@@ -49,6 +49,8 @@ def _snapshot(
     *,
     total_equity_usd: str = "100",
     usdt_available_usd: str = "0",
+    liquid_usdc_usd: str | None = None,
+    liquid_usdt_usd: str | None = None,
     earn_positions: list[dict] | None = None,
     perp_market: dict[str, PerpInfo] | None = None,
     perp_positions: list[PerpPosition] | None = None,
@@ -71,11 +73,20 @@ def _snapshot(
             products[cat] = items
     if alpha_products:
         products["AlphaFarm"] = alpha_products
+    # Default `liquid_usdt_usd` to `usdt_available_usd` so legacy tests
+    # that only set the UNIFIED-side balance still pass — production
+    # snapshots populate both, but tests pre-dating the 2026-06-03 fix
+    # never knew the field existed.
+    liquid_usdt_default = (
+        liquid_usdt_usd if liquid_usdt_usd is not None else usdt_available_usd
+    )
     return Snapshot(
         captured_at=datetime.now(UTC),
         wallet=WalletSnapshot(
             total_equity_usd=Decimal(total_equity_usd),
             usdt_available_usd=Decimal(usdt_available_usd),
+            liquid_usdc_usd=Decimal(liquid_usdc_usd or "0"),
+            liquid_usdt_usd=Decimal(liquid_usdt_default),
         ),
         earn_positions=earn_positions or [],
         lm_positions=lm_positions or [],
@@ -1519,10 +1530,11 @@ async def test_execute_open_perp_short_dry_run(tmp_path: Path) -> None:
 
 
 def test_diff_swap_emitted_when_usdt_short_for_open_hedge() -> None:
-    """Open hedge of $50, no USDT in UNIFIED → USDC→USDT swap $52.50
-    (5% buffer). A non-stable Earn pick (TON) also triggers a parallel
-    {coin}USDT Buy swap now (non-stable swap path landed 2026-06-03);
-    here we just locate the hedge-side USDCUSDT swap."""
+    """Open hedge of $50 + auto-Buy swap for non-stable TON pick → the
+    consolidated USDCUSDT swap (.06.03) covers BOTH perp margin and the
+    {coin}USDT Buy demand in a single conversion. Pre-consolidation the
+    hedge swap sized only $52.50 (margin only); Buy ran on starved
+    UNIFIED USDT and 170131'd."""
     snap = _snapshot(
         total_equity_usd="100",
         usdt_available_usd="0",
@@ -1540,7 +1552,9 @@ def test_diff_swap_emitted_when_usdt_short_for_open_hedge() -> None:
     sw = hedge_swaps[0]
     assert sw.side == "Sell"
     assert sw.coin == "USDT"
-    assert sw.amount == Decimal("52.50")  # 50 * 1.05 buffer
+    # perp margin 50 × 1.05 = 52.50; Buy demand for $50 TON pick =
+    # 50.00 × 1.01 = 50.50 → consolidated swap = 103.00.
+    assert sw.amount == Decimal("103.00")
 
 
 def test_diff_no_swap_when_usdt_already_sufficient() -> None:
@@ -1615,14 +1629,15 @@ def test_diff_no_swap_when_open_skipped_due_to_missing_perp_market() -> None:
 
 
 def test_diff_swap_suppressed_below_min_threshold() -> None:
-    """Sub-dollar hedge-side shortfall doesn't emit a USDCUSDT SWAP —
-    Bybit margin call won't fire on pennies, and a $0.30 swap is more
-    noise than signal. The TON Buy swap (non-stable Earn coverage) is
-    a separate concern and emits independently when above
-    MIN_SWAP_USDC."""
+    """Combined USDT demand (perp margin + Buy) below the available
+    liquid USDT by < MIN_SWAP_USDC → suppress the USDCUSDT swap. Bybit
+    fees on a sub-dollar swap exceed the value of the operation."""
     snap = _snapshot(
         total_equity_usd="100",
-        usdt_available_usd="52.30",  # buffered req = 52.50 → 0.20 short
+        # perp $52.50 + Buy $50.50 = $103.00 demand; liquid USDT $102.80
+        # → shortfall $0.20, below MIN_SWAP_USDC.
+        usdt_available_usd="102.80",
+        liquid_usdt_usd="102.80",
         perp_market={"TON": _perp("TON", mark="2.0")},
         onchain_products=[_TON_PRODUCT],
     )
