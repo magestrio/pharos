@@ -1883,6 +1883,94 @@ async def _ensure_unified_balance(
     )
 
 
+async def _ensure_fund_balance(
+    client: Any, coin: str, required: Decimal
+) -> None:
+    """Mirror of `_ensure_unified_balance` in the opposite direction:
+    make sure FUND holds at least `required` of `coin` before an
+    OnChain Earn subscribe (`accountType=FUND` per V5 spec). When the
+    Buy spot leg deposits the coin into UNIFIED (Bybit's only spot
+    delivery target on Unified Trading Account), the OnChain subscribe
+    then 180016's because the same coin isn't in FUND.
+
+    Live 2026-06-03: Buy TONUSDT delivered 7.53 TON to UNIFIED, OnChain
+    TON subscribe expected FUND, the place_earn_order returned
+    "Balance not enough" and a naked perp short was left in place.
+    """
+    if required <= 0:
+        return
+    try:
+        fund_have_raw = await client.get_account_coin_balance(
+            account_type="FUND", coin=coin
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("ensure_fund_balance: FUND probe failed for %s: %s", coin, e)
+        return
+    if not isinstance(fund_have_raw, Decimal):
+        try:
+            fund_have = Decimal(str(fund_have_raw))
+        except (InvalidOperation, TypeError, ValueError):
+            return
+    else:
+        fund_have = fund_have_raw
+    if fund_have >= required:
+        return
+    gap = required - fund_have
+    gap_with_buffer = (gap * Decimal("1.005")).quantize(
+        Decimal("0.000001"), rounding=ROUND_DOWN
+    )
+    try:
+        unified = await client.get_wallet_balance(coin=coin, account_type="UNIFIED")
+    except Exception as e:  # noqa: BLE001
+        log.warning("ensure_fund_balance: UNIFIED probe failed for %s: %s", coin, e)
+        return
+    unified_have = _coin_equity_from_wallet(unified, coin)
+    move = min(unified_have, gap_with_buffer)
+    if move <= 0:
+        log.info(
+            "ensure_fund_balance: no UNIFIED balance to move for %s "
+            "(fund=%s, required=%s, unified=%s)",
+            coin, fund_have, required, unified_have,
+        )
+        return
+    log.info(
+        "ensure_fund_balance: moving %s %s UNIFIED→FUND "
+        "(have=%s, required=%s, gap=%s)",
+        move, coin, fund_have, required, gap,
+    )
+    await client.internal_transfer(
+        coin=coin,
+        amount=str(move),
+        from_account_type="UNIFIED",
+        to_account_type="FUND",
+    )
+    # Mirror the settle-poll from `_ensure_unified_balance` — Bybit's
+    # internal-transfer is synchronous on the API but the destination
+    # endpoint lags ~0.5-2s before reflecting the new balance.
+    import asyncio as _asyncio
+    deadline = _asyncio.get_event_loop().time() + 5.0
+    while _asyncio.get_event_loop().time() < deadline:
+        try:
+            check = await client.get_account_coin_balance(
+                account_type="FUND", coin=coin
+            )
+            now_have = check if isinstance(check, Decimal) else Decimal(str(check))
+            if now_have >= required:
+                log.info(
+                    "ensure_fund_balance: transfer settled — %s %s now in FUND",
+                    now_have, coin,
+                )
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        await _asyncio.sleep(0.3)
+    log.warning(
+        "ensure_fund_balance: transfer for %s did not settle within 5s; "
+        "letting Earn place-order surface the real shortfall",
+        coin,
+    )
+
+
 def _coin_equity_from_wallet(
     accounts: list[Any], coin: str
 ) -> Decimal:
@@ -2717,6 +2805,23 @@ async def _execute_one(
                 if action.amount_native is not None
                 else action.amount
             )
+            # For OnChain Stake (FUND wallet, per V5 spec) the coin must
+            # already be in FUND. Non-stable Buy swaps deliver to UNIFIED,
+            # so we transfer UNIFIED→FUND first. Mirror of the existing
+            # FUND→UNIFIED auto-transfer the Buy-spot path already runs.
+            # Live 2026-06-03: TON OnChain subscribe 180016 after Buy
+            # deposited TON into UNIFIED — left a naked perp short.
+            if (
+                action.kind == ActionKind.SUBSCRIBE_EARN
+                and account_type == "FUND"
+                and action.coin
+            ):
+                try:
+                    await _ensure_fund_balance(
+                        client, action.coin, Decimal(str(send_amount))
+                    )
+                except (InvalidOperation, TypeError):
+                    pass
             earn_out = await client.place_earn_order(
                 category=action.category,  # type: ignore[arg-type]
                 product_id=action.product_id,

@@ -2357,6 +2357,61 @@ async def test_execute_subscribe_lm_dry_run(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_execute_onchain_subscribe_transfers_unified_to_fund_for_non_stable(
+    tmp_path: Path,
+) -> None:
+    """Live SUBSCRIBE_EARN for OnChain non-stable triggers
+    UNIFIED→FUND auto-transfer before place_earn_order. Without this,
+    Buy spot deposits the coin in UNIFIED but OnChain Earn expects
+    FUND → retCode=180016 and the paired perp short is orphaned.
+    """
+    from agent.bybit_oracle.bybit_client import WalletAccount, WalletCoin
+    client = AsyncMock()
+    # FUND has 0 TON, UNIFIED has 7.6 TON (from the upstream Buy swap).
+    # Settle-poll: first FUND probe returns 0, post-transfer probes 8.
+    fund_probe_results = iter([Decimal("0"), Decimal("8")])
+    client.get_account_coin_balance.side_effect = lambda **_: next(
+        fund_probe_results, Decimal("8")
+    )
+    client.get_wallet_balance.return_value = [
+        WalletAccount(
+            accountType="UNIFIED",
+            coin=[WalletCoin(coin="TON", walletBalance="7.6", availableToWithdraw="7.6")],
+        )
+    ]
+    from agent.bybit_oracle.bybit_client import EarnOrderResult
+    client.place_earn_order.return_value = EarnOrderResult(
+        orderId="earn-001", orderLinkId="sandbox-earn-001"
+    )
+    action = Action(
+        kind=ActionKind.SUBSCRIBE_EARN,
+        category="OnChain",
+        product_id="8",
+        coin="TON",
+        amount=Decimal("15.07"),
+        amount_native=Decimal("7.45"),
+        order_link_id="sandbox-earn-001",
+        reason="subscribe TON OnChain",
+    )
+    results = await execute_actions(
+        client, [action], snapshot_ts="20260603T180000Z",
+        dry_run=False, executions_dir=tmp_path,
+    )
+    assert results[0].status == "ok", results[0].error
+    # Auto-transfer must have fired with native qty + 0.5% headroom.
+    client.internal_transfer.assert_awaited()
+    xfer_kwargs = client.internal_transfer.await_args.kwargs
+    assert xfer_kwargs["coin"] == "TON"
+    assert xfer_kwargs["from_account_type"] == "UNIFIED"
+    assert xfer_kwargs["to_account_type"] == "FUND"
+    # Earn subscribe placed with native qty (not USD).
+    earn_kwargs = client.place_earn_order.await_args.kwargs
+    assert earn_kwargs["amount"] == "7.45"
+    assert earn_kwargs["account_type"] == "FUND"
+    assert earn_kwargs["coin"] == "TON"
+
+
+@pytest.mark.asyncio
 async def test_execute_subscribe_lm_live_calls_add_liquidity(tmp_path: Path) -> None:
     """Live SUBSCRIBE_LM dispatches to BybitClient.add_liquidity with the
     single-sided USDC body the diff layer encoded."""
