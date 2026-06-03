@@ -61,20 +61,83 @@ def _to_decimal(value: Any) -> Decimal | None:
         return None
 
 
+# Stablecoins priced 1:1 USD (USDC uses snapshot's measured peg).
+_STABLE_COINS = frozenset(
+    {
+        "USDT",
+        "USD1",
+        "USDE",
+        "USDTB",
+        "USD0",
+        "SUSDE",
+        "DAI",
+        "FDUSD",
+        "BUSD",
+        "USDP",
+        "TUSD",
+        "LUSD",
+        "GHO",
+        "PYUSD",
+    }
+)
+
+
+def _price_per_coin(coin: str | None, snapshot: dict[str, Any]) -> Decimal | None:
+    """Return spot USD price for one unit of `coin` based on what the
+    snapshot has on hand. Order of preference:
+      1. Stablecoins → 1.0 (USDC uses the measured peg price).
+      2. BTC / ETH → `market.btc_price` / `market.eth_price`.
+      3. Other coins → `perp_market[coin].mark_price` (Bybit linear-perp mark).
+    Returns None when no source covers the coin — caller leaves
+    `amount_usd` NULL so the UI can distinguish "unpriced" from "$0".
+    """
+    if not coin:
+        return None
+    c = coin.upper()
+    if c == "USDC":
+        peg = (snapshot.get("usdc_peg") or {}).get("price_usd")
+        d = _to_decimal(peg)
+        return d if d is not None else Decimal("1")
+    if c in _STABLE_COINS:
+        return Decimal("1")
+    market = snapshot.get("market") or {}
+    if c == "BTC":
+        return _to_decimal(market.get("btc_price"))
+    if c == "ETH":
+        return _to_decimal(market.get("eth_price"))
+    perp_market = snapshot.get("perp_market") or {}
+    perp = perp_market.get(c) or perp_market.get(coin)
+    if isinstance(perp, dict):
+        return _to_decimal(perp.get("mark_price"))
+    # WLFI / promo-coin tail: no spot/perp price in the snapshot yet.
+    return None
+
+
+def _amount_usd(
+    amount: Decimal | None, coin: str | None, snapshot: dict[str, Any]
+) -> Decimal | None:
+    """USD value of `amount` units of `coin` at snapshot time.
+    Returns None when amount or price is unavailable."""
+    if amount is None:
+        return None
+    price = _price_per_coin(coin, snapshot)
+    if price is None:
+        return None
+    return amount * price
+
+
 def _extract_positions(
     raw_snapshot: dict[str, Any],
-) -> list[tuple[str, str, str | None, Decimal | None]]:
+) -> list[tuple[str, str, str | None, Decimal | None, Decimal | None]]:
     """Flatten the snapshot's per-venue position arrays into uniform
-    rows: (venue, product_id, coin, amount). Empty/zero positions are
-    skipped — they pollute the table without adding signal.
+    rows: (venue, product_id, coin, amount, amount_usd). Empty/zero
+    positions are skipped — they pollute the table without adding signal.
 
-    `amount_usd` is intentionally NOT derived here. Computing it
-    requires the snapshot's per-coin USD value, which lives in
-    `wallet.accounts[].coinDetail[]` keyed by coin. Deferred to a
-    follow-up — for v1 the column stays NULL and the UI computes it
-    on read.
+    `amount_usd` is derived via `_price_per_coin` against the same
+    snapshot the agent saw at decision time, so historical rows price
+    against historical marks rather than today's price.
     """
-    out: list[tuple[str, str, str | None, Decimal | None]] = []
+    out: list[tuple[str, str, str | None, Decimal | None, Decimal | None]] = []
 
     for p in raw_snapshot.get("earn_positions") or []:
         amount = _to_decimal(p.get("amount"))
@@ -82,29 +145,64 @@ def _extract_positions(
             continue
         product_id = str(p.get("productId") or p.get("id") or "")
         coin = p.get("coin")
-        out.append(("earn", product_id, coin, amount))
+        # Bybit splits earn into categories; surface the category so the
+        # web grouping can separate Flexible / OnChain / DiscountBuy /
+        # DualAsset / HoldToEarn instead of lumping them as "earn".
+        category = str(p.get("category") or "").strip()
+        venue = _earn_venue(category)
+        out.append((venue, product_id, coin, amount, _amount_usd(amount, coin, raw_snapshot)))
 
     for p in raw_snapshot.get("lm_positions") or []:
         product_id = str(p.get("positionId") or p.get("id") or "")
         coin = p.get("coin") or p.get("baseCoin")
-        # LM positions don't have a single "amount" field — use the
-        # base-coin amount when present, else leave NULL.
         amount = _to_decimal(p.get("baseAmount") or p.get("amount"))
-        out.append(("lm", product_id, coin, amount))
+        # LM is a USDC-quoted CPMM pool — the most useful USD signal is
+        # the position's quote-side value when the snapshot writes it.
+        amount_usd = _to_decimal(p.get("quoteAmount") or p.get("notionalUsd"))
+        if amount_usd is None:
+            amount_usd = _amount_usd(amount, coin, raw_snapshot)
+        out.append(("bybit_lm", product_id, coin, amount, amount_usd))
 
     for p in raw_snapshot.get("alpha_positions") or []:
         product_id = str(p.get("tokenCode") or p.get("symbol") or "")
         coin = p.get("symbol")
         amount = _to_decimal(p.get("amount") or p.get("balance"))
-        out.append(("alpha", product_id, coin, amount))
+        amount_usd = _to_decimal(p.get("tokenAmountUsd") or p.get("notionalUsd"))
+        if amount_usd is None:
+            amount_usd = _amount_usd(amount, coin, raw_snapshot)
+        out.append(("bybit_alpha", product_id, coin, amount, amount_usd))
 
     for p in raw_snapshot.get("perp_positions") or []:
         symbol = str(p.get("symbol") or "")
         coin = symbol.removesuffix("USDT") if symbol.endswith("USDT") else symbol
         amount = _to_decimal(p.get("size") or p.get("positionValue"))
-        out.append(("perp", symbol, coin, amount))
+        # Perp positions usually carry positionValue in USD already.
+        amount_usd = _to_decimal(p.get("positionValue") or p.get("notionalUsd"))
+        if amount_usd is None:
+            amount_usd = _amount_usd(amount, coin, raw_snapshot)
+        out.append(("perp", symbol, coin, amount, amount_usd))
 
     return out
+
+
+def _earn_venue(category: str) -> str:
+    """Map Bybit Earn `category` to our venue id namespace. Unknown
+    categories fall back to a `bybit_earn:<category>` form so they're
+    still distinguishable rather than silently merged."""
+    norm = category.lower().replace(" ", "").replace("-", "_")
+    if norm in ("flexiblesaving", "flexible", "easyearn"):
+        return "bybit_flex"
+    if norm in ("onchain", "onchainearn"):
+        return "bybit_onchain"
+    if norm in ("discountbuy",):
+        return "bybit_discount_buy"
+    if norm in ("dualasset", "dualassets"):
+        return "bybit_dual_asset"
+    if norm in ("holdtoearn", "hold_to_earn"):
+        return "bybit_hold_to_earn"
+    if not category:
+        return "bybit_earn"
+    return f"bybit_earn:{category}"
 
 
 async def record_event(
@@ -226,15 +324,15 @@ async def record_cycle(
                 raw_decision,
             )
 
-        for venue, product_id, coin, amount in positions:
+        for venue, product_id, coin, amount, amount_usd in positions:
             await conn.execute(
                 """
                 INSERT INTO positions_snapshot (
-                    cycle_ts, venue, product_id, coin, amount
-                ) VALUES ($1, $2, $3, $4, $5)
+                    cycle_ts, venue, product_id, coin, amount, amount_usd
+                ) VALUES ($1, $2, $3, $4, $5, $6)
                 ON CONFLICT (cycle_ts, venue, product_id) DO NOTHING
                 """,
-                cycle_ts, venue, product_id, coin, amount,
+                cycle_ts, venue, product_id, coin, amount, amount_usd,
             )
 
         for idx, action in enumerate(actions):

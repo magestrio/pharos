@@ -122,16 +122,21 @@ async def test_record_cycle_writes_all_tables(fresh_db_dsn: str) -> None:
             assert dec["payload"]["confidence"] == 0.7
 
             positions = await conn.fetch(
-                "SELECT venue, product_id, coin, amount FROM positions_snapshot "
-                "ORDER BY venue, product_id"
+                "SELECT venue, product_id, coin, amount, amount_usd "
+                "FROM positions_snapshot ORDER BY venue, product_id"
             )
             venues = sorted({r["venue"] for r in positions})
-            assert venues == ["alpha", "earn", "lm", "perp"]
+            # Earn rows are split by Bybit `category` into venue-specific
+            # buckets so the web doesn't have to know about Bybit's
+            # internal taxonomy. FlexibleSaving → bybit_flex, etc.
+            assert venues == ["bybit_alpha", "bybit_flex", "bybit_lm", "perp"]
             # Zero-amount USDT row from earn_positions was skipped
-            earn_rows = [r for r in positions if r["venue"] == "earn"]
+            earn_rows = [r for r in positions if r["venue"] == "bybit_flex"]
             assert len(earn_rows) == 1
             assert earn_rows[0]["coin"] == "USD1"
             assert earn_rows[0]["amount"] == Decimal("100")
+            # USD1 is a stablecoin → priced 1:1 USD.
+            assert earn_rows[0]["amount_usd"] == Decimal("100")
 
             execs = await conn.fetch(
                 "SELECT idx, status, action FROM executions ORDER BY idx"
