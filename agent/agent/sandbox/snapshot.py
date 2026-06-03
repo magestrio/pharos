@@ -199,6 +199,10 @@ class PerpInfo(BaseModel):
     orderbook_depth_50bps_usd: Decimal | None = None
     min_order_qty: Decimal | None = None  # in base coin
     min_notional_usd: Decimal | None = None  # min_order_qty × mark_price
+    # Increment Bybit accepts as the qty step on this symbol. Orders
+    # with `qty` not a multiple of `qty_step` get rejected with
+    # retCode=10001. Executor rounds down to the nearest step.
+    qty_step: Decimal | None = None
     max_leverage: Decimal | None = None  # informational; we always hedge at 1x
 
 
@@ -302,6 +306,19 @@ def _flex_or_onchain_summary(
     if p.bonusEvents:
         notes.append(f"bonus_events={len(p.bonusEvents)}")
 
+    # minStakeAmount is denominated in the product's coin. For stables
+    # (USDC/USDT/USDE/USD1/etc.) coin units ≈ USD, so it doubles as a
+    # USD floor; for non-stables it's an under-estimate (we don't have
+    # the spot price here without coupling to the market block — caller
+    # treats this as a lower bound and the executor's 180012 rejection
+    # is the backstop).
+    min_stake: Decimal | None = None
+    if p.minStakeAmount is not None:
+        try:
+            min_stake = Decimal(str(p.minStakeAmount))
+        except (InvalidOperation, TypeError):
+            min_stake = None
+
     return ProductSummary(
         category=category,
         product_id=p.productId,
@@ -310,6 +327,7 @@ def _flex_or_onchain_summary(
         apr_source=src,
         base_apr_string=p.estimateApr,
         redeem_lockup_minutes=lockup,
+        min_subscribe_usd=min_stake,
         notes=notes,
     )
 
@@ -503,6 +521,13 @@ def _advance_earn_summary(
     if settlement:
         notes.append(f"settlement_ms={settlement}")
 
+    # Per-product minimum subscription size. We populate
+    # `min_subscribe_usd` for DualAssets / DiscountBuy so the planner +
+    # snapshot filter can size-gate picks before they hit Bybit's
+    # retCode=180012. Values are denominated in the staking coin (USDT
+    # for the products we trade), which ≈ USD for stables.
+    min_subscribe: Decimal | None = None
+
     if category == "DualAssets":
         base = p.get("baseCoin", "?")
         quote_coin = p.get("quoteCoin", "?")
@@ -511,6 +536,13 @@ def _advance_earn_summary(
         min_q = p.get("minPurchaseQuoteAmount")
         if min_b is not None and min_q is not None:
             notes.append(f"min_purchase=base{min_b}/quote{min_q}")
+        # Planner submits the quote-coin amount, so the USD floor is the
+        # quote-side minimum (USDT ≈ USD).
+        if min_q is not None:
+            try:
+                min_subscribe = Decimal(str(min_q))
+            except (InvalidOperation, TypeError):
+                pass
     elif category == "DiscountBuy":
         underlying = p.get("underlyingAsset")
         if underlying:
@@ -518,6 +550,10 @@ def _advance_earn_summary(
         min_pur = p.get("minPurchaseAmount")
         if min_pur is not None:
             notes.append(f"min_purchase={min_pur}")
+            try:
+                min_subscribe = Decimal(str(min_pur))
+            except (InvalidOperation, TypeError):
+                pass
     elif category == "SmartLeverage":
         underlying = p.get("underlyingAsset")
         direction = p.get("direction")
@@ -591,6 +627,7 @@ def _advance_earn_summary(
         apr_source=apr_source,
         base_apr_string=base_apr_string,
         redeem_lockup_minutes=None,
+        min_subscribe_usd=min_subscribe,
         notes=notes,
     )
 
@@ -1081,6 +1118,12 @@ async def _fetch_perp_info(
                 min_qty = Decimal(lot.minOrderQty)
             except InvalidOperation:
                 min_qty = None
+        qty_step_d: Decimal | None = None
+        if lot and lot.qtyStep:
+            try:
+                qty_step_d = Decimal(lot.qtyStep)
+            except InvalidOperation:
+                qty_step_d = None
         lev = inst.leverageFilter
         if lev and lev.maxLeverage:
             try:
@@ -1100,6 +1143,7 @@ async def _fetch_perp_info(
         orderbook_depth_50bps_usd=depth_usd,
         min_order_qty=min_qty,
         min_notional_usd=min_notional,
+        qty_step=qty_step_d,
         max_leverage=max_lev,
     )
 
@@ -1770,6 +1814,55 @@ async def collect_snapshot(
         eth_24h_change_pct=_ticker_24h(eth),
         eth_funding_rate=_ticker_funding(eth),
     )
+
+    # Small-vault product filter (2026-06-03). Drop any product whose
+    # per-pick minimum exceeds 30% of total vault equity. Rationale:
+    # the agent's hard caps already bound `effective_weight = venue.w ×
+    # pick.w` to ≤ 30% of book (LM leverage cap, plus implicit Earn
+    # diversification). A product with `min_subscribe_usd > 0.30 ×
+    # total_equity` cannot mathematically fit any in-cap pick at our
+    # current vault size — letting the LLM pick it just produces a
+    # downstream Bybit retCode=180012/170140 rejection.
+    #
+    # Filtering is data-layer (snapshot writes the catalog) rather than
+    # prompt-side because (a) prompt rules are trust-based and (b) the
+    # filter naturally re-includes products as the vault grows. The
+    # validator still enforces the formal cap; this is just keeping
+    # un-pickable items out of the LLM's choice set.
+    MAX_PICK_WEIGHT_FRACTION = Decimal("0.30")
+    capacity_floor = total_equity * MAX_PICK_WEIGHT_FRACTION
+    filter_stats: list[str] = []
+    for cat, items in list(products.items()):
+        if cat in ("HoldToEarn", "AlphaFarm"):
+            # HoldToEarn is read-only (venue cap 0); AlphaFarm has its
+            # own un-pickable gate via apr_source="momentum". Leave both
+            # untouched so the LLM still sees them as benchmark info.
+            continue
+        kept: list[ProductSummary] = []
+        dropped = 0
+        for item in items:
+            if (
+                item.min_subscribe_usd is None
+                or item.min_subscribe_usd <= 0
+                or item.min_subscribe_usd <= capacity_floor
+            ):
+                kept.append(item)
+            else:
+                dropped += 1
+        if dropped > 0:
+            filter_stats.append(f"{cat}={dropped}")
+        products[cat] = kept
+    if filter_stats and capacity_floor > 0:
+        # snapshot.py runs without a module-level logger; surface the
+        # filter outcome on stderr so operators see it in the live loop
+        # tail without taking on a logging dependency mid-file.
+        print(
+            f"snapshot: vault ${float(total_equity):.2f} × "
+            f"{float(MAX_PICK_WEIGHT_FRACTION * 100):.0f}% = "
+            f"${float(capacity_floor):.2f} cap → filtered out "
+            f"under-min products: {', '.join(filter_stats)}",
+            file=__import__('sys').stderr,
+        )
 
     # Convert raw position objects (pydantic models or dicts) to dicts
     # for JSON serialization without leaking pydantic types into Snapshot.

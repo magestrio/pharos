@@ -33,7 +33,7 @@ import os
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -169,7 +169,14 @@ HEDGE_MARGIN_BUFFER = Decimal("1.05")
 # Don't swap pennies. Below this threshold the diff suppresses the
 # SWAP action and trusts that Bybit's margin call won't fire on a
 # sub-dollar gap. Mirrors `MIN_ACTION_USDC` philosophy.
-MIN_SWAP_USDC = Decimal("1.00")
+#
+# Bumped 2026-06-03 from $1 to $5 after `retCode=170140 Order value
+# below lower limit` on USDCUSD1 with $1.14 notional. Bybit per-pair
+# min-notional varies (USDCUSDT ~$1, USDCUSD1 ~$5, USDCFDUSD ~$5);
+# $5 is a safe floor across the stables we trade. Worst case is a
+# residual sub-$5 shortfall that has to be filled out of band — vs.
+# the current behavior of a guaranteed live rejection.
+MIN_SWAP_USDC = Decimal("5.00")
 
 
 @dataclass
@@ -384,6 +391,38 @@ def diff_to_actions(
             continue
 
         if delta > 0:
+            # Per-product min_stake gate. Bybit rejects subscribes below
+            # `minStakeAmount` with retCode=180012 (Purchase share is
+            # invalid). Surfaced via `ProductSummary.min_subscribe_usd`
+            # for FlexibleSaving + OnChain; for stables coin units ≈
+            # USD so a direct compare works. Non-stables: skip when
+            # available (avoids the live rejection); when not surfaced
+            # the executor still hits Bybit and logs 180012.
+            min_stake = None
+            product_sum = _earn_product_lookup(snapshot, category, product_id)
+            if product_sum is not None:
+                min_stake = product_sum.min_subscribe_usd
+            if (
+                min_stake is not None
+                and min_stake > 0
+                and delta < min_stake
+            ):
+                skips.append(
+                    Action(
+                        kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                        category=category,
+                        product_id=product_id,
+                        coin=coin,
+                        amount=delta,
+                        order_link_id=order_link_id,
+                        reason=(
+                            f"{category}/{product_id} ({coin}): subscribe "
+                            f"${delta:.4f} below Bybit min ${min_stake} — "
+                            f"would retCode=180012; scale up or drop pick"
+                        ),
+                    )
+                )
+                continue
             subscribes.append(
                 Action(
                     kind=ActionKind.SUBSCRIBE_EARN,
@@ -625,7 +664,28 @@ def _hedge_diff_actions(
                     )
                 )
                 continue
-            qty = (target_notional / info.mark_price).quantize(Decimal("0.001"))
+            raw_qty = target_notional / info.mark_price
+            qty = _round_to_qty_step(raw_qty, info.qty_step, info.min_order_qty)
+            if qty is None or qty <= 0:
+                # Position too small to fit one lot — surface a skip so
+                # the cycle log records why no hedge fired (vs silently
+                # opening unprotected exposure).
+                opens.append(
+                    Action(
+                        kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                        category="Perp",
+                        product_id=info.symbol,
+                        coin=coin,
+                        amount=target_notional,
+                        order_link_id=_order_link_id(snapshot_ts, cursor),
+                        reason=(
+                            f"hedge {coin}: target qty {raw_qty} rounds to <{info.qty_step}, "
+                            f"below min_order_qty={info.min_order_qty}; skip hedge"
+                        ),
+                    )
+                )
+                cursor += 1
+                continue
             order_link_id = _order_link_id(snapshot_ts, cursor)
             cursor += 1
             opens.append(
@@ -638,7 +698,7 @@ def _hedge_diff_actions(
                     order_link_id=order_link_id,
                     reason=(
                         f"short {coin} ${target_notional:.2f} notional "
-                        f"({qty} {coin}) @ mark ${info.mark_price:.4f}"
+                        f"({qty} {coin}, step={info.qty_step}) @ mark ${info.mark_price:.4f}"
                     ),
                 )
             )
@@ -1295,7 +1355,11 @@ def _pick_offer_for_execute(
                 continue
             if best is None or apy > best[0]:
                 best = (apy, offer)
-        return best[1] if best else None
+        if best is None:
+            return None
+        # Tag direction so `_build_advance_extra` can write the
+        # orderDirection field without re-deriving it.
+        return {**best[1], "orderDirection": "BuyLow"}
     if category == "DiscountBuy":
         items = quote.get("offers") or quote.get("list") or []
         if not items or not isinstance(items[0], dict):
@@ -1325,6 +1389,178 @@ def _offer_expired(expired_raw: Any, now_ms: int) -> bool:
 _OFFER_PREFIX = " offer="
 
 
+def _round_to_qty_step(
+    raw_qty: Decimal,
+    qty_step: Decimal | None,
+    min_order_qty: Decimal | None,
+) -> Decimal | None:
+    """Round `raw_qty` DOWN to the nearest multiple of `qty_step`.
+    Returns None when the rounded result is below `min_order_qty` (the
+    caller surfaces a SKIP). When `qty_step` isn't known (snapshot
+    couldn't fetch instruments_info for this symbol), falls back to a
+    sane default of 0.001 — matches the previous hardcoded rounding."""
+    step = qty_step or Decimal("0.001")
+    if step <= 0:
+        return None
+    # Multiples of step: floor(raw / step) * step
+    steps = (raw_qty / step).to_integral_value(rounding=ROUND_DOWN)
+    qty = steps * step
+    # Normalize precision to the step's scale so str(qty) doesn't carry
+    # trailing zeros Bybit may reject.
+    qty = qty.quantize(step)
+    if min_order_qty is not None and qty < min_order_qty:
+        return None
+    return qty
+
+
+def _earn_product_lookup(
+    snapshot: Snapshot, category: str, product_id: str
+) -> Any:
+    """Find a ProductSummary in the snapshot's `products[<category>]`
+    list by product_id. Used by the planner to read `min_subscribe_usd`
+    before emitting a SUBSCRIBE_EARN — Bybit rejects sub-min subscribes
+    with retCode=180012."""
+    catalog = snapshot.products.get(category) if snapshot.products else None
+    if not catalog:
+        return None
+    for item in catalog:
+        if str(getattr(item, "product_id", "")) == str(product_id):
+            return item
+    return None
+
+
+def _swap_base_coin(symbol: str) -> str:
+    """Resolve the base coin of a spot symbol. We only swap by selling
+    base (Market Sell), so for USDCUSDT base=USDC. Handles 3-5 char
+    quote coins (USDT, USDC, USD1, FDUSD, USDE) since Bybit's USDC pair
+    namespace covers stable→stable hops in either direction. Longest
+    suffix match wins so USDCFDUSD parses to base=USDC, quote=FDUSD
+    rather than base=USDCF, quote=DUSD."""
+    quotes = ("FDUSD", "USDT", "USDC", "USD1", "USDE")
+    candidates = sorted(quotes, key=len, reverse=True)
+    for quote in candidates:
+        if symbol.endswith(quote) and symbol != quote:
+            return symbol[: -len(quote)]
+    return symbol
+
+
+async def _ensure_unified_balance(
+    client: Any, coin: str, required: Decimal
+) -> None:
+    """Make sure UNIFIED holds at least `required` of `coin` before a
+    spot trade. Queries UNIFIED via `/v5/account/wallet-balance` (the
+    only endpoint that returns UNIFIED), computes the gap, and pulls
+    the shortfall from FUND via `internal_transfer`. FUND balance lives
+    on a different endpoint (`/v5/asset/transfer/query-account-coin-
+    balance`) since `wallet-balance` is UNIFIED-only. A small +0.5%
+    headroom absorbs Bybit's per-coin precision and pending-balance
+    lag without a second round-trip."""
+    if required <= 0:
+        return
+    try:
+        unified = await client.get_wallet_balance(coin=coin, account_type="UNIFIED")
+    except Exception as e:  # noqa: BLE001
+        log.warning("ensure_unified_balance: UNIFIED probe failed for %s: %s", coin, e)
+        return
+    have = _coin_equity_from_wallet(unified, coin)
+    if have >= required:
+        return
+    gap = required - have
+    # +0.5% headroom
+    gap_with_buffer = (gap * Decimal("1.005")).quantize(
+        Decimal("0.000001"), rounding=ROUND_DOWN
+    )
+    try:
+        fund_have_raw = await client.get_account_coin_balance(account_type="FUND", coin=coin)
+    except Exception as e:  # noqa: BLE001
+        log.warning("ensure_unified_balance: FUND probe failed for %s: %s", coin, e)
+        return
+    # Defensive: callers (tests) sometimes mock this method and the
+    # mock return isn't a Decimal. Treat any non-Decimal as "no FUND
+    # balance available" — the spot order will surface the real
+    # shortfall on its own.
+    if not isinstance(fund_have_raw, Decimal):
+        try:
+            fund_have = Decimal(str(fund_have_raw))
+        except (InvalidOperation, TypeError, ValueError):
+            return
+    else:
+        fund_have = fund_have_raw
+    move = min(fund_have, gap_with_buffer)
+    if move <= 0:
+        log.info(
+            "ensure_unified_balance: no FUND balance to move for %s "
+            "(unified=%s, required=%s, fund=%s)",
+            coin, have, required, fund_have,
+        )
+        return
+    log.info(
+        "ensure_unified_balance: moving %s %s FUND→UNIFIED "
+        "(have=%s, required=%s, gap=%s)",
+        move, coin, have, required, gap,
+    )
+    await client.internal_transfer(
+        coin=coin,
+        amount=str(move),
+        from_account_type="FUND",
+        to_account_type="UNIFIED",
+    )
+    # Bybit returns transfer success synchronously but the UNIFIED
+    # balance lags ~0.5-2s before the spot endpoint sees it. Poll until
+    # we see at least `required` or 5s elapse. Without this loop the
+    # very next place_spot_order races and gets retCode=170131
+    # "Insufficient balance" despite the transfer log showing success.
+    import asyncio
+    deadline = asyncio.get_event_loop().time() + 5.0
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            check = await client.get_wallet_balance(coin=coin, account_type="UNIFIED")
+            now_have = _coin_equity_from_wallet(check, coin)
+            if now_have >= required:
+                log.info(
+                    "ensure_unified_balance: transfer settled — %s %s now in UNIFIED",
+                    now_have, coin,
+                )
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(0.3)
+    log.warning(
+        "ensure_unified_balance: transfer for %s did not settle within 5s; "
+        "letting spot order surface the real shortfall",
+        coin,
+    )
+
+
+def _coin_equity_from_wallet(
+    accounts: list[Any], coin: str
+) -> Decimal:
+    """Sum equity for `coin` across the WalletAccount list returned by
+    `get_wallet_balance`. The shape varies slightly by account type;
+    fall back to walking `coinDetail`/`coin` arrays when the model
+    doesn't expose a flat coin attribute."""
+    total = Decimal(0)
+    coin_u = coin.upper()
+    for acc in accounts:
+        # Prefer the structured accessor when WalletAccount provides one.
+        details = getattr(acc, "coinDetail", None) or getattr(acc, "coin", None) or []
+        if isinstance(details, list):
+            for entry in details:
+                entry_coin = (getattr(entry, "coin", None) or
+                              (entry.get("coin") if isinstance(entry, dict) else None))
+                if not entry_coin or entry_coin.upper() != coin_u:
+                    continue
+                eq = (getattr(entry, "equity", None) or
+                      getattr(entry, "walletBalance", None) or
+                      (entry.get("equity") if isinstance(entry, dict) else None) or
+                      (entry.get("walletBalance") if isinstance(entry, dict) else None))
+                try:
+                    total += Decimal(str(eq))
+                except (InvalidOperation, TypeError, ValueError):
+                    continue
+    return total
+
+
 def _decode_offer_from_reason(reason: str) -> dict[str, Any]:
     """Pull the JSON-encoded offer dict back out of the action's `reason`
     field. We store it there at diff time so the action is self-contained
@@ -1344,25 +1580,47 @@ def _decode_offer_from_reason(reason: str) -> dict[str, Any]:
 def _build_advance_extra(category: str, offer: dict[str, Any]) -> dict[str, Any]:
     """Translate the cached offer dict into the per-category `*Extra`
     block `place_advance_earn_order` merges into the request body. Keys
-    mirror Bybit V5 docs verbatim — caller passes the result as `extra=`."""
+    mirror the Bybit V5 docs verbatim
+    (https://bybit-exchange.github.io/docs/v5/finance/advanced-earn).
+
+    Field shape was updated 2026-06-03 after a live retCode=180001
+    (`Invalid parameter: initial_price` / `order_direction`) — Bybit
+    deprecated the older `side` / `currentPrice` / `expiredAt` keys.
+    Spec now requires:
+      DualAssets   → orderDirection (BuyLow|SellHigh), selectPrice, apyE8
+      DiscountBuy  → initialPrice, purchasePrice, knockoutPrice,
+                     knockoutCouponE8, settleType (Base|Quote), instUid
+    """
     if category == "DualAssets":
+        # Planner only emits buy-low picks (see `_pick_offer_for_execute`),
+        # so orderDirection is hardcoded. SellHigh would need a different
+        # diff-layer signal anyway.
         return {
             "dualAssetsExtra": {
+                "orderDirection": offer.get("orderDirection", "BuyLow"),
                 "selectPrice": offer.get("selectPrice"),
-                "side": offer.get("side", "Buy"),
-                "expiredTime": offer.get("expiredTime") or offer.get("expiredAt"),
                 "apyE8": offer.get("apyE8"),
             }
         }
     if category == "DiscountBuy":
+        # `initialPrice` was named `currentPrice` in older docs; the field
+        # in the quote response is still `currentPrice`, but the order
+        # body expects `initialPrice`. We accept either source key for
+        # forward/backward compat.
         return {
             "discountBuyExtra": {
-                "instUid": offer.get("instUid"),
-                "currentPrice": offer.get("currentPrice"),
+                "initialPrice": offer.get("initialPrice")
+                or offer.get("currentPrice"),
                 "purchasePrice": offer.get("purchasePrice"),
                 "knockoutPrice": offer.get("knockoutPrice"),
                 "knockoutCouponE8": offer.get("knockoutCouponE8"),
-                "expiredAt": offer.get("expiredAt") or offer.get("expiredTime"),
+                # Settle in base (underlying asset) when knockout doesn't
+                # fire; settle back in quote stable otherwise. We default
+                # to Base since our use-case is "buy BTC/ETH at discount"
+                # — settleType=Quote turns it into a flat-yield product
+                # which isn't why we pick DiscountBuy.
+                "settleType": offer.get("settleType", "Base"),
+                "instUid": offer.get("instUid"),
             }
         }
     return {}
@@ -1633,6 +1891,11 @@ async def _execute_one(
             # symbol to ~10x cross, which would magnify mark-price drift
             # on a delta-neutral hedge. set_leverage is idempotent.
             await client.set_leverage(action.product_id, 1)
+            # Planner already rounded qty to the instrument's qty_step
+            # via `_round_to_qty_step`, so `action.amount` is safe to
+            # pass through as-is. Older actions written before that fix
+            # may carry an unrounded qty; Bybit will reject those with
+            # retCode=10001 and the BybitAPIError handler records it.
             out = await client.place_perp_order(
                 symbol=action.product_id,
                 side="Sell",
@@ -1826,6 +2089,16 @@ async def _execute_one(
             # Market Sell uses base-coin qty (USDC here); Market Buy
             # would use quote, which is the asymmetry flagged in `.27`.
             # We always swap by selling USDC, so `qty` is always base.
+            #
+            # The base coin (USDC) frequently lives in FUND, not UNIFIED.
+            # Bybit spot trades in UNIFIED only, so we pre-flight a
+            # FUND→UNIFIED transfer of any shortfall before the order.
+            # This unblocks the cascade where every downstream
+            # subscribe_earn for non-USDC stables fails with
+            # `180016 Balance not enough` because the USDT swap never
+            # produced funds.
+            base_coin = _swap_base_coin(action.product_id)
+            await _ensure_unified_balance(client, base_coin, action.amount)
             out = await client.place_spot_order(
                 symbol=action.product_id,
                 side="Sell",

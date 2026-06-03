@@ -18,7 +18,7 @@ import base64
 import json
 import time
 import urllib.parse
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated, Any, Generic, Literal, TypeVar, Union
 
@@ -1581,6 +1581,63 @@ class BybitClient:
                 if entry.coin == coin:
                     total += Decimal(entry.walletBalance)
         return total
+
+    async def get_account_coin_balance(
+        self,
+        *,
+        account_type: str,
+        coin: str,
+    ) -> Decimal:
+        """Per-coin walletBalance across account types other than UNIFIED.
+        `/v5/account/wallet-balance` is UNIFIED-only; for FUND / CONTRACT
+        / OPTION balances Bybit requires `/v5/asset/transfer/query-
+        account-coin-balance` which works for all wallets. Returns 0 on
+        miss / parse error (the executor pre-flight just won't transfer
+        any shortfall, and the downstream order surfaces the live error).
+        """
+        data = await self._request(
+            "GET",
+            "/v5/asset/transfer/query-account-coin-balance",
+            params={"accountType": account_type, "coin": coin},
+        )
+        result = (data or {}).get("result") or {}
+        balance = result.get("balance") or {}
+        raw = balance.get("walletBalance") or balance.get("transferBalance")
+        if raw is None:
+            return Decimal(0)
+        try:
+            return Decimal(str(raw))
+        except (InvalidOperation, TypeError, ValueError):
+            return Decimal(0)
+
+    async def internal_transfer(
+        self,
+        *,
+        coin: str,
+        amount: str,
+        from_account_type: str,
+        to_account_type: str,
+        transfer_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Move funds between this account's own wallets (no sub-account
+        leg). POST /v5/asset/transfer/inter-transfer.
+
+        Used to satisfy swap_spot which trades in the Unified Trading
+        Account while idle USDC often sits in FUND. Bybit requires a
+        client-generated `transferId` (must be a valid UUID v4).
+        """
+        import uuid
+        body = {
+            "transferId": transfer_id or str(uuid.uuid4()),
+            "coin": coin,
+            "amount": amount,
+            "fromAccountType": from_account_type,
+            "toAccountType": to_account_type,
+        }
+        data = await self._request(
+            "POST", "/v5/asset/transfer/inter-transfer", body=body
+        )
+        return data.get("result") or {}
 
     async def place_spot_order(
         self,
