@@ -201,6 +201,18 @@ class Action:
     order_link_id: str
     reason: str
     position_id: str | None = None
+    # Spot-swap side. "Sell" (default) is the legacy USDC→stable flow
+    # where we sell USDC (base) for a stable quote (USDCUSDT,
+    # USDCUSD1). "Buy" is for non-stable Earn picks where we acquire
+    # the target coin via {coin}USDT pair, paying USDT (quote). Field
+    # is ignored for non-SWAP_SPOT kinds.
+    side: str = "Sell"
+    # Native-coin amount, populated only when `amount` (USD) and the
+    # native-coin units differ. Non-stable SUBSCRIBE_EARN/_LM picks
+    # set this to USD / mark_price so the dispatch can pass the right
+    # units to Bybit's place_earn_order (which always expects native
+    # coin amount, never USD).
+    amount_native: Decimal | None = None
     # Per-action overrides for dispatch parameters that don't fit the
     # flat field set. Currently used by REDEEM_LM to carry
     # `remove_rate` (1-100) for partial exits; default behavior when
@@ -211,6 +223,8 @@ class Action:
         d = asdict(self)
         d["kind"] = self.kind.value
         d["amount"] = str(self.amount)
+        if self.amount_native is not None:
+            d["amount_native"] = str(self.amount_native)
         return d
 
 
@@ -423,6 +437,15 @@ def diff_to_actions(
                     )
                 )
                 continue
+            # For non-stables, compute native-coin units (USD / mark
+            # price) so the dispatch can pass the right qty to Bybit.
+            # Earn endpoints always expect native units, never USD.
+            amount_native: Decimal | None = None
+            if coin and coin != "USDC" and coin not in _STABLES:
+                perp_info = (snapshot.perp_market or {}).get(coin)
+                mark = getattr(perp_info, "mark_price", None) if perp_info else None
+                if mark and mark > 0:
+                    amount_native = (delta / mark).quantize(Decimal("0.0001"))
             subscribes.append(
                 Action(
                     kind=ActionKind.SUBSCRIBE_EARN,
@@ -430,10 +453,12 @@ def diff_to_actions(
                     product_id=product_id,
                     coin=coin,
                     amount=delta,
+                    amount_native=amount_native,
                     order_link_id=order_link_id,
                     reason=(
                         f"subscribe to {category}/{product_id} ({coin}): "
                         f"target ${target_amt:.2f} - current ${current_amt:.2f}"
+                        + (f" ({amount_native} {coin} native)" if amount_native else "")
                     ),
                 )
             )
@@ -492,6 +517,86 @@ def diff_to_actions(
             + len(hedge_swaps)
         ),
     )
+    # USDC budget enforcement (2026-06-03). Hedge swaps and earn swaps
+    # are planned independently — both spend USDC. On a small vault
+    # they can collectively demand more USDC than the wallet holds,
+    # producing a chain of retCode=170131 'Insufficient balance' as
+    # the second swap finds USDC already drained by the first. Cap
+    # total swap demand at `wallet.liquid_usdc_usd` (UNIFIED+FUND
+    # combined, since `_transfer_satisfies_swap` can pull from either).
+    # Hedge swaps take priority (perp margin is risk-critical); any
+    # earn-side swap that overflows the budget is dropped along with
+    # its dependent SUBSCRIBE (else the subscribe 180016's at execute
+    # time).
+    earn_swaps, dropped_coins = _enforce_usdc_budget(
+        snapshot.wallet.liquid_usdc_usd, hedge_swaps, earn_swaps
+    )
+
+    # USDC-budget drops cascade to subscribes AND their paired perps.
+    # When a stable's swap is dropped because USDC ran out, the
+    # subscribe will 180016 at execute time and the perp would open
+    # naked — convert both to SKIPs.
+    #
+    # NOTE: we DON'T extend this to "non-stable subscribe with no
+    # swap path" — that's an architectural TODO (non-stable USD→native
+    # conversion isn't wired). The auto-hedge tests rely on the perp
+    # firing even when the spot fill is unresolved; until non-stable
+    # swap wiring lands, the subscribe will hit 180016 live and the
+    # operator manually closes the orphan perp. Tracked separately.
+    if dropped_coins:
+        new_subscribes: list[Action] = []
+        for a in subscribes:
+            if (
+                a.kind in (ActionKind.SUBSCRIBE_EARN, ActionKind.SUBSCRIBE_LM)
+                and a.coin in dropped_coins
+            ):
+                new_subscribes.append(
+                    Action(
+                        kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                        category=a.category,
+                        product_id=a.product_id,
+                        coin=a.coin,
+                        amount=a.amount,
+                        order_link_id=a.order_link_id,
+                        reason=(
+                            f"{a.category}/{a.product_id} ({a.coin}): swap "
+                            f"USDC→{a.coin} dropped (USDC budget exceeded); "
+                            f"subscribe would 180016 — skip"
+                        ),
+                    )
+                )
+            else:
+                new_subscribes.append(a)
+        subscribes = new_subscribes
+
+        new_hedge_opens: list[Action] = []
+        for a in hedge_opens:
+            if a.kind == ActionKind.OPEN_PERP_SHORT and a.coin in dropped_coins:
+                new_hedge_opens.append(
+                    Action(
+                        kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                        category=a.category,
+                        product_id=a.product_id,
+                        coin=a.coin,
+                        amount=a.amount,
+                        order_link_id=a.order_link_id,
+                        reason=(
+                            f"hedge {a.coin}: paired Earn subscribe dropped "
+                            f"(USDC budget exceeded); skipping perp open to "
+                            f"avoid naked short"
+                        ),
+                    )
+                )
+            else:
+                new_hedge_opens.append(a)
+        hedge_opens = new_hedge_opens
+        hedge_swaps = _swap_actions_for_hedges(
+            snapshot,
+            hedge_opens,
+            hedge_closes,
+            snapshot_ts,
+            idx_offset=len(all_pids) + len(hedge_closes) + len(hedge_opens),
+        )
 
     return (
         redeems
@@ -1709,6 +1814,60 @@ def _build_advance_extra(category: str, offer: dict[str, Any]) -> dict[str, Any]
     return {}
 
 
+def _enforce_usdc_budget(
+    liquid_usdc: Decimal,
+    hedge_swaps: list[Action],
+    earn_swaps: list[Action],
+) -> tuple[list[Action], set[str]]:
+    """Cap USDC-spending swap demand at `liquid_usdc`. Only Sell swaps
+    on the USDC-base pairs (USDCUSDT, USDCUSD1, …) charge USDC; Buy
+    swaps on {coin}USDT pairs charge USDT and are sized off the
+    separate USDT budget elsewhere — they don't compete with the USDC
+    cap. Hedge swaps are priority-1 (perp margin is risk-critical);
+    earn swaps that overflow get dropped from the tail. Returns the
+    (possibly pruned) earn_swaps list plus the set of target coins
+    whose USDC-side swap was dropped."""
+    if liquid_usdc <= 0:
+        return earn_swaps, set()
+    # Buy swaps spend USDT, not USDC — let them through regardless of
+    # USDC budget. They keep their slot in the returned earn_swaps
+    # list so the dispatch order is preserved.
+    buy_swaps = [a for a in earn_swaps if a.side == "Buy"]
+    sell_swaps = [a for a in earn_swaps if a.side != "Buy"]
+
+    hedge_demand = sum(
+        (a.amount for a in hedge_swaps if a.side != "Buy"), Decimal(0)
+    )
+    remaining = liquid_usdc - hedge_demand
+    if remaining <= 0:
+        dropped = {a.coin for a in sell_swaps}
+        if sell_swaps:
+            log.warning(
+                "usdc_budget: hedge demand $%s ≥ liquid USDC $%s — "
+                "dropping all %d USDC-side earn swap(s) for: %s",
+                hedge_demand, liquid_usdc, len(sell_swaps),
+                ", ".join(sorted(dropped)),
+            )
+        return buy_swaps, dropped
+    kept_sell: list[Action] = []
+    dropped: set[str] = set()
+    spent = Decimal(0)
+    for a in sell_swaps:
+        if spent + a.amount <= remaining:
+            kept_sell.append(a)
+            spent += a.amount
+        else:
+            dropped.add(a.coin)
+            log.warning(
+                "usdc_budget: drop swap USDC→%s ($%s) — would exceed "
+                "remaining budget $%s (already spent $%s on earn, "
+                "$%s on hedges, of $%s liquid)",
+                a.coin, a.amount, remaining - spent, spent, hedge_demand,
+                liquid_usdc,
+            )
+    return kept_sell + buy_swaps, dropped
+
+
 def _swap_actions_for_earn_picks(
     snapshot: Snapshot,
     subscribe_actions: list[Action],
@@ -1736,20 +1895,32 @@ def _swap_actions_for_earn_picks(
     one venue produces 3 distinct swaps (one per target coin), not
     one per pick.
     """
-    required_per_coin: dict[str, Decimal] = {}
+    # Split the demand by route:
+    #   stable_demand_usdc  — USDCx pair (Sell USDC for the target
+    #                          stable); qty is the USDC amount.
+    #   nonstable_demand_usdt — {coin}USDT pair (Buy {coin} with USDT);
+    #                          qty is the USDT amount to spend.
+    # Both flow through SWAP_SPOT but with different `side` and a
+    # different source coin → kept separate so the USDC budget pass
+    # doesn't double-count non-stable spend.
+    stable_demand: dict[str, Decimal] = {}
+    nonstable_demand_usd: dict[str, Decimal] = {}
     for a in subscribe_actions:
         if a.kind not in (ActionKind.SUBSCRIBE_EARN, ActionKind.SUBSCRIBE_LM):
             continue
         coin = a.coin
-        # Skip the source coin and anything we wouldn't recognize as
-        # a stable — the perp-hedge swap layer handles USDT margin
-        # separately, and we don't auto-convert into non-stables (an
-        # OnChain non-USD pick already requires a paired hedge).
-        if coin == "USDC":
+        if coin in (None, "USDC"):
             continue
-        if coin not in _STABLES:
-            continue
-        required_per_coin[coin] = required_per_coin.get(coin, Decimal(0)) + a.amount
+        if coin in _STABLES:
+            stable_demand[coin] = stable_demand.get(coin, Decimal(0)) + a.amount
+        elif a.amount_native is not None and a.amount_native > 0:
+            # Non-stable: a.amount is USD, a.amount_native is native
+            # coin qty. We'll Buy `coin` via {coin}USDT spending
+            # `a.amount` worth of USDT.
+            nonstable_demand_usd[coin] = (
+                nonstable_demand_usd.get(coin, Decimal(0)) + a.amount
+            )
+    required_per_coin = stable_demand
 
     # Pending REDEEM_EARN actions return their coin to the wallet
     # in-cycle, so credit them against the requirement before sizing
@@ -1785,10 +1956,53 @@ def _swap_actions_for_earn_picks(
                 product_id=symbol,
                 coin=coin,  # target coin of the swap
                 amount=qty,  # USDC to sell — Bybit Sell uses base-coin qty
+                side="Sell",
                 order_link_id=_order_link_id(snapshot_ts, cursor),
                 reason=(
                     f"swap {qty} USDC → {coin} for Earn/LM subscribe coverage "
                     f"(need ${need:.2f}, have ${available:.2f})"
+                ),
+            )
+        )
+        cursor += 1
+
+    # Non-stable Earn/LM picks (TON, ATOM, …) use Bybit's {coin}USDT
+    # pair with side=Buy — spend USDT to acquire the target coin.
+    # Bybit doesn't expose `USDC{coin}` pairs for these, so the route
+    # is two-legged from a USDC accounting view: USDC→USDT via
+    # _swap_actions_for_hedges (or transfer_satisfies_swap if FUND
+    # already has USDT), then USDT→coin here.
+    for coin, need_usd in nonstable_demand_usd.items():
+        wallet_balance = snapshot.wallet.unified_coin_balances.get(coin, Decimal(0))
+        # Convert wallet native balance to USD for the shortfall calc
+        # using the same mark price the planner used.
+        perp_info = (snapshot.perp_market or {}).get(coin)
+        mark = getattr(perp_info, "mark_price", None) if perp_info else None
+        if mark is None or mark <= 0:
+            # Without a mark price we can't size the swap — skip,
+            # subscribe will 180016 and be visible in cycle log.
+            continue
+        have_usd = wallet_balance * mark
+        shortfall_usd = need_usd - have_usd
+        if shortfall_usd < MIN_SWAP_USDC:
+            continue
+        # USDT to spend, with a 1% buffer for spread/slippage. Bybit
+        # market Buy on {coin}USDT uses quote-coin qty (USDT).
+        qty_usdt = (shortfall_usd * Decimal("1.01")).quantize(Decimal("0.01"))
+        symbol = f"{coin}USDT"
+        swaps.append(
+            Action(
+                kind=ActionKind.SWAP_SPOT,
+                category="Spot",
+                product_id=symbol,
+                coin=coin,  # target coin we're acquiring
+                amount=qty_usdt,  # USDT quote qty — side=Buy uses quote
+                side="Buy",
+                order_link_id=_order_link_id(snapshot_ts, cursor),
+                reason=(
+                    f"buy {coin} via {symbol} for Earn subscribe coverage "
+                    f"(need ${need_usd:.2f} = {need_usd/mark:.4f} {coin} @ "
+                    f"${mark:.4f}, have {wallet_balance} {coin})"
                 ),
             )
         )
@@ -2168,43 +2382,63 @@ async def _execute_one(
                 "slippage": _ALPHA_DEFAULT_SLIPPAGE,
             }
         elif action.kind == ActionKind.SWAP_SPOT:
-            # USDC → USDT via the USDCUSDT spot pair. Bybit's spot
-            # Market Sell uses base-coin qty (USDC here); Market Buy
-            # would use quote, which is the asymmetry flagged in `.27`.
-            # We always swap by selling USDC, so `qty` is always base.
-            #
-            # Pre-flight optimization: if the target coin (action.coin)
-            # already sits in FUND in sufficient quantity, just move it
-            # over — no need to spend a spot fee + slippage on a swap
-            # we don't have to make. This kicks in after the first live
-            # cycle's swap leaves USDT in FUND that subsequent cycles
-            # would otherwise re-swap-from-USDC.
-            target_coin = action.coin
-            if await _transfer_satisfies_swap(client, target_coin, action.amount):
-                response = {"transferred_in_lieu_of_swap": True, "coin": target_coin}
+            # Two routes:
+            #   side="Sell" (default): USDCx pair, sell USDC for quote
+            #                          stable. `amount` is USDC qty.
+            #   side="Buy":             {coin}USDT pair, buy non-stable
+            #                          with USDT. `amount` is USDT qty.
+            # Bybit's spot Market Sell uses base-coin qty; Market Buy
+            # uses quote-coin qty (the `.27` asymmetry).
+            side = action.side or "Sell"
+            if side == "Sell":
+                # Pre-flight: if target coin already sits in FUND in
+                # sufficient quantity, transfer it instead of paying
+                # spot fees to recreate balance we already have.
+                target_coin = action.coin
+                if await _transfer_satisfies_swap(client, target_coin, action.amount):
+                    response = {
+                        "transferred_in_lieu_of_swap": True,
+                        "coin": target_coin,
+                    }
+                else:
+                    # Source coin (USDC) often lives in FUND; pre-flight
+                    # FUND→UNIFIED transfer and poll until settled.
+                    base_coin = _swap_base_coin(action.product_id)
+                    await _ensure_unified_balance(client, base_coin, action.amount)
+                    out = await client.place_spot_order(
+                        symbol=action.product_id,
+                        side="Sell",
+                        qty=str(action.amount),
+                        order_link_id=action.order_link_id,
+                    )
+                    response = {"orderId": out.orderId}
             else:
-                # Fall back to the actual swap. Base coin (USDC) often
-                # lives in FUND; pre-flight a FUND→UNIFIED transfer of
-                # any shortfall and poll until it settles before placing
-                # the order. Without this the spot endpoint races and
-                # gets retCode=170131 'Insufficient balance' despite the
-                # transfer log showing success.
-                base_coin = _swap_base_coin(action.product_id)
-                await _ensure_unified_balance(client, base_coin, action.amount)
+                # Buy: spend `amount` USDT to acquire `action.coin`.
+                # Ensure UTA has enough USDT first (FUND→UNIFIED if
+                # needed).
+                await _ensure_unified_balance(client, "USDT", action.amount)
                 out = await client.place_spot_order(
                     symbol=action.product_id,
-                    side="Sell",
+                    side="Buy",
                     qty=str(action.amount),
                     order_link_id=action.order_link_id,
                 )
-                response = {"orderId": out.orderId}
+                response = {"orderId": out.orderId, "side": "Buy"}
         else:
             side = "Stake" if action.kind == ActionKind.SUBSCRIBE_EARN else "Redeem"
             account_type = _ACCOUNT_TYPE[action.category]
+            # Bybit Earn endpoints expect native-coin amount, never USD.
+            # For stables `amount` (USD) ≈ native; for non-stables the
+            # planner pre-computed `amount_native` via mark price.
+            send_amount = (
+                action.amount_native
+                if action.amount_native is not None
+                else action.amount
+            )
             earn_out = await client.place_earn_order(
                 category=action.category,  # type: ignore[arg-type]
                 product_id=action.product_id,
-                amount=str(action.amount),
+                amount=str(send_amount),
                 side=side,  # type: ignore[arg-type]
                 coin=action.coin,
                 account_type=account_type,  # type: ignore[arg-type]

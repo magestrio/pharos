@@ -124,6 +124,13 @@ class WalletSnapshot(BaseModel):
     # wallet doesn't hold yet. Empty dict when the asset-overview has
     # no UNIFIED account.
     unified_coin_balances: dict[str, Decimal] = Field(default_factory=dict)
+    # Total USDC the planner can spend on spot swaps this cycle — sum
+    # across UNIFIED + FUND. The executor's `_transfer_satisfies_swap`
+    # pre-flight can pull FUND USDC into UNIFIED, so for budgeting
+    # purposes both wallets count. Used by the swap planner to cap
+    # total swap demand and drop tail earn-swaps that would otherwise
+    # 170131 the moment USDC drains.
+    liquid_usdc_usd: Decimal = Decimal(0)
 
 
 class MarketSnapshot(BaseModel):
@@ -1029,6 +1036,27 @@ def _usdt_in_unified(accounts: list[dict[str, Any]]) -> Decimal:
     return Decimal(0)
 
 
+def _coin_across_all_accounts(
+    accounts: list[dict[str, Any]], coin: str
+) -> Decimal:
+    """Sum a coin's equity across every account in the asset-overview
+    list (UNIFIED + FUND + CONTRACT + …). Used by the swap planner to
+    cap total swap demand at the source coin's full liquid balance —
+    the executor's `_transfer_satisfies_swap` pulls from FUND as
+    needed, so for budgeting purposes both UTA and FUND count."""
+    total = Decimal(0)
+    for acct in accounts:
+        for entry in acct.get("coinDetail") or []:
+            if entry.get("coin") != coin:
+                continue
+            raw = entry.get("equity") or entry.get("walletBalance") or "0"
+            try:
+                total += Decimal(str(raw))
+            except (InvalidOperation, TypeError):
+                continue
+    return total
+
+
 def _all_coins_in_unified(accounts: list[dict[str, Any]]) -> dict[str, Decimal]:
     """Build `{coin: balance}` for every coin in the UNIFIED account.
     Lets the executor diff plan an auto-swap (USDC → pick.coin) ahead of
@@ -1633,6 +1661,10 @@ async def collect_snapshot(
     accounts = asset_overview.get("list", []) or []
     usdt_available = _usdt_in_unified(accounts)
     unified_coins = _all_coins_in_unified(accounts)
+    # USDC across UNIFIED + FUND + others. USDC is our universal swap
+    # source coin — the planner needs the full liquid balance to
+    # decide how many swaps it can afford without draining mid-cycle.
+    liquid_usdc = _coin_across_all_accounts(accounts, "USDC")
 
     # Products: normalize + rank with diversification floor.
     stable_floor = lambda s: s.coin in STABLES  # noqa: E731
@@ -1878,6 +1910,7 @@ async def collect_snapshot(
             accounts=accounts,
             usdt_available_usd=usdt_available,
             unified_coin_balances=unified_coins,
+            liquid_usdc_usd=liquid_usdc,
         ),
         earn_positions=earn_positions_dump,
         lm_positions=lm_positions,

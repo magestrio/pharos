@@ -1518,7 +1518,10 @@ async def test_execute_open_perp_short_dry_run(tmp_path: Path) -> None:
 
 
 def test_diff_swap_emitted_when_usdt_short_for_open_hedge() -> None:
-    """Open hedge of $50, no USDT in UNIFIED → swap $52.50 (5% buffer)."""
+    """Open hedge of $50, no USDT in UNIFIED → USDC→USDT swap $52.50
+    (5% buffer). A non-stable Earn pick (TON) also triggers a parallel
+    {coin}USDT Buy swap now (non-stable swap path landed 2026-06-03);
+    here we just locate the hedge-side USDCUSDT swap."""
     snap = _snapshot(
         total_equity_usd="100",
         usdt_available_usd="0",
@@ -1528,10 +1531,13 @@ def test_diff_swap_emitted_when_usdt_short_for_open_hedge() -> None:
     )
     d = _decision_with_hedge(hedge_notional=-50.0)
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
-    swaps = [a for a in actions if a.kind == ActionKind.SWAP_SPOT]
-    assert len(swaps) == 1
-    sw = swaps[0]
-    assert sw.product_id == "USDCUSDT"
+    hedge_swaps = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT and a.product_id == "USDCUSDT"
+    ]
+    assert len(hedge_swaps) == 1
+    sw = hedge_swaps[0]
+    assert sw.side == "Sell"
     assert sw.coin == "USDT"
     assert sw.amount == Decimal("52.50")  # 50 * 1.05 buffer
 
@@ -1608,8 +1614,11 @@ def test_diff_no_swap_when_open_skipped_due_to_missing_perp_market() -> None:
 
 
 def test_diff_swap_suppressed_below_min_threshold() -> None:
-    """Sub-dollar shortfall doesn't emit a SWAP — Bybit margin call won't
-    fire on pennies, and a $0.30 swap is more noise than signal."""
+    """Sub-dollar hedge-side shortfall doesn't emit a USDCUSDT SWAP —
+    Bybit margin call won't fire on pennies, and a $0.30 swap is more
+    noise than signal. The TON Buy swap (non-stable Earn coverage) is
+    a separate concern and emits independently when above
+    MIN_SWAP_USDC."""
     snap = _snapshot(
         total_equity_usd="100",
         usdt_available_usd="52.30",  # buffered req = 52.50 → 0.20 short
@@ -1618,7 +1627,11 @@ def test_diff_swap_suppressed_below_min_threshold() -> None:
     )
     d = _decision_with_hedge(hedge_notional=-50.0)
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
-    assert not [a for a in actions if a.kind == ActionKind.SWAP_SPOT]
+    hedge_swaps = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT and a.product_id == "USDCUSDT"
+    ]
+    assert not hedge_swaps
 
 
 def test_diff_sequence_redeems_closes_swaps_opens_subscribes() -> None:
