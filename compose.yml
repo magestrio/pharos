@@ -28,7 +28,7 @@ services:
     # talk to the DB; the agent/api compose services still use the
     # internal `postgres` hostname over the docker network.
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U vault8004 -d vault8004"]
       interval: 10s
@@ -43,6 +43,9 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgres://vault8004:${POSTGRES_PASSWORD}@postgres:5432/vault8004
+      # Pin RSA PEM path to the mount below so the in-container path is
+      # stable regardless of what's in .env on the host.
+      BYBIT_PRIVATE_KEY_PATH: /run/secrets/bybit-rsa.pem
     command: >
       python -m agent.sandbox.loop
       --interval 14400
@@ -56,6 +59,10 @@ services:
       - sandbox_captures:/app/agent/sandbox/captures
       - sandbox_state:/app/agent/sandbox/state
       - sandbox_events:/app/agent/sandbox/events
+      # Bybit RSA private key. Host path is configurable via
+      # BYBIT_RSA_HOST_PATH in .env (default /etc/vault8004/bybit-rsa.pem
+      # on Hetzner). chmod 600 root:root on the host.
+      - ${BYBIT_RSA_HOST_PATH:-/etc/vault8004/bybit-rsa.pem}:/run/secrets/bybit-rsa.pem:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -73,8 +80,12 @@ services:
       --port 8000
       --proxy-headers
       --forwarded-allow-ips=*
-    expose:
-      - "8000"
+    # Bind to 127.0.0.1 so local web dev can hit http://localhost:8000
+    # without exposing the API publicly. On Hetzner this also lets you
+    # `ssh -L 8000:localhost:8000` for debug without going through Caddy.
+    # Caddy still reaches the api via the internal docker network.
+    ports:
+      - "127.0.0.1:8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
