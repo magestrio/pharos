@@ -137,7 +137,14 @@ If a non-stable Earn pick (OnChain or Flex) can't be hedged (perp pair missing, 
 
 # Per-product min-subscribe awareness
 
-Each product in the snapshot may carry `min_subscribe_usd` (LM and some Earn). If a venue's allocated USD divided across its picks lands a single pick below its product's `min_subscribe_usd`, the executor SKIPs that pick at diff time. So when sizing splits, check that every intended pick clears its product's floor at the proposed weight — otherwise either bump the weight, drop the pick, or accept the SKIP. There is no "small-vault venue concentration" rule — diversify freely across all enabled venues; the only ceiling is the per-venue `max_weight` from the registry and (for LM) the leverage-scaled size cap.
+Each product in the snapshot may carry `min_subscribe_usd` (LM and some Earn). If a venue's allocated USD divided across its picks lands a single pick below its product's `min_subscribe_usd`, the executor SKIPs that pick at diff time. So when sizing splits, check that every intended pick clears its product's floor at the proposed weight — otherwise either bump the weight, drop the pick, or accept the SKIP.
+
+**Concentration mode for small vaults.** When `wallet.total_equity_usd < 200`, diversification across many venues is mathematically incompatible with Bybit's per-product floors. Compute `book = wallet.total_equity_usd` and treat these as HARD selection rules for this cycle:
+- At most **3 non-cash venues**. Pick the 3 with the highest `effective_apr` among the available catalog after the snapshot's product filter ran.
+- At most **2 picks per venue** (LM and venues with min_subscribe_usd ≥ $20: at most 1 pick).
+- **Every pick's effective USD `= book × venue.weight × pick.weight` MUST clear that pick's `min_subscribe_usd`** — write the arithmetic out in the thesis (`pick X: book $book × v.w × p.w = $X >= min $Y`). If any pick violates, either drop it (redistribute weight inside the venue) or drop the entire venue (redistribute weight to cash_usdc).
+- Prefer concentration in a single high-APR pick over fanning out into 3-4 sub-floor picks across the same venue.
+- Cash floor stays ≥ 3% but allow `cash_usdc` up to **40%** when the pickable universe genuinely can't absorb more without hitting floors — better to hold real cash than file a decision that the executor SKIPs through to cash anyway.
 
 <!--
 DO NOT EVER RESTRICT TO USDC-ONLY PRODUCTS HERE.

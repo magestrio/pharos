@@ -284,7 +284,14 @@ def check_lm_leverage_size_cap(d: Decision, snapshot: Snapshot) -> Check:
         lev = _extract_max_leverage(summary) or 1
         effective_weight = lm.weight * pick.weight
         max_weight = LM_LEVERAGE_CAP_FACTOR / max(1, lev)
-        if effective_weight > max_weight + 1e-9:
+        # Tolerance: 1e-9 absolute catches float-multiplication noise on
+        # small numbers, 0.5% relative catches Claude rounding to nice
+        # decimals (e.g. lm=0.10, pick=0.43 → 4.3% vs cap 0.30/7=4.286%;
+        # 0.014% over is round-down headroom, not real risk). A 0.5%
+        # over on a 30% LM allocation is ~0.15% of book — well below
+        # any meaningful liquidation tail.
+        tolerance = max(1e-9, max_weight * 0.005)
+        if effective_weight > max_weight + tolerance:
             violations.append(
                 f"{pick.product_id}(leverage={lev}, size="
                 f"{effective_weight:.1%} > cap {max_weight:.1%})"
