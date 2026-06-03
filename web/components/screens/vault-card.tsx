@@ -25,7 +25,11 @@ import {
 } from "@/lib/contracts";
 import { mantleExplorerAddress, mantleExplorerTx } from "@/lib/explorer";
 import { useActiveHedges } from "@/lib/hooks/use-active-hedges";
-import { useAllocationStats, type AllocationStats } from "@/lib/hooks/use-allocation-stats";
+import {
+  useAllocationStats,
+  usePlannedVsActual,
+  type AllocationStats,
+} from "@/lib/hooks/use-allocation-stats";
 import {
   formatHeartbeatShort,
   useAttestorHealth,
@@ -59,8 +63,11 @@ export function VaultCard() {
       <HeroBlock stats={stats} />
       <StatsRow stats={stats} />
       <MintRedeemPanel />
-      <ExchangeRateSection stats={stats} />
+      {/* Exchange rate chart needs the on-chain vUSDC contract — hidden
+          until Phase B deploy. Showing a mock series here is dishonest. */}
+      {stats.exchangeRate !== undefined && <ExchangeRateSection stats={stats} />}
       <AllocationSection stats={stats} allocation={allocation} />
+      <PlannedVsActualSection />
       <AttestorAndHedgesSection />
       <RecentWatcherEventsWidget />
       <RecentDecisionsPreview />
@@ -111,7 +118,11 @@ function HeroBlock({ stats }: { stats: VaultStats }) {
       </div>
       <div className="lg:col-span-1">
         <div className="lg:sticky lg:top-24">
-          <ReputationNFTCard />
+          {/* ReputationNFTCard reads ReputationOracle on-chain; the oracle
+              is deferred to Phase B, and rendering the mock score (1247
+              / "Decile rank: TOP 16%") here would be the most visually
+              prominent fake on the page. Hide until the contract is wired. */}
+          <ReputationNFTCardLive />
         </div>
       </div>
     </section>
@@ -119,25 +130,68 @@ function HeroBlock({ stats }: { stats: VaultStats }) {
 }
 
 function HeroBadgeLine() {
+  // ERC-8004 AGENT_ID=99 is the only on-chain identity actually wired
+  // (registered 2026-05-24, owner = SAFE). Reputation NFT score is
+  // not yet readable — ReputationOracle deferred to Phase B. Showing
+  // a mock "1247" was the bug; just omit it until live.
+  const rep = useReputation();
+  const repLabel = rep.isLive && rep.lastScoreBps !== null
+    ? formatBpsAsPct(rep.lastScoreBps)
+    : null;
+
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-2 font-mono text-[11.5px] uppercase tracking-[0.14em]">
-      <span className="text-white font-semibold">{VAULT.id}</span>
+      <span className="text-white font-semibold">VAULT8004</span>
       <span className="text-dim-600">│</span>
       <span className="text-dim-300">
-        ERC-8004 <span className="text-white">{VAULT.erc8004}</span>
+        ERC-8004 <span className="text-white">#{VAULT_AGENT_ID}</span>
       </span>
-      <span className="text-dim-600">│</span>
-      <span className="text-dim-300">
-        Reputation <span className="text-white">{VAULT.reputation}</span>
-      </span>
+      {repLabel !== null && (
+        <>
+          <span className="text-dim-600">│</span>
+          <span className="text-dim-300">
+            Reputation <span className="text-white">{repLabel}</span>
+          </span>
+        </>
+      )}
       <span className="text-dim-600">│</span>
       <span className="inline-flex items-center gap-2 text-neon">
-        <LiveDot /> {VAULT.status}
+        <LiveDot /> Live
       </span>
       <span className="text-dim-600">│</span>
       <span className="text-dim-300">Mantle Mainnet</span>
     </div>
   );
+}
+
+/**
+ * Wraps ReputationNFTCard with a live-data gate: when the on-chain
+ * ReputationOracle isn't deployed, render a compact placeholder instead
+ * of the legacy mock-score card.
+ */
+function ReputationNFTCardLive() {
+  const rep = useReputation();
+  if (!rep.isLive) {
+    return (
+      <div className="bg-ink-900 border border-ink-600/70 rounded-md p-5">
+        <div className="text-[10px] font-mono uppercase tracking-[0.16em] text-dim-400 mb-3 flex items-center gap-2">
+          <span className="w-1.5 h-1.5 rounded-sm bg-warn/70"></span>
+          ERC-8004 Reputation
+        </div>
+        <div className="text-sm text-dim-200 leading-relaxed">
+          Agent identity is live on-chain (
+          <span className="font-mono text-white">AGENT_ID=#{VAULT_AGENT_ID}</span>
+          ). Score-update path through{" "}
+          <span className="font-mono text-white">ReputationOracle</span> ships
+          with the Phase B vUSDC contract deploy.
+        </div>
+        <div className="text-[11px] font-mono text-dim-500 mt-3">
+          [mainnet pending]
+        </div>
+      </div>
+    );
+  }
+  return <ReputationNFTCard />;
 }
 
 function ReputationNFTCard() {
@@ -372,31 +426,65 @@ function MetricCell({ label, value, border = "" }: { label: string; value: strin
   );
 }
 
+function formatTvl(tvlUsdc: number | undefined): string {
+  if (tvlUsdc === undefined) return "—";
+  if (tvlUsdc >= 1_000_000) return "$" + (tvlUsdc / 1_000_000).toFixed(3) + "M";
+  if (tvlUsdc >= 1_000) return "$" + (tvlUsdc / 1_000).toFixed(2) + "k";
+  return "$" + tvlUsdc.toFixed(2);
+}
+
 function StatsRow({ stats }: { stats: VaultStats }) {
-  const exchangeRate = stats.exchangeRate ?? VAULT.exchangeRate;
-  const cumReturnPct = stats.cumReturnPct ?? (VAULT.exchangeRate / VAULT.exchangeRateStart - 1) * 100;
-  const tvlUsdc = stats.tvlUsdc ?? VAULT.tvlUsdc;
+  // Live data — derive APY + decisions count from the cycle history so
+  // numbers reflect what the agent actually did (vs. mock VAULT consts).
+  const cyclesQuery = useCycles({ limit: 50 });
+  const cycles = cyclesQuery.data ?? [];
+  const aprSamples = cycles
+    .map((c) => c.expected_apr_pct)
+    .filter((x): x is number => x !== null && Number.isFinite(x));
+  const avgApr =
+    aprSamples.length > 0
+      ? aprSamples.reduce((s, v) => s + v, 0) / aprSamples.length
+      : null;
+
   return (
     <section className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
       <StatCard
         label="vUSDC Exchange Rate"
-        value={exchangeRate.toFixed(5)}
+        value={stats.exchangeRate !== undefined ? stats.exchangeRate.toFixed(5) : "—"}
         tone="green"
-        sub={<span>+{cumReturnPct.toFixed(3)}% since inception</span>}
+        sub={
+          stats.cumReturnPct !== undefined ? (
+            <span>+{stats.cumReturnPct.toFixed(3)}% since inception</span>
+          ) : (
+            <span className="text-dim-500">vUSDC contract not deployed yet</span>
+          )
+        }
       />
       <StatCard
         label="Total Value Locked"
-        value={"$" + (tvlUsdc / 1_000_000).toFixed(3) + "M"}
-        sub={<span className="text-neon">+${(VAULT.tvlDelta / 1000).toFixed(0)}k since launch</span>}
+        value={formatTvl(stats.tvlUsdc)}
+        sub={
+          stats.tvlUsdc !== undefined ? (
+            <span className="text-dim-400">live · off-chain sandbox</span>
+          ) : (
+            <span className="text-dim-500">no data</span>
+          )
+        }
       />
       <StatCard
-        label="Effective APY"
-        value={VAULT.apyEffective.toFixed(1) + "%"}
-        sub={<span>annualised from 21-day window</span>}
+        label="Avg Expected APR"
+        value={avgApr !== null ? avgApr.toFixed(1) + "%" : "—"}
+        sub={
+          avgApr !== null ? (
+            <span>mean across {aprSamples.length} cycles</span>
+          ) : (
+            <span className="text-dim-500">no cycles yet</span>
+          )
+        }
       />
       <StatCard
         label="Decisions Logged"
-        value={String(VAULT.decisions)}
+        value={String(cycles.length)}
         sub={<span>Event-driven · 4h cron fallback</span>}
       />
     </section>
@@ -477,28 +565,18 @@ function AllocationSection({
   stats: VaultStats;
   allocation: AllocationStats;
 }) {
-  const [bybitOpen, setBybitOpen] = useState(true);
-  const portfolio = usePortfolio();
   const rows = allocation.rows;
-  const weightedApy = rows.reduce((s, a) => s + a.pct * a.apy, 0) / 100;
-  // Prefer on-chain TVL when present; otherwise fall back to allocation
-  // total (mock or live), then the legacy vault stat.
-  const tvlUsdc = stats.tvlUsdc ?? allocation.totalUsdc ?? VAULT.tvlUsdc;
-  const bybitSubLive = portfolioToBybitSubRows(portfolio.data?.positions ?? []);
-  const bybitSubRows = bybitSubLive.length > 0 ? bybitSubLive : BYBIT_SUB;
+  // Real allocation total first; on-chain TVL as a secondary signal
+  // (Phase B). No mock fallback — let the donut center read "—" if
+  // there's genuinely no data yet.
+  const tvlUsdc = allocation.totalUsdc || stats.tvlUsdc;
 
   return (
     <section>
       <SectionHead
-        eyebrow="Current Allocation"
-        title="Capital distribution across whitelisted venues"
-        subtitle="Live on-chain balances for Aave legs and cash. Bybit-side balances pushed every ~5 minutes by a 2-of-3 Gnosis Safe attestor. Sub-allocation inside Bybit selects from 200+ Earn products + delta-neutral basis trades."
-        right={
-          <div className="hidden md:flex items-center gap-3 text-[11px] font-mono">
-            <span className="text-dim-500 uppercase tracking-[0.14em]">Blended APY</span>
-            <span className="text-neon text-lg tabular">{weightedApy.toFixed(2)}%</span>
-          </div>
-        }
+        eyebrow="Current Allocation · live portfolio"
+        title="Capital distribution across venues"
+        subtitle="Single source of truth — positions from the latest /portfolio/current snapshot. Each Bybit sub-product (Flexible Earn, Liquidity Mining, OnChain, DiscountBuy, DualAsset, Hold-to-Earn) is its own line — independent products with different APR sources and execution paths."
       />
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
         <div className="lg:col-span-2 bg-ink-900 border border-ink-600/70 rounded-md p-6 flex flex-col items-center justify-center">
@@ -506,14 +584,19 @@ function AllocationSection({
             data={rows.map((a) => ({ pct: a.pct, color: a.color, label: a.key }))}
             size={220}
             thickness={18}
-            centerValue={"$" + (tvlUsdc / 1_000_000).toFixed(2) + "M"}
-            centerLabel="TVL · USDC"
+            centerValue={tvlUsdc ? formatTvl(tvlUsdc) : "—"}
+            centerLabel="TVL · USD"
           />
-          <div className="mt-5 grid grid-cols-2 gap-2 w-full">
+          <div className="mt-5 grid grid-cols-1 gap-2 w-full">
+            {rows.length === 0 && (
+              <div className="text-[11px] font-mono text-dim-500 text-center py-4">
+                No positions held — agent fully in cash this cycle.
+              </div>
+            )}
             {rows.map((a) => (
               <div key={a.key} className="flex items-center gap-2 text-[11px] font-mono">
                 <span className="w-2 h-2 rounded-sm shrink-0" style={{ background: a.color }} />
-                <span className="text-dim-300 truncate">{a.label.replace("Aave V3 ", "Aave ")}</span>
+                <span className="text-dim-300 truncate">{a.label}</span>
                 <span className="text-white tabular ml-auto">{a.pct}%</span>
               </div>
             ))}
@@ -522,113 +605,40 @@ function AllocationSection({
 
         <div className="lg:col-span-3 bg-ink-900 border border-ink-600/70 rounded-md overflow-hidden">
           <div className="grid grid-cols-12 text-[10px] uppercase tracking-[0.16em] font-mono text-dim-500 border-b border-ink-600/70 px-4 py-2.5 bg-ink-850">
-            <div className="col-span-4">Venue</div>
-            <div className="col-span-2 text-right">Weight</div>
-            <div className="col-span-2 text-right">APY</div>
-            <div className="col-span-3 text-right">Notional</div>
-            <div className="col-span-1 text-right">Tx</div>
+            <div className="col-span-5">Venue</div>
+            <div className="col-span-3 text-right">Weight</div>
+            <div className="col-span-4 text-right">Notional</div>
           </div>
-          {rows.map((a, i) => {
-            const isBybit = a.key === "BYBIT";
-            return (
-              <div key={a.key} style={{ display: "contents" }}>
-                <div
-                  className={`grid grid-cols-12 items-center px-4 py-3.5 ${
-                    isBybit ? "cursor-pointer hover:bg-ink-850/60" : ""
-                  } ${i !== rows.length - 1 || (isBybit && bybitOpen) ? "border-b border-ink-600/40" : ""}`}
-                  onClick={isBybit ? () => setBybitOpen((o) => !o) : undefined}
-                >
-                  <div className="col-span-4 flex items-center gap-3">
-                    <span className="w-1.5 h-8 rounded-sm shrink-0" style={{ background: a.color }} />
-                    <div className="min-w-0">
-                      <div className="text-white text-sm font-medium flex items-center gap-2">
-                        {a.label}
-                        {isBybit && (
-                          <span
-                            className={`inline-flex items-center justify-center w-4 h-4 rounded-sm border border-ink-500 text-dim-300 text-[9px] transition-transform ${
-                              bybitOpen ? "rotate-90" : ""
-                            }`}
-                          >
-                            <Icon.Chev />
-                          </span>
-                        )}
-                      </div>
-                      <div className="text-[11px] text-dim-500 font-mono">{a.sub}</div>
-                    </div>
-                  </div>
-                  <div className="col-span-2 text-right">
-                    <div className="font-mono text-white text-sm tabular">{a.pct}%</div>
-                    <div className="mt-1 h-[2px] bg-ink-700 rounded-sm overflow-hidden">
-                      <div className="h-full" style={{ width: a.pct + "%", background: a.color }} />
-                    </div>
-                  </div>
-                  <div className="col-span-2 text-right font-mono text-sm tabular">
-                    <span className={a.apy > 8 ? "text-neon" : a.apy > 0 ? "text-white" : "text-dim-500"}>
-                      {a.apy.toFixed(2)}%
-                    </span>
-                  </div>
-                  <div className="col-span-3 text-right font-mono text-sm text-white tabular">
-                    ${a.notional.toLocaleString("en-US", { maximumFractionDigits: 0 })}
-                  </div>
-                  <div className="col-span-1 text-right">
-                    <a
-                      href="#"
-                      className="inline-flex items-center justify-end text-dim-400 hover:text-white"
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      <Icon.Ext />
-                    </a>
-                  </div>
+          {rows.length === 0 && (
+            <div className="px-4 py-6 text-center text-[12px] font-mono text-dim-500">
+              No live positions yet.
+            </div>
+          )}
+          {rows.map((a, i) => (
+            <div
+              key={a.key}
+              className={`grid grid-cols-12 items-center px-4 py-3.5 ${
+                i !== rows.length - 1 ? "border-b border-ink-600/40" : ""
+              }`}
+            >
+              <div className="col-span-5 flex items-center gap-3">
+                <span className="w-1.5 h-8 rounded-sm shrink-0" style={{ background: a.color }} />
+                <div className="min-w-0">
+                  <div className="text-white text-sm font-medium">{a.label}</div>
+                  <div className="text-[11px] text-dim-500 font-mono">{a.sub}</div>
                 </div>
-
-                {isBybit && bybitOpen && (
-                  <div
-                    className={`bg-ink-850/40 border-l-2 border-elec/40 ${
-                      i !== rows.length - 1 ? "border-b border-ink-600/40" : ""
-                    }`}
-                  >
-                    <div className="px-4 py-2 text-[9.5px] uppercase tracking-[0.18em] font-mono text-elec/80 flex items-center gap-2">
-                      <span>↳ inside Bybit Attestor</span>
-                      <span className="text-dim-600">·</span>
-                      <span className="text-dim-500">via 0x4dc4…a037 (2-of-3 Safe)</span>
-                    </div>
-                    {bybitSubRows.map((b, j) => (
-                      <div
-                        key={b.key}
-                        className={`grid grid-cols-12 items-center px-4 py-2.5 ${
-                          j !== bybitSubRows.length - 1 ? "border-b border-ink-600/30" : ""
-                        }`}
-                      >
-                        <div className="col-span-4 flex items-center gap-3 pl-6">
-                          <span className="w-1 h-6 rounded-sm shrink-0" style={{ background: b.color }} />
-                          <div className="min-w-0">
-                            <div className="text-dim-300 text-[13px]">{b.label}</div>
-                            <div className="text-[10.5px] text-dim-500 font-mono">{b.sub}</div>
-                          </div>
-                        </div>
-                        <div className="col-span-2 text-right font-mono text-[12.5px] text-dim-300 tabular">
-                          {b.pct}%
-                        </div>
-                        <div className="col-span-2 text-right font-mono text-[12.5px] tabular">
-                          <span
-                            className={
-                              b.apy > 8 ? "text-neon" : b.apy > 0 ? "text-dim-300" : "text-dim-500"
-                            }
-                          >
-                            {b.apy.toFixed(2)}%
-                          </span>
-                        </div>
-                        <div className="col-span-3 text-right font-mono text-[12.5px] text-dim-300 tabular">
-                          ${b.notional.toLocaleString("en-US", { maximumFractionDigits: 0 })}
-                        </div>
-                        <div className="col-span-1"></div>
-                      </div>
-                    ))}
-                  </div>
-                )}
               </div>
-            );
-          })}
+              <div className="col-span-3 text-right">
+                <div className="font-mono text-white text-sm tabular">{a.pct}%</div>
+                <div className="mt-1 h-[2px] bg-ink-700 rounded-sm overflow-hidden">
+                  <div className="h-full" style={{ width: a.pct + "%", background: a.color }} />
+                </div>
+              </div>
+              <div className="col-span-4 text-right font-mono text-sm text-white tabular">
+                ${a.notional.toLocaleString("en-US", { maximumFractionDigits: 0 })}
+              </div>
+            </div>
+          ))}
         </div>
       </div>
     </section>
@@ -636,6 +646,11 @@ function AllocationSection({
 }
 
 function AttestorAndHedgesSection() {
+  const health = useAttestorHealth();
+  const hedges = useActiveHedges();
+  // Both legs need real signal to keep this section visible. Mock-only
+  // attestor + zero hedges is not "what the agent does today" — hide.
+  if (!health.isLive && !hedges.isLive) return null;
   return (
     <section>
       <SectionHead
@@ -957,6 +972,78 @@ function eventRowInner(ev: EventRow): React.ReactNode {
       </span>
       {ev.triggered_cycle_ts && <Icon.Chev className="text-dim-500" />}
     </>
+  );
+}
+
+function PlannedVsActualSection() {
+  const data = usePlannedVsActual();
+  // Hide when there's nothing meaningful to compare (no decision, or
+  // plan exactly matches reality within rounding).
+  if (data.rows.length === 0) return null;
+  if (!data.hasGap && data.actionsPlanned === data.actionsExecuted) return null;
+
+  const fillStatus =
+    data.actionsExecuted !== null && data.actionsPlanned !== null
+      ? `${data.actionsExecuted} / ${data.actionsPlanned} actions filled`
+      : "executor status unknown";
+  const fillTone =
+    data.actionsExecuted === 0 && (data.actionsPlanned ?? 0) > 0
+      ? "text-warn"
+      : data.actionsExecuted === data.actionsPlanned
+      ? "text-neon"
+      : "text-warn";
+
+  return (
+    <section>
+      <SectionHead
+        eyebrow="Planned vs Actual"
+        title="Decision target vs what's actually held"
+        subtitle="Latest cycle's allocation intent (left) compared to the snapshot's real positions (right). Non-zero `Δ` means the executor hasn't filled the rebalance yet — happens in dry-run, mid-cycle, or when a rate-limited subscribe is pending."
+        right={
+          <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-sm border border-ink-500 bg-ink-900 font-mono text-[10.5px] uppercase tracking-[0.14em] ${fillTone}`}>
+            {fillStatus}
+          </span>
+        }
+      />
+      <div className="bg-ink-900 border border-ink-600/70 rounded-md overflow-hidden">
+        <div className="grid grid-cols-12 text-[10px] uppercase tracking-[0.16em] font-mono text-dim-500 border-b border-ink-600/70 px-4 py-2.5 bg-ink-850">
+          <div className="col-span-5">Venue</div>
+          <div className="col-span-2 text-right">Planned</div>
+          <div className="col-span-2 text-right">Actual</div>
+          <div className="col-span-3 text-right">Δ (plan − real)</div>
+        </div>
+        {data.rows.map((r, i) => {
+          const diffTone =
+            Math.abs(r.diffPct) < 0.5
+              ? "text-dim-300"
+              : r.diffPct > 0
+              ? "text-warn"
+              : "text-elec";
+          const sign = r.diffPct > 0 ? "+" : "";
+          return (
+            <div
+              key={r.venue}
+              className={`grid grid-cols-12 items-center px-4 py-2.5 ${
+                i !== data.rows.length - 1 ? "border-b border-ink-600/40" : ""
+              }`}
+            >
+              <div className="col-span-5 font-mono text-[12.5px] text-white">
+                {r.label}
+              </div>
+              <div className="col-span-2 text-right font-mono text-[12.5px] text-dim-200 tabular">
+                {r.plannedPct.toFixed(1)}%
+              </div>
+              <div className="col-span-2 text-right font-mono text-[12.5px] text-dim-200 tabular">
+                {r.actualPct.toFixed(1)}%
+              </div>
+              <div className={`col-span-3 text-right font-mono text-[12.5px] tabular ${diffTone}`}>
+                {sign}{r.diffPct.toFixed(1)}%
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 

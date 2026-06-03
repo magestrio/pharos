@@ -8,6 +8,7 @@ import { useCycleDetail } from "@/lib/agent-store-context";
 import type { CycleDetail, EventRow, ExecutionRow } from "@/lib/agent-api";
 import { ipfsGateway, mantleExplorerTx } from "@/lib/explorer";
 import { HashChip, Icon, SectionHead, Tag } from "@/components/ui";
+import { ThesisView } from "@/components/thesis-view";
 
 export function DecisionLog() {
   const { decisions } = useDecisions();
@@ -324,7 +325,12 @@ function DecisionThesis({
               />
             </div>
           )}
-          <ThesisBlock title="Thesis" body={thesisBody} accent="white" />
+          <div>
+            <div className="text-[10.5px] font-mono uppercase tracking-[0.18em] text-dim-500 mb-2">
+              Thesis
+            </div>
+            <ThesisView body={thesisBody} />
+          </div>
           <div className="mt-5">
             <ThesisBlock
               title="Risk flags"

@@ -1,6 +1,7 @@
 "use client";
 
 import { useReadContracts } from "wagmi";
+import { useCycles, usePortfolio } from "@/lib/agent-store-context";
 import { VAULT } from "@/lib/data";
 import { VUSDC_ABI, VUSDC_ADDRESS, VUSDC_CHAIN_ID, isVUsdcConfigured } from "@/lib/contracts";
 
@@ -19,14 +20,42 @@ export interface VaultStats {
   isLive: boolean;
 }
 
-function deriveDaysLive(): number {
+function deriveDaysLiveFromCycles(firstCycleStartedAt: string | undefined): number | null {
+  if (!firstCycleStartedAt) return null;
+  const t = Date.parse(firstCycleStartedAt);
+  if (Number.isNaN(t)) return null;
+  return Math.max(0, Math.floor((Date.now() - t) / MS_PER_DAY));
+}
+
+function deriveDaysLiveFromInception(): number {
   const inception = Date.parse(VAULT.inception);
   if (Number.isNaN(inception)) return VAULT.daysLive;
   return Math.max(0, Math.floor((Date.now() - inception) / MS_PER_DAY));
 }
 
+function parseTotalEquityUsd(wallet: Record<string, unknown> | null | undefined): number | null {
+  if (!wallet || typeof wallet !== "object") return null;
+  const raw =
+    (wallet as { total_equity_usd?: unknown }).total_equity_usd ??
+    (wallet as { totalEquity?: unknown }).totalEquity;
+  if (raw === undefined || raw === null) return null;
+  const n = parseFloat(String(raw));
+  return Number.isFinite(n) ? n : null;
+}
+
 export function useVaultStats(): VaultStats {
-  const daysLive = deriveDaysLive();
+  const portfolioQuery = usePortfolio();
+  const cyclesQuery = useCycles({ limit: 50 });
+
+  // Off-chain real values from agent API. Used when the on-chain vUSDC
+  // contract isn't deployed (Phase B deferred) so the dashboard still
+  // shows the actual ~$50 sandbox vault equity instead of a mock.
+  const offchainTvlUsd = parseTotalEquityUsd(portfolioQuery.data?.wallet);
+  const cycles = cyclesQuery.data ?? [];
+  const firstCycleStartedAt =
+    cycles.length > 0 ? cycles[cycles.length - 1].started_at : undefined;
+  const liveDaysLive = deriveDaysLiveFromCycles(firstCycleStartedAt);
+  const daysLive = liveDaysLive ?? deriveDaysLiveFromInception();
 
   const query = useReadContracts({
     allowFailure: true,
@@ -51,15 +80,19 @@ export function useVaultStats(): VaultStats {
     },
   });
 
+  // No on-chain contract yet: surface the live off-chain numbers we
+  // actually have, leave exchangeRate/cumReturnPct undefined (their
+  // consumers render placeholders).
   if (!isVUsdcConfigured) {
     return {
-      tvlUsdc: undefined,
+      tvlUsdc: offchainTvlUsd ?? undefined,
       exchangeRate: undefined,
       cumReturnPct: undefined,
       daysLive,
-      isLoading: false,
-      isError: false,
-      isLive: false,
+      isLoading: portfolioQuery.isLoading,
+      isError: portfolioQuery.isError,
+      // "Live" means we have real numbers to show — off-chain equity counts.
+      isLive: offchainTvlUsd !== null,
     };
   }
 
@@ -72,9 +105,6 @@ export function useVaultStats(): VaultStats {
   let cumReturnPct: number | undefined;
 
   if (totalSupplyRaw !== undefined && exchangeRateRaw !== undefined) {
-    // totalSupply: 1e6 units (vUSDC has 6 decimals)
-    // exchangeRate: 1e18-scaled USDC-per-vUSDC
-    // TVL in raw USDC = totalSupply * exchangeRate / 1e18 (still 1e6 units) → divide by 1e6 for dollars
     const tvlRawUsdc = (totalSupplyRaw * exchangeRateRaw) / EXCHANGE_RATE_SCALE;
     tvlUsdc = Number(tvlRawUsdc) / Number(USDC_SCALE);
     exchangeRate = Number(exchangeRateRaw) / Number(EXCHANGE_RATE_SCALE);
@@ -82,12 +112,12 @@ export function useVaultStats(): VaultStats {
   }
 
   return {
-    tvlUsdc,
+    tvlUsdc: tvlUsdc ?? offchainTvlUsd ?? undefined,
     exchangeRate,
     cumReturnPct,
     daysLive,
     isLoading: query.isLoading,
     isError: query.isError,
-    isLive: tvlUsdc !== undefined,
+    isLive: tvlUsdc !== undefined || offchainTvlUsd !== null,
   };
 }

@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo } from "react";
-import { DECISIONS, type Decision } from "@/lib/data";
+import { type Decision } from "@/lib/data";
 import { useCycles } from "@/lib/agent-store-context";
 import type { CycleSummary } from "@/lib/agent-api";
 import {
@@ -120,6 +120,29 @@ function buildDecision(
   };
 }
 
+function decisionFromCycle(cycle: CycleSummary, nowMs: number): Decision {
+  const startedSec = cycleStartedSec(cycle);
+  return {
+    id: cycle.cycle_ts.slice(0, 19),
+    full: cycle.cycle_ts,
+    ts: formatTs(startedSec),
+    ago: formatAgo(startedSec, nowMs),
+    summary: deriveSummary(cycle),
+    risk: deriveRisk(cycle),
+    exec: deriveExec(cycle),
+    confidence: cycle.confidence ?? 0,
+    profitable: !cycle.error && (cycle.expected_apr_pct ?? 0) > 0,
+    conviction: deriveConviction(cycle),
+    thesis: `Cycle ${cycle.cycle_ts} · wake=${cycle.wake_reason} · result=${cycle.result}. Expand for full snapshot + decision detail.`,
+    risks: cycle.error ? `Cycle errored: ${cycle.error}` : "None.",
+    allora: "—",
+    flags: [],
+    ipfs: "",
+    tx: "",
+    cycleTs: cycle.cycle_ts,
+  };
+}
+
 /**
  * Joined on-chain decision rows: each row's identity (decisionId,
  * ipfsCid, txHash, timestamp) is the on-chain event; the surrounding
@@ -127,25 +150,26 @@ function buildDecision(
  * off-chain agent API via `useCycles`. Matched by closest timestamp
  * within a ±90s window.
  *
- * Pre-deploy fallback: when the DecisionLog contract isn't configured,
- * returns the mock `DECISIONS` array so the demo keeps rendering.
+ * Pre-deploy fallback: when the DecisionLog contract isn't configured
+ * (Phase A on-chain leg deferred), we derive decisions directly from
+ * the agent cycle history — no on-chain join, no mock data.
  */
 export function useDecisions(): DecisionsResult {
   const eventsQuery = useDecisionEvents();
   const cyclesQuery = useCycles({ limit: 50 });
 
   return useMemo<DecisionsResult>(() => {
+    const cycles = cyclesQuery.data ?? [];
+    const nowMs = Date.now();
     if (!eventsQuery.isLive) {
       return {
-        decisions: DECISIONS,
-        isLoading: false,
-        isError: false,
+        decisions: cycles.map((c) => decisionFromCycle(c, nowMs)),
+        isLoading: cyclesQuery.isLoading,
+        isError: cyclesQuery.isError,
         isLive: false,
       };
     }
     const events = eventsQuery.events;
-    const cycles = cyclesQuery.data ?? [];
-    const nowMs = Date.now();
     const decisions = events.map((event) => {
       const cycle = findMatchingCycle(event, cycles);
       return buildDecision(event, cycle, nowMs);

@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo } from "react";
-import { ACTIVE_HEDGES, type ActiveHedge } from "@/lib/data";
+import { type ActiveHedge } from "@/lib/data";
 import { usePortfolio } from "@/lib/agent-store-context";
 import type { PositionRow } from "@/lib/agent-api";
 
@@ -86,13 +86,8 @@ export function useActiveHedges(): ActiveHedgesResult {
   return useMemo<ActiveHedgesResult>(() => {
     const positions = portfolioQuery.data?.positions ?? [];
     const live = pairPositions(positions);
-    if (live.length > 0) {
-      return { hedges: live, isLive: true, isLoading: false };
-    }
-    return {
-      hedges: ACTIVE_HEDGES,
-      isLive: false,
-      isLoading: portfolioQuery.isLoading,
-    };
+    // No mock fallback — when there are no live hedge pairs (no perp leg
+    // matched to an earn leg) the panel renders an empty/honest state.
+    return { hedges: live, isLive: live.length > 0, isLoading: portfolioQuery.isLoading };
   }, [portfolioQuery.data, portfolioQuery.isLoading]);
 }

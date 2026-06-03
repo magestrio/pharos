@@ -7,7 +7,10 @@ import { useBybitEarn, usePortfolio, useSnapshot } from "@/lib/live";
 
 type TickerItem = { k: string; v: string; d: string; up: boolean };
 
-export function LiveTicker({ fallback }: { fallback: TickerItem[] }) {
+// `fallback` is kept for API compatibility but no longer renders by
+// default — showing mock ticker items behind real data is exactly the
+// kind of dishonest UI we're stripping out.
+export function LiveTicker({ fallback: _fallback }: { fallback?: TickerItem[] } = {}) {
   const snapshot = useSnapshot();
   const portfolio = usePortfolio();
   const flex = useBybitEarn({ category: "FlexibleSaving", limit: 3 });
@@ -87,8 +90,8 @@ export function LiveTicker({ fallback }: { fallback: TickerItem[] }) {
       });
     }
 
-    return out.length > 0 ? out : fallback;
-  }, [snapshot.data, portfolio.data, flex.data, fallback]);
+    return out;
+  }, [snapshot.data, portfolio.data, flex.data]);
 
   return <Ticker items={items} />;
 }

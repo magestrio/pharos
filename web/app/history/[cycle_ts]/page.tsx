@@ -16,8 +16,11 @@ import {
   type PositionRow,
   fetchCycle,
 } from "@/lib/agent-api";
+import { ThesisView } from "@/components/thesis-view";
 
 export const dynamic = "force-dynamic";
+
+type ValidatorResult = { ok?: boolean; errors?: string[] };
 
 type Decision = {
   thesis?: string;
@@ -31,9 +34,15 @@ type Decision = {
   risk_flags?: string[];
   notes?: string[];
   expected_blended_apr_pct?: number;
-  _meta?: Record<string, unknown>;
-  _validator?: { ok?: boolean; errors?: string[] };
+  _meta?: { _validator?: ValidatorResult } & Record<string, unknown>;
+  // The agent has historically written _validator at the top level too;
+  // accept either path so older + newer cycles both render.
+  _validator?: ValidatorResult;
 };
+
+function readValidator(decision: Decision): ValidatorResult {
+  return decision._meta?._validator ?? decision._validator ?? {};
+}
 
 export default async function CycleDetailPage({
   params,
@@ -137,18 +146,14 @@ function DecisionPanel({ decision }: { decision: Decision | null }) {
       </Panel>
     );
   }
-  const validatorErrors = decision._validator?.errors ?? [];
-  const validatorOk = decision._validator?.ok;
+  const validator = readValidator(decision);
+  const validatorErrors = validator.errors ?? [];
+  const validatorOk = validator.ok;
   return (
     <Panel title="Decision">
       {decision.thesis && (
         <div className="mb-4">
-          <div className="text-[10px] font-mono uppercase tracking-[0.14em] text-dim-500 mb-1">
-            Thesis
-          </div>
-          <div className="text-[13px] text-dim-200 leading-relaxed whitespace-pre-wrap">
-            {decision.thesis}
-          </div>
+          <ThesisView body={decision.thesis} />
         </div>
       )}
       <div className="mb-4">
