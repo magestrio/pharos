@@ -400,6 +400,46 @@ def diff_to_actions(
         current_amt = current_pos.amount_usd if current_pos else Decimal(0)
         coin = (target.coin if target else (current_pos.coin if current_pos else "USDC"))
 
+        # Defensive REDEEM (2026-06-03): a held non-stable Earn position
+        # whose perp mark went missing collapses to amount_usd=0; the
+        # USD-delta gate below would silently skip the redeem and leave
+        # naked spot exposure when the LLM dropped the pick. If we have
+        # a current native balance but the LLM dropped this product
+        # (target is None), force REDEEM using the native amount as
+        # ground truth. Bybit's `/v5/earn/place-order` for Redeem accepts
+        # native qty via `amount_native` (the dispatch path already
+        # prefers amount_native over amount when set).
+        if (
+            target is None
+            and current_pos is not None
+            and current_pos.amount_native > 0
+            and category in _BASIC_EARN_CATEGORIES
+        ):
+            # USD amount best-effort: if we have a mark, use it; else
+            # fall back to native qty (executor's send_amount prefers
+            # amount_native anyway). Reason string captures the gap.
+            redeems.append(
+                Action(
+                    kind=ActionKind.REDEEM_EARN,
+                    category=category,
+                    product_id=product_id,
+                    coin=coin,
+                    amount=current_amt if current_amt > 0 else current_pos.amount_native,
+                    amount_native=current_pos.amount_native,
+                    order_link_id=order_link_id,
+                    reason=(
+                        f"redeem {category}/{product_id} ({coin}): LLM dropped "
+                        f"pick, native qty {current_pos.amount_native} "
+                        + (
+                            f"(~${current_amt:.2f})"
+                            if current_amt > 0
+                            else "(USD value unknown — perp mark missing)"
+                        )
+                    ),
+                )
+            )
+            continue
+
         delta = target_amt - current_amt
         if abs(delta) < MIN_ACTION_USDC:
             continue
@@ -2818,6 +2858,12 @@ def _dry_run_payload(action: Action) -> dict[str, Any]:
 class _CurrentPos:
     coin: str
     amount_usd: Decimal
+    # Native-coin balance (e.g. 4.9005 LIT). Distinct from `amount_usd`
+    # because non-stable positions whose perp mark goes missing (Bybit
+    # delisted, snapshot's perp_market fan-out budget exhausted, etc.)
+    # silently collapse to amount_usd=0 — the diff layer needs the
+    # native value to still emit a REDEEM and avoid naked spot exposure.
+    amount_native: Decimal = Decimal(0)
 
 
 def _alpha_current_positions(
@@ -2886,7 +2932,9 @@ def _current_positions_by_pid(
             continue
         coin = data.get("coin") or "USDC"
         amount_usd = _amount_to_usd(coin, amt, perp_market)
-        out[(category, pid)] = _CurrentPos(coin=coin, amount_usd=amount_usd)
+        out[(category, pid)] = _CurrentPos(
+            coin=coin, amount_usd=amount_usd, amount_native=amt
+        )
     return out
 
 

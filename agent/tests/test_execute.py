@@ -357,6 +357,37 @@ def test_diff_redeems_when_currently_held_position_drops_out() -> None:
     assert redeem.amount == Decimal("30")
 
 
+def test_diff_redeems_dropped_non_stable_even_when_perp_mark_missing() -> None:
+    """Regression for 2026-06-03 live bug. A non-stable Earn position
+    (LIT) held from a prior cycle; this cycle's snapshot has no
+    perp_market[LIT] entry (Bybit fan-out budget exhausted, or coin
+    fell out of ranked picks). Pre-fix: _amount_to_usd→0 → delta→0 →
+    SKIP — naked spot exposure persists when the LLM drops the pick.
+    Post-fix: defensive REDEEM uses native qty regardless of USD
+    measurement; both legs close cleanly."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        # No perp_market entry for LIT — mark price unavailable.
+        earn_positions=[_pos("FlexibleSaving", "1114", "4.9005", coin="LIT")],
+    )
+    # LLM dropped the LIT pick entirely (USD1 only).
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_flex", 0.5, [("1131", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260603T170000Z")
+    redeems = [a for a in actions if a.kind == ActionKind.REDEEM_EARN]
+    assert len(redeems) == 1
+    r = redeems[0]
+    assert r.product_id == "1114"
+    assert r.coin == "LIT"
+    # Native qty must be preserved so the executor can pass it to Bybit
+    # — the USD path would have sent 0 and silently no-op'd.
+    assert r.amount_native == Decimal("4.9005")
+
+
 def test_diff_partial_redeem_when_target_below_current() -> None:
     snap = _snapshot(
         total_equity_usd="100",

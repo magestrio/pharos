@@ -1184,19 +1184,19 @@ async def _fetch_perp_info(
         if lot and lot.minOrderQty:
             try:
                 min_qty = Decimal(lot.minOrderQty)
-            except InvalidOperation:
+            except (InvalidOperation, TypeError):
                 min_qty = None
         qty_step_d: Decimal | None = None
         if lot and lot.qtyStep:
             try:
                 qty_step_d = Decimal(lot.qtyStep)
-            except InvalidOperation:
+            except (InvalidOperation, TypeError):
                 qty_step_d = None
         lev = inst.leverageFilter
         if lev and lev.maxLeverage:
             try:
                 max_lev = Decimal(lev.maxLeverage)
-            except InvalidOperation:
+            except (InvalidOperation, TypeError):
                 max_lev = None
 
     min_notional: Decimal | None = None
@@ -1866,6 +1866,43 @@ async def collect_snapshot(
         [products["OnChain"], products["FlexibleSaving"]],
         cap=PERP_HEDGE_TOP_K,
     )
+    # 2026-06-03 fix: ALSO include coins from currently-held Earn /
+    # perp positions even if they fell out of the ranked picks this
+    # cycle. Without this, a non-stable position we still hold (e.g.
+    # LIT after it dropped from the top-N flex ranking) shows up with
+    # no perp_market entry, the executor's `_amount_to_usd` returns 0,
+    # and the diff layer silently skips the REDEEM — leaving naked spot
+    # exposure when the LLM zeros the pick. Live hit 2026-06-03: LIT
+    # perp closed, LIT spot stayed open and unhedged.
+    held_perp_coins: list[str] = []
+    for p in earn_positions:
+        coin = (
+            (p.coin if hasattr(p, "coin") else p.get("coin"))
+            if (hasattr(p, "coin") or isinstance(p, dict))
+            else None
+        )
+        if not coin:
+            continue
+        coin = str(coin).upper()
+        if coin in STABLES:
+            continue
+        held_perp_coins.append(coin)
+    for p in perp_positions:
+        sym = p.symbol if hasattr(p, "symbol") else (p.get("symbol") if isinstance(p, dict) else None)
+        if not sym:
+            continue
+        coin = sym.removesuffix("USDT") if sym.endswith("USDT") else sym
+        if coin in STABLES:
+            continue
+        held_perp_coins.append(coin)
+    # Merge: dedupe, preserve perp_coins order first (ranked picks take
+    # priority within the per-coin fan-out budget), then append unseen
+    # held coins beyond the cap so they ALWAYS get a quote.
+    seen_perp: set[str] = set(perp_coins)
+    for coin in held_perp_coins:
+        if coin not in seen_perp:
+            perp_coins.append(coin)
+            seen_perp.add(coin)
     if perp_coins:
         perp_results = await asyncio.gather(
             *(_fetch_perp_info(client, c, errors) for c in perp_coins)
