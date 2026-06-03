@@ -3481,6 +3481,16 @@ def _current_positions_by_pid(
     as "unknown size, may re-subscribe" than to silently mis-size by
     treating coin units as dollars.
 
+    Bybit returns one row per subscribe transaction while it settles —
+    a freshly-subscribed OnChain position can appear as TWO entries
+    (the old settled balance + a new `Processing` chunk) for the same
+    `(category, productId)`. SUM them rather than overwrite so the
+    diff layer sees the actual total long exposure. Without this,
+    every cycle would underestimate `current` and the LLM's `target -
+    current` delta would re-trigger more subscribes, creating an
+    endless growth pattern of Processing entries (live hit 2026-06-03:
+    TON OnChain reached 3 Processing entries totalling 10+ native).
+
     Pydantic `EarnPosition` instances and raw dicts are both accepted so
     tests can build fixtures inline."""
     perp_market = perp_market or {}
@@ -3502,9 +3512,19 @@ def _current_positions_by_pid(
             continue
         coin = data.get("coin") or "USDC"
         amount_usd = _amount_to_usd(coin, amt, perp_market)
-        out[(category, pid)] = _CurrentPos(
-            coin=coin, amount_usd=amount_usd, amount_native=amt
-        )
+        existing = out.get((category, pid))
+        if existing is not None:
+            # Sum with prior entry (multiple Bybit rows for the same
+            # subscription state — e.g. settled + Processing chunks).
+            out[(category, pid)] = _CurrentPos(
+                coin=existing.coin,
+                amount_usd=existing.amount_usd + amount_usd,
+                amount_native=existing.amount_native + amt,
+            )
+        else:
+            out[(category, pid)] = _CurrentPos(
+                coin=coin, amount_usd=amount_usd, amount_native=amt
+            )
     return out
 
 

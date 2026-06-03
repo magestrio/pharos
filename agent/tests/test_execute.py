@@ -3313,3 +3313,41 @@ async def test_execute_atomic_guard_does_not_affect_other_coins(
     assert results[0].status == "error"
     assert results[1].status == "ok"  # DOGE close should run
     client.place_perp_order.assert_awaited_once()
+
+
+def test_current_positions_sums_multiple_entries_per_pid() -> None:
+    """Regression for 2026-06-03 endless-subscribe bug. When Bybit
+    returns multiple earn_positions rows for the same (category, pid)
+    (e.g. one settled + one Processing on a fresh subscribe), the diff
+    layer must SUM them, not overwrite. Pre-fix only the last entry
+    counted → diff saw target $15 vs current $5 ≪ target → emitted
+    SUBSCRIBE_EARN every cycle → endless growth of Processing entries."""
+    from agent.sandbox.execute import _current_positions_by_pid
+    from agent.sandbox.snapshot import PerpInfo
+    positions = [
+        {"category": "OnChain", "productId": "8", "coin": "TON",
+         "amount": "4.154", "status": ""},
+        {"category": "OnChain", "productId": "8", "coin": "TON",
+         "amount": "3.3823", "status": "Processing"},
+        {"category": "OnChain", "productId": "8", "coin": "TON",
+         "amount": "2.9871", "status": "Processing"},
+    ]
+    perp_market = {
+        "TON": PerpInfo(
+            symbol="TONUSDT",
+            funding_rate_8h=Decimal("0.0001"),
+            mark_price=Decimal("2.0"),
+            orderbook_depth_50bps_usd=Decimal("100000"),
+            min_order_qty=Decimal("0.1"),
+            min_notional_usd=Decimal("0.5"),
+            max_leverage=Decimal("50"),
+        )
+    }
+    out = _current_positions_by_pid(positions, perp_market)
+    assert ("OnChain", "8") in out
+    pos = out[("OnChain", "8")]
+    # Native sum: 4.154 + 3.3823 + 2.9871 = 10.5234
+    assert pos.amount_native == Decimal("10.5234")
+    # USD: 10.5234 * $2 = $21.0468
+    assert pos.amount_usd == Decimal("21.0468")
+    assert pos.coin == "TON"
