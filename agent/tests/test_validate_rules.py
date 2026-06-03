@@ -20,7 +20,7 @@ from decimal import Decimal
 
 import pytest
 
-from agent.reason.schema import Decision, Hedge, Pick, VenueAllocation
+from agent.reason.schema import Decision, Hedge, InvalidateAt, Pick, VenueAllocation
 from agent.sandbox.snapshot import (
     MarketSnapshot,
     PerpInfo,
@@ -291,21 +291,74 @@ def test_check_picks_required_fails_when_cash_has_picks() -> None:
     assert "cash_usdc" in (msg or "")
 
 
-def test_check_effective_pick_cap_fails_when_single_pick_oversizes() -> None:
-    # bybit_flex=0.60 × pick.weight=1.0 = 0.60 > 0.50 cap.
+def test_check_effective_pick_cap_fails_when_non_stable_oversizes() -> None:
+    """Non-stable picks (e.g. TON OnChain) still capped at 0.50.
+    Effective bybit_onchain=0.60 × pick.weight=1.0 = 0.60 > 0.50 cap."""
     d = _decision(
         venues=[
             _venue("cash_usdc", 0.40),
-            _venue("bybit_flex", 0.60, [("1131", 1.0)]),
+            _venue("bybit_onchain", 0.60, [("8", 1.0)]),
         ]
     )
-    ok, msg = check_effective_pick_cap(d)
+    s = _snapshot(
+        onchain_products=[
+            _product("8", "OnChain", coin="TON", effective_apr="0.18"),
+        ]
+    )
+    ok, msg = check_effective_pick_cap(d, s)
+    assert ok is False
+    assert "bybit_onchain/8" in (msg or "")
+
+
+def test_check_effective_pick_cap_passes_stable_at_70pct() -> None:
+    """2026-06-03 relaxation: stable Earn picks (USD1/USDC/USDT on
+    FlexibleSaving / OnChain) get a 0.70 cap so the LLM can deploy
+    capital into the highest-APR safe yield without artificially
+    splitting onto a lower-APR fallback."""
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.30),
+            _venue("bybit_flex", 0.70, [("1131", 1.0)]),  # USD1, eff 0.70
+        ]
+    )
+    s = _snapshot(
+        flex_products=[
+            _product(
+                "1131", "FlexibleSaving",
+                coin="USD1", effective_apr="0.075",
+                apr_source="estimate_apr",
+            ),
+        ]
+    )
+    ok, errs = validate(d, s)
+    assert ok, errs
+
+
+def test_check_effective_pick_cap_fails_stable_above_70pct() -> None:
+    """0.70 IS the stable cap — go above and it fails."""
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.20),
+            _venue("bybit_flex", 0.80, [("1131", 1.0)]),  # USD1, eff 0.80
+        ]
+    )
+    s = _snapshot(
+        flex_products=[
+            _product(
+                "1131", "FlexibleSaving",
+                coin="USD1", effective_apr="0.075",
+                apr_source="estimate_apr",
+            ),
+        ]
+    )
+    ok, msg = check_effective_pick_cap(d, s)
     assert ok is False
     assert "bybit_flex/1131" in (msg or "")
 
 
 def test_check_effective_pick_cap_passes_when_split() -> None:
-    # bybit_flex=0.60 split 50/50 → effective 0.30 each, under cap.
+    """Split still works — pre-fix behavior preserved for non-stable
+    picks where the cap matters most."""
     d = _decision(
         venues=[
             _venue("cash_usdc", 0.40),
@@ -316,7 +369,6 @@ def test_check_effective_pick_cap_passes_when_split() -> None:
             ),
         ]
     )
-    # Need both picks present in snapshot
     s = _snapshot(
         flex_products=[
             _product("1131", "FlexibleSaving", coin="USD1", effective_apr="0.075", apr_source="estimate_apr"),
@@ -592,25 +644,32 @@ def test_validate_aggregates_multiple_failures_in_one_pass() -> None:
     """The aggregator does NOT short-circuit — when a single decision
     violates several rules, all errors come back in one pass so the
     operator can debug them together."""
-    s = _snapshot(deviation_bps=-150.0)
+    # OnChain pick is TON (non-stable) so the 0.50 effective cap bites.
+    s = _snapshot(
+        deviation_bps=-150.0,
+        onchain_products=[
+            _product("8", "OnChain", coin="TON", effective_apr="0.18"),
+        ],
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
+    )
     d = _decision(
         confidence=0.3,
         risk_flags=["flag-a"],
         venues=[
             _venue("cash_usdc", 0.05),  # below 0.10 floor
-            _venue("bybit_onchain", 0.60, [("26", 1.0)]),  # above 0.40 cap
+            # Non-stable TON pick at 0.60 → > 0.50 effective cap
+            _venue("bybit_onchain", 0.60, [("8", 1.0)]),
             _venue("bybit_flex", 0.35, [("1131", 1.0)]),
         ],
     )
     ok, errors = validate(d, s)
     assert ok is False
-    # At least four distinct violations expected.
     assert len(errors) >= 4
     joined = " | ".join(errors)
     assert "confidence" in joined
     assert "risk_flags" in joined
     assert "cash_usdc" in joined  # floor
-    assert "bybit_onchain" in joined  # cap
+    assert "bybit_onchain" in joined  # effective pick cap (non-stable)
 
 
 def test_validate_clean_decision_passes() -> None:
@@ -817,3 +876,54 @@ def test_check_stable_spend_cap_skips_pick_without_perp_market() -> None:
     # stable_spend_cap passes (no demand). The actual rejection comes
     # from check_hedges_for_non_usd_picks elsewhere.
     assert check_stable_spend_cap(d, s) == (True, None)
+
+
+# ─── InvalidateAt schema (2026-06-03) ──────────────────────────────────────
+
+
+def test_invalidate_at_accepts_all_nulls() -> None:
+    """All-null InvalidateAt is valid — semantically "use category defaults"."""
+    iv = InvalidateAt()
+    assert iv.price_below is None
+    assert iv.peg_dev_above_bps is None
+
+
+def test_invalidate_at_rejects_price_below_above_inverted() -> None:
+    """price_below must be < price_above when both set — otherwise the
+    pick exits immediately on the open (no live range)."""
+    with pytest.raises(ValueError, match="price_below"):
+        InvalidateAt(price_below=2.0, price_above=1.5)
+
+
+def test_invalidate_at_accepts_price_below_under_above() -> None:
+    iv = InvalidateAt(price_below=1.5, price_above=2.5)
+    assert iv.price_below == 1.5
+    assert iv.price_above == 2.5
+
+
+def test_invalidate_at_accepts_funding_below_negative() -> None:
+    """funding_7d_below is a signed per-8h rate — negative values mean
+    'fire if funding turns more negative than this'. Must accept neg."""
+    iv = InvalidateAt(funding_7d_below=-0.00015)
+    assert iv.funding_7d_below == -0.00015
+
+
+def test_pick_accepts_invalidate_at_override() -> None:
+    """Pick model accepts InvalidateAt as an optional field; serializes
+    via model_dump and round-trips through validate."""
+    p = Pick(
+        product_id="8",
+        weight=1.0,
+        invalidate_at=InvalidateAt(price_below=1.40, funding_7d_below=-0.00015),
+    )
+    dumped = p.model_dump()
+    assert dumped["invalidate_at"]["price_below"] == 1.40
+    assert dumped["invalidate_at"]["funding_7d_below"] == -0.00015
+    # Round-trip
+    p2 = Pick.model_validate(dumped)
+    assert p2.invalidate_at == p.invalidate_at
+
+
+def test_pick_omitting_invalidate_at_defaults_to_none() -> None:
+    p = Pick(product_id="8", weight=1.0)
+    assert p.invalidate_at is None

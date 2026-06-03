@@ -464,3 +464,173 @@ def test_thresholds_match_taxonomy_doc():
     assert Decimal("2.0") == Thresholds.YIELD_JUMP_MULTIPLIER
     assert Decimal("500") == Thresholds.YIELD_JUMP_MIN_BASELINE_BPS
     assert Decimal("0.10") == Thresholds.LM_LIQ_DISTANCE_THRESHOLD
+
+
+# ───────────────────────── pick invalidation (event #9) ───────────────
+
+def _decision_with_invalidate(
+    venue_id: str,
+    product_id: str,
+    invalidate_at: dict | None = None,
+) -> dict:
+    pick = {"product_id": product_id, "weight": 1.0, "notes": []}
+    if invalidate_at is not None:
+        pick["invalidate_at"] = invalidate_at
+    return {
+        "thesis": "test",
+        "venues": [
+            {"venue_id": "cash_usdc", "weight": 0.3, "picks": []},
+            {"venue_id": venue_id, "weight": 0.7, "picks": [pick]},
+        ],
+        "confidence": 0.7,
+        "risk_flags": [],
+        "notes": [],
+        "expected_blended_apr_pct": 5.0,
+        "hedges": [],
+    }
+
+
+def _baseline_with_earn(
+    coin: str, product_id: str, entry_mark: str = "2.0"
+) -> WatcherBaseline:
+    return WatcherBaseline(
+        captured_at=datetime.now(UTC),
+        positions=[
+            HeldPosition(
+                position_id=f"earn:{product_id}",
+                venue="earn",
+                coin=coin,
+            ),
+            HeldPosition(
+                position_id=f"perp:{coin}USDT",
+                venue="perp",
+                coin=coin,
+                entry_mark_price=Decimal(entry_mark),
+            ),
+        ],
+    )
+
+
+def test_check_pick_invalidation_returns_empty_when_no_decision():
+    from agent.sandbox.watcher import check_pick_invalidation
+    baseline = WatcherBaseline(captured_at=datetime.now(UTC))
+    events = check_pick_invalidation(
+        decision=None, baseline=baseline,
+        snapshot_signals={}, peg_dev_bps=None,
+    )
+    assert events == []
+
+
+def test_check_pick_invalidation_non_stable_price_default_fires_on_30pct_drop():
+    """Category default for non-stable Earn picks: fire when mark drops
+    ≥30% from entry. TON entry $2, current $1.30 → 35% drop → fire."""
+    from agent.sandbox.watcher import check_pick_invalidation
+    decision = _decision_with_invalidate("bybit_onchain", "8")
+    baseline = _baseline_with_earn("TON", "8", entry_mark="2.0")
+    signals = {"TON": {"mark_price": Decimal("1.30"), "funding_7d": None}}
+    events = check_pick_invalidation(
+        decision=decision, baseline=baseline,
+        snapshot_signals=signals, peg_dev_bps=None,
+    )
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.kind == "pick_invalidated"
+    assert ev.severity == "P0"
+    assert ev.coin == "TON"
+    assert "price_drift_pct" in ev.threshold
+
+
+def test_check_pick_invalidation_non_stable_price_default_silent_on_small_drop():
+    """Same default at 10% drop — under threshold, no event."""
+    from agent.sandbox.watcher import check_pick_invalidation
+    decision = _decision_with_invalidate("bybit_onchain", "8")
+    baseline = _baseline_with_earn("TON", "8", entry_mark="2.0")
+    signals = {"TON": {"mark_price": Decimal("1.80"), "funding_7d": None}}
+    events = check_pick_invalidation(
+        decision=decision, baseline=baseline,
+        snapshot_signals=signals, peg_dev_bps=None,
+    )
+    assert events == []
+
+
+def test_check_pick_invalidation_custom_price_below_overrides_default():
+    """Operator-set price_below=1.50 absolute floor — fires when mark
+    goes below it even when drift-pct default wouldn't."""
+    from agent.sandbox.watcher import check_pick_invalidation
+    decision = _decision_with_invalidate(
+        "bybit_onchain", "8",
+        invalidate_at={"price_below": 1.50},
+    )
+    baseline = _baseline_with_earn("TON", "8", entry_mark="2.0")
+    signals = {"TON": {"mark_price": Decimal("1.45"), "funding_7d": None}}
+    events = check_pick_invalidation(
+        decision=decision, baseline=baseline,
+        snapshot_signals=signals, peg_dev_bps=None,
+    )
+    assert len(events) >= 1
+    msgs = [e.message for e in events]
+    assert any("price_below" in str(e.threshold) for e in events), msgs
+
+
+def test_check_pick_invalidation_funding_default_fires_below_neg_2_bps():
+    """Default funding_7d_below=-0.0002 for non-stable — fire when
+    funding sustained more negative."""
+    from agent.sandbox.watcher import check_pick_invalidation
+    decision = _decision_with_invalidate("bybit_onchain", "8")
+    baseline = _baseline_with_earn("TON", "8", entry_mark="2.0")
+    signals = {
+        "TON": {
+            "mark_price": Decimal("2.0"),
+            "funding_7d": Decimal("-0.00025"),
+        }
+    }
+    events = check_pick_invalidation(
+        decision=decision, baseline=baseline,
+        snapshot_signals=signals, peg_dev_bps=None,
+    )
+    funding_events = [
+        e for e in events if "funding_7d_below" in e.threshold
+    ]
+    assert len(funding_events) == 1
+    assert funding_events[0].severity == "P0"
+
+
+def test_check_pick_invalidation_stable_peg_default_fires_above_200bps():
+    """Stable USD1 Flex pick — default peg_dev_above_bps=200, fire at 250."""
+    from agent.sandbox.watcher import check_pick_invalidation
+    decision = _decision_with_invalidate("bybit_flex", "1131")
+    baseline = WatcherBaseline(
+        captured_at=datetime.now(UTC),
+        positions=[
+            HeldPosition(
+                position_id="earn:1131", venue="earn", coin="USD1",
+            ),
+        ],
+    )
+    events = check_pick_invalidation(
+        decision=decision, baseline=baseline,
+        snapshot_signals={},
+        peg_dev_bps=Decimal("-250"),  # USDC -250 bps from $1 → fires
+    )
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.kind == "pick_invalidated"
+    assert "peg_dev_above_bps" in ev.threshold
+
+
+def test_check_pick_invalidation_stable_silent_when_peg_within_default():
+    """Same setup, peg dev -150 bps — under 200 bps default, no event."""
+    from agent.sandbox.watcher import check_pick_invalidation
+    decision = _decision_with_invalidate("bybit_flex", "1131")
+    baseline = WatcherBaseline(
+        captured_at=datetime.now(UTC),
+        positions=[
+            HeldPosition(position_id="earn:1131", venue="earn", coin="USD1"),
+        ],
+    )
+    events = check_pick_invalidation(
+        decision=decision, baseline=baseline,
+        snapshot_signals={},
+        peg_dev_bps=Decimal("-150"),
+    )
+    assert events == []

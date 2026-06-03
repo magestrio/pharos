@@ -25,7 +25,22 @@ from agent.reason.venues import VENUE_REGISTRY, VenueId
 from agent.sandbox.snapshot import ProductSummary, Snapshot
 
 MIN_CONFIDENCE = 0.4
-MAX_EFFECTIVE_PRODUCT = 0.50  # cap on a single product as fraction of TOTAL book
+# Cap on a single non-stable product as fraction of TOTAL book.
+# Tight because non-stables carry directional + funding-rate risk on
+# top of counterparty risk — concentration in one volatile coin is
+# strictly worse than spreading across two.
+MAX_EFFECTIVE_PRODUCT = 0.50
+# Stable Earn picks (USD1/USDC/USDT/USDE/...) on FlexibleSaving / OnChain
+# get a wider cap. The dominant risk on a stable Earn pick is Bybit's
+# Earn-product counterparty risk (custody, smart contract, settlement),
+# which is independent of *which* stable is staked. Splitting USD1
+# across two products on the same venue doesn't actually reduce that
+# risk — it just dilutes APR onto the lower-yielding fallback. So we
+# let the LLM concentrate on the highest-APR stable Earn pick up to
+# the venue cap (typically 0.70). Raised from 0.50 on 2026-06-03 after
+# small-vault $30 idle audit — the prior cap forced LLM into 40% cash
+# when a 70% USD1 allocation was structurally safer.
+MAX_EFFECTIVE_STABLE_PRODUCT = 0.70
 
 # Conditional cap thresholds
 PEG_STRESS_BPS = 100
@@ -105,19 +120,49 @@ def check_picks_required(d: Decision) -> Check:
     return True, None
 
 
-def check_effective_pick_cap(d: Decision) -> Check:
-    """No single product holds more than MAX_EFFECTIVE_PRODUCT of the
-    total book. Effective share = venue.weight × pick.weight."""
+def check_effective_pick_cap(d: Decision, snapshot: Snapshot) -> Check:
+    """No single product holds more than its category-appropriate cap of
+    the total book. Effective share = venue.weight × pick.weight.
+
+    Two caps: stable Earn picks (FlexibleSaving / OnChain whose coin is
+    a stable per `_STABLE_COINS`) get `MAX_EFFECTIVE_STABLE_PRODUCT`,
+    everything else gets `MAX_EFFECTIVE_PRODUCT`. See module-level
+    constants for the rationale. Snapshot is needed to look up the coin
+    per product_id.
+    """
+    idx = _snapshot_index(snapshot)
     violations: list[str] = []
     for v in d.venues:
+        meta = VENUE_REGISTRY[v.venue_id]
+        cat = getattr(meta, "snapshot_category", None)
+        cat_idx = idx.get(cat, {}) if cat else {}
         for p in v.picks:
             eff = v.weight * p.weight
-            if eff > MAX_EFFECTIVE_PRODUCT + 1e-9:
-                violations.append(f"{v.venue_id}/{p.product_id}={eff:.2%}")
+            summary = cat_idx.get(p.product_id)
+            coin = (summary.coin.upper() if summary else "").upper()
+            # Stables-only relaxation applies to basic Earn categories
+            # (FlexibleSaving / OnChain). Advance-Earn, LM, Alpha get
+            # the strict cap regardless — their risk profile is not
+            # comparable to a flat stable Earn product.
+            stable_eligible = (
+                cat in ("FlexibleSaving", "OnChain")
+                and coin in _STABLE_COINS
+            )
+            cap = (
+                MAX_EFFECTIVE_STABLE_PRODUCT
+                if stable_eligible
+                else MAX_EFFECTIVE_PRODUCT
+            )
+            if eff > cap + 1e-9:
+                violations.append(
+                    f"{v.venue_id}/{p.product_id}({coin or '?'})"
+                    f"={eff:.2%}>{cap:.0%}"
+                )
     if violations:
         return False, (
-            f"effective product positions exceed "
-            f"{MAX_EFFECTIVE_PRODUCT:.0%} cap: {', '.join(violations)}"
+            f"effective product positions exceed cap (stable picks "
+            f"{MAX_EFFECTIVE_STABLE_PRODUCT:.0%}, others "
+            f"{MAX_EFFECTIVE_PRODUCT:.0%}): {', '.join(violations)}"
         )
     return True, None
 
@@ -559,11 +604,11 @@ def validate(decision: Decision, snapshot: Snapshot) -> tuple[bool, list[str]]:
         check_venue_caps,
         check_venue_floors,
         check_picks_required,
-        check_effective_pick_cap,
         check_confidence,
         check_risk_flags,
     ]
     snapshot_checks = [
+        check_effective_pick_cap,
         check_peg_stress,
         check_product_ids_in_snapshot,
         check_no_missing_apr_source,

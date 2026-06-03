@@ -33,7 +33,7 @@ async def test_apply_migrations_fresh_init_creates_all_tables(
     `0001_initial.sql` exists + `schema_migrations` records the version."""
     async with open_pool(fresh_db_dsn) as pool:
         applied = await apply_migrations(pool)
-        assert applied == ["0001_initial"]
+        assert applied == ["0001_initial", "0002_pick_invalidate_view"]
 
         async with pool.acquire() as conn:
             tables = {
@@ -61,7 +61,7 @@ async def test_apply_migrations_fresh_init_creates_all_tables(
                 r["version"]
                 for r in await conn.fetch("SELECT version FROM schema_migrations")
             }
-        assert versions == {"0001_initial"}
+        assert versions == {"0001_initial", "0002_pick_invalidate_view"}
 
 
 @pytest.mark.asyncio
@@ -71,12 +71,12 @@ async def test_apply_migrations_idempotent_on_repeat(fresh_db_dsn: str) -> None:
         first = await apply_migrations(pool)
         second = await apply_migrations(pool)
         third = await apply_migrations(pool)
-        assert first == ["0001_initial"]
+        assert first == ["0001_initial", "0002_pick_invalidate_view"]
         assert second == []
         assert third == []
         async with pool.acquire() as conn:
             count = await conn.fetchval("SELECT COUNT(*) FROM schema_migrations")
-        assert count == 1
+        assert count == 2
 
 
 @pytest.mark.asyncio

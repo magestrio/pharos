@@ -70,6 +70,34 @@ class Thresholds:
     PERP_LIQ_DISTANCE_THRESHOLD = Decimal("0.50")
 
 
+# Defaults for `Pick.invalidate_at` when the LLM didn't set one. Indexed
+# by (category, is_stable). Stables only get a peg-deviation default;
+# non-stables get a price-drift + funding floor pair. The fields here
+# mirror `agent.reason.schema.InvalidateAt` semantics: price_drift_pct
+# is "fraction adverse move from entry mark" (not absolute price),
+# funding_7d_below is per-8h signed Decimal, peg_dev_above_bps is
+# absolute deviation from $1.00. 2026-06-03 introduction; tuned vs the
+# existing `check_price_drift` (5% heads-up) and `check_funding_flip`
+# (sign-change) so the invalidate fires at a strictly more conservative
+# level — those events suggest action, invalidate forces a close.
+DEFAULT_INVALIDATE_BY_CATEGORY: dict[tuple[str, str], dict[str, Decimal]] = {
+    ("FlexibleSaving", "STABLE"): {"peg_dev_above_bps": Decimal("200")},
+    ("OnChain", "STABLE"): {"peg_dev_above_bps": Decimal("200")},
+    ("FlexibleSaving", "NON_STABLE"): {
+        "price_drift_pct": Decimal("0.30"),
+        "funding_7d_below": Decimal("-0.0002"),
+    },
+    ("OnChain", "NON_STABLE"): {
+        "price_drift_pct": Decimal("0.30"),
+        "funding_7d_below": Decimal("-0.0002"),
+    },
+    # LM and Alpha rely on their own checkers (lm_liq_distance,
+    # price_drift on alpha). No invalidate defaults — operator can set
+    # explicit `invalidate_at.liq_distance_below` per LM pick if they
+    # want tighter than the global 0.10 threshold.
+}
+
+
 # Stable coins — peg drift checked against $1, never flagged for funding
 # flip or price drift (a USDC mark moving 5% is itself depeg).
 STABLE_COINS: frozenset[str] = frozenset({"USDC", "USDT", "USDE", "USD1", "USDTB", "DAI"})
@@ -122,6 +150,25 @@ class WatcherBaseline(BaseModel):
 
 DEFAULT_BASELINE_PATH = Path(__file__).parent / "state" / "watcher-baseline.json"
 DEFAULT_EVENTS_DIR = Path(__file__).parent / "events"
+DEFAULT_DECISIONS_DIR = Path(__file__).parent / "decisions"
+
+
+def _read_latest_decision(
+    decisions_dir: Path = DEFAULT_DECISIONS_DIR,
+) -> dict[str, Any] | None:
+    """Return the most recent decision JSON in `decisions_dir`, or None.
+    Mirrors `agent.sandbox.decide._load_latest_prior_decision` but kept
+    self-contained to avoid the watcher importing the LLM-orchestration
+    module (and its anthropic dependency)."""
+    if not decisions_dir.is_dir():
+        return None
+    files = sorted(p for p in decisions_dir.glob("*.json"))
+    if not files:
+        return None
+    try:
+        return json.loads(files[-1].read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 # ───────────────────────── baseline IO ────────────────────────────────
@@ -500,6 +547,227 @@ def check_perp_liq_distance(
     )
 
 
+def check_pick_invalidation(
+    decision: dict[str, Any] | None,
+    baseline: WatcherBaseline,
+    snapshot_signals: dict[str, dict[str, Decimal | None]],
+    peg_dev_bps: Decimal | None = None,
+) -> list[EventRecord]:
+    """Event #9: per-pick invalidation thresholds (operator-defined OR
+    category default) breached against current signals.
+
+    Inputs:
+      decision         — latest decision dict (None ⇒ no defaults to
+                         apply, no events fire).
+      baseline         — watcher baseline; uses entry_mark_price for
+                         per-pick price drift calculation.
+      snapshot_signals — `{coin_upper: {mark_price, funding_7d}}` keyed
+                         per coin we want to check. Caller assembles it
+                         from the linear tickers it already pulled.
+      peg_dev_bps      — current USDC peg deviation (signed bps from $1).
+                         Only meaningful for the USDC ⇄ $1.00 invalidate
+                         since stables-other-than-USDC aren't tracked on
+                         CoinGecko in this snapshot layer; non-USDC
+                         stable invalidate uses USDC as a proxy here.
+
+    Each fired event references the pick's category + product_id + the
+    specific threshold breached. Severity P0 — next cycle MUST close.
+    """
+    if not decision or not isinstance(decision, dict):
+        return []
+    events: list[EventRecord] = []
+    entry_by_coin = {
+        p.coin.upper(): p.entry_mark_price
+        for p in baseline.positions
+        if p.coin and p.venue == "perp" and p.entry_mark_price
+    }
+    venue_to_category = {
+        "bybit_flex": "FlexibleSaving",
+        "bybit_onchain": "OnChain",
+    }
+    for v in decision.get("venues", []) or []:
+        venue_id = v.get("venue_id") or v.get("venueId")
+        category = venue_to_category.get(venue_id)
+        if not category:
+            # Only flex / onchain wired — LM has its own dedicated check,
+            # advance-Earn invalidates via the settlement window.
+            continue
+        for pick in v.get("picks", []) or []:
+            product_id = str(pick.get("product_id") or pick.get("productId") or "")
+            if not product_id:
+                continue
+            # Resolve the pick's coin via the baseline (it's the same
+            # productId-to-coin link captured in `update_baseline_from_snapshot`).
+            # When baseline doesn't carry it, skip — we can't compute
+            # price drift without an entry mark to compare against.
+            held = next(
+                (
+                    p for p in baseline.positions
+                    if p.position_id == f"earn:{product_id}"
+                ),
+                None,
+            )
+            if held is None:
+                continue
+            coin = (held.coin or "").upper()
+            if not coin:
+                continue
+            is_stable = coin in STABLE_COINS
+            custom = pick.get("invalidate_at") or {}
+            defaults = DEFAULT_INVALIDATE_BY_CATEGORY.get(
+                (category, "STABLE" if is_stable else "NON_STABLE"), {}
+            )
+
+            def _eff(key: str) -> Decimal | None:
+                v_custom = custom.get(key)
+                if v_custom is not None:
+                    try:
+                        return Decimal(str(v_custom))
+                    except (InvalidOperation, TypeError):
+                        return None
+                return defaults.get(key)
+
+            signals = snapshot_signals.get(coin, {}) or {}
+            mark = signals.get("mark_price")
+            funding = signals.get("funding_7d")
+
+            # Peg deviation (stables only). USDC peg comes from CoinGecko
+            # via `_fetch_peg_usd`; for non-USDC stables we don't have a
+            # second peg source so we proxy with USDC's deviation —
+            # imperfect but the same anchor catches systemic stable stress.
+            peg_thresh = _eff("peg_dev_above_bps")
+            if is_stable and peg_thresh is not None and peg_dev_bps is not None:
+                if abs(peg_dev_bps) > peg_thresh:
+                    events.append(
+                        EventRecord(
+                            ts=datetime.now(UTC),
+                            kind="pick_invalidated",
+                            severity="P0",
+                            position_id=f"earn:{product_id}",
+                            coin=coin,
+                            baseline={"peg_dev_bps_baseline": "0"},
+                            current={"peg_dev_bps": str(peg_dev_bps)},
+                            threshold={"peg_dev_above_bps": str(peg_thresh)},
+                            message=(
+                                f"pick {category}/{product_id} ({coin}) "
+                                f"invalidated — peg dev {peg_dev_bps:+} bps "
+                                f"|exceeds| {peg_thresh} bps"
+                            ),
+                        )
+                    )
+
+            # Non-stable price drift (fraction adverse from entry mark).
+            drift_thresh = _eff("price_drift_pct")
+            entry_mark = entry_by_coin.get(coin)
+            if (
+                not is_stable
+                and drift_thresh is not None
+                and mark is not None
+                and entry_mark is not None
+                and entry_mark > 0
+            ):
+                # Earn picks are LONG exposure on `coin`; an adverse
+                # move is DOWN. Fire when mark fell by >= threshold.
+                drop = (entry_mark - mark) / entry_mark
+                if drop >= drift_thresh:
+                    events.append(
+                        EventRecord(
+                            ts=datetime.now(UTC),
+                            kind="pick_invalidated",
+                            severity="P0",
+                            position_id=f"earn:{product_id}",
+                            coin=coin,
+                            baseline={"entry_mark_price": str(entry_mark)},
+                            current={"mark_price": str(mark)},
+                            threshold={"price_drift_pct": str(drift_thresh)},
+                            message=(
+                                f"pick {category}/{product_id} ({coin}) "
+                                f"invalidated — mark fell "
+                                f"{drop * Decimal(100):.1f}% from entry "
+                                f"(threshold {drift_thresh * Decimal(100):.0f}%)"
+                            ),
+                        )
+                    )
+
+            # Absolute price thresholds (override of drift-based default).
+            price_below = _eff("price_below")
+            if (
+                not is_stable
+                and price_below is not None
+                and mark is not None
+                and mark < price_below
+            ):
+                events.append(
+                    EventRecord(
+                        ts=datetime.now(UTC),
+                        kind="pick_invalidated",
+                        severity="P0",
+                        position_id=f"earn:{product_id}",
+                        coin=coin,
+                        baseline={},
+                        current={"mark_price": str(mark)},
+                        threshold={"price_below": str(price_below)},
+                        message=(
+                            f"pick {category}/{product_id} ({coin}) "
+                            f"invalidated — mark ${mark} below operator "
+                            f"floor ${price_below}"
+                        ),
+                    )
+                )
+
+            price_above = _eff("price_above")
+            if (
+                not is_stable
+                and price_above is not None
+                and mark is not None
+                and mark > price_above
+            ):
+                events.append(
+                    EventRecord(
+                        ts=datetime.now(UTC),
+                        kind="pick_invalidated",
+                        severity="P0",
+                        position_id=f"earn:{product_id}",
+                        coin=coin,
+                        baseline={},
+                        current={"mark_price": str(mark)},
+                        threshold={"price_above": str(price_above)},
+                        message=(
+                            f"pick {category}/{product_id} ({coin}) "
+                            f"invalidated — mark ${mark} above operator "
+                            f"ceiling ${price_above}"
+                        ),
+                    )
+                )
+
+            # Funding 7d sustained below threshold (non-stable hedged).
+            funding_thresh = _eff("funding_7d_below")
+            if (
+                not is_stable
+                and funding_thresh is not None
+                and funding is not None
+                and funding < funding_thresh
+            ):
+                events.append(
+                    EventRecord(
+                        ts=datetime.now(UTC),
+                        kind="pick_invalidated",
+                        severity="P0",
+                        position_id=f"earn:{product_id}",
+                        coin=coin,
+                        baseline={},
+                        current={"funding_7d": str(funding)},
+                        threshold={"funding_7d_below": str(funding_thresh)},
+                        message=(
+                            f"pick {category}/{product_id} ({coin}) "
+                            f"invalidated — funding 7d avg {funding}/8h "
+                            f"below {funding_thresh}/8h (hedge net cost)"
+                        ),
+                    )
+                )
+    return events
+
+
 # ───────────────────────── polling orchestration ──────────────────────
 
 async def _fetch_peg_usd(timeout: float = 5.0) -> Decimal | None:
@@ -633,6 +901,38 @@ async def poll_once(
                     events.append(ev)
         except Exception as e:  # noqa: BLE001
             log.warning("perp positions poll failed: %s", e)
+
+    # Event #9 — per-pick invalidation (operator-set or category default).
+    # Reads the latest decision from the standard decisions dir; if none
+    # exists or the file is unreadable, no events fire (safe no-op).
+    try:
+        decision = _read_latest_decision()
+    except Exception as e:  # noqa: BLE001
+        log.warning("decision read failed: %s", e)
+        decision = None
+    if decision is not None:
+        # Assemble per-coin signal map from the tickers we already pulled
+        # (price drift + funding) — no extra Bybit round-trips.
+        signals: dict[str, dict[str, Decimal | None]] = {}
+        for sym, t in tickers_by_symbol.items():
+            coin = sym.removesuffix("USDT") if sym.endswith("USDT") else sym
+            signals[coin.upper()] = {
+                "mark_price": _to_decimal(
+                    t.get("markPrice") or t.get("lastPrice")
+                ),
+                "funding_7d": _to_decimal(t.get("fundingRate")),
+            }
+        peg_dev_bps: Decimal | None = None
+        if peg_price is not None:
+            peg_dev_bps = (peg_price - Decimal("1.0")) * Decimal("10000")
+        events.extend(
+            check_pick_invalidation(
+                decision=decision,
+                baseline=baseline,
+                snapshot_signals=signals,
+                peg_dev_bps=peg_dev_bps,
+            )
+        )
 
     # Event #7 batch — re-fetch LM positions only when we hold at least one
     lm_positions = [p for p in baseline.positions if p.venue == "lm"]

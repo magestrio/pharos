@@ -24,6 +24,58 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from agent.reason.venues import VENUE_REGISTRY, VenueId
 
 
+class InvalidateAt(BaseModel):
+    """Per-pick invalidation thresholds (`event-driven-rebalance` extension
+    2026-06-03). When ANY populated threshold is breached against live
+    snapshot data, the watcher fires a `pick_invalidated` event and the
+    next cycle's LLM closes the position.
+
+    All fields optional — unset = fall back to category default in
+    `agent.sandbox.watcher.DEFAULT_INVALIDATE_BY_CATEGORY`. The LLM is
+    encouraged to override per pick when the position thesis implies a
+    tighter or looser exit than the default.
+
+    Field semantics:
+      • `price_below` / `price_above` — absolute USD mark price on the
+        underlying's USDT perp pair (skipped for stables — peg checks
+        run against the spot price, not the perp).
+      • `funding_7d_below` — per-8h funding rate (signed Decimal as
+        fraction). Trips when the perp's 7-day average funding falls
+        BELOW this value, indicating sustained negative funding cost.
+      • `apr_realized_below` — measured realized APR (fraction). Trips
+        when the Bybit "actualApy" hourly probe falls below this rate,
+        signaling the promo / measured yield has decayed.
+      • `peg_dev_above_bps` — absolute peg deviation in bps from $1.00
+        for stable coins (USDC / USD1 / USDE / ...). Trips when |dev|
+        > threshold. Only meaningful for stable picks.
+      • `liq_distance_below` — fractional distance from current mark to
+        perp liquidation price. Tighter than the watcher's hardcoded
+        0.50 threshold for picks where the operator wants earlier exit.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    price_below: float | None = Field(default=None, gt=0)
+    price_above: float | None = Field(default=None, gt=0)
+    funding_7d_below: float | None = None  # may be negative
+    apr_realized_below: float | None = Field(default=None, ge=0)
+    peg_dev_above_bps: float | None = Field(default=None, ge=0)
+    liq_distance_below: float | None = Field(default=None, gt=0, le=1)
+
+    @model_validator(mode="after")
+    def _range_consistency(self) -> "InvalidateAt":
+        if (
+            self.price_below is not None
+            and self.price_above is not None
+            and self.price_below >= self.price_above
+        ):
+            raise ValueError(
+                f"price_below {self.price_below} must be < "
+                f"price_above {self.price_above}"
+            )
+        return self
+
+
 class Pick(BaseModel):
     """One product / pool inside a venue.
 
@@ -32,6 +84,10 @@ class Pick(BaseModel):
     Bybit Earn ranker categories (Flex / OnChain / LM) require picks
     when the venue is non-zero; non-pickable venues (cash, Aave V3 USDC
     as single pool) leave the list empty.
+
+    `invalidate_at` is an optional override of the per-category default
+    exit triggers (see `InvalidateAt` for field semantics). When unset,
+    the watcher applies `DEFAULT_INVALIDATE_BY_CATEGORY`.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -39,6 +95,7 @@ class Pick(BaseModel):
     product_id: str
     weight: float = Field(ge=0, le=1)
     notes: list[str] = Field(default_factory=list)
+    invalidate_at: InvalidateAt | None = None
 
 
 class VenueAllocation(BaseModel):
