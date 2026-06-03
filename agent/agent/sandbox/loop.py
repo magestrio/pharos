@@ -47,6 +47,7 @@ import anthropic
 from dotenv import load_dotenv
 
 from agent.bybit_oracle.bybit_client import BybitClient
+from agent.reason.schema import Decision
 from agent.sandbox.decide import (
     DECISION_DIR,
     _load_latest_prior_decision,
@@ -118,6 +119,119 @@ _CRITICAL_PROBE_ENDPOINTS: frozenset[str] = frozenset(
 log = logging.getLogger(__name__)
 
 
+def _build_auto_close_decision(
+    prior: dict[str, Any] | None,
+    wake_events: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """Build a deterministic close-only decision from `pick_invalidated`
+    wake events — bypasses the LLM entirely so a tripped stop-loss
+    closes within seconds, not minutes (LLM round-trip + validator pass).
+
+    Returns:
+      - decision dict (mutated copy of `prior` with affected picks
+        removed and freed weight rolled into cash_usdc), OR
+      - None when no auto-close-eligible event is present (caller falls
+        through to the normal LLM decide path).
+
+    The mutation logic:
+      • For each `pick_invalidated` event, collect the closed product_id
+        (from `position_id="earn:<pid>"`) + coin.
+      • Walk the prior decision's venues. For each venue with any of
+        those picks: drop the closed picks, rescale remaining picks
+        within the venue to sum to 1.0, scale venue weight down
+        proportionally. If all picks are closed, drop the venue.
+      • All freed venue weight goes to cash_usdc (added to its current
+        weight, or appended as a new entry if absent).
+      • `hedges` array zeroed — auto-hedge derives from picks, so
+        removing the pick auto-closes the paired perp via `diff_to_actions`.
+
+    The output is structurally a valid Decision dict (sums to 1.0,
+    only known venue_ids, picks well-formed). Validator still runs on
+    it as a sanity net; with deterministic mutation the only realistic
+    failure is the cash_usdc venue exceeding its max_weight (1.0), so
+    in practice it always passes.
+    """
+    if not prior or not wake_events:
+        return None
+    close_pids: set[str] = set()
+    close_coins: set[str] = set()
+    for e in wake_events:
+        if (e.get("kind") or "") != "pick_invalidated":
+            continue
+        pid = e.get("position_id") or ""
+        if pid.startswith("earn:"):
+            close_pids.add(pid.removeprefix("earn:"))
+        coin = e.get("coin") or ""
+        if coin:
+            close_coins.add(coin.upper())
+    if not close_pids:
+        return None
+
+    new_venues: list[dict[str, Any]] = []
+    cash_addition = 0.0
+    for v in prior.get("venues", []) or []:
+        picks = v.get("picks", []) or []
+        venue_weight = float(v.get("weight", 0))
+        if not picks:
+            new_venues.append(dict(v))
+            continue
+        kept = [
+            p for p in picks
+            if str(p.get("product_id", "")) not in close_pids
+        ]
+        if len(kept) == len(picks):
+            new_venues.append(dict(v))
+            continue
+        if not kept:
+            cash_addition += venue_weight
+            continue
+        # Rescale kept picks within the venue + scale venue weight down
+        # by the fraction that was kept.
+        kept_sum = sum(float(p.get("weight", 0)) for p in kept)
+        if kept_sum <= 0:
+            cash_addition += venue_weight
+            continue
+        new_venue_weight = venue_weight * kept_sum
+        cash_addition += venue_weight - new_venue_weight
+        rescaled_picks = [
+            {**p, "weight": float(p.get("weight", 0)) / kept_sum}
+            for p in kept
+        ]
+        new_venues.append(
+            {**v, "weight": new_venue_weight, "picks": rescaled_picks}
+        )
+
+    # Roll freed weight into cash_usdc (create if missing).
+    cash_seen = False
+    for v in new_venues:
+        if v.get("venue_id") == "cash_usdc":
+            v["weight"] = float(v.get("weight", 0)) + cash_addition
+            cash_seen = True
+            break
+    if not cash_seen and cash_addition > 0:
+        new_venues.append(
+            {"venue_id": "cash_usdc", "weight": cash_addition, "picks": []}
+        )
+
+    coin_list = ", ".join(sorted(close_coins)) or "<none>"
+    pid_list = ", ".join(sorted(close_pids))
+    out: dict[str, Any] = {
+        "thesis": (
+            f"AUTO-CLOSE (no LLM): pick_invalidated fired for {coin_list}. "
+            f"Closed product(s) {pid_list}; freed venue weight rolled into "
+            f"cash_usdc. Next LLM cycle decides whether to re-enter once "
+            f"the invalidation condition has recovered."
+        ),
+        "venues": new_venues,
+        "hedges": [],
+        "confidence": 1.0,
+        "risk_flags": [],
+        "notes": [f"auto_close:{pid}" for pid in sorted(close_pids)],
+        "expected_blended_apr_pct": 0.0,
+    }
+    return out
+
+
 async def run_one_cycle(
     bybit_client: BybitClient,
     anthropic_client: anthropic.AsyncAnthropic,
@@ -182,14 +296,29 @@ async def run_one_cycle(
         except Exception as e:  # noqa: BLE001 — best effort
             log.warning("watcher baseline update failed: %s", e)
 
-        # 2. Decide
+        # 2. Decide — auto-close fast-path when ANY pick_invalidated
+        # event is in the wake set. Deterministic close from the prior
+        # decision; skips LLM entirely so the stop-loss closes in
+        # seconds rather than waiting for a Claude round-trip + token
+        # cost. Per-coin events fan out to the matching pick(s) and
+        # roll freed weight to cash. Falls through to the LLM path
+        # when no eligible event is present.
         prior = _load_latest_prior_decision()
-        decision = await decide(
-            raw_snapshot,
-            client=anthropic_client,
-            prior_decision=prior,
-            wake_events=wake_events,
-        )
+        auto_close = _build_auto_close_decision(prior, wake_events)
+        if auto_close is not None:
+            log.info(
+                "auto-close path: pick_invalidated event(s) — "
+                "skipping LLM, deterministic close"
+            )
+            decision = Decision.model_validate(auto_close)
+            outcome["auto_close"] = True
+        else:
+            decision = await decide(
+                raw_snapshot,
+                client=anthropic_client,
+                prior_decision=prior,
+                wake_events=wake_events,
+            )
         decision_path = write_decision(
             decision, snap_path, wake_events=wake_events
         )

@@ -1029,3 +1029,125 @@ def _async_cm_yielding(value):
         yield value
 
     return _cm()
+
+
+# ─── Auto-close fast-path (2026-06-03) ─────────────────────────────────────
+
+def test_build_auto_close_decision_returns_none_without_prior():
+    from agent.sandbox.loop import _build_auto_close_decision
+    assert _build_auto_close_decision(None, [{"kind": "pick_invalidated", "position_id": "earn:8"}]) is None
+
+
+def test_build_auto_close_decision_returns_none_without_invalidate_event():
+    """Other event kinds (price_drift, funding_flip) still go through LLM."""
+    from agent.sandbox.loop import _build_auto_close_decision
+    prior = {
+        "venues": [
+            {"venue_id": "cash_usdc", "weight": 0.5, "picks": []},
+            {"venue_id": "bybit_onchain", "weight": 0.5, "picks": [
+                {"product_id": "8", "weight": 1.0},
+            ]},
+        ],
+        "confidence": 0.7,
+    }
+    events = [{"kind": "price_drift", "position_id": "perp:TONUSDT", "coin": "TON"}]
+    assert _build_auto_close_decision(prior, events) is None
+
+
+def test_build_auto_close_decision_drops_affected_pick_to_cash():
+    """Single-pick venue with the affected product gets dropped entirely;
+    its weight rolls into cash_usdc."""
+    from agent.sandbox.loop import _build_auto_close_decision
+    prior = {
+        "venues": [
+            {"venue_id": "cash_usdc", "weight": 0.3, "picks": []},
+            {"venue_id": "bybit_flex", "weight": 0.5, "picks": [
+                {"product_id": "1131", "weight": 1.0},
+            ]},
+            {"venue_id": "bybit_onchain", "weight": 0.2, "picks": [
+                {"product_id": "8", "weight": 1.0},
+            ]},
+        ],
+        "hedges": [{"coin": "TON", "notional_usd": -16.0}],
+        "confidence": 0.7,
+    }
+    events = [
+        {"kind": "pick_invalidated", "position_id": "earn:8", "coin": "TON"}
+    ]
+    out = _build_auto_close_decision(prior, events)
+    assert out is not None
+    venues_by_id = {v["venue_id"]: v for v in out["venues"]}
+    # bybit_onchain dropped, its 0.2 in cash now.
+    assert "bybit_onchain" not in venues_by_id
+    assert venues_by_id["cash_usdc"]["weight"] == pytest.approx(0.5)
+    assert venues_by_id["bybit_flex"]["weight"] == 0.5
+    # Hedges array cleared so diff_to_actions auto-closes the perp.
+    assert out["hedges"] == []
+    # Validates as a Decision.
+    from agent.reason.schema import Decision
+    d = Decision.model_validate(out)
+    assert d.confidence == 1.0
+
+
+def test_build_auto_close_decision_rescales_multi_pick_venue():
+    """Venue with two picks: closing one rescales remaining to sum=1 within
+    venue + shrinks venue weight proportionally; freed weight to cash."""
+    from agent.sandbox.loop import _build_auto_close_decision
+    prior = {
+        "venues": [
+            {"venue_id": "cash_usdc", "weight": 0.1, "picks": []},
+            {"venue_id": "bybit_flex", "weight": 0.6, "picks": [
+                {"product_id": "1131", "weight": 0.7},  # USD1
+                {"product_id": "1", "weight": 0.3},     # USDT
+            ]},
+            {"venue_id": "bybit_onchain", "weight": 0.3, "picks": [
+                {"product_id": "8", "weight": 1.0},
+            ]},
+        ],
+        "confidence": 0.7,
+    }
+    events = [
+        {"kind": "pick_invalidated", "position_id": "earn:1131", "coin": "USD1"}
+    ]
+    out = _build_auto_close_decision(prior, events)
+    assert out is not None
+    venues_by_id = {v["venue_id"]: v for v in out["venues"]}
+    flex = venues_by_id["bybit_flex"]
+    # Kept pick "1" was 0.3 / 1.0 → rescales to 1.0 of venue.
+    assert len(flex["picks"]) == 1
+    assert flex["picks"][0]["product_id"] == "1"
+    assert flex["picks"][0]["weight"] == pytest.approx(1.0)
+    # Venue weight shrank to 0.6 * 0.3 = 0.18; freed 0.42 went to cash.
+    assert flex["weight"] == pytest.approx(0.18)
+    assert venues_by_id["cash_usdc"]["weight"] == pytest.approx(0.52)
+    # Total still 1.0 (0.52 + 0.18 + 0.30).
+    total = sum(v["weight"] for v in out["venues"])
+    assert total == pytest.approx(1.0)
+
+
+def test_build_auto_close_decision_multiple_picks_at_once():
+    """Two simultaneous invalidate events close both picks."""
+    from agent.sandbox.loop import _build_auto_close_decision
+    prior = {
+        "venues": [
+            {"venue_id": "cash_usdc", "weight": 0.2, "picks": []},
+            {"venue_id": "bybit_flex", "weight": 0.5, "picks": [
+                {"product_id": "1131", "weight": 1.0},
+            ]},
+            {"venue_id": "bybit_onchain", "weight": 0.3, "picks": [
+                {"product_id": "8", "weight": 1.0},
+            ]},
+        ],
+        "confidence": 0.7,
+    }
+    events = [
+        {"kind": "pick_invalidated", "position_id": "earn:1131", "coin": "USD1"},
+        {"kind": "pick_invalidated", "position_id": "earn:8", "coin": "TON"},
+    ]
+    out = _build_auto_close_decision(prior, events)
+    assert out is not None
+    venues_by_id = {v["venue_id"]: v for v in out["venues"]}
+    # Both venues dropped; all weight in cash.
+    assert "bybit_flex" not in venues_by_id
+    assert "bybit_onchain" not in venues_by_id
+    assert venues_by_id["cash_usdc"]["weight"] == pytest.approx(1.0)
