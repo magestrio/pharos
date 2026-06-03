@@ -3183,3 +3183,133 @@ async def test_execute_open_perp_short_skips_set_trading_stop_when_no_extras(
     )
     assert results[0].status == "ok"
     client.set_trading_stop.assert_not_awaited()
+
+
+# ─── Atomic redeem+close-pair guard (2026-06-03) ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_execute_atomic_redeem_failure_skips_paired_close_perp(
+    tmp_path: Path,
+) -> None:
+    """Regression for 2026-06-03 naked-long bug. When REDEEM_EARN for
+    TON fails (Bybit 180020 — Processing/locked), the subsequent
+    CLOSE_PERP for TON must be skipped so the perp short keeps hedging
+    the still-staked spot. Pre-fix the close ran → naked long $15."""
+    from agent.bybit_oracle.bybit_client import BybitAPIError
+    client = AsyncMock()
+    # REDEEM_EARN raises BybitAPIError(180020) like live
+    client.place_earn_order.side_effect = BybitAPIError(
+        180020, "Position not found", "/v5/earn/place-order"
+    )
+    # CLOSE_PERP would succeed if it ran — we assert it DIDN'T
+    client.place_perp_order.return_value = None
+    actions = [
+        Action(
+            kind=ActionKind.REDEEM_EARN,
+            category="OnChain",
+            product_id="8",
+            coin="TON",
+            amount=Decimal("8.0"),
+            amount_native=Decimal("4.0"),
+            order_link_id="r-001",
+            reason="redeem TON",
+        ),
+        Action(
+            kind=ActionKind.CLOSE_PERP,
+            category="linear",
+            product_id="TONUSDT",
+            coin="TON",
+            amount=Decimal("4.0"),
+            order_link_id="c-001",
+            reason="close TON short",
+        ),
+    ]
+    results = await execute_actions(
+        client, actions, snapshot_ts="20260603T210000Z",
+        dry_run=False, executions_dir=tmp_path,
+    )
+    assert len(results) == 2
+    # Redeem errored
+    assert results[0].status == "error"
+    assert "180020" in (results[0].error or "")
+    # Close was SKIPPED, not executed
+    assert results[1].status == "skipped"
+    assert results[1].action.kind == ActionKind.SKIP_OUT_OF_SCOPE
+    assert "paired REDEEM_EARN failed" in results[1].action.reason
+    # Critically: place_perp_order must NOT have been awaited
+    client.place_perp_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_redeem_success_lets_paired_close_perp_run(
+    tmp_path: Path,
+) -> None:
+    """Counter-test: when REDEEM succeeds, paired CLOSE_PERP runs
+    normally — no false-positive skipping."""
+    from agent.bybit_oracle.bybit_client import EarnOrderResult, SpotOrderResult
+    client = AsyncMock()
+    client.place_earn_order.return_value = EarnOrderResult(
+        orderId="earn-ok", orderLinkId="r-001"
+    )
+    client.place_perp_order.return_value = SpotOrderResult(
+        orderId="perp-ok", orderLinkId="c-001"
+    )
+    actions = [
+        Action(
+            kind=ActionKind.REDEEM_EARN,
+            category="OnChain", product_id="8", coin="TON",
+            amount=Decimal("8.0"), amount_native=Decimal("4.0"),
+            order_link_id="r-001", reason="redeem",
+        ),
+        Action(
+            kind=ActionKind.CLOSE_PERP,
+            category="linear", product_id="TONUSDT", coin="TON",
+            amount=Decimal("4.0"),
+            order_link_id="c-001", reason="close",
+        ),
+    ]
+    results = await execute_actions(
+        client, actions, snapshot_ts="20260603T210001Z",
+        dry_run=False, executions_dir=tmp_path,
+    )
+    assert results[0].status == "ok"
+    assert results[1].status == "ok"
+    client.place_perp_order.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_atomic_guard_does_not_affect_other_coins(
+    tmp_path: Path,
+) -> None:
+    """REDEEM_EARN failure on TON must NOT block CLOSE_PERP on a
+    different coin (DOGE) in the same batch."""
+    from agent.bybit_oracle.bybit_client import BybitAPIError, SpotOrderResult
+    client = AsyncMock()
+    client.place_earn_order.side_effect = BybitAPIError(
+        180020, "Position not found", "/v5/earn/place-order"
+    )
+    client.place_perp_order.return_value = SpotOrderResult(
+        orderId="perp-doge-ok", orderLinkId="c-002"
+    )
+    actions = [
+        Action(
+            kind=ActionKind.REDEEM_EARN,
+            category="OnChain", product_id="8", coin="TON",
+            amount=Decimal("8.0"), amount_native=Decimal("4.0"),
+            order_link_id="r-001", reason="redeem TON",
+        ),
+        Action(
+            kind=ActionKind.CLOSE_PERP,
+            category="linear", product_id="DOGEUSDT", coin="DOGE",
+            amount=Decimal("100.0"),
+            order_link_id="c-002", reason="close DOGE",
+        ),
+    ]
+    results = await execute_actions(
+        client, actions, snapshot_ts="20260603T210002Z",
+        dry_run=False, executions_dir=tmp_path,
+    )
+    assert results[0].status == "error"
+    assert results[1].status == "ok"  # DOGE close should run
+    client.place_perp_order.assert_awaited_once()

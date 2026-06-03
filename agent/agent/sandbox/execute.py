@@ -2889,16 +2889,79 @@ async def execute_actions(
     Sequential by design — Bybit Earn subscriptions affect the same
     wallet balance; running in parallel would risk insufficient-funds
     errors mid-batch when the first subscribe hasn't settled yet.
+
+    Atomic-pair guard (2026-06-03): if a REDEEM_EARN errors out (most
+    commonly retCode=180020 "Position not found" / "Processing"), the
+    paired CLOSE_PERP on the same coin is converted to a SKIP. Without
+    this, the perp closes successfully while the spot leg stays
+    staked → naked LONG. Live hit: TON Earn 7.5 in Processing lock,
+    redeem 180020'd, perp closed → $15 naked long until next cycle.
     """
     executions_dir.mkdir(parents=True, exist_ok=True)
     log_path = executions_dir / f"{snapshot_ts}.jsonl"
     results: list[ActionResult] = []
+    redeem_failed_coins: set[str] = set()
     with log_path.open("a") as log_file:
         for action in actions:
+            # Atomic-pair guard: if REDEEM_EARN for this coin failed
+            # earlier in the batch, skip any CLOSE_PERP / OPEN_PERP_SHORT
+            # touching the same coin — leaving the perp in its prior
+            # state (open if it was open, closed if it was closed)
+            # preserves the hedge instead of stranding spot exposure.
+            if (
+                action.kind in (
+                    ActionKind.CLOSE_PERP, ActionKind.OPEN_PERP_SHORT
+                )
+                and action.coin
+                and action.coin.upper() in redeem_failed_coins
+            ):
+                skip = ActionResult(
+                    action=Action(
+                        kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                        category=action.category,
+                        product_id=action.product_id,
+                        coin=action.coin,
+                        amount=action.amount,
+                        order_link_id=action.order_link_id,
+                        reason=(
+                            f"{action.kind.value} {action.coin}: paired "
+                            f"REDEEM_EARN failed earlier in batch — "
+                            f"skipping perp side to preserve hedge "
+                            f"(avoids naked exposure)"
+                        ),
+                    ),
+                    status="skipped",
+                    response=None,
+                    error=None,
+                    started_at=datetime.now(UTC).isoformat(),
+                    finished_at=datetime.now(UTC).isoformat(),
+                )
+                results.append(skip)
+                log_file.write(json.dumps(skip.to_log()) + "\n")
+                log_file.flush()
+                log.warning(
+                    "atomic-pair guard: skipping %s on %s — paired "
+                    "REDEEM_EARN failed earlier",
+                    action.kind.value, action.coin,
+                )
+                continue
+
             res = await _execute_one(client, action, dry_run=dry_run)
             results.append(res)
             log_file.write(json.dumps(res.to_log()) + "\n")
             log_file.flush()
+
+            if (
+                action.kind == ActionKind.REDEEM_EARN
+                and res.status == "error"
+                and action.coin
+            ):
+                redeem_failed_coins.add(action.coin.upper())
+                log.warning(
+                    "redeem_earn failed for %s: %s — guarding any later "
+                    "CLOSE_PERP / OPEN_PERP_SHORT on this coin",
+                    action.coin, res.error,
+                )
     return results
 
 
