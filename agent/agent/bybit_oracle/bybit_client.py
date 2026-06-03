@@ -1737,6 +1737,59 @@ class BybitClient:
                 return
             raise
 
+    async def set_trading_stop(
+        self,
+        symbol: str,
+        *,
+        stop_loss: str | None = None,
+        take_profit: str | None = None,
+        category: str = "linear",
+        position_idx: int = 0,
+        sl_trigger_by: str = "MarkPrice",
+        tp_trigger_by: str = "MarkPrice",
+    ) -> None:
+        """Attach a Bybit-side stop-loss (and/or take-profit) to an open
+        position via `/v5/position/trading-stop`. When mark price (default
+        trigger) crosses `stop_loss`, Bybit market-closes the position
+        without further input. Visible on the Positions page in the
+        Bybit UI — the human-auditable redundancy layer alongside the
+        agent's internal watcher-driven close.
+
+        For a SHORT position (auto-hedge), stop_loss should be ABOVE
+        the entry / current mark (the short loses when underlying rises).
+
+        Setting both stop_loss and take_profit at the same time is
+        supported by Bybit and conserves one round-trip vs separate calls.
+
+        Bybit returns retCode=10001 if neither stop_loss nor take_profit
+        is provided; we guard against it client-side. retCode=34040
+        ("not modified") is swallowed — idempotent re-application of the
+        same level is fine.
+        """
+        if stop_loss is None and take_profit is None:
+            raise ValueError(
+                "set_trading_stop requires stop_loss or take_profit"
+            )
+        body: dict[str, Any] = {
+            "category": category,
+            "symbol": symbol,
+            "positionIdx": position_idx,
+        }
+        if stop_loss is not None:
+            body["stopLoss"] = stop_loss
+            body["slTriggerBy"] = sl_trigger_by
+        if take_profit is not None:
+            body["takeProfit"] = take_profit
+            body["tpTriggerBy"] = tp_trigger_by
+        try:
+            await self._request(
+                "POST", "/v5/position/trading-stop", body=body
+            )
+        except BybitAPIError as e:
+            if e.ret_code == 34040:  # not modified — already at this level
+                return
+            raise
+
     async def get_positions(
         self,
         category: str = "linear",

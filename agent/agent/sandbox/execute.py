@@ -873,6 +873,35 @@ def _auto_hedge_targets(
     return targets
 
 
+def _invalidate_for_coin(
+    decision: Decision, snapshot: Snapshot, coin: str
+) -> dict[str, Any]:
+    """Return `Pick.invalidate_at` (as dict) for the FIRST non-stable
+    Earn pick on `coin` across the decision, or `{}` when none set.
+    Used by the hedge planner to attach Bybit-side stop / take-profit
+    levels to OPEN_PERP_SHORT actions — operator-set thresholds get
+    mirrored to Bybit so a tripped stop closes the perp on Bybit's
+    side without waiting on the watcher poll."""
+    coin_u = coin.upper()
+    for v in decision.venues:
+        meta = VENUE_REGISTRY[v.venue_id]
+        cat = getattr(meta, "snapshot_category", None)
+        if cat not in _AUTO_HEDGE_CATEGORIES or not v.picks:
+            continue
+        product_coin = {
+            p.product_id: p.coin
+            for p in snapshot.products.get(cat, [])
+        }
+        for pick in v.picks:
+            if product_coin.get(pick.product_id, "").upper() != coin_u:
+                continue
+            inv = getattr(pick, "invalidate_at", None)
+            if inv is None:
+                return {}
+            return inv.model_dump(mode="python") if hasattr(inv, "model_dump") else dict(inv)
+    return {}
+
+
 def _hedge_diff_actions(
     snapshot: Snapshot,
     decision: Decision,
@@ -999,6 +1028,21 @@ def _hedge_diff_actions(
                 continue
             order_link_id = _order_link_id(snapshot_ts, cursor)
             cursor += 1
+            # Mirror LLM-set invalidate_at levels onto the perp as
+            # Bybit-side stop / take-profit so a tripped threshold
+            # closes the position on Bybit's side without waiting on
+            # the watcher poll. For a SHORT:
+            #   price_above → stopLoss (short loses as mark rises)
+            #   price_below → takeProfit (short wins as mark falls,
+            #                  user wants out anyway when this fires)
+            invalidate = _invalidate_for_coin(decision, snapshot, coin)
+            extra: dict[str, Any] = {}
+            sl = invalidate.get("price_above") if invalidate else None
+            tp = invalidate.get("price_below") if invalidate else None
+            if sl is not None:
+                extra["stop_loss"] = str(sl)
+            if tp is not None:
+                extra["take_profit"] = str(tp)
             opens.append(
                 Action(
                     kind=ActionKind.OPEN_PERP_SHORT,
@@ -1007,9 +1051,12 @@ def _hedge_diff_actions(
                     coin=coin,
                     amount=qty,
                     order_link_id=order_link_id,
+                    extra=extra,
                     reason=(
                         f"short {coin} ${target_notional:.2f} notional "
                         f"({qty} {coin}, step={info.qty_step}) @ mark ${info.mark_price:.4f}"
+                        + (f" SL=${sl}" if sl is not None else "")
+                        + (f" TP=${tp}" if tp is not None else "")
                     ),
                 )
             )
@@ -2895,6 +2942,36 @@ async def _execute_one(
                 order_link_id=action.order_link_id,
             )
             response = {"orderId": out.orderId}
+            # 2026-06-03: Bybit-side stop-loss / take-profit on the
+            # freshly-opened perp. Levels come from the planner's
+            # `extra` (mirrored from the pick's `invalidate_at` block).
+            # When Bybit triggers, the perp closes without waiting on
+            # the agent's watcher poll. The matching Earn redeem is
+            # handled separately by the auto-close path on the next
+            # cycle (or by `check_perp_stopped_out` if we wire that).
+            sl = action.extra.get("stop_loss") if action.extra else None
+            tp = action.extra.get("take_profit") if action.extra else None
+            if sl is not None or tp is not None:
+                try:
+                    await client.set_trading_stop(
+                        action.product_id,
+                        stop_loss=sl,
+                        take_profit=tp,
+                    )
+                    response["stop_loss"] = sl
+                    response["take_profit"] = tp
+                except BybitAPIError as e:
+                    # Stop placement failure shouldn't fail the whole
+                    # perp open — log + carry on. Internal watcher
+                    # remains the safety net.
+                    log.warning(
+                        "set_trading_stop failed for %s (sl=%s tp=%s): "
+                        "retCode=%s %s",
+                        action.product_id, sl, tp, e.ret_code, e.ret_msg,
+                    )
+                    response["stop_loss_error"] = (
+                        f"retCode={e.ret_code} {e.ret_msg}"
+                    )
         elif action.kind == ActionKind.CLOSE_PERP:
             # Buy-to-close the short. `reduce_only=True` so we can't
             # accidentally flip into a long if the size we computed is

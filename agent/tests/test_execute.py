@@ -3022,3 +3022,164 @@ def test_enforce_usdt_budget_leaves_sell_swaps_untouched() -> None:
     # Sell goes first (preserved order in `other_swaps + kept_buy`); Buy fits.
     assert dropped == set()
     assert kept == [sell, buy]
+
+
+# ─── Bybit-side stop-loss on perp open (2026-06-03) ────────────────────────
+
+
+def test_invalidate_for_coin_returns_pick_thresholds() -> None:
+    """Helper extracts invalidate_at from the matching non-stable Earn
+    pick, or {} when none set."""
+    from agent.reason.schema import InvalidateAt
+    from agent.sandbox.execute import _invalidate_for_coin
+    snap = _snapshot(
+        total_equity_usd="100",
+        onchain_products=[_TON_PRODUCT],
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
+    )
+    d = Decision(
+        thesis="TON OnChain with operator stop levels.",
+        venues=[
+            _venue("cash_usdc", 0.5),
+            VenueAllocation(
+                venue_id="bybit_onchain",  # type: ignore[arg-type]
+                weight=0.5,
+                picks=[Pick(
+                    product_id="8",
+                    weight=1.0,
+                    invalidate_at=InvalidateAt(
+                        price_below=1.50, price_above=2.50,
+                    ),
+                )],
+            ),
+        ],
+        hedges=[],
+        confidence=0.7,
+        risk_flags=[],
+        notes=[],
+        expected_blended_apr_pct=10.0,
+    )
+    inv = _invalidate_for_coin(d, snap, "TON")
+    assert inv["price_below"] == 1.50
+    assert inv["price_above"] == 2.50
+
+
+def test_diff_attaches_stop_levels_to_open_perp_short_from_invalidate() -> None:
+    """When the LLM sets invalidate_at on the matching pick, the
+    OPEN_PERP_SHORT action carries stop_loss / take_profit in `extra`
+    so the executor mirrors them to Bybit via set_trading_stop."""
+    from agent.reason.schema import InvalidateAt
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="0.1")},
+        onchain_products=[_TON_PRODUCT],
+    )
+    d = Decision(
+        thesis="TON OnChain hedged with operator stop levels.",
+        venues=[
+            _venue("cash_usdc", 0.5),
+            VenueAllocation(
+                venue_id="bybit_onchain",  # type: ignore[arg-type]
+                weight=0.5,
+                picks=[Pick(
+                    product_id="8",
+                    weight=1.0,
+                    invalidate_at=InvalidateAt(
+                        price_below=1.40, price_above=2.60,
+                    ),
+                )],
+            ),
+        ],
+        hedges=[],
+        confidence=0.7,
+        risk_flags=[],
+        notes=[],
+        expected_blended_apr_pct=10.0,
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260603T200000Z")
+    opens = [a for a in actions if a.kind == ActionKind.OPEN_PERP_SHORT]
+    assert len(opens) == 1
+    op = opens[0]
+    assert op.coin == "TON"
+    assert op.extra.get("stop_loss") == "2.6"  # price_above → SL on short
+    assert op.extra.get("take_profit") == "1.4"  # price_below → TP on short
+    assert "SL=$2.6" in op.reason
+    assert "TP=$1.4" in op.reason
+
+
+def test_diff_open_perp_short_no_extra_when_invalidate_unset() -> None:
+    """When invalidate_at is None on the pick, no stop levels attach —
+    backward-compat: action.extra stays empty {}."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="0.1")},
+        onchain_products=[_TON_PRODUCT],
+    )
+    d = _decision_with_hedge(hedge_notional=-50.0)  # no invalidate_at
+    actions = diff_to_actions(snap, d, snapshot_ts="20260603T200000Z")
+    opens = [a for a in actions if a.kind == ActionKind.OPEN_PERP_SHORT]
+    assert len(opens) == 1
+    assert opens[0].extra == {}
+
+
+@pytest.mark.asyncio
+async def test_execute_open_perp_short_calls_set_trading_stop_when_extras_present(
+    tmp_path: Path,
+) -> None:
+    """Live OPEN_PERP_SHORT with stop_loss/take_profit in `extra` →
+    executor calls set_trading_stop on the matching symbol post-open."""
+    from agent.bybit_oracle.bybit_client import SpotOrderResult as PerpOrderResult
+    client = AsyncMock()
+    client.set_leverage.return_value = None
+    client.place_perp_order.return_value = PerpOrderResult(
+        orderId="perp-001", orderLinkId="sandbox-h-001",
+    )
+    client.set_trading_stop.return_value = None
+    action = Action(
+        kind=ActionKind.OPEN_PERP_SHORT,
+        category="Perp",
+        product_id="TONUSDT",
+        coin="TON",
+        amount=Decimal("4.1"),
+        order_link_id="sandbox-h-001",
+        reason="short TON",
+        extra={"stop_loss": "2.60", "take_profit": "1.40"},
+    )
+    results = await execute_actions(
+        client, [action], snapshot_ts="20260603T200000Z",
+        dry_run=False, executions_dir=tmp_path,
+    )
+    assert results[0].status == "ok"
+    client.set_trading_stop.assert_awaited_once()
+    kwargs = client.set_trading_stop.await_args.kwargs
+    assert kwargs["stop_loss"] == "2.60"
+    assert kwargs["take_profit"] == "1.40"
+    assert client.set_trading_stop.await_args.args[0] == "TONUSDT"
+
+
+@pytest.mark.asyncio
+async def test_execute_open_perp_short_skips_set_trading_stop_when_no_extras(
+    tmp_path: Path,
+) -> None:
+    """Action without stop_loss/take_profit in extras → no set_trading_stop
+    call. Backward-compat for picks that don't carry invalidate_at."""
+    from agent.bybit_oracle.bybit_client import SpotOrderResult as PerpOrderResult
+    client = AsyncMock()
+    client.set_leverage.return_value = None
+    client.place_perp_order.return_value = PerpOrderResult(
+        orderId="perp-002", orderLinkId="sandbox-h-002",
+    )
+    client.set_trading_stop.return_value = None
+    action = Action(
+        kind=ActionKind.OPEN_PERP_SHORT,
+        category="Perp", product_id="TONUSDT", coin="TON",
+        amount=Decimal("4.1"),
+        order_link_id="sandbox-h-002",
+        reason="short TON",
+    )
+    results = await execute_actions(
+        client, [action], snapshot_ts="20260603T200000Z",
+        dry_run=False, executions_dir=tmp_path,
+    )
+    assert results[0].status == "ok"
+    client.set_trading_stop.assert_not_awaited()

@@ -797,6 +797,21 @@ def _coin_to_perp_symbol(coin: str) -> str:
     return f"{coin.upper()}USDT"
 
 
+def _perp_to_earn_product_id(symbol: str, baseline: WatcherBaseline) -> str:
+    """Resolve the held Earn productId for a given perp symbol's coin.
+    Used by the perp-stopped-out detector to attach the right
+    position_id (`earn:<pid>`) so the auto-close path can match it back
+    to the pick in the decision file. Returns empty string when no
+    matching Earn position is held — caller falls back to the perp
+    position_id."""
+    coin = symbol.removesuffix("USDT") if symbol.endswith("USDT") else symbol
+    coin_u = coin.upper()
+    for p in baseline.positions:
+        if p.venue == "earn" and (p.coin or "").upper() == coin_u:
+            return p.position_id.removeprefix("earn:")
+    return ""
+
+
 async def poll_once(
     client: BybitClient, baseline: WatcherBaseline
 ) -> list[EventRecord]:
@@ -892,6 +907,34 @@ async def poll_once(
                 symbol = pos.position_id.removeprefix("perp:")
                 live = live_by_symbol.get(symbol)
                 if live is None:
+                    # Perp WAS in baseline but no longer open. Two cases:
+                    #   1. We held a paired Earn long on the same coin —
+                    #      Bybit (stop / TP / liq) closed the perp out
+                    #      from under us, paired Earn is now naked, fire
+                    #      pick_invalidated so auto-close redeems.
+                    #   2. No paired Earn — the perp was closed by our
+                    #      own planner this cycle, or it's a stale
+                    #      baseline entry. Nothing to clean up, skip.
+                    earn_pid = _perp_to_earn_product_id(symbol, baseline)
+                    if not earn_pid:
+                        continue
+                    events.append(
+                        EventRecord(
+                            ts=datetime.now(UTC),
+                            kind="pick_invalidated",
+                            severity="P0",
+                            position_id=f"earn:{earn_pid}",
+                            coin=pos.coin,
+                            baseline={"perp_symbol": symbol},
+                            current={"open_size": "0"},
+                            threshold={},
+                            message=(
+                                f"perp {symbol} closed outside the agent "
+                                f"(Bybit stop / TP / liquidation) — paired "
+                                f"Earn long is now naked, auto-closing"
+                            ),
+                        )
+                    )
                     continue
                 mark = _to_decimal(live.markPrice)
                 liq = _to_decimal(live.liqPrice)
