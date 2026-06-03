@@ -103,6 +103,16 @@ class ProductSummary(BaseModel):
     # floor — avoiding live-side `180005` / `180016` rejections.
     # None = unknown / no floor surfaced for this product family.
     min_subscribe_usd: Decimal | None = None
+    # Number of decimal places the Earn product accepts for `amount`
+    # on `/v5/earn/place-order` (`.precision` field on the raw V5
+    # product row). Live retCode=180001 on USDT FlexibleSaving product
+    # 1 (2026-06-03) was triggered by sending amount="10.69056" — 5
+    # decimals — to a product with precision=4. The planner now
+    # quantizes SUBSCRIBE_EARN amounts to this value before emitting
+    # the action. None ⇒ unknown precision; executor falls back to
+    # passing amount as-is (legacy behavior). LM products don't
+    # populate this field — their fill is `addLiquidity` not Earn.
+    stake_precision: int | None = None
     notes: list[str] = Field(default_factory=list)
 
 
@@ -131,6 +141,13 @@ class WalletSnapshot(BaseModel):
     # total swap demand and drop tail earn-swaps that would otherwise
     # 170131 the moment USDC drains.
     liquid_usdc_usd: Decimal = Decimal(0)
+    # Same as above for USDT — sum across UNIFIED + FUND. The USDT side
+    # of the budget covers (a) perp margin (UNIFIED USDT consumed by
+    # OPEN_PERP_SHORT) and (b) non-stable Earn Buy swaps on {coin}USDT
+    # pairs. Without this cap a small vault can chain 170131 when a
+    # USDC→USDT hedge swap drains the available USDT before the next
+    # Buy swap fires.
+    liquid_usdt_usd: Decimal = Decimal(0)
 
 
 class MarketSnapshot(BaseModel):
@@ -326,6 +343,28 @@ def _flex_or_onchain_summary(
         except (InvalidOperation, TypeError):
             min_stake = None
 
+    # Bybit V5 returns `precision` as either a decimal-count string
+    # ("4") or a step ("0.0001"). Normalize both to a positive int
+    # (decimal places). Unparseable / missing → leave None and let
+    # the executor fall back to raw amount.
+    stake_precision: int | None = None
+    raw_precision = getattr(p, "precision", None)
+    if raw_precision is not None:
+        s = str(raw_precision).strip()
+        if s:
+            try:
+                n = int(s)
+                if n >= 0:
+                    stake_precision = n
+            except ValueError:
+                try:
+                    step = Decimal(s)
+                    if step > 0 and step <= 1:
+                        # 0.0001 → -exponent (4); 1 → 0; 0.01 → 2
+                        stake_precision = max(0, -step.as_tuple().exponent)
+                except (InvalidOperation, TypeError):
+                    pass
+
     return ProductSummary(
         category=category,
         product_id=p.productId,
@@ -335,6 +374,7 @@ def _flex_or_onchain_summary(
         base_apr_string=p.estimateApr,
         redeem_lockup_minutes=lockup,
         min_subscribe_usd=min_stake,
+        stake_precision=stake_precision,
         notes=notes,
     )
 
@@ -1665,6 +1705,7 @@ async def collect_snapshot(
     # source coin — the planner needs the full liquid balance to
     # decide how many swaps it can afford without draining mid-cycle.
     liquid_usdc = _coin_across_all_accounts(accounts, "USDC")
+    liquid_usdt = _coin_across_all_accounts(accounts, "USDT")
 
     # Products: normalize + rank with diversification floor.
     stable_floor = lambda s: s.coin in STABLES  # noqa: E731
@@ -1911,6 +1952,7 @@ async def collect_snapshot(
             usdt_available_usd=usdt_available,
             unified_coin_balances=unified_coins,
             liquid_usdc_usd=liquid_usdc,
+            liquid_usdt_usd=liquid_usdt,
         ),
         earn_positions=earn_positions_dump,
         lm_positions=lm_positions,

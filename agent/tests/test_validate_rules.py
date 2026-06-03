@@ -45,6 +45,7 @@ from agent.validate.rules import (
     check_picks_required,
     check_product_ids_in_snapshot,
     check_risk_flags,
+    check_stable_spend_cap,
     check_venue_caps,
     check_venue_floors,
     validate,
@@ -91,6 +92,8 @@ def _snapshot(
     lm_products: list[ProductSummary] | None = None,
     perp_market: dict[str, PerpInfo] | None = None,
     total_equity_usd: str = "100",
+    liquid_usdc_usd: str = "0",
+    liquid_usdt_usd: str = "0",
 ) -> Snapshot:
     """Build a Snapshot with all the bells the validator reads. Defaults
     yield a calm regime — peg fine, one stable in flex, one stable in
@@ -106,7 +109,11 @@ def _snapshot(
     }
     return Snapshot(
         captured_at=datetime.now(UTC),
-        wallet=WalletSnapshot(total_equity_usd=Decimal(total_equity_usd)),
+        wallet=WalletSnapshot(
+            total_equity_usd=Decimal(total_equity_usd),
+            liquid_usdc_usd=Decimal(liquid_usdc_usd),
+            liquid_usdt_usd=Decimal(liquid_usdt_usd),
+        ),
         earn_positions=[],
         lm_positions=[],
         products=products,
@@ -722,6 +729,9 @@ def test_aggregate_validate_passes_hedged_non_usd_pick() -> None:
     s = _snapshot(
         onchain_products=_onchain_ton(),
         perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
+        # liquid covers $40 spot + $42 perp margin
+        liquid_usdc_usd="60",
+        liquid_usdt_usd="30",
     )
     d = _hedged_decision(
         hedge_notional=-40.0,
@@ -729,3 +739,81 @@ def test_aggregate_validate_passes_hedged_non_usd_pick() -> None:
     )
     ok, errors = validate(d, s)
     assert ok, errors
+
+
+# ─── check_stable_spend_cap (2026-06-03) ───────────────────────────────────
+
+
+def test_check_stable_spend_cap_passes_with_no_non_stable_picks() -> None:
+    """All-stable decision (cash + USD1 flex) bypasses the cap entirely —
+    nothing to count, no constraint to enforce."""
+    s = _snapshot(liquid_usdc_usd="50", liquid_usdt_usd="0")
+    d = _decision()  # default: cash 50% + flex USD1 50%
+    assert check_stable_spend_cap(d, s) == (True, None)
+
+
+def test_check_stable_spend_cap_passes_when_liquid_unset() -> None:
+    """No liquid data (legacy fixture / pre-pivot) → no-op, matches the
+    executor-side `_enforce_*_budget` early-out semantics."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
+        liquid_usdc_usd="0",
+        liquid_usdt_usd="0",
+    )
+    d = _hedged_decision(onchain_venue_weight=0.40)
+    assert check_stable_spend_cap(d, s) == (True, None)
+
+
+def test_check_stable_spend_cap_fails_when_demand_exceeds_supply() -> None:
+    """Non-stable pick at $40 → demand $40 spot + $42 margin = $82.
+    Liquid stables $50 → cap exceeded, reject."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
+        liquid_usdc_usd="20",
+        liquid_usdt_usd="30",
+    )
+    d = _hedged_decision(onchain_venue_weight=0.40)
+    ok, msg = check_stable_spend_cap(d, s)
+    assert not ok
+    assert msg is not None
+    assert "non-stable spend" in msg
+    assert "exceeds liquid stables" in msg
+
+
+def test_check_stable_spend_cap_passes_when_supply_sufficient() -> None:
+    """Same pick at $40 (demand $82) but liquid stables $100 → fits."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
+        liquid_usdc_usd="60",
+        liquid_usdt_usd="40",
+    )
+    d = _hedged_decision(onchain_venue_weight=0.40)
+    assert check_stable_spend_cap(d, s) == (True, None)
+
+
+def test_check_stable_spend_cap_ignores_stable_picks() -> None:
+    """Stable Earn picks (USDT/USD1) don't count — they're funded by USDC
+    Sell swap and capped by the executor's USDC budget separately."""
+    s = _snapshot(liquid_usdc_usd="1", liquid_usdt_usd="0")
+    # Even a tiny $1 liquid pool passes because the picks are stable
+    d = _decision()  # cash + USD1 flex
+    assert check_stable_spend_cap(d, s) == (True, None)
+
+
+def test_check_stable_spend_cap_skips_pick_without_perp_market() -> None:
+    """Picks lacking a perp pair are rejected by
+    `check_hedges_for_non_usd_picks`; this rule must not double-count
+    them as demand (or it'd produce a confusing duplicate error)."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={},  # no TON perp → un-hedgeable
+        liquid_usdc_usd="1",  # absurdly low, but no demand counted
+        liquid_usdt_usd="0",
+    )
+    d = _hedged_decision(onchain_venue_weight=0.40)
+    # stable_spend_cap passes (no demand). The actual rejection comes
+    # from check_hedges_for_non_usd_picks elsewhere.
+    assert check_stable_spend_cap(d, s) == (True, None)

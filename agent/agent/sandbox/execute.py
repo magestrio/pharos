@@ -446,6 +446,25 @@ def diff_to_actions(
                 mark = getattr(perp_info, "mark_price", None) if perp_info else None
                 if mark and mark > 0:
                     amount_native = (delta / mark).quantize(Decimal("0.0001"))
+            # Bybit V5 Earn `/place-order` rejects amounts that exceed
+            # the product's `precision` with retCode=180001 (live hit
+            # 2026-06-03 on USDT Flex product 1, amount=10.69056). The
+            # snapshot now carries `stake_precision`; quantize the
+            # native unit that goes on the wire (amount_native for
+            # non-stables, delta for stables) down to that precision so
+            # we never out-precision the product. ROUND_DOWN avoids
+            # ever rounding past `delta` (which would trip the min-stake
+            # gate above retroactively or 180016 'balance not enough').
+            precision = getattr(product_sum, "stake_precision", None)
+            if precision is not None and precision >= 0:
+                step = Decimal(1).scaleb(-precision)
+                delta = delta.quantize(step, rounding=ROUND_DOWN)
+                if amount_native is not None:
+                    amount_native = amount_native.quantize(
+                        step, rounding=ROUND_DOWN
+                    )
+                if delta < MIN_ACTION_USDC:
+                    continue
             subscribes.append(
                 Action(
                     kind=ActionKind.SUBSCRIBE_EARN,
@@ -583,6 +602,81 @@ def diff_to_actions(
                         reason=(
                             f"hedge {a.coin}: paired Earn subscribe dropped "
                             f"(USDC budget exceeded); skipping perp open to "
+                            f"avoid naked short"
+                        ),
+                    )
+                )
+            else:
+                new_hedge_opens.append(a)
+        hedge_opens = new_hedge_opens
+        hedge_swaps = _swap_actions_for_hedges(
+            snapshot,
+            hedge_opens,
+            hedge_closes,
+            snapshot_ts,
+            idx_offset=len(all_pids) + len(hedge_closes) + len(hedge_opens),
+        )
+
+    # USDT budget enforcement (2026-06-03). Mirror of the USDC pass but
+    # for the USDT side of the swap graph: non-stable Earn Buy swaps on
+    # {coin}USDT pairs spend USDT directly, and OPEN_PERP_SHORT consumes
+    # UNIFIED USDT for margin. The hedge USDC→USDT swap topped up USDT
+    # supply, but on a small vault the combined demand (perp margin +
+    # multiple non-stable Buy swaps) can still exceed liquid_usdt and
+    # chain 170131 'Insufficient balance' across Buy legs. Perp margin
+    # is priority-1 (risk-critical); tail Buy swaps are dropped, along
+    # with their dependent subscribe (the perp itself is unrelated to
+    # the Buy swap — it pairs with the SUBSCRIBE_EARN, not the Buy swap
+    # leg — but a dropped subscribe still cascades the perp to avoid
+    # naked-short, same as the USDC pass).
+    earn_swaps, usdt_dropped = _enforce_usdt_budget(
+        snapshot.wallet.liquid_usdt_usd,
+        hedge_swaps,
+        hedge_opens,
+        hedge_closes,
+        earn_swaps,
+        snapshot,
+    )
+    if usdt_dropped:
+        new_subscribes: list[Action] = []
+        for a in subscribes:
+            if (
+                a.kind in (ActionKind.SUBSCRIBE_EARN, ActionKind.SUBSCRIBE_LM)
+                and a.coin in usdt_dropped
+            ):
+                new_subscribes.append(
+                    Action(
+                        kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                        category=a.category,
+                        product_id=a.product_id,
+                        coin=a.coin,
+                        amount=a.amount,
+                        order_link_id=a.order_link_id,
+                        reason=(
+                            f"{a.category}/{a.product_id} ({a.coin}): Buy "
+                            f"swap USDT→{a.coin} dropped (USDT budget "
+                            f"exceeded); subscribe would 180016 — skip"
+                        ),
+                    )
+                )
+            else:
+                new_subscribes.append(a)
+        subscribes = new_subscribes
+
+        new_hedge_opens: list[Action] = []
+        for a in hedge_opens:
+            if a.kind == ActionKind.OPEN_PERP_SHORT and a.coin in usdt_dropped:
+                new_hedge_opens.append(
+                    Action(
+                        kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                        category=a.category,
+                        product_id=a.product_id,
+                        coin=a.coin,
+                        amount=a.amount,
+                        order_link_id=a.order_link_id,
+                        reason=(
+                            f"hedge {a.coin}: paired Earn subscribe dropped "
+                            f"(USDT budget exceeded); skipping perp open to "
                             f"avoid naked short"
                         ),
                     )
@@ -1866,6 +1960,104 @@ def _enforce_usdc_budget(
                 liquid_usdc,
             )
     return kept_sell + buy_swaps, dropped
+
+
+def _enforce_usdt_budget(
+    liquid_usdt: Decimal,
+    hedge_swaps: list[Action],
+    hedge_opens: list[Action],
+    hedge_closes: list[Action],
+    earn_swaps: list[Action],
+    snapshot: Snapshot,
+) -> tuple[list[Action], set[str]]:
+    """Cap total USDT-spending demand at `liquid_usdt` (UNIFIED+FUND).
+    USDT is consumed by:
+      - OPEN_PERP_SHORT margin (UNIFIED USDT) — priority-1, risk-critical
+      - SWAP_SPOT Buy on {coin}USDT pairs (non-stable Earn picks) — drop-tail
+    USDT is supplied by:
+      - existing wallet (`liquid_usdt`)
+      - USDC→USDT hedge swap inflow (USDCUSDT Sell, side != "Buy")
+      - CLOSE_PERP releases (margin returns as USDT)
+    Returns the (possibly pruned) earn_swaps list + set of target coins
+    whose Buy swap was dropped (so caller cascades to subscribes/perps).
+    Sell swaps on USDCx pairs are left untouched — they spend USDC, not
+    USDT, and were already capped by `_enforce_usdc_budget`."""
+    # Mirror of `_enforce_usdc_budget`: when the snapshot didn't populate
+    # liquid_usdt (legacy callers / tests / pre-pivot fixtures), skip the
+    # cap and fall back to the pre-budget behavior of letting the Buy
+    # swap 170131 at runtime. Production always populates the field.
+    if liquid_usdt <= 0:
+        return earn_swaps, set()
+
+    # Supply: existing USDT + hedge USDC→USDT swap inflow + close releases.
+    hedge_swap_inflow = sum(
+        (
+            s.amount
+            for s in hedge_swaps
+            if s.kind == ActionKind.SWAP_SPOT
+            and s.product_id == "USDCUSDT"
+            and s.side != "Buy"
+        ),
+        Decimal(0),
+    )
+    close_release = Decimal(0)
+    for a in hedge_closes:
+        info = snapshot.perp_market.get(a.coin) or snapshot.perp_market.get(
+            a.coin.upper()
+        )
+        if info is None or info.mark_price is None or info.mark_price <= 0:
+            continue
+        close_release += a.amount * info.mark_price
+
+    supply = liquid_usdt + hedge_swap_inflow + close_release
+
+    # Demand: perp margin (with buffer).
+    perp_demand = Decimal(0)
+    for a in hedge_opens:
+        if a.kind != ActionKind.OPEN_PERP_SHORT:
+            continue
+        info = snapshot.perp_market.get(a.coin) or snapshot.perp_market.get(
+            a.coin.upper()
+        )
+        if info is None or info.mark_price is None or info.mark_price <= 0:
+            continue
+        perp_demand += a.amount * info.mark_price * HEDGE_MARGIN_BUFFER
+
+    buy_swaps = [a for a in earn_swaps if a.side == "Buy"]
+    other_swaps = [a for a in earn_swaps if a.side != "Buy"]
+
+    if not buy_swaps:
+        return earn_swaps, set()
+
+    remaining = supply - perp_demand
+    if remaining <= 0:
+        dropped = {a.coin for a in buy_swaps}
+        log.warning(
+            "usdt_budget: perp margin demand $%s ≥ USDT supply $%s "
+            "(liquid $%s + hedge swap $%s + close release $%s) — "
+            "dropping all %d non-stable Buy swap(s) for: %s",
+            perp_demand, supply, liquid_usdt, hedge_swap_inflow,
+            close_release, len(buy_swaps), ", ".join(sorted(dropped)),
+        )
+        return other_swaps, dropped
+
+    kept_buy: list[Action] = []
+    dropped: set[str] = set()
+    spent = Decimal(0)
+    for a in buy_swaps:
+        if spent + a.amount <= remaining:
+            kept_buy.append(a)
+            spent += a.amount
+        else:
+            dropped.add(a.coin)
+            log.warning(
+                "usdt_budget: drop Buy swap %s ($%s) — would exceed "
+                "remaining USDT budget $%s (already spent $%s on Buy, "
+                "$%s on perp margin, of $%s supply)",
+                a.product_id, a.amount, remaining - spent, spent,
+                perp_demand, supply,
+            )
+    return other_swaps + kept_buy, dropped
 
 
 def _swap_actions_for_earn_picks(

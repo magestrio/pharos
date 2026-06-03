@@ -29,6 +29,7 @@ from agent.sandbox.execute import (
     ActionKind,
     diff_to_actions,
     execute_actions,
+    _enforce_usdt_budget,
     _order_link_id,
 )
 from agent.sandbox.snapshot import (
@@ -2421,3 +2422,251 @@ async def test_execute_claim_lm_live_calls_claim_interest(tmp_path: Path) -> Non
     assert results[0].status == "ok"
     assert results[0].response == {"claimed": True}
     client.claim_lm_interest.assert_awaited_once_with(product_id="-1")
+
+
+# ─── USDT budget enforcement (2026-06-03) ───────────────────────────────────
+
+
+def _spot_action(
+    *,
+    product_id: str,
+    coin: str,
+    amount: str,
+    side: str,
+    idx: int = 0,
+) -> Action:
+    return Action(
+        kind=ActionKind.SWAP_SPOT,
+        category="Spot",
+        product_id=product_id,
+        coin=coin,
+        amount=Decimal(amount),
+        side=side,
+        order_link_id=f"sandbox-test-{idx:03d}",
+        reason="test",
+    )
+
+
+def _open_short_action(coin: str, qty: str, idx: int = 0) -> Action:
+    return Action(
+        kind=ActionKind.OPEN_PERP_SHORT,
+        category="linear",
+        product_id=f"{coin}USDT",
+        coin=coin,
+        amount=Decimal(qty),
+        order_link_id=f"sandbox-hedge-{idx:03d}",
+        reason="test",
+    )
+
+
+def test_enforce_usdt_budget_noop_when_liquid_zero() -> None:
+    """liquid_usdt=0 → no-op (preserves pre-budget runtime behavior, mirrors
+    `_enforce_usdc_budget` early-out). Tests that don't populate the field
+    keep their original expectations."""
+    snap = _snapshot(total_equity_usd="100", perp_market={"ID": _perp("ID", mark="0.5")})
+    buy_swap = _spot_action(product_id="IDUSDT", coin="ID", amount="40", side="Buy")
+    kept, dropped = _enforce_usdt_budget(
+        Decimal("0"),
+        hedge_swaps=[],
+        hedge_opens=[_open_short_action("ID", "80")],
+        hedge_closes=[],
+        earn_swaps=[buy_swap],
+        snapshot=snap,
+    )
+    assert kept == [buy_swap]
+    assert dropped == set()
+
+
+def test_enforce_usdt_budget_drops_buy_when_perp_consumes_all() -> None:
+    """liquid_usdt + hedge_swap_inflow + close_release fully covers
+    perp_demand → no headroom for non-stable Buy swap → drop it."""
+    snap = _snapshot(total_equity_usd="100", perp_market={"ID": _perp("ID", mark="0.5")})
+    # perp ID short 80 qty × $0.5 mark × 1.05 buffer = $42 margin
+    # liquid_usdt $10 + hedge swap $32 inflow = $42 supply → exact match
+    hedge_swap = _spot_action(product_id="USDCUSDT", coin="USDT", amount="32", side="Sell")
+    buy_swap = _spot_action(product_id="IDUSDT", coin="ID", amount="40", side="Buy", idx=1)
+    kept, dropped = _enforce_usdt_budget(
+        Decimal("10"),
+        hedge_swaps=[hedge_swap],
+        hedge_opens=[_open_short_action("ID", "80")],
+        hedge_closes=[],
+        earn_swaps=[buy_swap],
+        snapshot=snap,
+    )
+    assert dropped == {"ID"}
+    assert kept == []
+
+
+def test_enforce_usdt_budget_keeps_buy_with_headroom() -> None:
+    """liquid_usdt covers both perp margin + Buy swap → Buy stays."""
+    snap = _snapshot(total_equity_usd="200", perp_market={"ID": _perp("ID", mark="0.5")})
+    # perp demand = 80 × 0.5 × 1.05 = $42; Buy = $40 → total $82
+    # liquid_usdt $100 supply → fits
+    buy_swap = _spot_action(product_id="IDUSDT", coin="ID", amount="40", side="Buy")
+    kept, dropped = _enforce_usdt_budget(
+        Decimal("100"),
+        hedge_swaps=[],
+        hedge_opens=[_open_short_action("ID", "80")],
+        hedge_closes=[],
+        earn_swaps=[buy_swap],
+        snapshot=snap,
+    )
+    assert dropped == set()
+    assert kept == [buy_swap]
+
+
+def test_enforce_usdt_budget_drops_tail_buys_sequentially() -> None:
+    """Two Buy swaps, only first fits in remaining budget → drop second."""
+    snap = _snapshot(
+        total_equity_usd="200",
+        perp_market={
+            "ID": _perp("ID", mark="0.5"),
+            "IO": _perp("IO", mark="1.0"),
+        },
+    )
+    # No perp margin; liquid_usdt = $50; first Buy $30 fits, second $30 overflows
+    buy_a = _spot_action(product_id="IDUSDT", coin="ID", amount="30", side="Buy", idx=0)
+    buy_b = _spot_action(product_id="IOUSDT", coin="IO", amount="30", side="Buy", idx=1)
+    kept, dropped = _enforce_usdt_budget(
+        Decimal("50"),
+        hedge_swaps=[],
+        hedge_opens=[],
+        hedge_closes=[],
+        earn_swaps=[buy_a, buy_b],
+        snapshot=snap,
+    )
+    assert dropped == {"IO"}
+    assert kept == [buy_a]
+
+
+def test_enforce_usdt_budget_credits_close_release() -> None:
+    """CLOSE_PERP releases its IM back as USDT → counts as supply,
+    lets a Buy swap fit that would otherwise overflow."""
+    snap = _snapshot(
+        total_equity_usd="200",
+        perp_market={
+            "TON": _perp("TON", mark="5.0"),
+            "ID": _perp("ID", mark="0.5"),
+        },
+    )
+    # No live perp; closing TON 10 qty × $5 mark = $50 release
+    # liquid_usdt = $0; Buy $40 → supply $50 ≥ demand $40 → keep
+    close = Action(
+        kind=ActionKind.CLOSE_PERP,
+        category="linear",
+        product_id="TONUSDT",
+        coin="TON",
+        amount=Decimal("10"),
+        order_link_id="sandbox-close-000",
+        reason="test",
+    )
+    buy = _spot_action(product_id="IDUSDT", coin="ID", amount="40", side="Buy")
+    kept, dropped = _enforce_usdt_budget(
+        # Tiny non-zero liquid to bypass early-out; supply still ~ close
+        Decimal("0.01"),
+        hedge_swaps=[],
+        hedge_opens=[],
+        hedge_closes=[close],
+        earn_swaps=[buy],
+        snapshot=snap,
+    )
+    assert dropped == set()
+    assert kept == [buy]
+
+
+def test_diff_subscribe_quantizes_amount_to_stake_precision() -> None:
+    """`.precision` quantization (2026-06-03 fix for live retCode=180001
+    on USDT Flex product 1). When the product surfaces `stake_precision`,
+    the emitted SUBSCRIBE_EARN amount must be rounded DOWN to that many
+    decimal places — never out-precision the product on the wire."""
+    usdt_flex = ProductSummary(
+        category="FlexibleSaving",
+        product_id="1",
+        coin="USDT",
+        effective_apr=Decimal("0.0224"),
+        apr_source="estimate_apr",
+        min_subscribe_usd=Decimal("1.5"),
+        stake_precision=4,
+    )
+    snap = _snapshot(
+        total_equity_usd="100",
+        # FUND has USDT for the subscribe to be sourceable
+        usdt_available_usd="100",
+        flex_products=[usdt_flex],
+    )
+    # weight 0.107 of $100 = $10.70; pick.weight=1.0 → raw $10.70.
+    # Should serialize to amount="10.7000" (4 decimals), never 5+.
+    d = Decision(
+        thesis="USDT Flex pick to validate precision quantization.",
+        venues=[
+            _venue("cash_usdc", 0.893),
+            _venue("bybit_flex", 0.107, [("1", 1.0)]),
+        ],
+        hedges=[],
+        confidence=0.7,
+        risk_flags=[],
+        notes=[],
+        expected_blended_apr_pct=2.0,
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260603T120000Z")
+    subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_EARN]
+    assert len(subs) == 1
+    sent = subs[0].amount
+    # Quantized to ≤4 decimals (no 5+ decimal artifact like 10.69056).
+    exp = sent.as_tuple().exponent
+    assert exp >= -4, f"amount={sent} has {-exp} decimals, want ≤4"
+    # And rounded DOWN (never above the requested delta).
+    assert sent <= Decimal("10.70")
+
+
+def test_diff_subscribe_skips_when_precision_rounds_below_min_action() -> None:
+    """If precision rounds the delta below MIN_ACTION_USDC, skip the
+    subscribe rather than emit a sub-min action that the Earn endpoint
+    would reject downstream."""
+    tiny_precision = ProductSummary(
+        category="FlexibleSaving",
+        product_id="99",
+        coin="USDC",
+        effective_apr=Decimal("0.05"),
+        apr_source="estimate_apr",
+        min_subscribe_usd=Decimal("0.01"),
+        stake_precision=0,  # integer-only — rounds $0.99 down to $0
+    )
+    snap = _snapshot(
+        total_equity_usd="100",
+        flex_products=[tiny_precision],
+    )
+    d = Decision(
+        thesis="Edge case: precision=0 + tiny weight rounds to zero.",
+        venues=[
+            _venue("cash_usdc", 0.9901),
+            _venue("bybit_flex", 0.0099, [("99", 1.0)]),
+        ],
+        hedges=[],
+        confidence=0.7,
+        risk_flags=[],
+        notes=[],
+        expected_blended_apr_pct=0.5,
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260603T120000Z")
+    subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_EARN]
+    assert subs == []
+
+
+def test_enforce_usdt_budget_leaves_sell_swaps_untouched() -> None:
+    """USDC→stable Sell swaps don't spend USDT (capped by USDC budget
+    instead). They pass through this filter regardless."""
+    snap = _snapshot(total_equity_usd="100", perp_market={"ID": _perp("ID", mark="0.5")})
+    sell = _spot_action(product_id="USDCUSDT", coin="USDT", amount="20", side="Sell")
+    buy = _spot_action(product_id="IDUSDT", coin="ID", amount="30", side="Buy", idx=1)
+    kept, dropped = _enforce_usdt_budget(
+        Decimal("50"),
+        hedge_swaps=[],
+        hedge_opens=[],
+        hedge_closes=[],
+        earn_swaps=[sell, buy],
+        snapshot=snap,
+    )
+    # Sell goes first (preserved order in `other_swaps + kept_buy`); Buy fits.
+    assert dropped == set()
+    assert kept == [sell, buy]

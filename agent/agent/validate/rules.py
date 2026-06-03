@@ -449,6 +449,99 @@ def _pick_usd_value(
     return out
 
 
+# ─── Stable-spend cap (2026-06-03) ─────────────────────────────────────────
+
+
+# Matches `execute.HEDGE_MARGIN_BUFFER`; the validator's pre-trade math
+# must agree with the executor's swap sizing so a decision that passes
+# validation can actually be funded by liquid_usdc + liquid_usdt.
+_VALIDATOR_HEDGE_MARGIN_BUFFER = 1.05
+
+
+def check_stable_spend_cap(d: Decision, snapshot: Snapshot) -> Check:
+    """Reject decisions whose non-stable spend can't be funded by the
+    liquid stable balance. Each non-stable Earn pick triggers two USD
+    outflows the executor must satisfy from the stable pool:
+
+      • spot leg — `pick_usd` worth of USDT spent on Buy {coin}USDT
+      • perp margin — `pick_usd × HEDGE_MARGIN_BUFFER` of USDT locked
+        in UNIFIED for the paired short
+
+    Supply is `liquid_usdc + liquid_usdt` (UNIFIED+FUND across both),
+    matching the executor's `_enforce_*_budget` pre-trade caps. When
+    demand exceeds supply the executor will cascade-drop tail Buy
+    swaps + paired subscribes/perps (safe), but the LLM could have
+    avoided the partial fill by downsizing. This check surfaces the
+    over-commit upstream so the rejected cycle's notes reach the next
+    LLM turn instead of leaving partial exposure behind.
+
+    Stable Earn picks (USDT/USD1/...) are not counted here — they
+    consume USDC via a Sell swap, which is sized comfortably against
+    `liquid_usdc` alone (the executor's USDC budget already handles
+    that). This rule scopes specifically to the non-stable case where
+    perp + spot demand stack on the USDT side.
+    """
+    total_book = float(snapshot.wallet.total_equity_usd)
+    if total_book <= 0:
+        return True, None
+
+    perp_market = getattr(snapshot, "perp_market", None) or {}
+    perp_demand = 0.0
+    spot_demand = 0.0
+    contributors: list[str] = []
+
+    for venue_id, category in _AUTO_HEDGE_VENUES:
+        venue = d.venue(venue_id)  # type: ignore[arg-type]
+        if venue is None or venue.weight <= 0 or not venue.picks:
+            continue
+        idx = _snapshot_index(snapshot).get(category, {})
+        for pick in venue.picks:
+            summary = idx.get(pick.product_id)
+            if summary is None:
+                continue
+            coin = summary.coin.upper()
+            if coin in _STABLE_COINS:
+                continue
+            # Skip picks that wouldn't hedge anyway (no perp pair) —
+            # check_hedges_for_non_usd_picks already rejects them, no
+            # need to double-count here.
+            info = perp_market.get(coin) or perp_market.get(coin.lower())
+            if info is None:
+                continue
+            pick_usd = total_book * float(venue.weight) * float(pick.weight)
+            if pick_usd <= 0:
+                continue
+            perp_demand += pick_usd * _VALIDATOR_HEDGE_MARGIN_BUFFER
+            spot_demand += pick_usd
+            contributors.append(
+                f"{venue_id}/{pick.product_id}({coin})=${pick_usd:.2f}"
+            )
+
+    if not contributors:
+        return True, None
+
+    total_demand = perp_demand + spot_demand
+    liquid_usdc = float(snapshot.wallet.liquid_usdc_usd)
+    liquid_usdt = float(snapshot.wallet.liquid_usdt_usd)
+    supply = liquid_usdc + liquid_usdt
+
+    # When the snapshot didn't populate either field (pre-pivot fixtures,
+    # the test sandbox, or a legacy collector), fall through — same
+    # no-op semantics as the executor-side budget enforcers.
+    if supply <= 0:
+        return True, None
+
+    if total_demand > supply + 1e-9:
+        return False, (
+            f"non-stable spend ${total_demand:.2f} (perp margin "
+            f"${perp_demand:.2f} + spot ${spot_demand:.2f}) exceeds "
+            f"liquid stables ${supply:.2f} "
+            f"(USDC ${liquid_usdc:.2f} + USDT ${liquid_usdt:.2f}) — "
+            f"downsize non-stable picks: {', '.join(contributors)}"
+        )
+    return True, None
+
+
 # ─── Aggregate ─────────────────────────────────────────────────────────────
 
 
@@ -478,6 +571,7 @@ def validate(decision: Decision, snapshot: Snapshot) -> tuple[bool, list[str]]:
         check_lm_leverage_size_cap,
         check_hedges_for_non_usd_picks,
         check_funding_rate_floor,
+        check_stable_spend_cap,
     ]
     errors: list[str] = []
     for check in pure_checks:
