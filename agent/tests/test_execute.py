@@ -413,6 +413,178 @@ def test_diff_orphan_spot_skipped_when_subscribe_also_planned() -> None:
     assert ton_sells == []
 
 
+def test_diff_orphan_sell_respects_open_perp_short_coverage() -> None:
+    """Regression for 2026-06-03: TON-style naked-short bug. When the
+    wallet holds non-stable spot AND there's an open perp short on the
+    same coin, only the EXCESS over the hedge should be sold — not the
+    spot that's currently backing the short."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
+        # Held TON Earn 4.154 + open TON short 4.1 = balanced hedge.
+        earn_positions=[_pos("OnChain", "8", "4.154", coin="TON")],
+        perp_positions=[_short_pos("TON", size="4.1", position_value="8.2")],
+    )
+    # 3.34 TON sitting in UNIFIED on top of the hedged pair → excess.
+    snap.wallet.unified_coin_balances = {"TON": Decimal("3.34")}
+    # LLM keeps TON as-is (matching the existing position).
+    d = _decision_with_hedge(hedge_notional=-8.2)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260603T180000Z")
+    sells = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "TONUSDT"
+        and a.side == "Sell"
+    ]
+    assert len(sells) == 1
+    sold_qty = sells[0].amount
+    # Excess long = (3.34 + 4.154) - 4.1 = 3.394; sellable capped at
+    # wallet (3.34), then quantized down to qty_step. Must be <= 3.34
+    # and > 3.0 (a quantization that kills most of it would indicate
+    # the cap didn't trigger correctly).
+    assert sold_qty <= Decimal("3.34")
+    assert sold_qty > Decimal("3.0")
+
+
+def test_diff_orphan_sell_skipped_when_perp_fully_covers_wallet() -> None:
+    """When the perp short matches the long exposure exactly (no excess),
+    orphan-sell must not fire — selling would reduce long below short
+    and create a naked short."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
+        earn_positions=[_pos("OnChain", "8", "4.15", coin="TON")],
+        perp_positions=[_short_pos("TON", size="4.1", position_value="8.2")],
+    )
+    # No spot in UNIFIED; everything else balanced.
+    snap.wallet.unified_coin_balances = {"TON": Decimal("0")}
+    d = _decision_with_hedge(hedge_notional=-8.2)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260603T180000Z")
+    ton_sells = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "TONUSDT"
+        and a.side == "Sell"
+    ]
+    assert ton_sells == []
+
+
+def test_diff_closes_naked_perp_short_when_long_gone() -> None:
+    """Recovery: TON perp short 4.1 with zero TON long → some CLOSE_PERP
+    must fire. In this scenario `_hedge_diff_actions` already catches
+    it (LLM dropped TON → target hedge = 0); the new
+    `_close_naked_perp_actions` is defense-in-depth for cases where
+    hedge_diff doesn't (e.g. mid-cycle long-side loss after subscribes
+    + redeems net out below the perp). Asserting on the outcome (TON
+    perp closes by ANY path) makes the test future-proof against
+    refactors that move responsibility between the two functions."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
+        earn_positions=[],
+        perp_positions=[_short_pos("TON", size="4.1", position_value="8.2")],
+    )
+    snap.wallet.unified_coin_balances = {"TON": Decimal("0")}
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_flex", 0.5, [("1131", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260603T180000Z")
+    closes = [
+        a for a in actions
+        if a.kind == ActionKind.CLOSE_PERP and a.coin == "TON"
+    ]
+    assert len(closes) >= 1
+    total_closed = sum((a.amount for a in closes), Decimal(0))
+    # The whole 4.1 short should be closed (combined across any sources).
+    assert total_closed >= Decimal("4.0")
+
+
+def test_close_naked_perp_actions_unit_trim_unhedged_portion() -> None:
+    """Unit test the safety-net function directly: when long_now <
+    perp_short post-cycle, only the naked portion (short - long) gets
+    a CLOSE_PERP, never the whole short. Bypasses diff_to_actions
+    because the conditions where this fires (hedge_diff's rebalance
+    threshold doesn't catch a small long-side gap) are tricky to set
+    up at the integration level."""
+    from agent.sandbox.execute import _close_naked_perp_actions
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="0.1")},
+        # Earn 3 TON; perp short 5 TON (already on the book).
+        earn_positions=[_pos("OnChain", "8", "3.0", coin="TON")],
+        perp_positions=[_short_pos("TON", size="5.0", position_value="10.0")],
+    )
+    snap.wallet.unified_coin_balances = {"TON": Decimal("0")}
+    # Empty plan — no subscribes / redeems / hedge actions planned this
+    # cycle. Long = 3 (Earn), short = 5 (perp). Naked = 2.
+    closes = _close_naked_perp_actions(
+        snap,
+        hedge_closes=[],
+        hedge_opens=[],
+        redeems=[],
+        subscribes=[],
+        snapshot_ts="20260603T180000Z",
+        idx_offset=0,
+    )
+    assert len(closes) == 1
+    c = closes[0]
+    assert c.coin == "TON"
+    assert c.product_id == "TONUSDT"
+    assert c.amount == Decimal("2.000")
+    assert "auto-close naked" in c.reason
+
+
+def test_close_naked_perp_actions_unit_skip_when_balanced() -> None:
+    """When long == short post-cycle, no auto-close fires."""
+    from agent.sandbox.execute import _close_naked_perp_actions
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="0.1")},
+        earn_positions=[_pos("OnChain", "8", "5.0", coin="TON")],
+        perp_positions=[_short_pos("TON", size="5.0", position_value="10.0")],
+    )
+    snap.wallet.unified_coin_balances = {"TON": Decimal("0")}
+    closes = _close_naked_perp_actions(
+        snap, [], [], [], [], "20260603T180000Z", idx_offset=0
+    )
+    assert closes == []
+
+
+def test_close_naked_perp_actions_unit_credits_planned_subscribe() -> None:
+    """A planned SUBSCRIBE_EARN this cycle adds to long_now — its
+    amount_native counts as backing for the perp short. Without this
+    credit, auto-close would trigger pre-emptively and trim a perp
+    that's about to be fully hedged a moment later."""
+    from agent.sandbox.execute import _close_naked_perp_actions
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="0.1")},
+        # Earn empty pre-cycle; will be subscribed via the planned action.
+        earn_positions=[],
+        perp_positions=[_short_pos("TON", size="4.0", position_value="8.0")],
+    )
+    snap.wallet.unified_coin_balances = {"TON": Decimal("0")}
+    planned_subscribe = Action(
+        kind=ActionKind.SUBSCRIBE_EARN,
+        category="OnChain",
+        product_id="8",
+        coin="TON",
+        amount=Decimal("8.0"),
+        amount_native=Decimal("4.0"),
+        order_link_id="x",
+        reason="planned",
+    )
+    closes = _close_naked_perp_actions(
+        snap, [], [], [], [planned_subscribe],
+        "20260603T180000Z", idx_offset=0,
+    )
+    # Long post-cycle = 0 + 4.0 (subscribe) = 4.0; short = 4.0. Balanced.
+    assert closes == []
+
+
 def test_diff_orphan_spot_skipped_below_min_swap() -> None:
     """Dust-sized orphan (< MIN_SWAP_USDC) isn't worth a swap — Bybit
     spot fees would exceed the recovery."""
