@@ -1164,6 +1164,35 @@ def _advance_earn_subscribe_action(
             ),
         )
 
+    # Per-product min-stake gate (mirrors the SUBSCRIBE_EARN gate).
+    # DualAssets/DiscountBuy carry their own floors ($10-$20) which
+    # often exceed a small-vault per-pick allocation — Bybit rejects
+    # sub-floor stakes with retCode=180012 'Purchase share is invalid:
+    # Amount out of range'. SKIP at diff time so the cycle log is
+    # readable and the live executor doesn't burn rate-limit quota on
+    # known-failing calls.
+    product_sum = _earn_product_lookup(snapshot, category, product_id)
+    if (
+        product_sum is not None
+        and product_sum.min_subscribe_usd is not None
+        and product_sum.min_subscribe_usd > 0
+        and target_amount_usd < product_sum.min_subscribe_usd
+    ):
+        return Action(
+            kind=ActionKind.SKIP_OUT_OF_SCOPE,
+            category=category,
+            product_id=product_id,
+            coin=coin,
+            amount=target_amount_usd,
+            order_link_id=order_link_id,
+            reason=(
+                f"{category}/{product_id} ({coin}): subscribe "
+                f"${target_amount_usd:.2f} below Bybit min "
+                f"${product_sum.min_subscribe_usd} — would retCode=180012; "
+                f"concentrate the venue or drop pick"
+            ),
+        )
+
     # Encode the per-category offer details into the action's reason so
     # the dispatch has a fallback if the execute-time refresh fails. May
     # be empty `{}` when the diff-time quote had no fresh offers — the
@@ -1442,6 +1471,60 @@ def _swap_base_coin(symbol: str) -> str:
         if symbol.endswith(quote) and symbol != quote:
             return symbol[: -len(quote)]
     return symbol
+
+
+async def _transfer_satisfies_swap(
+    client: Any, target_coin: str | None, required: Decimal
+) -> bool:
+    """Pre-flight check before spot swap: if `target_coin` already sits
+    in FUND in sufficient amount, transfer it to UNIFIED instead of
+    paying a spot fee + slippage to manufacture it. Returns True when
+    the transfer covered the requirement (caller skips the swap).
+
+    Tolerates mocked clients in tests — any TypeError / non-Decimal
+    return from `get_account_coin_balance` flips back to the swap
+    path."""
+    if not target_coin or required <= 0:
+        return False
+    try:
+        fund_have_raw = await client.get_account_coin_balance(
+            account_type="FUND", coin=target_coin
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "transfer_satisfies_swap: FUND probe for %s failed: %s",
+            target_coin, e,
+        )
+        return False
+    if not isinstance(fund_have_raw, Decimal):
+        try:
+            fund_have = Decimal(str(fund_have_raw))
+        except (InvalidOperation, TypeError, ValueError):
+            return False
+    else:
+        fund_have = fund_have_raw
+    if fund_have < required:
+        return False
+    log.info(
+        "transfer_satisfies_swap: %s FUND has %s ≥ required %s — "
+        "skipping swap, moving FUND→UNIFIED",
+        target_coin, fund_have, required,
+    )
+    try:
+        await client.internal_transfer(
+            coin=target_coin,
+            amount=str(required),
+            from_account_type="FUND",
+            to_account_type="UNIFIED",
+        )
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "transfer_satisfies_swap: transfer for %s failed: %s — "
+            "falling back to swap",
+            target_coin, e,
+        )
+        return False
 
 
 async def _ensure_unified_balance(
@@ -2090,22 +2173,31 @@ async def _execute_one(
             # would use quote, which is the asymmetry flagged in `.27`.
             # We always swap by selling USDC, so `qty` is always base.
             #
-            # The base coin (USDC) frequently lives in FUND, not UNIFIED.
-            # Bybit spot trades in UNIFIED only, so we pre-flight a
-            # FUND→UNIFIED transfer of any shortfall before the order.
-            # This unblocks the cascade where every downstream
-            # subscribe_earn for non-USDC stables fails with
-            # `180016 Balance not enough` because the USDT swap never
-            # produced funds.
-            base_coin = _swap_base_coin(action.product_id)
-            await _ensure_unified_balance(client, base_coin, action.amount)
-            out = await client.place_spot_order(
-                symbol=action.product_id,
-                side="Sell",
-                qty=str(action.amount),
-                order_link_id=action.order_link_id,
-            )
-            response = {"orderId": out.orderId}
+            # Pre-flight optimization: if the target coin (action.coin)
+            # already sits in FUND in sufficient quantity, just move it
+            # over — no need to spend a spot fee + slippage on a swap
+            # we don't have to make. This kicks in after the first live
+            # cycle's swap leaves USDT in FUND that subsequent cycles
+            # would otherwise re-swap-from-USDC.
+            target_coin = action.coin
+            if await _transfer_satisfies_swap(client, target_coin, action.amount):
+                response = {"transferred_in_lieu_of_swap": True, "coin": target_coin}
+            else:
+                # Fall back to the actual swap. Base coin (USDC) often
+                # lives in FUND; pre-flight a FUND→UNIFIED transfer of
+                # any shortfall and poll until it settles before placing
+                # the order. Without this the spot endpoint races and
+                # gets retCode=170131 'Insufficient balance' despite the
+                # transfer log showing success.
+                base_coin = _swap_base_coin(action.product_id)
+                await _ensure_unified_balance(client, base_coin, action.amount)
+                out = await client.place_spot_order(
+                    symbol=action.product_id,
+                    side="Sell",
+                    qty=str(action.amount),
+                    order_link_id=action.order_link_id,
+                )
+                response = {"orderId": out.orderId}
         else:
             side = "Stake" if action.kind == ActionKind.SUBSCRIBE_EARN else "Redeem"
             account_type = _ACCOUNT_TYPE[action.category]
