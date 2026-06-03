@@ -58,6 +58,16 @@ class Thresholds:
     YIELD_JUMP_MULTIPLIER = Decimal("2.0")
     YIELD_JUMP_MIN_BASELINE_BPS = Decimal("500")  # noise floor — ignore tiny APRs
     LM_LIQ_DISTANCE_THRESHOLD = Decimal("0.10")
+    # Perp short distance-to-liquidation: (liqPrice - mark) / mark.
+    # At 1x leverage liqPrice ≈ 1.95 × mark on entry → initial distance
+    # ≈ 0.95. Threshold 0.50 trips when liqPrice ≤ 1.50 × mark, i.e.
+    # the underlying has moved ~+30% against the short — perp lost ~30%
+    # of margin and ~70% still recoverable on voluntary close. Tight
+    # enough to preserve material margin in a tail event, loose enough
+    # to not churn on routine 5-10% moves. Mirror LM_LIQ_DISTANCE_THRESHOLD
+    # but per-leverage-class: LM caps leverage at 7, so 10% is tight;
+    # hedge perps are 1x so we can afford the looser cap.
+    PERP_LIQ_DISTANCE_THRESHOLD = Decimal("0.50")
 
 
 # Stable coins — peg drift checked against $1, never flagged for funding
@@ -192,17 +202,30 @@ def update_baseline_from_snapshot(
         )
 
     # Perp positions (the hedge leg). Funding flip + price drift
-    # checked off the linear ticker for `symbol`.
+    # checked off the linear ticker for `symbol`; `last_liq_distance`
+    # is the prior cycle's distance-to-liquidation so the watcher's
+    # `perp_liq_distance` checker can detect "newly breached"
+    # transitions (vs already-breached and noisy).
     for p in snap.get("perp_positions") or []:
         symbol = str(p.get("symbol") or "")
         coin = symbol.removesuffix("USDT") if symbol.endswith("USDT") else symbol
+        mark_p = _to_decimal(p.get("markPrice") or p.get("entryPrice"))
+        liq_p = _to_decimal(p.get("liqPrice"))
+        last_dist: Decimal | None = None
+        if (
+            mark_p is not None and mark_p > 0
+            and liq_p is not None and liq_p > 0
+            and liq_p > mark_p
+        ):
+            last_dist = (liq_p - mark_p) / mark_p
         positions.append(
             HeldPosition(
                 position_id=f"perp:{symbol}",
                 venue="perp",
                 coin=coin,
-                entry_mark_price=_to_decimal(p.get("markPrice") or p.get("entryPrice")),
+                entry_mark_price=mark_p,
                 last_funding_rate=_to_decimal(p.get("fundingRate")),
+                last_liq_distance=last_dist,
             )
         )
 
@@ -422,6 +445,61 @@ def check_lm_liq_distance(
     )
 
 
+def check_perp_liq_distance(
+    position: HeldPosition,
+    mark_price: Decimal,
+    liq_price: Decimal,
+) -> EventRecord | None:
+    """Event #8: hedge perp's distance-to-liquidation breaches threshold.
+
+    For short positions, liqPrice > mark; distance = (liq - mark) / mark.
+    A smaller distance means a rising underlying has eaten into the
+    short's margin. We fire when distance ≤ PERP_LIQ_DISTANCE_THRESHOLD
+    so the next cycle's LLM closes both legs (perp + paired spot Earn
+    on the same coin) before Bybit force-liquidates.
+
+    Skips:
+      - non-short positions (we only auto-hedge with shorts),
+      - missing or zero liqPrice (Bybit didn't compute one yet —
+        fresh position, flat row, or isolated-margin with cross-only data).
+    """
+    if mark_price <= 0 or liq_price <= 0:
+        return None
+    # Only shorts are at risk on the upside; longs (we don't open them
+    # as hedges) would have liq < mark and a different formula. Bybit's
+    # liqPrice > mark unambiguously implies short with rising-mark risk.
+    if liq_price <= mark_price:
+        return None
+    distance = (liq_price - mark_price) / mark_price
+    if distance > Thresholds.PERP_LIQ_DISTANCE_THRESHOLD:
+        return None
+    last_dist = (
+        str(position.last_liq_distance)
+        if position.last_liq_distance is not None
+        else None
+    )
+    return EventRecord(
+        ts=datetime.now(UTC),
+        kind="perp_liquidation_distance",
+        severity="P0",
+        position_id=position.position_id,
+        coin=position.coin,
+        baseline={"last_distance": last_dist},
+        current={
+            "distance": str(distance),
+            "mark_price": str(mark_price),
+            "liq_price": str(liq_price),
+        },
+        threshold={"min_distance": str(Thresholds.PERP_LIQ_DISTANCE_THRESHOLD)},
+        message=(
+            f"perp {position.coin} short liq distance "
+            f"{distance * Decimal(100):.1f}% ≤ "
+            f"{Thresholds.PERP_LIQ_DISTANCE_THRESHOLD * Decimal(100):.0f}% "
+            f"(mark ${mark_price}, liq ${liq_price})"
+        ),
+    )
+
+
 # ───────────────────────── polling orchestration ──────────────────────
 
 async def _fetch_peg_usd(timeout: float = 5.0) -> Decimal | None:
@@ -528,6 +606,33 @@ async def poll_once(
         # Event #7 — LM liq distance (single endpoint, fan-out across all
         # LM positions; only fetch if at least one held).
         # (Handled below in a single batched call.)
+
+    # Event #8 batch — re-fetch perp positions only when we hold at
+    # least one short hedge. One `/v5/position/list?category=linear`
+    # call returns liqPrice + markPrice for every open position; we
+    # match by symbol back to the baseline.
+    perp_positions = [p for p in baseline.positions if p.venue == "perp"]
+    if perp_positions:
+        try:
+            live_perps = await client.get_positions(category="linear", settle_coin="USDT")
+            live_by_symbol = {
+                p.symbol: p
+                for p in live_perps
+                if p.side == "Sell" and p.size and Decimal(p.size) > 0
+            }
+            for pos in perp_positions:
+                symbol = pos.position_id.removeprefix("perp:")
+                live = live_by_symbol.get(symbol)
+                if live is None:
+                    continue
+                mark = _to_decimal(live.markPrice)
+                liq = _to_decimal(live.liqPrice)
+                if mark is None or liq is None:
+                    continue
+                if ev := check_perp_liq_distance(pos, mark, liq):
+                    events.append(ev)
+        except Exception as e:  # noqa: BLE001
+            log.warning("perp positions poll failed: %s", e)
 
     # Event #7 batch — re-fetch LM positions only when we hold at least one
     lm_positions = [p for p in baseline.positions if p.venue == "lm"]

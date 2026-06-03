@@ -27,6 +27,7 @@ from agent.sandbox.watcher import (
     check_lm_liq_distance,
     check_new_hold_to_earn,
     check_peg_drift,
+    check_perp_liq_distance,
     check_price_drift,
     check_yield_jump,
     poll_once,
@@ -227,6 +228,73 @@ def test_lm_liq_distance_fires_p0_below_10pct():
     assert ev is not None and ev.severity == "P0"
     ev2 = check_lm_liq_distance(_lm_pos(), Decimal("0.05"))
     assert ev2 is not None and ev2.severity == "P0"
+
+
+# ───────────────────────── perp liq distance (event #8) ────────────────
+
+def _perp_short_pos() -> HeldPosition:
+    return HeldPosition(
+        position_id="perp:LITUSDT",
+        venue="perp",
+        coin="LIT",
+        entry_mark_price=Decimal("1.71"),
+        last_liq_distance=Decimal("0.95"),
+    )
+
+
+def test_perp_liq_distance_safe_when_far():
+    """Fresh 1x hedge: mark=$1.71, liq=$3.33 → distance ~0.95, no event."""
+    pos = _perp_short_pos()
+    ev = check_perp_liq_distance(pos, Decimal("1.71"), Decimal("3.33"))
+    assert ev is None
+
+
+def test_perp_liq_distance_safe_just_above_threshold():
+    """Distance 0.51 — above 0.50 threshold, no event."""
+    pos = _perp_short_pos()
+    ev = check_perp_liq_distance(pos, Decimal("1.00"), Decimal("1.51"))
+    assert ev is None
+
+
+def test_perp_liq_distance_fires_p0_at_threshold():
+    """Distance exactly 0.50 → fires (≤ threshold)."""
+    pos = _perp_short_pos()
+    ev = check_perp_liq_distance(pos, Decimal("1.00"), Decimal("1.50"))
+    assert ev is not None
+    assert ev.kind == "perp_liquidation_distance"
+    assert ev.severity == "P0"
+    assert ev.coin == "LIT"
+    assert "LIT short liq distance" in ev.message
+
+
+def test_perp_liq_distance_fires_p0_well_inside():
+    """Distance 0.20 — well inside the close window."""
+    pos = _perp_short_pos()
+    ev = check_perp_liq_distance(pos, Decimal("2.00"), Decimal("2.40"))
+    assert ev is not None and ev.severity == "P0"
+
+
+def test_perp_liq_distance_skips_when_liq_below_mark():
+    """Long-position shape (liq < mark) — we only auto-hedge with
+    shorts; treat as no-signal rather than misfire."""
+    pos = _perp_short_pos()
+    ev = check_perp_liq_distance(pos, Decimal("2.00"), Decimal("1.00"))
+    assert ev is None
+
+
+def test_perp_liq_distance_skips_on_zero_mark():
+    """Defensive — divide-by-zero guard."""
+    pos = _perp_short_pos()
+    ev = check_perp_liq_distance(pos, Decimal("0"), Decimal("1.50"))
+    assert ev is None
+
+
+def test_perp_liq_distance_skips_on_zero_liq():
+    """Bybit returns empty string / 0 for fresh-flat / uncomputed rows.
+    Should be a no-op, not a false P0."""
+    pos = _perp_short_pos()
+    ev = check_perp_liq_distance(pos, Decimal("1.50"), Decimal("0"))
+    assert ev is None
 
 
 # ───────────────────────── baseline IO ────────────────────────────────

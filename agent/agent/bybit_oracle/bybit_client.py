@@ -400,6 +400,12 @@ class PerpPosition(BaseModel):
     unrealisedPnl: str | None = None
     leverage: str | None = None
     positionIdx: int | None = None  # 0 one-way, 1/2 hedge-mode
+    # Server-computed liquidation price (USD). Empty string / "0" when
+    # not yet computed (fresh position or flat row). The
+    # `perp_liquidation_distance` watcher uses
+    # `(liqPrice - markPrice) / markPrice` on short positions as the
+    # distance-to-liquidation; threshold trip → CLOSE event.
+    liqPrice: str | None = None
 
 
 class PerpPositionList(BaseModel):
