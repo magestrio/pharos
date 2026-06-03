@@ -761,11 +761,31 @@ def diff_to_actions(
             extra_usdt_demand=buy_usdt_demand,
         )
 
+    # Defensive orphan-cleanup: any non-stable coin left sitting in
+    # UNIFIED wallet without a fresh subscribe this cycle gets Sold
+    # back to USDT. Runs LAST so it sees the final subscribe list
+    # (post-cascade) — a coin the cascade re-dropped from subscribes
+    # correctly counts as orphan and gets cleaned up.
+    orphan_sells = _orphan_spot_sell_actions(
+        snapshot,
+        subscribes,
+        redeems,
+        snapshot_ts,
+        idx_offset=(
+            len(all_pids)
+            + len(hedge_closes)
+            + len(hedge_opens)
+            + len(hedge_swaps)
+            + len(earn_swaps)
+        ),
+    )
+
     return (
         redeems
         + hedge_closes
         + hedge_swaps
         + earn_swaps
+        + orphan_sells
         + hedge_opens
         + subscribes
         + skips
@@ -2215,6 +2235,98 @@ def _enforce_usdt_budget(
                 perp_demand, supply,
             )
     return other_swaps + kept_buy, dropped
+
+
+def _orphan_spot_sell_actions(
+    snapshot: Snapshot,
+    subscribes: list[Action],
+    redeems: list[Action],
+    snapshot_ts: str,
+    *,
+    idx_offset: int,
+) -> list[Action]:
+    """Defensive cleanup: any non-stable coin sitting in UNIFIED wallet
+    that this cycle is NOT subscribing back into Earn gets Sold to USDT
+    via `{coin}USDT`. Catches:
+      - LIT-style: prior cycle redeemed Earn → coin moved to UNIFIED
+        wallet → LLM dropped the pick → would otherwise sit naked-long
+        forever (live hit 2026-06-03).
+      - TON-style: subscribe consumed less native qty than the wallet
+        holds (LLM sized via `book × weight` not wallet inventory) →
+        residual sits naked-long alongside the hedged Earn+perp pair.
+      - Earn 180016 leftovers: subscribe failed but the upstream Buy
+        already filled, leaving the bought coin orphaned.
+
+    Skips:
+      - Stables (USDC/USDT/etc.) — they're the destination, not source.
+      - Coins also being subscribed this cycle — let the subscribe path
+        consume the wallet balance via `_ensure_fund_balance` etc.
+      - Coins with no perp mark — can't price them, can't size the swap.
+      - Sub-MIN_SWAP_USDC notional — fees would exceed the recovery.
+      - Sub-min_order_qty after qty_step rounding — Bybit would reject.
+
+    Emits real SWAP_SPOT Sell actions (one per orphan coin). Runs after
+    the subscribe planner so it knows which coins are in-play this cycle.
+    """
+    pending_subscribe_coins = {
+        a.coin for a in subscribes
+        if a.kind in (ActionKind.SUBSCRIBE_EARN, ActionKind.SUBSCRIBE_LM)
+        and a.coin
+    }
+    pending_redeem_coins = {
+        a.coin for a in redeems
+        if a.kind == ActionKind.REDEEM_EARN and a.coin
+    }
+    swaps: list[Action] = []
+    cursor = idx_offset
+    balances = snapshot.wallet.unified_coin_balances or {}
+    for coin, balance in balances.items():
+        if not coin:
+            continue
+        coin_u = coin.upper()
+        if coin_u in _STABLES or coin_u == "USDC":
+            continue
+        if balance <= 0:
+            continue
+        if coin in pending_subscribe_coins or coin_u in pending_subscribe_coins:
+            continue
+        # If we're also redeeming this coin's Earn position this cycle,
+        # the redeem will pile MORE into UNIFIED — orphan-sell should
+        # still fire (the redeemed coin needs converting too), so don't
+        # skip on redeem presence. Both sides of the pair settle to USDT.
+        _ = pending_redeem_coins  # documented intent, no filter
+        perp_info = (snapshot.perp_market or {}).get(coin_u) or (
+            snapshot.perp_market or {}
+        ).get(coin)
+        mark = getattr(perp_info, "mark_price", None) if perp_info else None
+        if not mark or mark <= 0:
+            continue
+        usd = balance * mark
+        if usd < MIN_SWAP_USDC:
+            continue
+        qty_step = getattr(perp_info, "qty_step", None) if perp_info else None
+        min_qty = getattr(perp_info, "min_order_qty", None) if perp_info else None
+        qty = _round_to_qty_step(balance, qty_step, min_qty)
+        if qty is None or qty <= 0:
+            continue
+        symbol = f"{coin_u}USDT"
+        swaps.append(
+            Action(
+                kind=ActionKind.SWAP_SPOT,
+                category="Spot",
+                product_id=symbol,
+                coin="USDT",
+                amount=qty,
+                side="Sell",
+                order_link_id=_order_link_id(snapshot_ts, cursor),
+                reason=(
+                    f"sell orphan {qty} {coin_u} → USDT (~${usd:.2f}): "
+                    f"UNIFIED spot not staked back this cycle; cleanup"
+                ),
+            )
+        )
+        cursor += 1
+    return swaps
 
 
 def _swap_actions_for_earn_picks(

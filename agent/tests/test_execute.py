@@ -357,6 +357,85 @@ def test_diff_redeems_when_currently_held_position_drops_out() -> None:
     assert redeem.amount == Decimal("30")
 
 
+def test_diff_orphan_spot_sold_to_usdt_when_not_subscribed() -> None:
+    """Regression for 2026-06-03: after redeeming LIT Earn or after a
+    failed subscribe leaves Buy proceeds in UNIFIED, the orphan spot
+    sits naked-long unless we Sell it back to USDT. Auto-orphan-cleanup
+    must emit a SWAP_SPOT Sell on {coin}USDT for each orphan above
+    MIN_SWAP_USDC."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"LIT": _perp("LIT", mark="1.65", min_notional="1.0")},
+    )
+    # Inject the orphan via wallet directly — fixture default doesn't
+    # populate unified_coin_balances.
+    snap.wallet.unified_coin_balances = {"LIT": Decimal("4.9")}
+    # LLM picks nothing for LIT (cash + USD1 only).
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_flex", 0.5, [("1131", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260603T180000Z")
+    sells = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "LITUSDT"
+        and a.side == "Sell"
+    ]
+    assert len(sells) == 1, [a.kind for a in actions]
+    s = sells[0]
+    # Rounded DOWN to qty_step (default 0.001 when not surfaced).
+    assert s.amount > Decimal("4.8")
+    assert s.amount <= Decimal("4.9")
+    assert "orphan" in s.reason.lower()
+
+
+def test_diff_orphan_spot_skipped_when_subscribe_also_planned() -> None:
+    """If the LLM is subscribing more of the same coin this cycle,
+    auto-sell must not fire — the subscribe path will consume the
+    wallet balance via _ensure_fund_balance / Buy-credit logic."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
+        onchain_products=[_TON_PRODUCT],
+    )
+    snap.wallet.unified_coin_balances = {"TON": Decimal("5.0")}
+    d = _decision_with_hedge(hedge_notional=-40.0)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260603T180000Z")
+    ton_sells = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "TONUSDT"
+        and a.side == "Sell"
+    ]
+    assert ton_sells == []
+
+
+def test_diff_orphan_spot_skipped_below_min_swap() -> None:
+    """Dust-sized orphan (< MIN_SWAP_USDC) isn't worth a swap — Bybit
+    spot fees would exceed the recovery."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"LIT": _perp("LIT", mark="0.50", min_notional="1.0")},
+    )
+    snap.wallet.unified_coin_balances = {"LIT": Decimal("2.0")}  # $1 USD
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_flex", 0.5, [("1131", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260603T180000Z")
+    sells = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT and a.side == "Sell"
+        and a.product_id == "LITUSDT"
+    ]
+    assert sells == []
+
+
 def test_diff_redeems_dropped_non_stable_even_when_perp_mark_missing() -> None:
     """Regression for 2026-06-03 live bug. A non-stable Earn position
     (LIT) held from a prior cycle; this cycle's snapshot has no
