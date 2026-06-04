@@ -285,6 +285,19 @@ class BybitOrderError(RuntimeError):
     """
 
 
+# Terminal `orderStatus` values for spot orders — once reached, no retry
+# will move the order forward. Note Bybit's actual spelling
+# "PartiallyFilledCanceled" (single L). Shared between
+# `BybitClient.poll_spot_order_filled` and the executor's inline
+# carry-spot poll loop so the two can't drift apart on a Bybit-API rename.
+TERMINAL_BAD_SPOT_STATUSES: frozenset[str] = frozenset({
+    "Cancelled",
+    "Rejected",
+    "Deactivated",
+    "PartiallyFilledCanceled",
+})
+
+
 class DepositChain(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -1564,19 +1577,13 @@ class BybitClient:
         violation, manual cancel) that the orchestrator must surface, not
         silently retry.
         """
-        _TERMINAL_BAD = {
-            "Cancelled",
-            "Rejected",
-            "Deactivated",
-            "PartiallyFilledCanceled",  # note Bybit's actual spelling
-        }
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout_seconds
         while True:
             status = await self.get_spot_order_status(order_id)
             if status.orderStatus == "Filled":
                 return Decimal(status.cumExecQty)
-            if status.orderStatus in _TERMINAL_BAD:
+            if status.orderStatus in TERMINAL_BAD_SPOT_STATUSES:
                 raise BybitOrderError(
                     f"order {order_id} terminal status={status.orderStatus} "
                     f"reason={status.rejectReason}"

@@ -45,6 +45,7 @@ from agent.bybit_oracle.bybit_client import (
     BybitClient,
     BybitOrderError,
     EarnPosition,
+    TERMINAL_BAD_SPOT_STATUSES,
 )
 from agent.reason.schema import Decision, Pick, VenueAllocation
 from agent.reason.venues import VENUE_REGISTRY
@@ -1856,6 +1857,19 @@ _CARRY_PAIRED_NOTIONAL_TOLERANCE = Decimal("0.05")
 # reset to 0 on the next successful CLOSE (which deletes the record).
 MAX_CARRY_CLOSE_ATTEMPTS = 3
 
+# How long the OPEN_FUNDING_CARRY spot-fill poll waits (seconds) before
+# orphaning the action. Market orders typically fill instantly; the 10s
+# budget covers Bybit's worst-case settlement lag on a busy spot pair.
+# If the fill isn't confirmed within this window the perp leg is NOT
+# opened — orphan + surface for next-cycle reconciliation.
+_CARRY_SPOT_FILL_POLL_SECONDS = 10.0
+_CARRY_SPOT_FILL_POLL_INTERVAL = 0.5
+
+# How long to wait between the first and second set_trading_stop attempt
+# on OPEN_PERP_SHORT (fix #8). Transient SL failures (price-band drift,
+# order-state race) typically clear in well under a second.
+_PERP_SL_RETRY_BACKOFF = 1.0
+
 
 def _funding_carry_targets(
     decision: Decision,
@@ -3338,9 +3352,8 @@ async def _execute_one(
                 # Don't cancel the freshly-opened perp on failure — that
                 # would create a new exposure window and the watcher
                 # poll still covers the position.
-                last_err: BybitAPIError | None = None
-                attempt = 0
-                while attempt < 2:
+                _SL_MAX_ATTEMPTS = 2
+                for attempt in range(_SL_MAX_ATTEMPTS):
                     try:
                         await client.set_trading_stop(
                             action.product_id,
@@ -3351,36 +3364,33 @@ async def _execute_one(
                         response["take_profit"] = tp
                         if attempt > 0:
                             response["stop_loss_retry_succeeded"] = True
-                        last_err = None
                         break
                     except BybitAPIError as e:
-                        last_err = e
-                        attempt += 1
-                        if attempt < 2:
+                        is_last = attempt == _SL_MAX_ATTEMPTS - 1
+                        if is_last:
+                            # Final attempt failed — log loudly, perp
+                            # stays open under watcher protection only.
+                            # `stop_loss_error` surfaces in the cycle log.
+                            log.warning(
+                                "set_trading_stop failed %d× for %s "
+                                "(sl=%s tp=%s): retCode=%s %s — watcher "
+                                "is sole safety net until next cycle",
+                                _SL_MAX_ATTEMPTS, action.product_id, sl, tp,
+                                e.ret_code, e.ret_msg,
+                            )
+                            response["stop_loss_error"] = (
+                                f"retCode={e.ret_code} {e.ret_msg}"
+                            )
+                            response["stop_loss_retry_exhausted"] = True
+                        else:
                             log.warning(
                                 "set_trading_stop attempt %d failed for "
                                 "%s (sl=%s tp=%s): retCode=%s %s — "
                                 "retrying after backoff",
-                                attempt, action.product_id, sl, tp,
+                                attempt + 1, action.product_id, sl, tp,
                                 e.ret_code, e.ret_msg,
                             )
-                            await asyncio.sleep(1.0)
-                if last_err is not None:
-                    # Both attempts failed — log loudly, perp stays
-                    # open under watcher protection only. The
-                    # `stop_loss_error` key in the response surfaces in
-                    # the cycle log for operator visibility.
-                    log.warning(
-                        "set_trading_stop failed twice for %s (sl=%s "
-                        "tp=%s): retCode=%s %s — watcher is sole "
-                        "safety net for this perp until next cycle",
-                        action.product_id, sl, tp,
-                        last_err.ret_code, last_err.ret_msg,
-                    )
-                    response["stop_loss_error"] = (
-                        f"retCode={last_err.ret_code} {last_err.ret_msg}"
-                    )
-                    response["stop_loss_retry_exhausted"] = True
+                            await asyncio.sleep(_PERP_SL_RETRY_BACKOFF)
         elif action.kind == ActionKind.OPEN_FUNDING_CARRY:
             # Compound dispatch (`bybit-strategy-expansion.5`): spot Buy
             # + perp Sell as ONE atomic intent. Sequence:
@@ -3430,13 +3440,10 @@ async def _execute_one(
             actual_qty: Decimal | None = None
             actual_value: Decimal | None = None
             poll_error: str | None = None
-            _TERMINAL_BAD = {
-                "Cancelled",
-                "Rejected",
-                "Deactivated",
-                "PartiallyFilledCanceled",
-            }
-            deadline = asyncio.get_event_loop().time() + 10.0
+            deadline = (
+                asyncio.get_event_loop().time()
+                + _CARRY_SPOT_FILL_POLL_SECONDS
+            )
             while asyncio.get_event_loop().time() < deadline:
                 try:
                     status = await client.get_spot_order_status(spot_out.orderId)
@@ -3450,13 +3457,13 @@ async def _execute_one(
                     except (InvalidOperation, TypeError) as e:
                         poll_error = f"bad fill numerics: {e}"
                     break
-                if status.orderStatus in _TERMINAL_BAD:
+                if status.orderStatus in TERMINAL_BAD_SPOT_STATUSES:
                     poll_error = (
                         f"terminal {status.orderStatus} "
                         f"(reject={status.rejectReason})"
                     )
                     break
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(_CARRY_SPOT_FILL_POLL_INTERVAL)
             else:
                 poll_error = "fill not confirmed within poll window"
 
