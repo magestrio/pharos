@@ -736,6 +736,22 @@ def test_check_hedges_for_non_usd_picks_fails_when_perp_market_missing() -> None
     assert "no perp_market" in (msg or "")
 
 
+def test_check_hedges_for_non_usd_picks_uses_decimal_on_borderline_size() -> None:
+    """`check_hedges_for_non_usd_picks` is Decimal-based — a pick sized
+    EXACTLY at the perp `min_notional_usd` must pass without a
+    float-precision off-by-cents reject. Pre-fix the same case could
+    flip pass/fail depending on `total_book * float(weight)` rounding
+    at large notionals."""
+    # total_equity 100 × venue 1.0 × pick 1.0 = 100 USD pick → exactly
+    # equal to a 100 USD min_notional → passes (strict `<` comparison).
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={"TON": _perp("TON", min_notional="100.0")},
+    )
+    d = _hedged_decision(hedge_notional=-100.0, onchain_venue_weight=1.0)
+    assert check_hedges_for_non_usd_picks(d, s) == (True, None)
+
+
 def test_check_funding_rate_floor_fails_when_7d_avg_below_floor() -> None:
     """Persistent negative funding → hedge is net cost → exit pick."""
     s = _snapshot(

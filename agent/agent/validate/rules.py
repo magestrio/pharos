@@ -20,6 +20,8 @@ time, so they're not re-checked here.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from agent.reason.schema import Decision, VenueAllocation
 from agent.reason.venues import VENUE_REGISTRY, VenueId
 from agent.sandbox.snapshot import ProductSummary, Snapshot
@@ -378,7 +380,10 @@ def check_hedges_for_non_usd_picks(d: Decision, snapshot: Snapshot) -> Check:
     rejected here (would otherwise SKIP at executor and leave the
     underlying unhedged)."""
     perp_market = getattr(snapshot, "perp_market", None) or {}
-    total_book = float(snapshot.wallet.total_equity_usd)
+    # Decimal throughout — matches the executor's sizing math so a pick
+    # that passes here can't be rejected downstream by a cents-level
+    # rounding gap.
+    total_book = snapshot.wallet.total_equity_usd
     bad: list[str] = []
     for venue_id, category in _AUTO_HEDGE_VENUES:
         venue = d.venue(venue_id)  # type: ignore[arg-type]
@@ -399,12 +404,14 @@ def check_hedges_for_non_usd_picks(d: Decision, snapshot: Snapshot) -> Check:
             if info.min_notional_usd is None:
                 bad.append(f"{venue_id}/{pick.product_id}({coin}): min_notional unknown")
                 continue
-            pick_usd = total_book * float(venue.weight) * float(pick.weight)
-            if pick_usd < float(info.min_notional_usd):
+            pick_usd = (
+                total_book * Decimal(str(venue.weight)) * Decimal(str(pick.weight))
+            )
+            if pick_usd < info.min_notional_usd:
                 bad.append(
                     f"{venue_id}/{pick.product_id}({coin}): pick "
                     f"${pick_usd:.2f} below perp min_notional "
-                    f"${float(info.min_notional_usd):.2f} — hedge can't be placed"
+                    f"${info.min_notional_usd:.2f} — hedge can't be placed"
                 )
     if bad:
         return False, "non-USD Earn picks not hedgeable: " + " | ".join(bad)

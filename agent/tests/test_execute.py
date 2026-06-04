@@ -3315,6 +3315,133 @@ async def test_execute_atomic_guard_does_not_affect_other_coins(
     client.place_perp_order.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_execute_subscribe_failure_skips_paired_open_perp_short(
+    tmp_path: Path,
+) -> None:
+    """Symmetric to the REDEEM/CLOSE_PERP guard. When SUBSCRIBE_EARN
+    fails (most commonly 180016 insufficient balance, or product full),
+    the paired OPEN_PERP_SHORT must be skipped — otherwise the short
+    opens without the backing earn leg → naked SHORT. Live risk: tried
+    to scale into TON, balance shortfall hit subscribe, short opened
+    on the assumption the spot would land → $X naked short until next
+    cycle."""
+    from agent.bybit_oracle.bybit_client import BybitAPIError
+    client = AsyncMock()
+    client.place_earn_order.side_effect = BybitAPIError(
+        180016, "Insufficient balance", "/v5/earn/place-order"
+    )
+    client.place_perp_order.return_value = None
+    actions = [
+        Action(
+            kind=ActionKind.SUBSCRIBE_EARN,
+            category="OnChain",
+            product_id="8",
+            coin="TON",
+            amount=Decimal("8.0"),
+            amount_native=Decimal("4.0"),
+            order_link_id="s-001",
+            reason="subscribe TON",
+        ),
+        Action(
+            kind=ActionKind.OPEN_PERP_SHORT,
+            category="linear",
+            product_id="TONUSDT",
+            coin="TON",
+            amount=Decimal("4.0"),
+            order_link_id="o-001",
+            reason="open TON short",
+        ),
+    ]
+    results = await execute_actions(
+        client, actions, snapshot_ts="20260604T100000Z",
+        dry_run=False, executions_dir=tmp_path,
+    )
+    assert len(results) == 2
+    assert results[0].status == "error"
+    assert "180016" in (results[0].error or "")
+    assert results[1].status == "skipped"
+    assert results[1].action.kind == ActionKind.SKIP_OUT_OF_SCOPE
+    assert "SUBSCRIBE_EARN failed" in results[1].action.reason
+    client.place_perp_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_subscribe_success_lets_paired_open_perp_short_run(
+    tmp_path: Path,
+) -> None:
+    """Counter-test: successful SUBSCRIBE_EARN does not block paired
+    OPEN_PERP_SHORT."""
+    from agent.bybit_oracle.bybit_client import EarnOrderResult, SpotOrderResult
+    client = AsyncMock()
+    client.place_earn_order.return_value = EarnOrderResult(
+        orderId="earn-ok", orderLinkId="s-001"
+    )
+    client.place_perp_order.return_value = SpotOrderResult(
+        orderId="perp-ok", orderLinkId="o-001"
+    )
+    actions = [
+        Action(
+            kind=ActionKind.SUBSCRIBE_EARN,
+            category="OnChain", product_id="8", coin="TON",
+            amount=Decimal("8.0"), amount_native=Decimal("4.0"),
+            order_link_id="s-001", reason="subscribe",
+        ),
+        Action(
+            kind=ActionKind.OPEN_PERP_SHORT,
+            category="linear", product_id="TONUSDT", coin="TON",
+            amount=Decimal("4.0"),
+            order_link_id="o-001", reason="open short",
+        ),
+    ]
+    results = await execute_actions(
+        client, actions, snapshot_ts="20260604T100001Z",
+        dry_run=False, executions_dir=tmp_path,
+    )
+    assert results[0].status == "ok"
+    assert results[1].status == "ok"
+    client.place_perp_order.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_subscribe_guard_does_not_block_close_perp(
+    tmp_path: Path,
+) -> None:
+    """SUBSCRIBE failure on TON must NOT block a CLOSE_PERP on TON —
+    those are unrelated semantically (CLOSE_PERP unwinds a prior short,
+    not the new subscribe). Only OPEN_PERP_SHORT pairs with SUBSCRIBE."""
+    from agent.bybit_oracle.bybit_client import BybitAPIError, SpotOrderResult
+    client = AsyncMock()
+    client.place_earn_order.side_effect = BybitAPIError(
+        180016, "Insufficient balance", "/v5/earn/place-order"
+    )
+    client.place_perp_order.return_value = SpotOrderResult(
+        orderId="perp-close-ok", orderLinkId="c-001"
+    )
+    actions = [
+        Action(
+            kind=ActionKind.SUBSCRIBE_EARN,
+            category="OnChain", product_id="8", coin="TON",
+            amount=Decimal("8.0"), amount_native=Decimal("4.0"),
+            order_link_id="s-001", reason="subscribe TON",
+        ),
+        Action(
+            kind=ActionKind.CLOSE_PERP,
+            category="linear", product_id="TONUSDT", coin="TON",
+            amount=Decimal("4.0"),
+            order_link_id="c-001", reason="close TON short (unrelated)",
+        ),
+    ]
+    results = await execute_actions(
+        client, actions, snapshot_ts="20260604T100002Z",
+        dry_run=False, executions_dir=tmp_path,
+    )
+    assert results[0].status == "error"
+    # CLOSE_PERP ran — not gated by subscribe guard.
+    assert results[1].status == "ok"
+    client.place_perp_order.assert_awaited_once()
+
+
 def test_current_positions_sums_multiple_entries_per_pid() -> None:
     """Regression for 2026-06-03 endless-subscribe bug. When Bybit
     returns multiple earn_positions rows for the same (category, pid)

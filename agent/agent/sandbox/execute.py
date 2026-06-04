@@ -2896,25 +2896,51 @@ async def execute_actions(
     this, the perp closes successfully while the spot leg stays
     staked → naked LONG. Live hit: TON Earn 7.5 in Processing lock,
     redeem 180020'd, perp closed → $15 naked long until next cycle.
+
+    Subscribe-side symmetry (2026-06-04): if SUBSCRIBE_EARN fails (most
+    commonly retCode=180016 "Insufficient balance" or a product full),
+    any paired OPEN_PERP_SHORT on the same coin is converted to SKIP —
+    otherwise the short opens without the backing earn leg → naked
+    SHORT. Different direction from the redeem case but same class of
+    bug.
     """
     executions_dir.mkdir(parents=True, exist_ok=True)
     log_path = executions_dir / f"{snapshot_ts}.jsonl"
     results: list[ActionResult] = []
     redeem_failed_coins: set[str] = set()
+    subscribe_failed_coins: set[str] = set()
     with log_path.open("a") as log_file:
         for action in actions:
-            # Atomic-pair guard: if REDEEM_EARN for this coin failed
-            # earlier in the batch, skip any CLOSE_PERP / OPEN_PERP_SHORT
-            # touching the same coin — leaving the perp in its prior
-            # state (open if it was open, closed if it was closed)
-            # preserves the hedge instead of stranding spot exposure.
+            # Atomic-pair guard: skip the paired perp side when its
+            # earn-side counterpart already failed earlier in the batch.
+            # `CLOSE_PERP` follows a REDEEM only; `OPEN_PERP_SHORT`
+            # follows a SUBSCRIBE only — but we test both sets against
+            # `OPEN_PERP_SHORT` defensively (an LLM could in theory queue
+            # an OPEN_PERP_SHORT alongside a REDEEM during a rebalance).
+            coin_upper = (action.coin or "").upper()
+            skip_reason: str | None = None
             if (
                 action.kind in (
                     ActionKind.CLOSE_PERP, ActionKind.OPEN_PERP_SHORT
                 )
-                and action.coin
-                and action.coin.upper() in redeem_failed_coins
+                and coin_upper in redeem_failed_coins
             ):
+                skip_reason = (
+                    f"{action.kind.value} {action.coin}: paired "
+                    f"REDEEM_EARN failed earlier in batch — "
+                    f"skipping perp side to preserve hedge "
+                    f"(avoids naked exposure)"
+                )
+            elif (
+                action.kind == ActionKind.OPEN_PERP_SHORT
+                and coin_upper in subscribe_failed_coins
+            ):
+                skip_reason = (
+                    f"{action.kind.value} {action.coin}: paired "
+                    f"SUBSCRIBE_EARN failed earlier in batch — "
+                    f"skipping OPEN_PERP_SHORT to avoid naked short"
+                )
+            if skip_reason is not None:
                 skip = ActionResult(
                     action=Action(
                         kind=ActionKind.SKIP_OUT_OF_SCOPE,
@@ -2923,12 +2949,7 @@ async def execute_actions(
                         coin=action.coin,
                         amount=action.amount,
                         order_link_id=action.order_link_id,
-                        reason=(
-                            f"{action.kind.value} {action.coin}: paired "
-                            f"REDEEM_EARN failed earlier in batch — "
-                            f"skipping perp side to preserve hedge "
-                            f"(avoids naked exposure)"
-                        ),
+                        reason=skip_reason,
                     ),
                     status="skipped",
                     response=None,
@@ -2940,9 +2961,8 @@ async def execute_actions(
                 log_file.write(json.dumps(skip.to_log()) + "\n")
                 log_file.flush()
                 log.warning(
-                    "atomic-pair guard: skipping %s on %s — paired "
-                    "REDEEM_EARN failed earlier",
-                    action.kind.value, action.coin,
+                    "atomic-pair guard: skipping %s on %s — %s",
+                    action.kind.value, action.coin, skip_reason,
                 )
                 continue
 
@@ -2960,6 +2980,17 @@ async def execute_actions(
                 log.warning(
                     "redeem_earn failed for %s: %s — guarding any later "
                     "CLOSE_PERP / OPEN_PERP_SHORT on this coin",
+                    action.coin, res.error,
+                )
+            elif (
+                action.kind == ActionKind.SUBSCRIBE_EARN
+                and res.status == "error"
+                and action.coin
+            ):
+                subscribe_failed_coins.add(action.coin.upper())
+                log.warning(
+                    "subscribe_earn failed for %s: %s — guarding any "
+                    "later OPEN_PERP_SHORT on this coin",
                     action.coin, res.error,
                 )
     return results
