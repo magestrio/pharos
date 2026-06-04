@@ -88,6 +88,27 @@ MIN_ACTION_USDC = Decimal("0.50")
 # of the SUBSCRIBE_EARN — same shape as `_swap_actions_for_hedges`.
 _STABLES = STABLES
 
+# Coins known to have liquid USDC-quote spot pairs on Bybit. When an
+# orphan spot balance accumulates in one of these (post-DiscountBuy
+# settlement is the canonical case: BTC/ETH lands in UNIFIED after a 1d
+# DiscountBuy without knockout), the cleanup sell routes directly to
+# USDC via `{coin}USDC` instead of the default `{coin}USDT` path —
+# avoids the double-fee BTC→USDT→USDC round-trip and keeps the vault's
+# USDC denomination. Conservative whitelist; expanding it is a one-line
+# registry change once Bybit-side liquidity on a new pair clears the
+# per-cycle MIN_SWAP_USDC threshold. `.49`.
+_USDC_PAIR_COINS: frozenset[str] = frozenset({"BTC", "ETH", "SOL"})
+
+
+def _orphan_sell_quote(coin_u: str) -> tuple[str, str]:
+    """Pick the spot pair + destination coin for an orphan sell. Returns
+    `(symbol, dest_coin)`. USDC is preferred for the whitelisted coins
+    so the vault rebases to USDC directly; everything else falls back
+    to the universal USDT quote."""
+    if coin_u in _USDC_PAIR_COINS:
+        return f"{coin_u}USDC", "USDC"
+    return f"{coin_u}USDT", "USDT"
+
 # Earn account-type per category. FlexibleSaving runs on UNIFIED;
 # OnChain Earn requires the FUND wallet per Bybit V5 spec. Advance-Earn
 # (DualAssets, DiscountBuy) also runs on UNIFIED per V5 docs (`.35`).
@@ -346,6 +367,40 @@ def diff_to_actions(
             # Advance-Earn subscribe path (`.35`). Redeem not wired —
             # DualAssets / DiscountBuy settle automatically at expiry.
             if target and target.amount_usd > MIN_ACTION_USDC:
+                # `.48` dedup: Bybit's `orderLinkId` server-side dedup
+                # window is ~30min, but advance-Earn positions can stay
+                # open for days (DualAssets/DiscountBuy settle at
+                # `expiredTime`). Re-subscribing within an open
+                # position's lifecycle opens a SECOND position rather
+                # than no-oping, double-locking capital. SKIP when any
+                # position exists for this (category, product_id).
+                # Missing key in `advance_earn_positions` means the
+                # snapshot didn't fetch positions for this product
+                # (outside the top-K quote/position window) — treat as
+                # "not held" because such a product also isn't pickable.
+                pos_key = f"{category}/{product_id}"
+                held = _advance_earn_positions_held(
+                    snapshot.advance_earn_positions.get(pos_key)
+                )
+                if held > 0:
+                    skips.append(Action(
+                        kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                        category=category,
+                        product_id=product_id,
+                        coin="?",
+                        amount=target.amount_usd,
+                        order_link_id=order_link_id,
+                        reason=(
+                            f"{category}/{product_id}: existing position "
+                            f"with amount={held} already open — skip "
+                            f"re-subscribe (advance-Earn settles at "
+                            f"expiry; re-staking opens a 2nd position "
+                            f"and double-locks capital, Bybit "
+                            f"orderLinkId dedup only spans ~30min)"
+                        ),
+                    ))
+                    continue
+
                 action = _advance_earn_subscribe_action(
                     snapshot,
                     category,
@@ -1527,6 +1582,60 @@ def _alpha_action_for_target(
         ),
         extra={"token_amount_native": token_amount_native},
     )
+
+
+# Position-payload amount fields across advance-Earn categories. Bybit's
+# per-category schemas differ but every active row carries one of these.
+# Order matters: we pick the first present field that parses to a
+# positive Decimal so a row with both `amount` and `quoteAmount` doesn't
+# get summed twice.
+_ADVANCE_EARN_AMOUNT_FIELDS: tuple[str, ...] = (
+    "amount",
+    "stakeAmount",
+    "quoteAmount",
+    "purchaseAmount",
+    "positionAmount",
+)
+
+
+def _advance_earn_positions_held(
+    rows: list[dict[str, Any]] | None,
+) -> Decimal:
+    """Sum the active stake across a list of advance-Earn position rows
+    (`.48`). Returns the total in the position's stake currency.
+
+    A row counts as "active" when it has a positive amount in any of
+    the per-category amount fields and no obviously-terminal status.
+    Bybit's `/v5/earn/advance/position` endpoint already filters to
+    open positions in practice — the status check is a belt-and-braces
+    guard in case Bybit echoes a settled row during the brief window
+    between settlement and the row being purged.
+
+    Returns `Decimal(0)` for missing/empty input — that's also what the
+    diff branch treats as "not held, safe to subscribe".
+    """
+    if not rows:
+        return Decimal(0)
+    terminal = {"settled", "completed", "expired", "cancelled", "closed"}
+    total = Decimal(0)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        status = str(row.get("status") or "").strip().lower()
+        if status in terminal:
+            continue
+        for field in _ADVANCE_EARN_AMOUNT_FIELDS:
+            raw = row.get(field)
+            if raw is None:
+                continue
+            try:
+                value = Decimal(str(raw))
+            except (InvalidOperation, ValueError, TypeError):
+                continue
+            if value > 0:
+                total += value
+                break
+    return total
 
 
 def _advance_earn_subscribe_action(
@@ -2770,20 +2879,24 @@ def _orphan_spot_sell_actions(
         qty = _round_to_qty_step(sellable, qty_step, min_qty)
         if qty is None or qty <= 0:
             continue
-        symbol = f"{coin_u}USDT"
+        # `.49`: BTC/ETH (DiscountBuy settlement landing spots) ship to
+        # USDC directly via `{coin}USDC`. Everything else keeps the
+        # universal `{coin}USDT` route.
+        symbol, dest_coin = _orphan_sell_quote(coin_u)
         swaps.append(
             Action(
                 kind=ActionKind.SWAP_SPOT,
                 category="Spot",
                 product_id=symbol,
-                coin="USDT",
+                coin=dest_coin,
                 amount=qty,
                 side="Sell",
                 order_link_id=_order_link_id(snapshot_ts, cursor),
                 reason=(
-                    f"sell orphan {qty} {coin_u} → USDT (~${usd:.2f}): "
-                    f"UNIFIED {balance} + Earn {earn_long.get(coin_u, 0)} "
-                    f"- perp short {short} = excess {excess_long}"
+                    f"sell orphan {qty} {coin_u} → {dest_coin} "
+                    f"(~${usd:.2f}): UNIFIED {balance} + Earn "
+                    f"{earn_long.get(coin_u, 0)} - perp short {short} = "
+                    f"excess {excess_long}"
                 ),
             )
         )
@@ -3426,12 +3539,14 @@ async def _execute_one(
             response = {"legs": {}}
             await client.set_leverage(action.product_id, 1)
             # Spot Buy uses QUOTE amount (USDT) on V5 market orders —
-            # action.amount is the USD-equivalent target.
+            # action.amount is the USD-equivalent target. `.27` API now
+            # takes `qty_quote=` explicitly so the asymmetry can't be
+            # misremembered at the call site.
             spot_qty_quote = str(action.amount)
             spot_out = await client.place_spot_order(
                 symbol=action.product_id,
                 side="Buy",
-                qty=spot_qty_quote,
+                qty_quote=spot_qty_quote,
                 order_link_id=spot_link,
             )
             response["legs"]["spot"] = {
@@ -3611,7 +3726,7 @@ async def _execute_one(
             spot_out = await client.place_spot_order(
                 symbol=action.product_id,
                 side="Sell",
-                qty=str(base_qty),
+                qty_base=str(base_qty),
                 order_link_id=spot_link,
             )
             response["legs"]["spot"] = {
@@ -3865,7 +3980,7 @@ async def _execute_one(
                     out = await client.place_spot_order(
                         symbol=action.product_id,
                         side="Sell",
-                        qty=str(action.amount),
+                        qty_base=str(action.amount),
                         order_link_id=action.order_link_id,
                     )
                     response = {"orderId": out.orderId}
@@ -3877,7 +3992,7 @@ async def _execute_one(
                 out = await client.place_spot_order(
                     symbol=action.product_id,
                     side="Buy",
-                    qty=str(action.amount),
+                    qty_quote=str(action.amount),
                     order_link_id=action.order_link_id,
                 )
                 response = {"orderId": out.orderId, "side": "Buy"}
@@ -3945,6 +4060,90 @@ async def _execute_one(
         started_at=started,
         finished_at=datetime.now(UTC).isoformat(),
     )
+
+
+def reconcile_executions(
+    snapshot_ts: str,
+    executions_dir: Path = EXECUTIONS_DIR,
+) -> dict[str, Any]:
+    """Read-only summary of one cycle's executions log (`.42`).
+
+    Used at startup when a prior cycle's `executions/<ts>.jsonl` exists
+    but no matching cycle_log entry does — typically systemd-OOM /
+    SIGKILL between `execute_actions` writing the per-action line and
+    `run_one_cycle` writing the cycle outcome. The function does NOT
+    mutate state or replay actions; the caller (loop startup) decides
+    whether to surface a warning or block restart.
+
+    Returns
+    -------
+    dict with:
+      - `snapshot_ts`: echoes input
+      - `path`: absolute path to the executions file (str)
+      - `exists`: whether the file is on disk
+      - `total`: total per-action lines parsed
+      - `counts`: {status → count} histogram across `"ok"`, `"error"`,
+        `"orphan"`, `"skipped"`, `"dry-run"`. Unknown statuses are
+        bucketed as-is so a future status addition surfaces visibly.
+      - `errors`: list of `{kind, product_id, error}` for non-ok rows
+        (truncated to first 10 — operator usually only needs the
+        head for triage)
+      - `last_started_at` / `last_finished_at`: ISO strings for the
+        tail-end action, useful for "how far did the cycle get"
+
+    Returns the same shape with `exists=False, total=0` when the file
+    doesn't exist (cleanly absent — caller treats as a no-op).
+    """
+    log_path = executions_dir / f"{snapshot_ts}.jsonl"
+    result: dict[str, Any] = {
+        "snapshot_ts": snapshot_ts,
+        "path": str(log_path),
+        "exists": log_path.is_file(),
+        "total": 0,
+        "counts": {},
+        "errors": [],
+        "last_started_at": None,
+        "last_finished_at": None,
+    }
+    if not result["exists"]:
+        return result
+
+    counts: dict[str, int] = {}
+    errors: list[dict[str, Any]] = []
+    last_started: str | None = None
+    last_finished: str | None = None
+    total = 0
+    for raw in log_path.read_text().splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            # Corrupt trailing line is common at the OS-kill boundary —
+            # count it as malformed and continue.
+            counts["malformed"] = counts.get("malformed", 0) + 1
+            continue
+        total += 1
+        status = str(row.get("status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+        if status not in ("ok", "dry-run", "skipped") and len(errors) < 10:
+            action_block = row.get("action") or {}
+            errors.append({
+                "kind": action_block.get("kind"),
+                "product_id": action_block.get("product_id"),
+                "error": row.get("error"),
+            })
+        if row.get("started_at"):
+            last_started = row["started_at"]
+        if row.get("finished_at"):
+            last_finished = row["finished_at"]
+    result["total"] = total
+    result["counts"] = counts
+    result["errors"] = errors
+    result["last_started_at"] = last_started
+    result["last_finished_at"] = last_finished
+    return result
 
 
 def _dry_run_payload(action: Action) -> dict[str, Any]:

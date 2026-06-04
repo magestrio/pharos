@@ -19,7 +19,21 @@ import pytest
 
 from agent.bybit_oracle.bybit_client import EarnOrderResult
 from agent.reason.schema import Decision, Pick, VenueAllocation
+from agent.sandbox.decide import DecisionUsage
 from agent.sandbox.loop import run_loop, run_one_cycle
+
+
+def _stub_usage() -> DecisionUsage:
+    """Minimal usage stub for mocked `decide()` returns. Tests that
+    care about specific token counts override fields per-call."""
+    return DecisionUsage(
+        model="claude-sonnet-4-6",
+        input_tokens=0,
+        cache_creation_input_tokens=0,
+        cache_read_input_tokens=0,
+        output_tokens=0,
+        estimated_cost_usd=Decimal("0"),
+    )
 from agent.sandbox.snapshot import (
     MarketSnapshot,
     ProductSummary,
@@ -136,7 +150,7 @@ async def test_run_one_cycle_happy_path_dry_run(tmp_path: Path) -> None:
         ),
         patch(
             "agent.sandbox.loop.decide",
-            AsyncMock(return_value=decision),
+            AsyncMock(return_value=(decision, _stub_usage())),
         ),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -171,7 +185,7 @@ async def test_run_one_cycle_validator_failure_short_circuits(tmp_path: Path) ->
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
         patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
-        patch("agent.sandbox.loop.decide", AsyncMock(return_value=bad_decision)),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=(bad_decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
             lambda d, sp, **_kw: tmp_path / "decision.json",
@@ -201,7 +215,7 @@ async def test_run_one_cycle_no_actions_when_book_zero(tmp_path: Path) -> None:
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
         patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
-        patch("agent.sandbox.loop.decide", AsyncMock(return_value=decision)),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
             lambda d, sp, **_kw: tmp_path / "decision.json",
@@ -348,7 +362,7 @@ async def test_run_one_cycle_trips_halt_when_carry_state_write_fails(
             lambda s: tmp_path / "snap.json",
         ),
         patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
-        patch("agent.sandbox.loop.decide", AsyncMock(return_value=decision)),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
             lambda d, sp, **_kw: tmp_path / "decision.json",
@@ -419,7 +433,7 @@ async def test_run_one_cycle_live_without_approval_downgrades(tmp_path: Path) ->
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
         patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
-        patch("agent.sandbox.loop.decide", AsyncMock(return_value=decision)),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
             lambda d, sp, **_kw: tmp_path / "decision.json",
@@ -481,7 +495,7 @@ async def test_run_loop_once_executes_single_cycle(tmp_path: Path) -> None:
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
         patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
-        patch("agent.sandbox.loop.decide", AsyncMock(return_value=decision)),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
             lambda d, sp, **_kw: tmp_path / "decision.json",
@@ -603,7 +617,7 @@ async def test_run_loop_continues_on_informational_probe_failure(tmp_path: Path)
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
         patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
-        patch("agent.sandbox.loop.decide", AsyncMock(return_value=decision)),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
             lambda d, sp, **_kw: tmp_path / "decision.json",
@@ -715,7 +729,7 @@ async def test_run_one_cycle_stamps_wake_reason_heartbeat(tmp_path: Path) -> Non
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
         patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
-        patch("agent.sandbox.loop.decide", AsyncMock(return_value=decision)),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
             lambda d, sp, **_kw: tmp_path / "decision.json",
@@ -736,7 +750,7 @@ async def test_run_one_cycle_passes_wake_events_through(tmp_path: Path) -> None:
     anthropic_client = AsyncMock()
     snap = _snapshot()
     decision = _decision_clean()
-    decide_mock = AsyncMock(return_value=decision)
+    decide_mock = AsyncMock(return_value=(decision, _stub_usage()))
     write_decision_mock = MagicMock(
         side_effect=lambda d, sp, **_kw: tmp_path / "decision.json"
     )
@@ -787,7 +801,7 @@ async def test_run_one_cycle_updates_watcher_baseline(tmp_path: Path) -> None:
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
         patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
-        patch("agent.sandbox.loop.decide", AsyncMock(return_value=bad_decision)),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=(bad_decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
             lambda d, sp, **_kw: tmp_path / "decision.json",
@@ -852,7 +866,7 @@ async def test_run_loop_watcher_wakes_early_on_p0_event(tmp_path: Path) -> None:
         cycles["n"] += 1
         if cycles["n"] >= 2:
             stop_event.set()
-        return decision
+        return decision, _stub_usage()
 
     with (
         patch(
@@ -941,7 +955,7 @@ async def test_run_loop_watcher_disabled_by_default(tmp_path: Path) -> None:
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
         patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
-        patch("agent.sandbox.loop.decide", AsyncMock(return_value=decision)),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
             lambda d, sp, **_kw: tmp_path / "decision.json",
@@ -1045,7 +1059,7 @@ async def test_e2e_price_drop_drives_event_driven_cycle(
         cycles["calls"].append(kw.get("wake_events"))
         if cycles["n"] >= 2:
             stop_event.set()
-        return decision
+        return decision, _stub_usage()
 
     # No-op peg fetch so we don't spam CoinGecko in CI and so peg_drift
     # doesn't also fire and mask the assertions.
@@ -1164,7 +1178,7 @@ async def test_run_loop_continues_when_db_record_cycle_raises(
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
         patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
-        patch("agent.sandbox.loop.decide", AsyncMock(return_value=decision)),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
             lambda d, sp, **_kw: tmp_path / "decision.json",
@@ -1334,3 +1348,105 @@ def test_build_auto_close_decision_multiple_picks_at_once():
     assert "bybit_flex" not in venues_by_id
     assert "bybit_onchain" not in venues_by_id
     assert venues_by_id["cash_usdc"]["weight"] == pytest.approx(1.0)
+
+
+# ─── .42 mid-cycle restart detection ──────────────────────────────────────
+
+
+def test_detect_unfinished_cycles_clean_dirs(tmp_path: Path) -> None:
+    """Both cycle_log + executions empty → no unfinished cycles."""
+    from agent.sandbox.loop import detect_unfinished_cycles
+
+    cycle_log = tmp_path / "cycle_log.jsonl"
+    executions = tmp_path / "executions"
+    executions.mkdir()
+    assert detect_unfinished_cycles(cycle_log, executions) == []
+
+
+def test_detect_unfinished_cycles_all_matched(tmp_path: Path) -> None:
+    """Every executions file has a matching cycle_log entry → nothing
+    unfinished (canonical clean-restart case)."""
+    from agent.sandbox.loop import detect_unfinished_cycles
+
+    ts = "20260604T120000Z"
+    executions = tmp_path / "executions"
+    executions.mkdir()
+    (executions / f"{ts}.jsonl").write_text(
+        json.dumps({"action": {"kind": "subscribe_earn"}, "status": "ok"}) + "\n"
+    )
+    cycle_log = tmp_path / "cycle_log.jsonl"
+    cycle_log.write_text(
+        json.dumps({"snapshot_filename": f"{ts}.json", "result": "executed"})
+        + "\n"
+    )
+    assert detect_unfinished_cycles(cycle_log, executions) == []
+
+
+def test_detect_unfinished_cycles_finds_orphan_execution_file(tmp_path: Path) -> None:
+    """Crash scenario: executions/<ts>.jsonl exists but no cycle_log
+    entry → surface with the reconcile summary."""
+    from agent.sandbox.loop import detect_unfinished_cycles
+
+    completed = "20260604T120000Z"
+    crashed = "20260604T160000Z"
+    executions = tmp_path / "executions"
+    executions.mkdir()
+    (executions / f"{completed}.jsonl").write_text(
+        json.dumps({"action": {"kind": "subscribe_earn"}, "status": "ok"}) + "\n"
+    )
+    (executions / f"{crashed}.jsonl").write_text(
+        "\n".join([
+            json.dumps({
+                "action": {"kind": "subscribe_earn", "product_id": "p1"},
+                "status": "ok",
+            }),
+            json.dumps({
+                "action": {"kind": "swap_spot", "product_id": "ETHUSDC"},
+                "status": "error",
+                "error": "retCode=170131",
+            }),
+        ]) + "\n"
+    )
+    cycle_log = tmp_path / "cycle_log.jsonl"
+    cycle_log.write_text(
+        json.dumps({
+            "snapshot_filename": f"{completed}.json",
+            "result": "executed",
+        }) + "\n"
+    )
+
+    unfinished = detect_unfinished_cycles(cycle_log, executions)
+    assert len(unfinished) == 1
+    u = unfinished[0]
+    assert u["snapshot_ts"] == crashed
+    assert u["total"] == 2
+    assert u["counts"] == {"ok": 1, "error": 1}
+
+
+def test_detect_unfinished_cycles_missing_cycle_log(tmp_path: Path) -> None:
+    """Brand-new install (no cycle_log yet) but executions exist → all
+    count as unfinished."""
+    from agent.sandbox.loop import detect_unfinished_cycles
+
+    executions = tmp_path / "executions"
+    executions.mkdir()
+    (executions / "20260604T120000Z.jsonl").write_text(
+        json.dumps({"action": {"kind": "subscribe_earn"}, "status": "ok"}) + "\n"
+    )
+    cycle_log = tmp_path / "cycle_log.jsonl"  # not on disk
+    unfinished = detect_unfinished_cycles(cycle_log, executions)
+    assert len(unfinished) == 1
+    assert unfinished[0]["snapshot_ts"] == "20260604T120000Z"
+
+
+def test_detect_unfinished_cycles_skips_empty_execution_files(tmp_path: Path) -> None:
+    """Empty `.jsonl` → don't surface; the cycle didn't actually do
+    anything that needs reconciliation."""
+    from agent.sandbox.loop import detect_unfinished_cycles
+
+    executions = tmp_path / "executions"
+    executions.mkdir()
+    (executions / "20260604T120000Z.jsonl").write_text("")
+    cycle_log = tmp_path / "cycle_log.jsonl"
+    cycle_log.write_text("")
+    assert detect_unfinished_cycles(cycle_log, executions) == []

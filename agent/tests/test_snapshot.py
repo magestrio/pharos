@@ -990,6 +990,78 @@ async def test_collect_snapshot_persists_advance_earn_quotes() -> None:
     assert reparsed.advance_earn_quotes["DiscountBuy/db-7"]["list"][0]["instUid"] == "inst-xyz"
 
 
+# ─── advance_earn_positions persistence (.48) ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_collect_snapshot_persists_advance_earn_positions() -> None:
+    """`.48`: position fetch fans out alongside the quote fan-out so the
+    executor's diff can SKIP re-subscribes when a product is still held
+    inside its settlement window."""
+    client = _mock_client_full()
+    client.list_advance_earn_products.side_effect = lambda category, **_: (
+        [{"productId": "da-1", "baseCoin": "BTC", "quoteCoin": "USDT"}]
+        if category == "DualAssets"
+        else [{"productId": "db-7", "coin": "USDT"}]
+        if category == "DiscountBuy"
+        else []
+    )
+    client.get_advance_product_quote.return_value = {"list": []}
+    client.get_advance_earn_positions.side_effect = (
+        lambda category, product_id: (
+            [
+                {
+                    "positionId": "pos-1",
+                    "amount": "40",
+                    "status": "Subscribed",
+                }
+            ]
+            if category == "DualAssets"
+            else []
+        )
+    )
+
+    with patch("agent.sandbox.snapshot._fetch_usdc_peg", _fake_peg_ok):
+        snap = await collect_snapshot(client)
+
+    assert "DualAssets/da-1" in snap.advance_earn_positions
+    assert snap.advance_earn_positions["DualAssets/da-1"][0]["amount"] == "40"
+    # Empty-list result still populates the key — that's the
+    # "fetched, none held" signal vs missing-key "outside top-K".
+    assert snap.advance_earn_positions.get("DiscountBuy/db-7") == []
+    # Round-trip
+    blob = snap.model_dump_json()
+    reparsed = Snapshot.model_validate_json(blob)
+    assert (
+        reparsed.advance_earn_positions["DualAssets/da-1"][0]["positionId"]
+        == "pos-1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_collect_snapshot_degrades_when_advance_position_fetch_fails() -> None:
+    """A per-product position fetch failure is swallowed into errors so
+    the snapshot still builds — same fail-soft contract as the quote
+    fan-out."""
+    client = _mock_client_full()
+    client.list_advance_earn_products.side_effect = lambda category, **_: (
+        [{"productId": "da-1", "baseCoin": "BTC", "quoteCoin": "USDT"}]
+        if category == "DualAssets"
+        else []
+    )
+    client.get_advance_product_quote.return_value = {"list": []}
+    client.get_advance_earn_positions.side_effect = BybitAPIError(
+        180001, "invalid parameter", "/v5/earn/advance/position"
+    )
+
+    with patch("agent.sandbox.snapshot._fetch_usdc_peg", _fake_peg_ok):
+        snap = await collect_snapshot(client)
+
+    # No DualAssets/da-1 key — missing = "not held, treat as subscribable"
+    assert "DualAssets/da-1" not in snap.advance_earn_positions
+    assert any("advance_position[DualAssets/da-1]" in e for e in snap.errors)
+
+
 @pytest.mark.asyncio
 async def test_collect_snapshot_degrades_when_perp_positions_fail() -> None:
     """A perm/permission error on `/v5/position/list` must NOT crash the

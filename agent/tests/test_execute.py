@@ -29,6 +29,7 @@ from agent.sandbox.execute import (
     ActionKind,
     diff_to_actions,
     execute_actions,
+    reconcile_executions,
     _enforce_usdt_budget,
     _order_link_id,
 )
@@ -55,6 +56,7 @@ def _snapshot(
     perp_market: dict[str, PerpInfo] | None = None,
     perp_positions: list[PerpPosition] | None = None,
     advance_earn_quotes: dict[str, dict] | None = None,
+    advance_earn_positions: dict[str, list[dict]] | None = None,
     lm_products: list[ProductSummary] | None = None,
     lm_positions: list[dict] | None = None,
     advance_products: dict[str, list[ProductSummary]] | None = None,
@@ -96,6 +98,7 @@ def _snapshot(
         perp_market=perp_market or {},
         perp_positions=perp_positions or [],
         advance_earn_quotes=advance_earn_quotes or {},
+        advance_earn_positions=advance_earn_positions or {},
         usdc_peg=UsdcPegSnapshot(
             price_usd=Decimal("1.0"),
             deviation_bps=Decimal("0"),
@@ -252,13 +255,19 @@ def _short_pos(
     )
 
 
-def _perp(coin: str, *, mark: str = "2.0", min_notional: str = "0.5") -> PerpInfo:
+def _perp(
+    coin: str,
+    *,
+    mark: str = "2.0",
+    min_notional: str = "0.5",
+    min_order_qty: str = "0.1",
+) -> PerpInfo:
     return PerpInfo(
         symbol=f"{coin.upper()}USDT",
         funding_rate_8h=Decimal("0.0001"),
         mark_price=Decimal(mark),
         orderbook_depth_50bps_usd=Decimal("100000"),
-        min_order_qty=Decimal("0.1"),
+        min_order_qty=Decimal(min_order_qty),
         min_notional_usd=Decimal(min_notional),
         max_leverage=Decimal("50"),
     )
@@ -390,6 +399,111 @@ def test_diff_orphan_spot_sold_to_usdt_when_not_subscribed() -> None:
     assert s.amount > Decimal("4.8")
     assert s.amount <= Decimal("4.9")
     assert "orphan" in s.reason.lower()
+
+
+def test_diff_orphan_spot_btc_routes_to_usdc_directly() -> None:
+    """`.49`: BTC settling out of a 1d DiscountBuy lands in UNIFIED with
+    no Earn position and no perp short backing it. Orphan cleanup must
+    route to `BTCUSDC` (single hop) instead of `BTCUSDT` + a subsequent
+    USDT→USDC sweep. Vault is USDC-denominated; the indirect path
+    pays double fees and orphans USDT."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        # Live Bybit BTC perp min_order_qty is 0.001 BTC — the default
+        # 0.1 used elsewhere in this fixture is a placeholder that would
+        # SKIP a realistic $100-of-BTC orphan as below-min.
+        perp_market={
+            "BTC": _perp(
+                "BTC", mark="65000", min_notional="5.0", min_order_qty="0.001"
+            )
+        },
+    )
+    snap.wallet.unified_coin_balances = {"BTC": Decimal("0.0015")}
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_flex", 0.5, [("1131", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260604T120000Z")
+    sells = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT and a.product_id == "BTCUSDC"
+    ]
+    assert len(sells) == 1, [a.product_id for a in actions if a.kind == ActionKind.SWAP_SPOT]
+    s = sells[0]
+    assert s.side == "Sell"
+    assert s.coin == "USDC"
+    # No leftover BTCUSDT order — only BTCUSDC.
+    assert not [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT and a.product_id == "BTCUSDT"
+    ]
+    assert "→ USDC" in s.reason
+
+
+def test_diff_orphan_spot_eth_routes_to_usdc() -> None:
+    """Same as BTC: ETH is the other common DiscountBuy underlying and
+    has a deep ETHUSDC spot pair on Bybit (verified in `.4`)."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={
+            "ETH": _perp(
+                "ETH", mark="3500", min_notional="1.0", min_order_qty="0.01"
+            )
+        },
+    )
+    snap.wallet.unified_coin_balances = {"ETH": Decimal("0.03")}
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_flex", 0.5, [("1131", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260604T120000Z")
+    sells = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT and a.product_id == "ETHUSDC"
+    ]
+    assert len(sells) == 1
+    assert sells[0].coin == "USDC"
+
+
+def test_diff_orphan_spot_other_coin_keeps_usdt_route() -> None:
+    """Coins outside the `_USDC_PAIR_COINS` whitelist (TON, LIT, AGIX,
+    long-tail memecoins) lack liquid USDC-quote spot pairs on Bybit —
+    they MUST keep the universal `{coin}USDT` route. This is the
+    regression guard for the conservative whitelist design."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"LIT": _perp("LIT", mark="1.65", min_notional="1.0")},
+    )
+    snap.wallet.unified_coin_balances = {"LIT": Decimal("4.9")}
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_flex", 0.5, [("1131", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260604T120000Z")
+    sells = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT and a.product_id == "LITUSDT"
+    ]
+    assert len(sells) == 1
+    assert sells[0].coin == "USDT"
+
+
+def test_orphan_sell_quote_dispatch_table() -> None:
+    """Unit-level: helper must dispatch `BTC`/`ETH`/`SOL` to USDC and
+    everything else to USDT. Guards against accidental whitelist
+    typo / case drift."""
+    from agent.sandbox.execute import _orphan_sell_quote
+    assert _orphan_sell_quote("BTC") == ("BTCUSDC", "USDC")
+    assert _orphan_sell_quote("ETH") == ("ETHUSDC", "USDC")
+    assert _orphan_sell_quote("SOL") == ("SOLUSDC", "USDC")
+    assert _orphan_sell_quote("TON") == ("TONUSDT", "USDT")
+    assert _orphan_sell_quote("LIT") == ("LITUSDT", "USDT")
 
 
 def test_diff_orphan_spot_skipped_when_subscribe_also_planned() -> None:
@@ -2018,7 +2132,7 @@ async def test_execute_swap_spot_live_sells_usdc(tmp_path: Path) -> None:
     kwargs = client.place_spot_order.await_args.kwargs
     assert kwargs["symbol"] == "USDCUSDT"
     assert kwargs["side"] == "Sell"
-    assert kwargs["qty"] == "52.50"
+    assert kwargs["qty_base"] == "52.50"
     assert kwargs["order_link_id"] == "sandbox-test-swap-001"
 
 
@@ -2208,6 +2322,142 @@ def test_diff_discount_buy_stale_offer_still_emits_subscribe() -> None:
     subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN]
     assert len(subs) == 1
     assert "stale-at-diff" in subs[0].reason
+
+
+# ─── .48 advance-Earn position dedup ──────────────────────────────────────
+
+
+def test_diff_advance_earn_skips_when_dual_assets_position_held() -> None:
+    """`.48`: re-subscribing on top of an open DualAssets position would
+    silently open a second position (Bybit's orderLinkId dedup window is
+    only ~30min; advance-Earn positions live until expiry). Diff must
+    SKIP with a clear reason instead of emitting SUBSCRIBE_ADVANCE_EARN."""
+    quote = _dual_quote(base="BTC", quote_coin="USDT")
+    snap = _snapshot(
+        total_equity_usd="200",
+        advance_earn_quotes={"DualAssets/da-1": quote},
+        advance_earn_positions={
+            "DualAssets/da-1": [
+                {
+                    "positionId": "pos-1",
+                    "amount": "40",
+                    "strikePrice": "62000",
+                    "status": "Subscribed",
+                }
+            ]
+        },
+        advance_products={
+            "DualAssets": [_advance_product("DualAssets", "da-1", "BTC/USDT")]
+        },
+    )
+    d = _advance_decision("bybit_dual_asset", "da-1", weight=0.2)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    assert not [a for a in actions if a.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN]
+    dedup = [
+        a
+        for a in actions
+        if a.kind == ActionKind.SKIP_OUT_OF_SCOPE
+        and a.category == "DualAssets"
+        and a.product_id == "da-1"
+    ]
+    assert len(dedup) == 1
+    assert "existing position" in dedup[0].reason
+    assert "double-lock" in dedup[0].reason
+
+
+def test_diff_advance_earn_skips_when_discount_buy_position_held() -> None:
+    """Mirror of the DualAssets dedup for DiscountBuy."""
+    quote = _discount_quote(coin="USDT", inst_uid="inst-xyz")
+    snap = _snapshot(
+        total_equity_usd="100",
+        advance_earn_quotes={"DiscountBuy/db-7": quote},
+        advance_earn_positions={
+            "DiscountBuy/db-7": [
+                {
+                    "positionId": "pos-2",
+                    "purchaseAmount": "20",
+                    "status": "Active",
+                }
+            ]
+        },
+        advance_products={
+            "DiscountBuy": [_advance_product("DiscountBuy", "db-7", "USDT")]
+        },
+    )
+    d = _advance_decision("bybit_discount_buy", "db-7", weight=0.2)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    assert not [a for a in actions if a.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN]
+    dedup = [
+        a
+        for a in actions
+        if a.kind == ActionKind.SKIP_OUT_OF_SCOPE
+        and a.category == "DiscountBuy"
+    ]
+    assert len(dedup) == 1
+
+
+def test_diff_advance_earn_subscribes_when_position_list_empty() -> None:
+    """Explicit empty list (positions fetch ran, no positions held) →
+    happy-path SUBSCRIBE. Distinguishes from missing-key semantics
+    (product fell outside the snapshot's top-K window)."""
+    quote = _dual_quote(base="BTC", quote_coin="USDT")
+    snap = _snapshot(
+        total_equity_usd="200",
+        advance_earn_quotes={"DualAssets/da-1": quote},
+        advance_earn_positions={"DualAssets/da-1": []},
+        advance_products={
+            "DualAssets": [_advance_product("DualAssets", "da-1", "BTC/USDT")]
+        },
+    )
+    d = _advance_decision("bybit_dual_asset", "da-1", weight=0.2)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN]
+    assert len(subs) == 1
+
+
+def test_diff_advance_earn_subscribes_when_only_terminal_positions() -> None:
+    """A row with status=Settled is past lifecycle — Bybit's open-position
+    endpoint shouldn't return it, but if it slips through we must NOT
+    block re-subscribe. Belt-and-braces for shape drift."""
+    quote = _dual_quote(base="BTC", quote_coin="USDT")
+    snap = _snapshot(
+        total_equity_usd="200",
+        advance_earn_quotes={"DualAssets/da-1": quote},
+        advance_earn_positions={
+            "DualAssets/da-1": [
+                {"positionId": "old", "amount": "40", "status": "Settled"}
+            ]
+        },
+        advance_products={
+            "DualAssets": [_advance_product("DualAssets", "da-1", "BTC/USDT")]
+        },
+    )
+    d = _advance_decision("bybit_dual_asset", "da-1", weight=0.2)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_ADVANCE_EARN]
+    assert len(subs) == 1
+
+
+def test_advance_earn_positions_held_handles_missing_amount_fields() -> None:
+    """Bybit per-category schemas vary — the helper must scan every
+    known amount alias before deciding a row is empty."""
+    from agent.sandbox.execute import _advance_earn_positions_held
+
+    # quoteAmount instead of amount (DualAssets variant on some products)
+    assert _advance_earn_positions_held(
+        [{"positionId": "x", "quoteAmount": "12.5"}]
+    ) == Decimal("12.5")
+    # purchaseAmount (DiscountBuy variant)
+    assert _advance_earn_positions_held(
+        [{"positionId": "y", "purchaseAmount": "8"}]
+    ) == Decimal("8")
+    # No usable amount field → treated as not held
+    assert _advance_earn_positions_held(
+        [{"positionId": "z", "note": "nothing here"}]
+    ) == Decimal(0)
+    # None / empty
+    assert _advance_earn_positions_held(None) == Decimal(0)
+    assert _advance_earn_positions_held([]) == Decimal(0)
 
 
 def test_diff_smart_leverage_still_skips_with_explanatory_reason() -> None:
@@ -3565,3 +3815,109 @@ def test_current_positions_sums_multiple_entries_per_pid() -> None:
     # USD: 10.5234 * $2 = $21.0468
     assert pos.amount_usd == Decimal("21.0468")
     assert pos.coin == "TON"
+
+
+# ─── .42 reconcile_executions ─────────────────────────────────────────────
+
+
+def _write_exec_log(
+    path: Path, rows: list[dict], trailing_garbage: str = ""
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = "\n".join(json.dumps(r) for r in rows)
+    if trailing_garbage:
+        text = text + "\n" + trailing_garbage
+    path.write_text(text + "\n")
+
+
+def test_reconcile_executions_missing_file(tmp_path: Path) -> None:
+    """No file on disk → empty summary, not an error. The startup scan
+    treats this as 'nothing to reconcile' (cleanly absent)."""
+    summary = reconcile_executions("20260604T100000Z", executions_dir=tmp_path)
+    assert summary["exists"] is False
+    assert summary["total"] == 0
+    assert summary["counts"] == {}
+
+
+def test_reconcile_executions_counts_statuses(tmp_path: Path) -> None:
+    """Mixed status batch → per-status histogram + error list with kind
+    + product_id + error_msg for non-ok rows."""
+    ts = "20260604T120000Z"
+    _write_exec_log(
+        tmp_path / f"{ts}.jsonl",
+        [
+            {
+                "action": {"kind": "subscribe_earn", "product_id": "p1"},
+                "status": "ok", "error": None,
+                "started_at": "2026-06-04T12:00:01Z",
+                "finished_at": "2026-06-04T12:00:02Z",
+            },
+            {
+                "action": {"kind": "swap_spot", "product_id": "ETHUSDC"},
+                "status": "error",
+                "error": "retCode=170131",
+                "started_at": "2026-06-04T12:00:03Z",
+                "finished_at": "2026-06-04T12:00:03Z",
+            },
+            {
+                "action": {"kind": "open_perp_short", "product_id": "TONUSDT"},
+                "status": "orphan",
+                "error": "spot fill not confirmed",
+                "started_at": "2026-06-04T12:00:04Z",
+                "finished_at": "2026-06-04T12:00:05Z",
+            },
+            {
+                "action": {"kind": "skip_out_of_scope", "product_id": "x"},
+                "status": "skipped", "error": None,
+                "started_at": "2026-06-04T12:00:06Z",
+                "finished_at": "2026-06-04T12:00:06Z",
+            },
+        ],
+    )
+    summary = reconcile_executions(ts, executions_dir=tmp_path)
+    assert summary["exists"] is True
+    assert summary["total"] == 4
+    assert summary["counts"] == {
+        "ok": 1, "error": 1, "orphan": 1, "skipped": 1,
+    }
+    assert len(summary["errors"]) == 2
+    kinds = {e["kind"] for e in summary["errors"]}
+    assert kinds == {"swap_spot", "open_perp_short"}
+    assert summary["last_finished_at"] == "2026-06-04T12:00:06Z"
+
+
+def test_reconcile_executions_handles_malformed_trailing_line(tmp_path: Path) -> None:
+    """OS-kill at the boundary often leaves a half-written final line.
+    The summarizer must keep going and bucket it as `malformed`
+    instead of raising — operator gets visibility of corruption count."""
+    ts = "20260604T130000Z"
+    _write_exec_log(
+        tmp_path / f"{ts}.jsonl",
+        [
+            {"action": {"kind": "subscribe_earn", "product_id": "p1"},
+             "status": "ok", "error": None},
+        ],
+        trailing_garbage='{"action": {"kind": "swap_spot"',  # cut off
+    )
+    summary = reconcile_executions(ts, executions_dir=tmp_path)
+    assert summary["total"] == 1
+    assert summary["counts"]["ok"] == 1
+    assert summary["counts"]["malformed"] == 1
+
+
+def test_reconcile_executions_errors_capped_at_ten(tmp_path: Path) -> None:
+    """Avoid unbounded growth of the errors list — operator only needs
+    the head for triage."""
+    ts = "20260604T140000Z"
+    rows = [
+        {
+            "action": {"kind": "subscribe_earn", "product_id": f"p{i}"},
+            "status": "error", "error": f"err{i}",
+        }
+        for i in range(25)
+    ]
+    _write_exec_log(tmp_path / f"{ts}.jsonl", rows)
+    summary = reconcile_executions(ts, executions_dir=tmp_path)
+    assert summary["total"] == 25
+    assert summary["counts"]["error"] == 25
+    assert len(summary["errors"]) == 10

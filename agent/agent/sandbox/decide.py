@@ -24,7 +24,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +43,133 @@ MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 4096
 TOOL_NAME = "submit_decision"
 DECISION_DIR = Path(__file__).parent / "decisions"
+
+# Prompt-cache TTL on the system block. Anthropic's `ephemeral` cache
+# defaults to 5min; the explicit `"1h"` extends that to 60min at the
+# cost of a higher cache-write rate (2× input vs 1.25× for 5m). For
+# Vault8004 the 4h heartbeat misses cache regardless of TTL, but the
+# event-driven re-decide path (`event-driven-rebalance`) often fires
+# multiple cycles within an hour (peg drift + funding flip in the same
+# window) — those amortize the 2× write against several cache-reads at
+# 10% of input. Net win on event-driven days, neutral on heartbeat-only
+# days. `.40`.
+CACHE_TTL = "1h"
+
+
+# Per-million-token pricing in USD, per model. Values reflect Anthropic
+# public pricing as of 2026-01; refresh when Anthropic publishes new
+# rates. Unknown models yield `estimated_cost_usd=0` rather than guessing
+# — the per-cycle cost surfaces zero and the operator notices the gap.
+# `cache_creation` rates assume the 1h TTL set by `CACHE_TTL` (2× base
+# input vs the 5min TTL's 1.25×); change both together.
+_PRICING_PER_MTOK: dict[str, dict[str, Decimal]] = {
+    "claude-sonnet-4-6": {
+        "input": Decimal("3.00"),
+        "cache_creation": Decimal("6.00"),  # 1h TTL = 2× input
+        "cache_read": Decimal("0.30"),
+        "output": Decimal("15.00"),
+    },
+    "claude-sonnet-4-7": {
+        "input": Decimal("3.00"),
+        "cache_creation": Decimal("6.00"),
+        "cache_read": Decimal("0.30"),
+        "output": Decimal("15.00"),
+    },
+    "claude-opus-4-7": {
+        "input": Decimal("15.00"),
+        "cache_creation": Decimal("30.00"),  # 1h TTL = 2× input
+        "cache_read": Decimal("1.50"),
+        "output": Decimal("75.00"),
+    },
+}
+
+_TOKENS_PER_MTOK = Decimal(1_000_000)
+
+
+def _estimate_cost_usd(
+    model: str,
+    *,
+    input_tokens: int,
+    cache_creation_input_tokens: int,
+    cache_read_input_tokens: int,
+    output_tokens: int,
+) -> Decimal:
+    """Per-cycle USD estimate from the Anthropic usage block. Returns
+    `Decimal(0)` for unknown models so the cycle log entry surfaces a
+    clear miss rather than silently fabricating a number from default
+    rates.
+    """
+    rates = _PRICING_PER_MTOK.get(model)
+    if rates is None:
+        return Decimal(0)
+    total = (
+        Decimal(input_tokens) * rates["input"]
+        + Decimal(cache_creation_input_tokens) * rates["cache_creation"]
+        + Decimal(cache_read_input_tokens) * rates["cache_read"]
+        + Decimal(output_tokens) * rates["output"]
+    ) / _TOKENS_PER_MTOK
+    return total.quantize(Decimal("0.000001"))
+
+
+@dataclass(frozen=True)
+class DecisionUsage:
+    """Anthropic API usage metadata for a single `decide()` call.
+
+    Mirrors the SDK's `response.usage` shape (input_tokens /
+    cache_creation_input_tokens / cache_read_input_tokens /
+    output_tokens) plus the model id + a server-side cost estimate.
+
+    Persisted as a `_usage` sidecar on the decision file and copied
+    into the cycle log entry so post-mortem analysis (`.38`) can join
+    cost against outcome without re-reading every decision JSON.
+    """
+
+    model: str
+    input_tokens: int
+    cache_creation_input_tokens: int
+    cache_read_input_tokens: int
+    output_tokens: int
+    estimated_cost_usd: Decimal
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model": self.model,
+            "input_tokens": self.input_tokens,
+            "cache_creation_input_tokens": self.cache_creation_input_tokens,
+            "cache_read_input_tokens": self.cache_read_input_tokens,
+            "output_tokens": self.output_tokens,
+            "estimated_cost_usd": str(self.estimated_cost_usd),
+        }
+
+
+def _usage_from_response(
+    response: anthropic.types.Message, model: str
+) -> DecisionUsage:
+    """Pull the four usage counters off the SDK's `response.usage` block
+    and price them. Defensive against partial responses — every field
+    falls back to 0 if the SDK didn't populate it.
+    """
+    usage = getattr(response, "usage", None)
+    input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+    cache_creation = int(
+        getattr(usage, "cache_creation_input_tokens", 0) or 0
+    )
+    cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    return DecisionUsage(
+        model=model,
+        input_tokens=input_tokens,
+        cache_creation_input_tokens=cache_creation,
+        cache_read_input_tokens=cache_read,
+        output_tokens=output_tokens,
+        estimated_cost_usd=_estimate_cost_usd(
+            model,
+            input_tokens=input_tokens,
+            cache_creation_input_tokens=cache_creation,
+            cache_read_input_tokens=cache_read,
+            output_tokens=output_tokens,
+        ),
+    )
 
 _PICK_SCHEMA = {
     "type": "object",
@@ -267,8 +396,11 @@ async def decide(
     system_prompt: str | None = None,
     prior_decision: dict[str, Any] | None = None,
     wake_events: list[dict[str, Any]] | None = None,
-) -> Decision:
-    """Run one decision cycle. Returns a validated Decision.
+) -> tuple[Decision, DecisionUsage]:
+    """Run one decision cycle. Returns `(Decision, DecisionUsage)` — the
+    validated decision and the Anthropic-side token + cost metadata for
+    the call (`.39`). The runtime cost tracker reads the usage tuple
+    member and joins it into the cycle log.
 
     `prior_decision`, when provided, is summarized and prepended to the
     user message so the model can detect whipsaw and respect the "move
@@ -289,7 +421,7 @@ async def decide(
             {
                 "type": "text",
                 "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": {"type": "ephemeral", "ttl": CACHE_TTL},
             }
         ],
         tools=[_DECISION_TOOL],
@@ -305,7 +437,9 @@ async def decide(
     )
 
     tool_input = _extract_tool_input(response)
-    return Decision.model_validate(tool_input)
+    decision = Decision.model_validate(tool_input)
+    usage = _usage_from_response(response, MODEL)
+    return decision, usage
 
 
 def write_decision(
@@ -317,6 +451,7 @@ def write_decision(
     decisions_dir: Path = DECISION_DIR,
     prompt_version: str = "reason.prompt",
     wake_events: list[dict[str, Any]] | None = None,
+    usage: DecisionUsage | None = None,
 ) -> Path:
     """Persist the decision (and its validator outcome, if known) next to
     the snapshot. File naming pairs decision↔snapshot via shared UTC
@@ -346,6 +481,8 @@ def write_decision(
     if validator_result is not None:
         ok, errors = validator_result
         payload["_validator"] = {"ok": ok, "errors": errors}
+    if usage is not None:
+        payload["_usage"] = usage.to_dict()
     out.write_text(json.dumps(payload, indent=2))
     return out
 
@@ -374,11 +511,13 @@ def _main() -> None:
 
     async def run() -> None:
         async with anthropic.AsyncAnthropic() as client:
-            decision = await decide(
+            decision, usage = await decide(
                 raw_snapshot, client=client, prior_decision=prior
             )
         result = validate(decision, snap)
-        path = write_decision(decision, args.snapshot, validator_result=result)
+        path = write_decision(
+            decision, args.snapshot, validator_result=result, usage=usage
+        )
         ok, errs = result
         print(f"decision → {path}")
         print(

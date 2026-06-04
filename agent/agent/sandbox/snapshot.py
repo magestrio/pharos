@@ -332,6 +332,20 @@ class Snapshot(BaseModel):
     # LLM doesn't see this — it consumes the normalized APR via
     # `products[Category][i].effective_apr` instead.
     advance_earn_quotes: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    # Open advance-Earn positions (`/v5/earn/advance/position`), keyed by
+    # `"<Category>/<ProductId>"`. Bybit's `orderLinkId` dedup window is
+    # ~30min — re-subscribing to a product we still hold within the
+    # position's settlement window opens a SECOND position rather than
+    # being deduped, double-locking capital silently. The executor's
+    # advance-Earn diff branch reads this and SKIPs re-subscribes when
+    # any active position exists for the (category, product_id) pair.
+    # Empty list ⇔ no position; missing key ⇔ product fell outside the
+    # top-K fan-out (treated as "not held" — best-effort, with the
+    # caveat that products outside the quote window also can't be
+    # picked, so the dedup only needs to cover the pickable surface).
+    advance_earn_positions: dict[str, list[dict[str, Any]]] = Field(
+        default_factory=dict
+    )
     # Mantle on-chain context (`.37a`). Carries Aave V3 USDC pool APR
     # + vault balances so the LLM can compare CEX vs DeFi rates in one
     # snapshot. None when the RPC fetch fails (Mantle outage, missing
@@ -1545,6 +1559,54 @@ async def _quote_advance_top_k(
     return out
 
 
+async def _positions_advance_top_k(
+    client: BybitClient,
+    advance_products: dict[str, list[dict[str, Any]]],
+    errors: list[str],
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """Fan-out `get_advance_earn_positions` for the same yield-bearing
+    advance-Earn top-K we quote (`.48`). Returns `{(category,
+    product_id): [position_dict, ...]}` so the executor diff can SKIP
+    re-subscribes when a position is already open.
+
+    Same scope as `_quote_advance_top_k` so the position-feed and the
+    pickable surface stay in lockstep — products outside the quote
+    window can't be picked anyway, so they don't need dedup coverage.
+
+    Failures per product are swallowed and logged in `errors`; missing
+    keys downstream mean "no position info, treat as not held" — best-
+    effort fail-soft, mirroring the quote fan-out contract.
+    """
+    yield_bearing = ("DualAssets", "DiscountBuy")
+    pairs: list[tuple[str, str]] = []
+    coros = []
+    for cat in yield_bearing:
+        items = advance_products.get(cat) or []
+        for p in items[:ADVANCE_QUOTE_TOP_K]:
+            pid = str(p.get("productId", ""))
+            if not pid:
+                continue
+            pairs.append((cat, pid))
+            coros.append(
+                client.get_advance_earn_positions(category=cat, product_id=pid)
+            )
+    if not coros:
+        return {}
+    results = await asyncio.gather(*coros, return_exceptions=True)
+    out: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for (cat, pid), res in zip(pairs, results):
+        if isinstance(res, BaseException):
+            errors.append(
+                f"advance_position[{cat}/{pid}]: {type(res).__name__}: {res}"
+            )
+            continue
+        if isinstance(res, list):
+            out[(cat, pid)] = res
+        # Non-list / non-exception → AsyncMock leak from a test, or a
+        # Bybit shape drift; ignore (treat as no position info).
+    return out
+
+
 async def _kline_smart_leverage_underlyings(
     client: BybitClient,
     advance_products: dict[str, list[dict[str, Any]]],
@@ -2005,6 +2067,9 @@ async def collect_snapshot(
     quote_results = await _quote_advance_top_k(
         client, advance_products, errors
     )
+    position_results = await _positions_advance_top_k(
+        client, advance_products, errors
+    )
     smart_leverage_momentum = await _kline_smart_leverage_underlyings(
         client, advance_products, errors
     )
@@ -2080,6 +2145,10 @@ async def collect_snapshot(
     advance_earn_quotes = {
         f"{cat}/{pid}": payload
         for (cat, pid), payload in quote_results.items()
+    }
+    advance_earn_positions = {
+        f"{cat}/{pid}": rows
+        for (cat, pid), rows in position_results.items()
     }
 
     # Aave V3 USDC surface (`.37a`). When the on-chain fetch succeeded,
@@ -2277,6 +2346,7 @@ async def collect_snapshot(
         perp_market=perp_market,
         perp_positions=perp_positions,
         advance_earn_quotes=advance_earn_quotes,
+        advance_earn_positions=advance_earn_positions,
         on_chain_state=on_chain_state,
         usdc_peg=usdc_peg,
         errors=errors,

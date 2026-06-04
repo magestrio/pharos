@@ -61,9 +61,11 @@ from agent.sandbox.carry_state import (
 )
 from agent.sandbox.execute import (
     DEFAULT_AUTO_APPROVE_MIN_CONFIDENCE,
+    EXECUTIONS_DIR,
     apply_carry_results_to_state,
     diff_to_actions,
     execute_actions,
+    reconcile_executions,
     request_approval,
 )
 from agent.sandbox.safety import (
@@ -112,6 +114,52 @@ from agent.validate.rules import validate
 # cycles add on top.
 DEFAULT_INTERVAL_SECONDS = 4 * 60 * 60  # 4h
 CYCLE_LOG = Path(__file__).parent / "cycle_log.jsonl"
+
+
+def detect_unfinished_cycles(
+    cycle_log_path: Path = CYCLE_LOG,
+    executions_dir: Path = EXECUTIONS_DIR,
+) -> list[dict[str, Any]]:
+    """Scan for cycles whose `executions/<ts>.jsonl` exists but whose
+    cycle outcome was never written to `cycle_log.jsonl` (`.42`).
+
+    Crash signature: systemd OOM / SIGKILL between `execute_actions`
+    writing per-action lines and `run_one_cycle` returning. The per-
+    action log persists (it's flushed line-by-line); the cycle entry
+    doesn't, because it's written by the outer loop AFTER `run_one_cycle`
+    completes.
+
+    Returns one summary dict per unfinished cycle (sorted oldest →
+    newest), each carrying the `reconcile_executions` output. Empty
+    list when everything is clean. Read-only — does NOT mutate state
+    or replay actions.
+    """
+    if not executions_dir.is_dir():
+        return []
+
+    completed_ts: set[str] = set()
+    if cycle_log_path.is_file():
+        for raw in cycle_log_path.read_text().splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                entry = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            ts = entry.get("snapshot_filename")
+            if isinstance(ts, str) and ts.endswith(".json"):
+                completed_ts.add(ts[:-5])
+
+    unfinished: list[dict[str, Any]] = []
+    for path in sorted(executions_dir.glob("*.jsonl")):
+        ts = path.stem
+        if ts in completed_ts:
+            continue
+        summary = reconcile_executions(ts, executions_dir=executions_dir)
+        if summary.get("total", 0) > 0:
+            unfinished.append(summary)
+    return unfinished
 
 # Endpoints whose failure aborts the loop at startup. If any of these
 # come back !=ok from `permission_probe`, the loop refuses to start —
@@ -349,6 +397,7 @@ async def run_one_cycle(
         # when no eligible event is present.
         prior = _load_latest_prior_decision()
         auto_close = _build_auto_close_decision(prior, wake_events)
+        usage = None  # set only on the LLM path; auto-close skips Anthropic
         if auto_close is not None:
             log.info(
                 "auto-close path: pick_invalidated event(s) — "
@@ -357,14 +406,19 @@ async def run_one_cycle(
             decision = Decision.model_validate(auto_close)
             outcome["auto_close"] = True
         else:
-            decision = await decide(
+            decision, usage = await decide(
                 raw_snapshot,
                 client=anthropic_client,
                 prior_decision=prior,
                 wake_events=wake_events,
             )
+            outcome["usage"] = usage.to_dict()
+            outcome["estimated_cost_usd"] = float(usage.estimated_cost_usd)
         decision_path = write_decision(
-            decision, snap_path, wake_events=wake_events
+            decision,
+            snap_path,
+            wake_events=wake_events,
+            usage=usage,
         )
         outcome["decision_filename"] = decision_path.name
         outcome["confidence"] = float(decision.confidence)
@@ -452,7 +506,25 @@ async def run_one_cycle(
                 for r in results
             ]
             outcome["stages"].append("execute")
-            outcome["result"] = "executed" if not effective_dry_run else "ok"
+            if effective_dry_run:
+                outcome["result"] = "ok"
+            else:
+                # `.42`: surface partial completion so the next-cycle
+                # startup scan + post-mortem analyzer can distinguish a
+                # clean batch from one where some actions errored mid-
+                # cycle (Bybit transient 5xx, atomic-pair guard fired,
+                # retCode rejected, etc.). Pre-fix the field said
+                # "executed" regardless and operator only knew via
+                # actions_executed < actions_planned in the entry.
+                failed = sum(
+                    1 for r in results
+                    if r.status in ("error", "orphan")
+                )
+                if failed > 0:
+                    outcome["result"] = "executed_partial"
+                    outcome["actions_failed"] = failed
+                else:
+                    outcome["result"] = "executed"
         finally:
             # Roll forward carry state from the dispatch results (`.5`).
             # Skipped on dry-run so a `--live` run is required to mutate
@@ -573,6 +645,26 @@ async def run_loop(
             raise SystemExit(
                 "permission probe failed on critical endpoints: "
                 f"{sorted(critical_failures)}"
+            )
+
+        # `.42` startup scan: a prior cycle may have crashed between
+        # writing per-action execution lines and writing the cycle
+        # outcome (systemd OOM / SIGKILL). Surface those cycles in the
+        # operator log so manual reconciliation can happen before the
+        # new cycle starts opening positions. Read-only — does NOT
+        # replay; auto-replay would risk duplicating already-executed
+        # actions whose response landed before the crash.
+        unfinished = detect_unfinished_cycles(cycle_log_path)
+        for u in unfinished:
+            log.warning(
+                "unfinished prior cycle detected (no cycle_log entry): "
+                "ts=%s total=%d counts=%s last_finished=%s — "
+                "review %s before next cycle's diff opens new positions",
+                u["snapshot_ts"],
+                u["total"],
+                u["counts"],
+                u.get("last_finished_at"),
+                u["path"],
             )
 
         # Cycle store init (`data-store.3`). Failures degrade gracefully:
