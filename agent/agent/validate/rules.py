@@ -27,6 +27,8 @@ from agent.reason.venues import VENUE_REGISTRY, VenueId
 from agent.sandbox.snapshot import (
     DEFAULT_FUNDING_INTERVAL_HOURS,
     FUNDING_FLOOR_CARRY_ANNUAL,
+    HEDGE_MARGIN_BUFFER,
+    STABLES,
     ProductSummary,
     Snapshot,
     _annual_funding,
@@ -55,11 +57,13 @@ PEG_STRESS_BPS = 100
 PEG_STRESS_STABLES_FLOOR = 0.50  # cash + bybit_flex must be ≥ this when peg is stressed
 
 # Stables-set treated as "hedge not required" by the OnChain validator.
-# Mirrored in `agent.sandbox.snapshot.STABLES`; keeping both lists in
-# sync is checked indirectly by the snapshot tests.
-_STABLE_COINS: frozenset[str] = frozenset(
-    {"USDC", "USDT", "USD1", "FDUSD", "DAI", "USDE", "USDTB", "PYUSD", "RLUSD"}
-)
+# Single source of truth lives in `agent.sandbox.snapshot.STABLES` — the
+# snapshot's ranker uses it to whitelist USDC-equivalents through the
+# top-K filter, and the validator needs the same set so a coin can't be
+# classified as "stable" in one layer and "non-stable" in another (which
+# would let an un-hedged non-stable pick slip through). Aliased here for
+# readability in the rule bodies.
+_STABLE_COINS = STABLES
 
 Check = tuple[bool, str | None]
 
@@ -655,10 +659,14 @@ def _pick_usd_value(
 # ─── Stable-spend cap (2026-06-03) ─────────────────────────────────────────
 
 
-# Matches `execute.HEDGE_MARGIN_BUFFER`; the validator's pre-trade math
-# must agree with the executor's swap sizing so a decision that passes
-# validation can actually be funded by liquid_usdc + liquid_usdt.
-_VALIDATOR_HEDGE_MARGIN_BUFFER = 1.05
+# Single source of truth for the margin-buffer multiplier lives in
+# `agent.sandbox.snapshot.HEDGE_MARGIN_BUFFER` so the executor's USDT
+# budget and the validator's pre-trade reservation can't drift. We hold
+# a float alias here because the validator runs all its capital-flow math
+# in floats — Decimal precision isn't required at the budget-screening
+# scale, and propagating Decimal through every multiplication adds noise
+# without changing outcomes.
+_VALIDATOR_HEDGE_MARGIN_BUFFER = float(HEDGE_MARGIN_BUFFER)
 
 
 def check_stable_spend_cap(d: Decision, snapshot: Snapshot) -> Check:

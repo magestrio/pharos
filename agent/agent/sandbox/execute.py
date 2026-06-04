@@ -53,7 +53,13 @@ from agent.sandbox.carry_state import (
     CarryPositionRecord,
     CarryState,
 )
-from agent.sandbox.snapshot import SNAPSHOT_DIR, STABLES, PerpInfo, Snapshot
+from agent.sandbox.snapshot import (
+    HEDGE_MARGIN_BUFFER,
+    SNAPSHOT_DIR,
+    STABLES,
+    PerpInfo,
+    Snapshot,
+)
 
 EXECUTIONS_DIR = Path(__file__).parent / "executions"
 log = logging.getLogger(__name__)
@@ -172,11 +178,10 @@ _ADVANCE_EARN_CATEGORIES: frozenset[str] = frozenset({"DualAssets", "DiscountBuy
 # partial reduce, and avoids guessing minOrderQty steps for the residual).
 HEDGE_NOTIONAL_REBALANCE_THRESHOLD = Decimal("0.10")
 
-# Buffer multiplier on top of the raw hedge notional when sizing the
-# USDT margin reserve (`.33`). Covers Bybit's initial-margin rounding
-# + headroom for funding/fees accumulation between cycles. 5% on a $50
-# hedge = $2.5 extra — cheap insurance against retCode=110007.
-HEDGE_MARGIN_BUFFER = Decimal("1.05")
+# HEDGE_MARGIN_BUFFER lives in `agent.sandbox.snapshot` so the validator
+# (`check_stable_spend_cap`) and the executor (USDT-budget enforcement)
+# can never go out of sync on the buffer multiplier — both read the same
+# constant. Re-exported here for back-compat with internal references.
 
 # Don't swap pennies. Below this threshold the diff suppresses the
 # SWAP action and trusts that Bybit's margin call won't fire on a

@@ -127,6 +127,14 @@ STABLES: frozenset[str] = frozenset(
     {"USDC", "USDT", "USD1", "FDUSD", "DAI", "USDE", "USDTB", "PYUSD", "RLUSD"}
 )
 
+# Multiplier on perp-short notional → USDT margin demand. Both validator
+# (pre-trade reservation) and executor (USDT budget enforcement) read
+# this so adding a non-stable pick can't pass one layer's check on a
+# tighter buffer and then fail the other on a looser one. Decimal type
+# for executor's price-precision arithmetic; validator converts to float
+# at the usage site.
+HEDGE_MARGIN_BUFFER: Decimal = Decimal("1.05")
+
 
 class ProductSummary(BaseModel):
     """One Earn product, normalized across category families.
