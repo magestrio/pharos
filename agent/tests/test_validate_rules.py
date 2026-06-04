@@ -30,9 +30,11 @@ from agent.sandbox.snapshot import (
     WalletSnapshot,
 )
 from agent.validate.rules import (
+    CASH_FLOOR,
     FUNDING_FLOOR_HEDGE_ANNUAL,
     PEG_STRESS_BPS,
     PEG_STRESS_STABLES_FLOOR,
+    check_capital_flow_simulation,
     check_confidence,
     check_disabled_venues,
     check_effective_pick_cap,
@@ -41,6 +43,7 @@ from agent.validate.rules import (
     check_hedges_for_non_usd_picks,
     check_lm_leverage_size_cap,
     check_lockup_cap,
+    check_min_stake,
     check_no_double_carry_hedge,
     check_no_missing_apr_source,
     check_peg_stress,
@@ -73,6 +76,7 @@ def _product(
     apr_source: str = "estimate_apr",
     notes: list[str] | None = None,
     redeem_lockup_minutes: int | None = None,
+    min_subscribe_usd: str | None = None,
 ) -> ProductSummary:
     return ProductSummary(
         category=category,
@@ -82,6 +86,9 @@ def _product(
         apr_source=apr_source,
         base_apr_string=None,
         redeem_lockup_minutes=redeem_lockup_minutes,
+        min_subscribe_usd=(
+            Decimal(min_subscribe_usd) if min_subscribe_usd is not None else None
+        ),
         notes=notes or [],
     )
 
@@ -916,6 +923,346 @@ def test_check_stable_spend_cap_skips_pick_without_perp_market() -> None:
     # stable_spend_cap passes (no demand). The actual rejection comes
     # from check_hedges_for_non_usd_picks elsewhere.
     assert check_stable_spend_cap(d, s) == (True, None)
+
+
+# ─── check_min_stake (2026-06-04, `.51`) ──────────────────────────────────
+
+
+def test_check_min_stake_passes_default_clean() -> None:
+    """Default decision (USD1 flex at $50 on $100 book) sits far above
+    any realistic min_subscribe_usd — fixture doesn't even set one."""
+    s = _snapshot()
+    d = _decision()
+    assert check_min_stake(d, s) == (True, None)
+
+
+def test_check_min_stake_no_op_when_book_zero() -> None:
+    s = _snapshot(total_equity_usd="0")
+    d = _decision()
+    assert check_min_stake(d, s) == (True, None)
+
+
+def test_check_min_stake_no_op_when_min_unset() -> None:
+    """A product without `min_subscribe_usd` must not trigger the rule —
+    Bybit's missing minStakeAmount field is common on legacy products."""
+    s = _snapshot(
+        flex_products=[
+            _product(
+                "1131", "FlexibleSaving",
+                coin="USD1", effective_apr="0.075",
+                min_subscribe_usd=None,
+            )
+        ],
+        total_equity_usd="100",
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_flex", 0.5, [("1131", 1.0)]),
+        ]
+    )
+    assert check_min_stake(d, s) == (True, None)
+
+
+def test_check_min_stake_fails_below_floor() -> None:
+    """Tiny FlexibleSaving pick (e.g. ID at $1.79 floor) gets a sub-min
+    allocation when Claude over-diversifies on a small vault. Validator
+    must reject so the next cycle's prior-decision summary surfaces the
+    violation."""
+    s = _snapshot(
+        flex_products=[
+            _product(
+                "id-1", "FlexibleSaving",
+                coin="ID", effective_apr="0.30",
+                min_subscribe_usd="1.79",
+            )
+        ],
+        total_equity_usd="50",
+        # ID coin needs a perp entry to bypass other hedge rules in
+        # the test (not what we're exercising here).
+        perp_market={"ID": _perp("ID", mark="0.5", min_notional="0.1")},
+    )
+    # ID pick at 2% of $50 book = $1.00 — below the $1.79 floor.
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.98),
+            _venue("bybit_flex", 0.02, [("id-1", 1.0)]),
+        ]
+    )
+    ok, msg = check_min_stake(d, s)
+    assert not ok
+    assert "bybit_flex/id-1" in (msg or "")
+    assert "180012" in (msg or "")
+
+
+def test_check_min_stake_passes_at_floor() -> None:
+    """Pick sized exactly at min_subscribe_usd passes (the `+1e-9`
+    tolerance handles fp comparison without spurious rejection)."""
+    s = _snapshot(
+        flex_products=[
+            _product(
+                "id-1", "FlexibleSaving",
+                coin="ID", effective_apr="0.30",
+                min_subscribe_usd="2.00",
+            )
+        ],
+        total_equity_usd="100",
+        perp_market={"ID": _perp("ID", mark="0.5", min_notional="0.1")},
+    )
+    # 2% of $100 = $2.00 — exactly at floor.
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.98),
+            _venue("bybit_flex", 0.02, [("id-1", 1.0)]),
+        ]
+    )
+    assert check_min_stake(d, s) == (True, None)
+
+
+def test_check_min_stake_fails_lm_below_floor() -> None:
+    """Mirror for LM picks — the validator applies to every venue where
+    the snapshot category populates `min_subscribe_usd`. LM has the
+    deepest floors ($50 for BTC/USDC, ETH/USDC) — easy to trip on a
+    small vault."""
+    s = _snapshot(
+        lm_products=[
+            _product(
+                "24", "LiquidityMining",
+                coin="ETH/USDC", effective_apr="0.025",
+                apr_source="apy_e8",
+                notes=["max_leverage=1"],
+                min_subscribe_usd="50",
+            )
+        ],
+        total_equity_usd="100",
+    )
+    # 20% of $100 = $20 — below $50 LM floor.
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.80),
+            _venue("bybit_lm", 0.20, [("24", 1.0)]),
+        ]
+    )
+    ok, msg = check_min_stake(d, s)
+    assert not ok
+    assert "bybit_lm/24" in (msg or "")
+
+
+def test_check_min_stake_collects_multiple_violations() -> None:
+    """All violations surface in a single error message — operator sees
+    every problem in one pass."""
+    s = _snapshot(
+        flex_products=[
+            _product(
+                "id-1", "FlexibleSaving",
+                coin="ID", effective_apr="0.30",
+                min_subscribe_usd="1.79",
+            ),
+            _product(
+                "io-1", "FlexibleSaving",
+                coin="IO", effective_apr="0.25",
+                min_subscribe_usd="1.28",
+            ),
+        ],
+        total_equity_usd="50",
+        perp_market={
+            "ID": _perp("ID", mark="0.5", min_notional="0.1"),
+            "IO": _perp("IO", mark="0.7", min_notional="0.1"),
+        },
+    )
+    # Both at 1% of $50 = $0.50 each — below their respective floors.
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.98),
+            _venue(
+                "bybit_flex", 0.02,
+                [("id-1", 0.5), ("io-1", 0.5)],
+            ),
+        ]
+    )
+    ok, msg = check_min_stake(d, s)
+    assert not ok
+    assert "id-1" in (msg or "")
+    assert "io-1" in (msg or "")
+
+
+# ─── check_capital_flow_simulation (2026-06-04, `.50`) ────────────────────
+
+
+def test_check_capital_flow_passes_on_clean_default() -> None:
+    """Default decision (cash 50% + USD1 flex 50%) is well under the
+    capital-flow ceiling — stable picks commit at face value, no margin
+    layer, comfortably within `book × (1 - cash_floor)`."""
+    s = _snapshot(total_equity_usd="100")
+    d = _decision()
+    assert check_capital_flow_simulation(d, s) == (True, None)
+
+
+def test_check_capital_flow_no_op_when_book_zero() -> None:
+    """`total_equity_usd == 0` is the no-op guard (legacy fixture / pre-
+    pivot snapshot) — same shape as `check_stable_spend_cap`."""
+    s = _snapshot(total_equity_usd="0")
+    d = _decision()
+    assert check_capital_flow_simulation(d, s) == (True, None)
+
+
+def test_check_capital_flow_fails_hedged_overflow() -> None:
+    """OnChain TON 45% + cash 55% on $100, TON perp available → commit
+    = 45 × 2.05 = $92.25, allowable = $100 × (1 - 0.10) = $90 → reject.
+    Hedged non-stable picks layer stake (100% of pick_usd) + perp margin
+    (~105% of pick_usd) so each non-stable book-dollar locks 2.05×."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
+        total_equity_usd="100",
+    )
+    d = _hedged_decision(onchain_venue_weight=0.45)
+    ok, msg = check_capital_flow_simulation(d, s)
+    assert not ok
+    assert msg is not None
+    assert "target capital commitment" in msg
+    assert "exceeds" in msg
+
+
+def test_check_capital_flow_passes_hedged_within_cap() -> None:
+    """OnChain TON 40% + cash 60% on $100 → commit = 40 × 2.05 = $82,
+    allowable = $90 → fits with headroom."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
+        total_equity_usd="100",
+    )
+    d = _hedged_decision(onchain_venue_weight=0.40)
+    assert check_capital_flow_simulation(d, s) == (True, None)
+
+
+def test_check_capital_flow_fails_mixed_venues_overflow() -> None:
+    """OnChain TON 30% (hedged) + LM 30% + cash 40% on $100 → commit
+    = 30×2.05 + 30 + 0 = $61.50 + $30 = $91.50, allowable $90 → reject.
+    Hidden hedge margin pushes a venue-cap-compliant portfolio over the
+    book ceiling once the face-value LM slice is added in."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
+        total_equity_usd="100",
+    )
+    d = Decision(
+        thesis="hedged onchain + LM split blows past book cap",
+        venues=[
+            _venue("cash_usdc", 0.40),
+            _venue("bybit_onchain", 0.30, [("8", 1.0)]),
+            _venue("bybit_lm", 0.30, [("24", 1.0)]),
+        ],
+        hedges=[Hedge(coin="TON", notional_usd=-30.0)],
+        confidence=0.7,
+        risk_flags=[],
+        notes=[],
+        expected_blended_apr_pct=12.0,
+    )
+    ok, msg = check_capital_flow_simulation(d, s)
+    assert not ok
+    assert msg is not None
+    assert "bybit_onchain" in msg
+    assert "bybit_lm" in msg
+
+
+def test_check_capital_flow_stable_picks_no_buffer() -> None:
+    """Stable Earn picks commit at face value — no margin layer. USD1
+    flex 90% + cash 10% on $100 → commit = $90, allowable = $90 → pass
+    exactly at the cap."""
+    s = _snapshot(
+        flex_products=[
+            _product(
+                "1131", "FlexibleSaving",
+                coin="USD1", effective_apr="0.075",
+            )
+        ],
+        total_equity_usd="100",
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.10),
+            _venue("bybit_flex", 0.90, [("1131", 1.0)]),
+        ]
+    )
+    # Violates bybit_flex.max_weight=0.70 but check_capital_flow_simulation
+    # is the unit under test here — it should pass on the math alone.
+    assert check_capital_flow_simulation(d, s) == (True, None)
+
+
+def test_check_capital_flow_skips_unhedgeable_non_stable() -> None:
+    """Non-stable pick lacking a `perp_market` entry isn't hedged
+    (`check_hedges_for_non_usd_picks` rejects upstream) — counting
+    margin here would produce a duplicate error. Pick commits at face."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={},  # no TON perp → un-hedgeable
+        total_equity_usd="100",
+    )
+    d = _hedged_decision(onchain_venue_weight=0.85)
+    # 85 × 1.0 = 85 ≤ 90 (allowable) → passes; the hedge feasibility
+    # rejection happens in a different check.
+    assert check_capital_flow_simulation(d, s) == (True, None)
+
+
+def test_check_capital_flow_carry_pick_includes_buffer() -> None:
+    """Carry picks always commit stake + margin. carry 0.10 + cash 0.20
+    + flex stable 0.70 on $100 → commit = 10×2.05 + 70 = $90.50 > $90 →
+    reject. Without the buffer the same allocation would read $80 and
+    pass — the rule exists exactly to catch this hidden overhead."""
+    s = _carry_snapshot(
+        carry_products=[_carry_product("TON")],
+        perp_market={"TON": _perp("TON", funding_rate_7d_avg="0.0001")},
+        total_equity_usd="100",
+    )
+    d = Decision(
+        thesis="carry + stable mix overflows once margin is added",
+        venues=[
+            _venue("cash_usdc", 0.20),
+            _venue("bybit_flex", 0.70, [("1131", 1.0)]),
+            _venue("bybit_funding_carry", 0.10, [("TONUSDT", 1.0)]),
+        ],
+        hedges=[],
+        confidence=0.7,
+        risk_flags=[],
+        notes=[],
+        expected_blended_apr_pct=8.0,
+    )
+    ok, msg = check_capital_flow_simulation(d, s)
+    assert not ok
+    assert "bybit_funding_carry" in (msg or "")
+
+
+def test_check_capital_flow_carry_within_cap() -> None:
+    """Same carry shape but cash buffer covers the hidden margin: carry
+    0.08 + cash 0.22 + flex 0.70 → commit = 8×2.05 + 70 = $86.40 ≤ $90
+    → passes."""
+    s = _carry_snapshot(
+        carry_products=[_carry_product("TON")],
+        perp_market={"TON": _perp("TON", funding_rate_7d_avg="0.0001")},
+        total_equity_usd="100",
+    )
+    d = Decision(
+        thesis="carry + stable mix sized within book cap",
+        venues=[
+            _venue("cash_usdc", 0.22),
+            _venue("bybit_flex", 0.70, [("1131", 1.0)]),
+            _venue("bybit_funding_carry", 0.08, [("TONUSDT", 1.0)]),
+        ],
+        hedges=[],
+        confidence=0.7,
+        risk_flags=[],
+        notes=[],
+        expected_blended_apr_pct=8.0,
+    )
+    assert check_capital_flow_simulation(d, s) == (True, None)
+
+
+def test_cash_floor_matches_registry() -> None:
+    """`CASH_FLOOR` must mirror `cash_usdc.min_weight` — single source
+    of truth invariant."""
+    from agent.reason.venues import VENUE_REGISTRY
+    assert CASH_FLOOR == float(VENUE_REGISTRY["cash_usdc"].min_weight)
 
 
 # ─── InvalidateAt schema (2026-06-03) ──────────────────────────────────────

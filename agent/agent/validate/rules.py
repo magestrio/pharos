@@ -677,6 +677,13 @@ def _pick_usd_value(
 # without changing outcomes.
 _VALIDATOR_HEDGE_MARGIN_BUFFER = float(HEDGE_MARGIN_BUFFER)
 
+# Cash floor as a fraction of total book — read off the cash_usdc venue's
+# `min_weight` so a registry change propagates here without an edit. The
+# capital-flow simulation treats the floor as the equity slice unavailable
+# for commitment (the redemption / re-allocation buffer the executor uses
+# to absorb withdrawal timing + slippage). Single source of truth: registry.
+CASH_FLOOR = float(VENUE_REGISTRY["cash_usdc"].min_weight)
+
 
 def check_stable_spend_cap(d: Decision, snapshot: Snapshot) -> Check:
     """Reject decisions whose non-stable spend can't be funded by the
@@ -786,6 +793,196 @@ def check_stable_spend_cap(d: Decision, snapshot: Snapshot) -> Check:
     return True, None
 
 
+# ─── Per-product min-stake gate (2026-06-04, `.51`) ────────────────────────
+
+
+def check_min_stake(d: Decision, snapshot: Snapshot) -> Check:
+    """Reject decisions where any pick's USD allocation falls below the
+    product's `min_subscribe_usd` floor.
+
+    Bybit rejects sub-floor subscribes with `retCode=180012` (Purchase
+    share invalid). The executor's diff layer already SKIPs them so the
+    live call doesn't fire — but that quietly drops the pick from the
+    cycle WITHOUT surfacing the violation to Claude. Catching it here
+    puts the rejection in `_validator.errors`, where
+    `_summarize_prior_decision` carries it into the next cycle as
+    "downsize ID below $1.79 floor" instead of producing a silent
+    partial allocation.
+
+    Applies to every venue family where the snapshot category populates
+    `min_subscribe_usd` (FlexibleSaving / OnChain / LiquidityMining /
+    DualAssets / DiscountBuy). For stable coins (USDC/USDT/USD1/...)
+    the snapshot stores the floor 1:1 with USD (Bybit's `minStakeAmount`
+    is denominated in the product's coin); for non-stables it's an
+    under-estimate so this rule reads as "best-effort lower bound" and
+    the executor's diff-level SKIP is the backstop for the under-priced
+    cases.
+    """
+    total_book = float(snapshot.wallet.total_equity_usd)
+    if total_book <= 0:
+        return True, None
+
+    snapshot_idx = _snapshot_index(snapshot)
+    violations: list[str] = []
+
+    for v in d.venues:
+        if v.weight <= 0 or not v.picks:
+            continue
+        meta = VENUE_REGISTRY[v.venue_id]
+        category = meta.snapshot_category
+        if not category:
+            continue
+        cat_idx = snapshot_idx.get(category, {})
+        for p in v.picks:
+            summary = cat_idx.get(p.product_id)
+            if summary is None:
+                continue
+            min_usd = summary.min_subscribe_usd
+            if min_usd is None or min_usd <= 0:
+                continue
+            pick_usd = total_book * float(v.weight) * float(p.weight)
+            if pick_usd + 1e-9 < float(min_usd):
+                violations.append(
+                    f"{v.venue_id}/{p.product_id}({summary.coin})="
+                    f"${pick_usd:.2f}<min ${float(min_usd):.2f}"
+                )
+    if violations:
+        return False, (
+            f"picks below per-product min_subscribe_usd "
+            f"(Bybit retCode=180012 at execute): {', '.join(violations)}"
+        )
+    return True, None
+
+
+# ─── Capital-flow simulation (2026-06-04, `.50`) ───────────────────────────
+
+
+# Venues whose picks commit at face value — no margin layer, no hedged
+# spot leg. LM at leverage=1 is unleveraged; advance-Earn / hold-to-earn
+# / alpha / aave all consume a single coin balance without a paired
+# perp. cash_usdc is the float itself, excluded from commitment.
+_FACE_VALUE_VENUES: frozenset[VenueId] = frozenset({
+    "bybit_lm",
+    "bybit_dual_asset",
+    "bybit_discount_buy",
+    "bybit_smart_leverage",
+    "bybit_double_win",
+    "bybit_hold_to_earn",
+    "bybit_alpha",
+    "aave_v3_usdc",
+})
+
+
+def check_capital_flow_simulation(d: Decision, snapshot: Snapshot) -> Check:
+    """Reject target portfolios whose committed capital overflows book
+    equity once hedge margin is layered on top of Earn stakes.
+
+    Each non-stable Earn pick on `bybit_flex`/`bybit_onchain` (and every
+    `bybit_funding_carry` pick) commits two slices of book:
+      • spot stake — `pick_usd` worth of the underlying coin
+      • perp margin — `pick_usd × HEDGE_MARGIN_BUFFER` of USDT locked
+        in UNIFIED for the paired short
+
+    Only the stake is captured by `sum(venue.weight) ≤ 1`; the margin
+    is invisible to per-venue cap math. So a portfolio like
+    `bybit_onchain=0.65 + bybit_lm=0.25 + cash=0.10` passes every cap
+    individually but commits `0.65×1.05 + 0.25 + 0.10 = 1.03×book` —
+    the live cycle will `retCode=170131` on the perp open.
+
+    Stable Earn picks, LM (leverage=1), advance-Earn, hold-to-earn,
+    alpha, and Aave commit at face value (no separate margin lock).
+    Picks without a `perp_market` entry on the symbol get face value
+    too — `check_hedges_for_non_usd_picks` rejects them upstream, so
+    counting margin here would produce a confusing duplicate error.
+
+    Allowable commitment = `total_equity_usd × (1 - CASH_FLOOR)`. The
+    cash floor is the equity slice the executor reserves as a
+    redemption / re-allocation buffer; commitment must fit in what's
+    left.
+
+    Distinct from `check_stable_spend_cap`: that rule screens the
+    *live* execute step against the actually-liquid USDC+USDT pool.
+    This rule screens the *target state* against total equity, firing
+    even when liquid stables happen to be high (e.g. on the cycle
+    right after a big redeem) — without it the next live cycle walks
+    into the same wall once positions land.
+    """
+    total_book = float(snapshot.wallet.total_equity_usd)
+    if total_book <= 0:
+        return True, None
+
+    allowable = total_book * (1.0 - CASH_FLOOR)
+    perp_market = getattr(snapshot, "perp_market", None) or {}
+    snapshot_idx = _snapshot_index(snapshot)
+
+    committed = 0.0
+    contributors: list[str] = []
+
+    for v in d.venues:
+        if v.weight <= 0 or v.venue_id == "cash_usdc":
+            continue
+        venue_usd = total_book * float(v.weight)
+
+        if v.venue_id in {"bybit_flex", "bybit_onchain"}:
+            category = VENUE_REGISTRY[v.venue_id].snapshot_category
+            cat_idx = snapshot_idx.get(category, {}) if category else {}
+            for p in v.picks:
+                pick_usd = venue_usd * float(p.weight)
+                if pick_usd <= 0:
+                    continue
+                summary = cat_idx.get(p.product_id)
+                coin = (summary.coin.upper() if summary else "")
+                multiplier = 1.0
+                if coin and coin not in _STABLE_COINS:
+                    info = (
+                        perp_market.get(coin)
+                        or perp_market.get(coin.lower())
+                    )
+                    if info is not None:
+                        multiplier = 1.0 + _VALIDATOR_HEDGE_MARGIN_BUFFER
+                slice_usd = pick_usd * multiplier
+                committed += slice_usd
+                contributors.append(
+                    f"{v.venue_id}/{p.product_id}({coin or '?'})"
+                    f"=${slice_usd:.2f}"
+                )
+            continue
+
+        if v.venue_id == CARRY_VENUE_ID:
+            # Carry picks are always non-stable and always paired with
+            # a perp short — every pick contributes stake + margin.
+            for p in v.picks:
+                pick_usd = venue_usd * float(p.weight)
+                if pick_usd <= 0:
+                    continue
+                slice_usd = pick_usd * (1.0 + _VALIDATOR_HEDGE_MARGIN_BUFFER)
+                committed += slice_usd
+                contributors.append(
+                    f"{v.venue_id}/{p.product_id}=${slice_usd:.2f}"
+                )
+            continue
+
+        if v.venue_id in _FACE_VALUE_VENUES:
+            committed += venue_usd
+            contributors.append(f"{v.venue_id}=${venue_usd:.2f}")
+            continue
+
+        # Unknown venue: be conservative and count at face — keeps the
+        # rule safe if a new venue ships without updating this dispatch.
+        committed += venue_usd
+        contributors.append(f"{v.venue_id}=${venue_usd:.2f}")
+
+    if committed > allowable + 1e-9:
+        return False, (
+            f"target capital commitment ${committed:.2f} exceeds "
+            f"book × (1 - cash_floor) = ${allowable:.2f} "
+            f"(book ${total_book:.2f}, cash_floor {CASH_FLOOR:.0%}, "
+            f"hedge buffer {_VALIDATOR_HEDGE_MARGIN_BUFFER:.2f}×) — "
+            f"downsize: {', '.join(contributors)}"
+        )
+    return True, None
+
+
 # ─── Aggregate ─────────────────────────────────────────────────────────────
 
 
@@ -818,6 +1015,8 @@ def validate(decision: Decision, snapshot: Snapshot) -> tuple[bool, list[str]]:
         check_funding_carry_floor,
         check_no_double_carry_hedge,
         check_stable_spend_cap,
+        check_capital_flow_simulation,
+        check_min_stake,
     ]
     errors: list[str] = []
     for check in pure_checks:
