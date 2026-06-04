@@ -30,14 +30,26 @@ from agent.sandbox.snapshot import (
 
 
 @pytest.fixture(autouse=True)
-def _stub_watcher_baseline_update():
+def _stub_watcher_baseline_update(tmp_path: Path):
     """`event-driven-rebalance.3` plumbed an `update_baseline_from_snapshot`
     call inside `run_one_cycle` (writes `state/watcher-baseline.json`).
     Stub it out across this file so existing cycle/loop tests don't
-    pollute the on-disk state."""
-    with patch(
-        "agent.sandbox.loop.update_baseline_from_snapshot",
-        lambda *_a, **_kw: None,
+    pollute the on-disk state.
+
+    Also redirects the safety-net constants (`HALT_FILE`,
+    `EQUITY_HISTORY_FILE`) to `tmp_path` so each test sees a clean
+    halt / drawdown world. Without this, a previous test that creates
+    a halt marker would block subsequent tests, and equity-history
+    rows would leak across tests."""
+    halt_path = tmp_path / "HALT"
+    equity_path = tmp_path / "equity.jsonl"
+    with (
+        patch(
+            "agent.sandbox.loop.update_baseline_from_snapshot",
+            lambda *_a, **_kw: None,
+        ),
+        patch("agent.sandbox.safety.HALT_FILE", halt_path),
+        patch("agent.sandbox.safety.EQUITY_HISTORY_FILE", equity_path),
     ):
         yield
 
@@ -202,6 +214,177 @@ async def test_run_one_cycle_no_actions_when_book_zero(tmp_path: Path) -> None:
 
     assert outcome["result"] == "no_actions"
     assert outcome["actions_planned"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_halts_when_marker_present(tmp_path: Path) -> None:
+    """Operator places `state/HALT` → cycle short-circuits before
+    snapshot. No Bybit API call, no decision, no execute. Outcome's
+    `result="halted"` carries the reason from the file so the cycle
+    log shows WHY we stopped without grepping the log."""
+    from agent.sandbox.safety import halt
+    halt("operator paused for review")
+
+    bybit = AsyncMock()
+    anthropic_client = AsyncMock()
+
+    with patch(
+        "agent.sandbox.loop.collect_snapshot",
+        AsyncMock(),
+    ) as snap_mock:
+        outcome = await run_one_cycle(
+            bybit, anthropic_client, live=True, yes=True, min_confidence=0.6
+        )
+
+    assert outcome["result"] == "halted"
+    assert outcome.get("halt_reason") is not None
+    assert "operator paused" in outcome["halt_reason"]
+    snap_mock.assert_not_called()
+    assert "finished_at" in outcome
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_trips_halt_on_24h_drawdown(tmp_path: Path) -> None:
+    """24h-old equity at $400, current at $300 = 25% drop → exceeds
+    default 10% threshold → cycle creates HALT marker, returns with
+    `halt_trigger="daily_drawdown"`, and does NOT reach decision/execute."""
+    from datetime import timedelta
+    from agent.sandbox.safety import EQUITY_HISTORY_FILE, HALT_FILE, record_equity
+
+    # Seed history with a 25h-old high-water entry.
+    record_equity(
+        Decimal("400"),
+        ts=datetime.now(UTC) - timedelta(hours=25),
+    )
+
+    bybit = AsyncMock()
+    anthropic_client = AsyncMock()
+    snap = _snapshot(total_equity_usd="300")  # 25% drop vs $400 baseline
+
+    with (
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch(
+            "agent.sandbox.loop.write_snapshot",
+            lambda s: tmp_path / "snap.json",
+        ),
+        patch("agent.sandbox.loop.decide", AsyncMock()) as decide_mock,
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        outcome = await run_one_cycle(
+            bybit, anthropic_client, live=False, yes=False, min_confidence=0.6
+        )
+
+    assert outcome["result"] == "halted"
+    assert outcome.get("halt_trigger") == "daily_drawdown"
+    assert "drawdown" in outcome["halt_reason"]
+    # HALT marker on disk so the NEXT cycle also short-circuits.
+    assert HALT_FILE.exists()
+    # decide() was never called — circuit broke before LLM round-trip.
+    decide_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_trips_halt_when_carry_state_write_fails(
+    tmp_path: Path,
+) -> None:
+    """State-coherence guard: if write_carry_state raises after a
+    successful execute, the cycle creates HALT so the operator must
+    manually reconcile before the next run (otherwise a stale state
+    file could lead to a double-position next cycle). We mock around
+    the diff/execute layer here — the carry-state pathway is exercised
+    by injecting a state mutation that triggers the write."""
+    from agent.sandbox.carry_state import CarryPositionRecord, CarryState
+    from agent.sandbox.execute import ActionKind
+    from agent.sandbox.execute import Action, ActionResult
+    from agent.sandbox.safety import HALT_FILE
+
+    bybit = AsyncMock()
+    anthropic_client = AsyncMock()
+    snap = _snapshot()
+    decision = _decision_clean()
+
+    # Fake "successful carry open" result that apply_carry_results_to_state
+    # turns into a non-empty state, so write_carry_state actually runs.
+    carry_action = Action(
+        kind=ActionKind.OPEN_FUNDING_CARRY,
+        category="FundingCarry",
+        product_id="TONUSDT",
+        coin="TON",
+        amount=Decimal("15"),
+        amount_native=Decimal("7.5"),
+        order_link_id="t-001",
+        reason="carry open",
+        extra={"mark_price": "2.0"},
+    )
+    fake_result = ActionResult(
+        action=carry_action,
+        status="ok",
+        response={"legs": {"spot": {}, "perp": {}}},
+        error=None,
+        started_at="2026-06-04T00:00:00+00:00",
+        finished_at="2026-06-04T00:00:01+00:00",
+    )
+
+    fresh_state = CarryState(
+        positions=[
+            CarryPositionRecord(
+                coin="TON",
+                opened_at=datetime.now(UTC),
+                target_pick_usd=Decimal("15"),
+                spot_qty_base=Decimal("7.5"),
+                perp_qty_base=Decimal("7.5"),
+                mark_price_at_open=Decimal("2.0"),
+                spot_order_link_id="t-001_spot",
+                perp_order_link_id="t-001_perp",
+            )
+        ]
+    )
+
+    boom = OSError("disk full")
+    with (
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch(
+            "agent.sandbox.loop.write_snapshot",
+            lambda s: tmp_path / "snap.json",
+        ),
+        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=decision)),
+        patch(
+            "agent.sandbox.loop.write_decision",
+            lambda d, sp, **_kw: tmp_path / "decision.json",
+        ),
+        patch(
+            "agent.sandbox.loop.request_approval", return_value=True
+        ),
+        # Bypass real diff/execute — they're heavy and orthogonal to the
+        # carry-state failure path under test.
+        patch(
+            "agent.sandbox.loop.diff_to_actions",
+            return_value=[carry_action],
+        ),
+        patch(
+            "agent.sandbox.loop.execute_actions",
+            AsyncMock(return_value=[fake_result]),
+        ),
+        patch(
+            "agent.sandbox.loop.apply_carry_results_to_state",
+            return_value=fresh_state,
+        ),
+        # The bug class we're guarding: state write raises after execute.
+        patch("agent.sandbox.loop.write_carry_state", side_effect=boom),
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        outcome = await run_one_cycle(
+            bybit, anthropic_client, live=True, yes=True, min_confidence=0.6
+        )
+
+    # Cycle still completes (execute already happened) but flags the
+    # carry_state_error AND auto-creates HALT so the next cycle stops.
+    assert outcome.get("carry_state_error") is not None
+    assert "disk full" in outcome["carry_state_error"]
+    assert HALT_FILE.exists()
+    body = HALT_FILE.read_text()
+    assert "carry_state write failed" in body
 
 
 @pytest.mark.asyncio

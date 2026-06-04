@@ -66,6 +66,12 @@ from agent.sandbox.execute import (
     execute_actions,
     request_approval,
 )
+from agent.sandbox.safety import (
+    check_daily_drawdown,
+    halt,
+    is_halted,
+    record_equity,
+)
 from agent.sandbox.snapshot import SNAPSHOT_DIR, collect_snapshot, write_snapshot
 from agent.sandbox.store import (
     apply_migrations,
@@ -275,6 +281,19 @@ async def run_one_cycle(
         else "heartbeat"
     )
 
+    # 0. Halt check — operator-controlled kill switch + auto-tripped on
+    # state-coherence failures (carry_state write errors trip this so the
+    # next cycle can't double-position on a stale state file). Checked
+    # BEFORE snapshot to avoid an unnecessary API round-trip when the
+    # agent is already meant to be off.
+    halted, halt_reason = is_halted()
+    if halted:
+        outcome["result"] = "halted"
+        outcome["halt_reason"] = halt_reason
+        outcome["finished_at"] = datetime.now(UTC).isoformat()
+        log.warning("cycle skipped: %s", halt_reason)
+        return outcome
+
     try:
         # 1. Snapshot
         snap = await collect_snapshot(
@@ -285,6 +304,25 @@ async def run_one_cycle(
         snap_path = write_snapshot(snap)
         outcome["snapshot_filename"] = snap_path.name
         outcome["stages"].append("snapshot")
+
+        # 1b. Daily-drawdown circuit breaker — trips the HALT marker
+        # if the wallet has lost more than the configured pct over the
+        # 24h window. Recording AND checking happens here so even
+        # halted runs still extend the history (drawdown can recover
+        # only if data is being collected). On trip we fall through to
+        # the outer halt-after-return path, but explicitly mark the
+        # outcome so the cycle log distinguishes "halted by drawdown"
+        # from "halted by operator".
+        current_equity = snap.wallet.total_equity_usd
+        record_equity(current_equity)
+        drawdown_hit, drawdown_reason = check_daily_drawdown(current_equity)
+        if drawdown_hit and drawdown_reason is not None:
+            halt(drawdown_reason)
+            outcome["result"] = "halted"
+            outcome["halt_reason"] = drawdown_reason
+            outcome["halt_trigger"] = "daily_drawdown"
+            outcome["finished_at"] = datetime.now(UTC).isoformat()
+            return outcome
 
         raw_snapshot = json.loads(snap_path.read_text())
 
@@ -432,8 +470,20 @@ async def run_one_cycle(
                             "carry_state_updated"
                         )
                 except Exception as e:  # noqa: BLE001
+                    # Real Bybit position may now be open while the
+                    # state file is stale — next cycle could re-emit
+                    # OPEN and double-position. Trip the HALT marker
+                    # so the operator MUST manually reconcile before
+                    # the agent runs again.
                     outcome["carry_state_error"] = f"{type(e).__name__}: {e}"
-                    log.warning("carry_state update failed: %s", e)
+                    halt(
+                        f"carry_state write failed after execute "
+                        f"({type(e).__name__}: {e}) — manual "
+                        f"reconciliation required before resume"
+                    )
+                    log.exception(
+                        "carry_state update failed — HALT created"
+                    )
     except Exception as e:  # noqa: BLE001 — outermost guard
         outcome["error"] = f"{type(e).__name__}: {e}"
         outcome["result"] = "error"
