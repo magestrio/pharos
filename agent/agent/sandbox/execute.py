@@ -43,10 +43,15 @@ from dotenv import load_dotenv
 from agent.bybit_oracle.bybit_client import (
     BybitAPIError,
     BybitClient,
+    BybitOrderError,
     EarnPosition,
 )
 from agent.reason.schema import Decision, Pick, VenueAllocation
 from agent.reason.venues import VENUE_REGISTRY
+from agent.sandbox.carry_state import (
+    CarryPositionRecord,
+    CarryState,
+)
 from agent.sandbox.snapshot import SNAPSHOT_DIR, STABLES, PerpInfo, Snapshot
 
 EXECUTIONS_DIR = Path(__file__).parent / "executions"
@@ -144,6 +149,12 @@ class ActionKind(StrEnum):
     SWAP_SPOT = "swap_spot"
     ALPHA_PURCHASE = "alpha_purchase"
     ALPHA_REDEEM = "alpha_redeem"
+    # Funding-carry compound actions (`bybit-strategy-expansion.5`).
+    # OPEN dispatches: set_leverage(1) → spot Buy → paired-notional
+    # check → perp Sell, atomic-pair guard between legs. CLOSE: spot
+    # Sell → perp Buy reduce-only, same guard.
+    OPEN_FUNDING_CARRY = "open_funding_carry"
+    CLOSE_FUNDING_CARRY = "close_funding_carry"
     SKIP_OUT_OF_SCOPE = "skip_out_of_scope"
 
 
@@ -256,6 +267,7 @@ def diff_to_actions(
     decision: Decision,
     snapshot_ts: str,
     total_book_usd: Decimal | None = None,
+    carry_state: CarryState | None = None,
 ) -> list[Action]:
     """Plan the action list. Redeems first (free USD), then subscribes,
     then out-of-scope skips for visibility.
@@ -264,11 +276,20 @@ def diff_to_actions(
     default we read `snapshot.wallet.total_equity_usd`. The validator
     is responsible for vetoing the decision shape — this function
     trusts the decision and just translates it into orders.
+
+    `carry_state` (`bybit-strategy-expansion.5`) lets the caller pass
+    the persistent funding-carry state so the hedge reconciliation
+    knows which existing perp shorts belong to carry (and must not be
+    auto-closed) and so a fresh carry diff can be planned alongside
+    the Earn / hedge / swap layers. None → empty state (no carry
+    positions known; hedge layer behaves as pre-`.5`).
     """
     if total_book_usd is None:
         total_book_usd = snapshot.wallet.total_equity_usd
     if total_book_usd <= 0:
         return []
+    if carry_state is None:
+        carry_state = CarryState()
 
     current = _current_positions_by_pid(
         snapshot.earn_positions, snapshot.perp_market
@@ -553,6 +574,7 @@ def diff_to_actions(
         snapshot_ts,
         idx_offset=len(all_pids),
         total_book_usd=total_book_usd,
+        carry_coins=carry_state.active_coins(),
     )
     # Earn swaps planned FIRST so the hedge-swap sizer can see total
     # USDT demand (perp margin + non-stable Buy demand) and produce a
@@ -802,14 +824,40 @@ def diff_to_actions(
         ),
     )
 
+    # Funding-carry plan (`.5`). Sits in its own offset block past
+    # every preceding action so `orderLinkId`s never collide. Carry
+    # CLOSEs free both spot principal AND perp margin — they slot in
+    # with the close group; carry OPENs consume USDT so they go in
+    # the open group after the Earn-hedge perps (hedges are risk-
+    # critical and must clear first).
+    carry_offset = (
+        len(all_pids)
+        + len(hedge_closes)
+        + len(hedge_opens)
+        + len(hedge_swaps)
+        + len(earn_swaps)
+        + len(orphan_sells)
+        + len(naked_closes)
+    )
+    carry_closes, carry_opens = _funding_carry_diff(
+        snapshot,
+        decision,
+        carry_state,
+        snapshot_ts,
+        idx_offset=carry_offset,
+        total_book_usd=total_book_usd,
+    )
+
     return (
         redeems
+        + carry_closes
         + hedge_closes
         + naked_closes
         + hedge_swaps
         + earn_swaps
         + orphan_sells
         + hedge_opens
+        + carry_opens
         + subscribes
         + skips
     )
@@ -909,22 +957,34 @@ def _hedge_diff_actions(
     *,
     idx_offset: int,
     total_book_usd: Decimal,
+    carry_coins: set[str] | None = None,
 ) -> tuple[list[Action], list[Action]]:
     """Compute `(closes, opens)` for the perp hedge layer. Target hedges
     are auto-derived from non-stable OnChain picks (see
     `_auto_hedge_targets`) — `decision.hedges` is informational only and
-    NOT used for sizing here."""
+    NOT used for sizing here.
+
+    `carry_coins` (`bybit-strategy-expansion.5`) lists coins owned by
+    the funding-carry layer's persistent state — their open perp shorts
+    are NOT Earn-hedges and MUST NOT be reconciled here. None / empty
+    set preserves pre-`.5` behavior (every short is treated as a hedge).
+    """
+    carry_coins = {c.upper() for c in (carry_coins or set())}
     closes: list[Action] = []
     opens: list[Action] = []
 
     # Index current open shorts by base coin. Long positions in the
     # sandbox are not expected — surface as out-of-scope rather than
-    # touching them (the executor is hedge-only).
+    # touching them (the executor is hedge-only). Carry-owned coins
+    # are skipped: their perp shorts will be reconciled by the carry
+    # diff via `_funding_carry_diff`, not here.
     current_by_coin: dict[str, Any] = {}
     for pos in snapshot.perp_positions:
         if not pos.symbol.endswith("USDT"):
             continue
         coin = _coin_from_perp_symbol(pos.symbol)
+        if coin.upper() in carry_coins:
+            continue
         if pos.side != "Sell":
             # Long perp — not something the hedge layer produced. Skip
             # in plan; operator can deal with it manually.
@@ -1774,6 +1834,230 @@ def _offer_expired(expired_raw: Any, now_ms: int) -> bool:
 
 
 _OFFER_PREFIX = " offer="
+
+
+# ─── Funding-carry diff (`bybit-strategy-expansion.5`) ─────────────────────
+
+
+# Carry-side constant: how tight the paired spot/perp legs must match in
+# USD at dispatch time. The diff sizes both legs to the same base-qty
+# so they're equal by construction; the check in `_execute_one` guards
+# against a planning-time bug or qty-step rounding that produced an
+# uneven pair (which would leave residual directional exposure).
+_CARRY_PAIRED_NOTIONAL_TOLERANCE = Decimal("0.05")
+
+# Maximum CLOSE_FUNDING_CARRY retry attempts before the diff layer
+# stops emitting on a stuck position. Each failed CLOSE leaves spot
+# unwound and perp open (or vice versa) — auto-retry every cycle is
+# the right behavior for transient failures (margin lag, network
+# blip), but a perp leg that fails the same way 3+ cycles in a row
+# almost always needs operator attention (persistent margin shortfall,
+# symbol delisted, account flag). Counter lives on the state record;
+# reset to 0 on the next successful CLOSE (which deletes the record).
+MAX_CARRY_CLOSE_ATTEMPTS = 3
+
+
+def _funding_carry_targets(
+    decision: Decision,
+    snapshot: Snapshot,
+    total_book_usd: Decimal,
+) -> dict[str, Decimal]:
+    """Derive `{coin: target_pick_usd}` from `bybit_funding_carry` picks.
+    Mirrors `_auto_hedge_targets` but reads the FundingCarry category
+    instead of OnChain/Flex. Empty when the venue isn't picked or has
+    no picks; coin keys are uppercase per executor convention.
+    """
+    venue = decision.venue("bybit_funding_carry")  # type: ignore[arg-type]
+    if venue is None or venue.weight <= 0 or not venue.picks:
+        return {}
+    carry_products = {
+        p.product_id: p
+        for p in snapshot.products.get("FundingCarry", [])
+    }
+    targets: dict[str, Decimal] = {}
+    for pick in venue.picks:
+        summary = carry_products.get(pick.product_id)
+        if summary is None:
+            continue
+        coin = summary.coin.upper()
+        if not coin:
+            continue
+        pick_usd = total_book_usd * Decimal(str(venue.weight)) * Decimal(str(pick.weight))
+        if pick_usd <= 0:
+            continue
+        targets[coin] = targets.get(coin, Decimal(0)) + pick_usd
+    return targets
+
+
+def apply_carry_results_to_state(
+    state: CarryState, results: list[ActionResult]
+) -> CarryState:
+    """Roll a fresh `CarryState` forward by walking dispatch results.
+
+    Successful `OPEN_FUNDING_CARRY` (status="ok") → insert a position
+    record sized from the planned action. Successful
+    `CLOSE_FUNDING_CARRY` → drop the matching coin's record.
+    OPEN orphans leave naked spot (no record to write — the orphan log
+    captures it for operator reconciliation). CLOSE orphans KEEP the
+    record (partial unwind, next cycle's CLOSE retries) AND bump the
+    `close_attempts` counter so `_funding_carry_diff` can stop emitting
+    after `MAX_CARRY_CLOSE_ATTEMPTS` cycles — protects against
+    unbounded retry when the perp leg fails identically every cycle.
+
+    Dry-run / skip / error results don't move state.
+    """
+    next_state = state
+    for r in results:
+        a = r.action
+        if a.kind == ActionKind.OPEN_FUNDING_CARRY and r.status == "ok":
+            if a.amount_native is None or a.amount_native <= 0:
+                continue
+            try:
+                mark = Decimal(str(a.extra.get("mark_price") or "0"))
+            except (InvalidOperation, TypeError):
+                mark = Decimal(0)
+            next_state = next_state.upsert(
+                CarryPositionRecord(
+                    coin=a.coin.upper(),
+                    opened_at=datetime.now(UTC),
+                    target_pick_usd=a.amount,
+                    spot_qty_base=a.amount_native,
+                    perp_qty_base=a.amount_native,
+                    mark_price_at_open=mark,
+                    spot_order_link_id=(
+                        a.extra.get("spot_order_link_id")
+                        or f"{a.order_link_id}_spot"
+                    ),
+                    perp_order_link_id=(
+                        a.extra.get("perp_order_link_id")
+                        or f"{a.order_link_id}_perp"
+                    ),
+                )
+            )
+        elif a.kind == ActionKind.CLOSE_FUNDING_CARRY and r.status == "ok":
+            next_state = next_state.remove(a.coin)
+        elif a.kind == ActionKind.CLOSE_FUNDING_CARRY and r.status == "orphan":
+            existing = next_state.get(a.coin)
+            if existing is not None:
+                bumped = existing.model_copy(
+                    update={"close_attempts": existing.close_attempts + 1}
+                )
+                next_state = next_state.upsert(bumped)
+    return next_state
+
+
+def _funding_carry_diff(
+    snapshot: Snapshot,
+    decision: Decision,
+    carry_state: CarryState,
+    snapshot_ts: str,
+    *,
+    idx_offset: int,
+    total_book_usd: Decimal,
+) -> tuple[list[Action], list[Action]]:
+    """Produce `(closes, opens)` carry actions.
+
+    Branches per coin in (targets ∪ carry_state):
+      - target only AND target ≥ MIN_ACTION_USDC → OPEN_FUNDING_CARRY
+      - state only (target=0 or coin dropped from picks) → CLOSE_FUNDING_CARRY
+      - both → no-op (MVP holds existing position; ADJUST deferred)
+
+    Sizing for OPEN: `pick_usd / mark_price` → rounded down to
+    `qty_step` → both legs use the same base-qty so they're
+    delta-neutral by construction. Coins lacking perp_market data are
+    skipped (caller has already validated this via
+    `check_funding_carry_floor`, but this is defensive).
+
+    `idx_offset` slots `orderLinkId`s after the pre-existing planning
+    blocks so collisions with REDEEM/SUBSCRIBE/hedge IDs are
+    impossible.
+    """
+    targets = _funding_carry_targets(decision, snapshot, total_book_usd)
+    state_by_coin = {p.coin.upper(): p for p in carry_state.positions}
+    perp_market = getattr(snapshot, "perp_market", None) or {}
+
+    coins = sorted(set(targets.keys()) | set(state_by_coin.keys()))
+    opens: list[Action] = []
+    closes: list[Action] = []
+
+    for offset, coin in enumerate(coins):
+        order_link_id = _order_link_id(snapshot_ts, idx_offset + offset)
+        target = targets.get(coin, Decimal(0))
+        existing = state_by_coin.get(coin)
+
+        if target >= MIN_ACTION_USDC and existing is None:
+            info = perp_market.get(coin) or perp_market.get(coin.lower())
+            if info is None or info.mark_price is None or info.mark_price <= 0:
+                continue
+            raw_qty = target / info.mark_price
+            qty = _round_to_qty_step(
+                raw_qty, info.qty_step, info.min_order_qty
+            )
+            if qty is None or qty <= 0:
+                continue
+            opens.append(
+                Action(
+                    kind=ActionKind.OPEN_FUNDING_CARRY,
+                    category="FundingCarry",
+                    product_id=info.symbol,
+                    coin=coin,
+                    amount=target,
+                    amount_native=qty,
+                    order_link_id=order_link_id,
+                    reason=(
+                        f"open funding-carry {coin}: pick_usd=${target:.2f} "
+                        f"@ mark={info.mark_price} → qty={qty}"
+                    ),
+                    extra={
+                        "mark_price": str(info.mark_price),
+                        "spot_order_link_id": f"{order_link_id}_spot",
+                        "perp_order_link_id": f"{order_link_id}_perp",
+                    },
+                )
+            )
+            continue
+
+        if existing is not None and target < MIN_ACTION_USDC:
+            if existing.close_attempts >= MAX_CARRY_CLOSE_ATTEMPTS:
+                # Persistent CLOSE failure (typically perp leg failing
+                # on margin / symbol issue) — stop auto-retry, surface
+                # for operator action. The state record stays so the
+                # operator can inspect it; once they unwind manually
+                # they can `read_carry_state` → bump counter back to 0
+                # or remove the record.
+                log.warning(
+                    "carry CLOSE skipped for %s: close_attempts=%d "
+                    "exceeded MAX_CARRY_CLOSE_ATTEMPTS=%d — needs "
+                    "operator review (state file holds the position)",
+                    coin, existing.close_attempts, MAX_CARRY_CLOSE_ATTEMPTS,
+                )
+                continue
+            symbol = f"{coin}USDT"
+            closes.append(
+                Action(
+                    kind=ActionKind.CLOSE_FUNDING_CARRY,
+                    category="FundingCarry",
+                    product_id=symbol,
+                    coin=coin,
+                    amount=existing.target_pick_usd,
+                    amount_native=existing.spot_qty_base,
+                    order_link_id=order_link_id,
+                    reason=(
+                        f"close funding-carry {coin}: LLM dropped pick, "
+                        f"close spot qty={existing.spot_qty_base} + perp "
+                        f"qty={existing.perp_qty_base}"
+                    ),
+                    extra={
+                        "spot_order_link_id": f"{order_link_id}_spot",
+                        "perp_order_link_id": f"{order_link_id}_perp",
+                    },
+                )
+            )
+            continue
+        # Both → MVP holds, no-op. ADJUST (resize up/down) lands in a
+        # follow-up subtask.
+
+    return closes, opens
 
 
 def _round_to_qty_step(
@@ -3066,6 +3350,262 @@ async def _execute_one(
                     response["stop_loss_error"] = (
                         f"retCode={e.ret_code} {e.ret_msg}"
                     )
+        elif action.kind == ActionKind.OPEN_FUNDING_CARRY:
+            # Compound dispatch (`bybit-strategy-expansion.5`): spot Buy
+            # + perp Sell as ONE atomic intent. Sequence:
+            #   1. set_leverage(1) on the perp symbol — idempotent
+            #   2. spot Buy {coin}USDT, qty = USDT quote amount
+            #   3. paired-notional check (tolerance ±5%): spot fill
+            #      USD ≈ planned perp notional USD
+            #   4. perp Sell, qty = base coin (= spot qty)
+            # Atomic-pair guard: if step 2 fails, step 4 is skipped
+            # (no naked short). If step 4 fails AFTER step 2 succeeded,
+            # we have a naked spot long — surface as orphan + record
+            # in response so the next cycle's close branch can wind it
+            # down. Don't raise — the cycle log captures everything.
+            spot_link = action.extra.get("spot_order_link_id") or (
+                f"{action.order_link_id}_spot"
+            )
+            perp_link = action.extra.get("perp_order_link_id") or (
+                f"{action.order_link_id}_perp"
+            )
+            response = {"legs": {}}
+            await client.set_leverage(action.product_id, 1)
+            # Spot Buy uses QUOTE amount (USDT) on V5 market orders —
+            # action.amount is the USD-equivalent target.
+            spot_qty_quote = str(action.amount)
+            spot_out = await client.place_spot_order(
+                symbol=action.product_id,
+                side="Buy",
+                qty=spot_qty_quote,
+                order_link_id=spot_link,
+            )
+            response["legs"]["spot"] = {
+                "orderId": spot_out.orderId,
+                "side": "Buy",
+                "qty_quote_usdt": spot_qty_quote,
+            }
+            # Resolve the ACTUAL spot fill — base qty and quote value
+            # come from Bybit's exec record, not the planner's estimate.
+            # Sizing the perp leg from `action.amount_native` (planned)
+            # leaves a delta gap whenever the market fills the spot at
+            # a different price than the snapshot's mark. Fix
+            # 2026-06-04: short-poll the spot order until Filled, then
+            # size perp from the real cumExecQty. If the fill can't be
+            # confirmed within the window, do NOT open the perp —
+            # orphan + surface so the next cycle reconciles. Without
+            # this guard the executor would open a sized-from-plan
+            # short on top of an indeterminate spot leg.
+            actual_qty: Decimal | None = None
+            actual_value: Decimal | None = None
+            poll_error: str | None = None
+            _TERMINAL_BAD = {
+                "Cancelled",
+                "Rejected",
+                "Deactivated",
+                "PartiallyFilledCanceled",
+            }
+            deadline = asyncio.get_event_loop().time() + 10.0
+            while asyncio.get_event_loop().time() < deadline:
+                try:
+                    status = await client.get_spot_order_status(spot_out.orderId)
+                except BybitOrderError as e:
+                    poll_error = f"realtime lookup failed: {e}"
+                    break
+                if status.orderStatus == "Filled":
+                    try:
+                        actual_qty = Decimal(status.cumExecQty)
+                        actual_value = Decimal(status.cumExecValue or "0")
+                    except (InvalidOperation, TypeError) as e:
+                        poll_error = f"bad fill numerics: {e}"
+                    break
+                if status.orderStatus in _TERMINAL_BAD:
+                    poll_error = (
+                        f"terminal {status.orderStatus} "
+                        f"(reject={status.rejectReason})"
+                    )
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                poll_error = "fill not confirmed within poll window"
+
+            if actual_qty is None or actual_qty <= 0:
+                response["legs"]["spot"]["fill_check"] = poll_error or "unfilled"
+                response["legs"]["perp"] = {
+                    "skipped": (
+                        f"spot fill not confirmed ({poll_error}); "
+                        f"perp leg not opened — naked spot risk if order "
+                        f"settles later, next-cycle CLOSE reconciles"
+                    )
+                }
+                return ActionResult(
+                    action=action,
+                    status="orphan",
+                    response=response,
+                    error="spot fill verification failed",
+                    started_at=started,
+                    finished_at=datetime.now(UTC).isoformat(),
+                )
+
+            response["legs"]["spot"]["cumExecQty"] = str(actual_qty)
+            if actual_value is not None and actual_value > 0:
+                response["legs"]["spot"]["cumExecValue"] = str(actual_value)
+
+            # Drift check now compares ACTUAL spot fill USD vs perp
+            # notional sized from ACTUAL base qty — catches anomalous
+            # slippage between mark_price (used to size the plan) and
+            # the realized fill price. With both legs sized from the
+            # same base qty the drift is purely the (mark vs fill)
+            # spread.
+            base_qty = actual_qty
+            try:
+                mark = Decimal(str(action.extra.get("mark_price") or "0"))
+            except (InvalidOperation, TypeError):
+                mark = Decimal(0)
+            if mark > 0:
+                perp_notional_usd = base_qty * mark
+                spot_notional_usd = (
+                    actual_value if actual_value is not None and actual_value > 0
+                    else action.amount
+                )
+                drift = (
+                    abs(perp_notional_usd - spot_notional_usd)
+                    / spot_notional_usd
+                    if spot_notional_usd > 0
+                    else Decimal(0)
+                )
+                if drift > _CARRY_PAIRED_NOTIONAL_TOLERANCE:
+                    # Orphan: spot already filled, perp uneven —
+                    # don't open a mis-sized short. Record + surface.
+                    response["legs"]["perp"] = {
+                        "skipped": (
+                            f"paired-notional drift {drift:.2%} > "
+                            f"{_CARRY_PAIRED_NOTIONAL_TOLERANCE:.0%} tolerance "
+                            f"(spot ${spot_notional_usd:.2f} vs "
+                            f"perp ${perp_notional_usd:.2f}); "
+                            f"naked spot long left — next-cycle CLOSE will reconcile"
+                        )
+                    }
+                    return ActionResult(
+                        action=action,
+                        status="orphan",
+                        response=response,
+                        error="paired-notional check failed after spot fill",
+                        started_at=started,
+                        finished_at=datetime.now(UTC).isoformat(),
+                    )
+            try:
+                perp_out = await client.place_perp_order(
+                    symbol=action.product_id,
+                    side="Sell",
+                    qty=str(base_qty),
+                    order_link_id=perp_link,
+                )
+                response["legs"]["perp"] = {
+                    "orderId": perp_out.orderId,
+                    "side": "Sell",
+                    "qty_base": str(base_qty),
+                }
+            except BybitAPIError as e:
+                # Spot already filled, perp leg failed → naked
+                # spot long. Return orphan + error so the cycle
+                # log carries the gap and the next cycle's diff
+                # CLOSE branch can wind it down (state file won't
+                # have a record since we never reached the success
+                # path — operator manually injects a state row
+                # OR uses the spot balance + missing-record path
+                # via the hedge layer fallback).
+                response["legs"]["perp"] = {
+                    "error": f"retCode={e.ret_code} {e.ret_msg}",
+                    "skipped": "naked spot long left after perp leg failure",
+                }
+                return ActionResult(
+                    action=action,
+                    status="orphan",
+                    response=response,
+                    error=(
+                        f"perp leg failed after spot fill: "
+                        f"retCode={e.ret_code} {e.ret_msg}"
+                    ),
+                    started_at=started,
+                    finished_at=datetime.now(UTC).isoformat(),
+                )
+        elif action.kind == ActionKind.CLOSE_FUNDING_CARRY:
+            # Mirror of OPEN: spot Sell + perp Buy(reduceOnly). Atomic-
+            # pair guard same shape — spot fail means perp skipped, no
+            # naked short. perp fail after spot succeeded leaves naked
+            # spot USDT (loose USDT principal back in the wallet on
+            # spot Sell — far less risky than a naked short, so we just
+            # surface as orphan and let the operator reconcile).
+            spot_link = action.extra.get("spot_order_link_id") or (
+                f"{action.order_link_id}_spot"
+            )
+            perp_link = action.extra.get("perp_order_link_id") or (
+                f"{action.order_link_id}_perp"
+            )
+            base_qty = action.amount_native
+            response = {"legs": {}}
+            if base_qty is None or base_qty <= 0:
+                # Defensive: state-derived qty must be present. Without
+                # it we can't close cleanly — skip both legs, surface
+                # for operator.
+                return ActionResult(
+                    action=action,
+                    status="error",
+                    response=None,
+                    error="amount_native missing on CLOSE_FUNDING_CARRY",
+                    started_at=started,
+                    finished_at=datetime.now(UTC).isoformat(),
+                )
+            spot_out = await client.place_spot_order(
+                symbol=action.product_id,
+                side="Sell",
+                qty=str(base_qty),
+                order_link_id=spot_link,
+            )
+            response["legs"]["spot"] = {
+                "orderId": spot_out.orderId,
+                "side": "Sell",
+                "qty_base": str(base_qty),
+            }
+            try:
+                perp_out = await client.place_perp_order(
+                    symbol=action.product_id,
+                    side="Buy",
+                    qty=str(base_qty),
+                    reduce_only=True,
+                    order_link_id=perp_link,
+                )
+                response["legs"]["perp"] = {
+                    "orderId": perp_out.orderId,
+                    "side": "Buy",
+                    "qty_base": str(base_qty),
+                    "reduce_only": True,
+                }
+            except BybitAPIError as e:
+                # Spot Sell already filled (we have USDT back); perp
+                # short still open. Less catastrophic than the OPEN
+                # orphan case (no naked direction beyond the unwound
+                # short), but state needs reconciliation: the carry
+                # record persists (next cycle will retry CLOSE) and
+                # the orphan perp short surfaces in the next snapshot's
+                # `perp_positions` for the hedge layer (which excludes
+                # carry coins, so it won't auto-close it).
+                response["legs"]["perp"] = {
+                    "error": f"retCode={e.ret_code} {e.ret_msg}",
+                    "skipped": "naked perp short left after spot sell",
+                }
+                return ActionResult(
+                    action=action,
+                    status="orphan",
+                    response=response,
+                    error=(
+                        f"perp leg failed after spot fill: "
+                        f"retCode={e.ret_code} {e.ret_msg}"
+                    ),
+                    started_at=started,
+                    finished_at=datetime.now(UTC).isoformat(),
+                )
         elif action.kind == ActionKind.CLOSE_PERP:
             # Buy-to-close the short. `reduce_only=True` so we can't
             # accidentally flip into a long if the size we computed is
@@ -3382,6 +3922,34 @@ def _dry_run_payload(action: Action) -> dict[str, Any]:
             "symbol": action.product_id,
             "qty": str(action.amount),
             "order_link_id": action.order_link_id,
+        }
+    if action.kind == ActionKind.OPEN_FUNDING_CARRY:
+        return {
+            "would_call": "open_funding_carry",
+            "symbol": action.product_id,
+            "coin": action.coin,
+            "spot_qty_quote_usdt": str(action.amount),
+            "perp_qty_base": str(action.amount_native) if action.amount_native else None,
+            "mark_price": action.extra.get("mark_price"),
+            "spot_order_link_id": action.extra.get(
+                "spot_order_link_id"
+            ) or f"{action.order_link_id}_spot",
+            "perp_order_link_id": action.extra.get(
+                "perp_order_link_id"
+            ) or f"{action.order_link_id}_perp",
+        }
+    if action.kind == ActionKind.CLOSE_FUNDING_CARRY:
+        return {
+            "would_call": "close_funding_carry",
+            "symbol": action.product_id,
+            "coin": action.coin,
+            "qty_base": str(action.amount_native) if action.amount_native else None,
+            "spot_order_link_id": action.extra.get(
+                "spot_order_link_id"
+            ) or f"{action.order_link_id}_spot",
+            "perp_order_link_id": action.extra.get(
+                "perp_order_link_id"
+            ) or f"{action.order_link_id}_perp",
         }
     if action.kind == ActionKind.SUBSCRIBE_LM:
         return {

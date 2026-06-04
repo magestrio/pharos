@@ -65,6 +65,57 @@ ADVANCE_QUOTE_TOP_K = 10
 # any non-stable Earn pick without a perp_market entry, so silent
 # under-fetch turns into a hard skipped-cycle.
 PERP_HEDGE_TOP_K = 16
+# Funding-carry venue (`bybit-strategy-expansion.2`). Number of carry
+# candidates surfaced in `products["FundingCarry"]` after the friction-
+# adjusted ranking. Pre-fan-out we filter the all-linear-tickers feed
+# down to `FUNDING_CARRY_PRESELECT_K` using single-period `fundingRate`
+# (cheap proxy), then `_fetch_perp_info` resolves the 7d avg for those
+# coins; the final list ranks by friction-adjusted `effective_apr` and
+# is capped at `FUNDING_CARRY_TOP_K`.
+FUNDING_CARRY_TOP_K = 10
+FUNDING_CARRY_PRESELECT_K = 20
+# Default funding-interval assumption when Bybit doesn't echo
+# `fundingIntervalHour` for a symbol. 8h covers the majority of mature
+# perps; 4h is the other common case (memecoins / new listings).
+# Defaulting to 8h is the conservative choice for annualization — it
+# UNDER-states APR by ~2× when the real interval is 4h, which sinks
+# rank rather than over-promising yield. Callers must surface the
+# fallback in errors so operator can spot symbols missing the field.
+DEFAULT_FUNDING_INTERVAL_HOURS = Decimal("8")
+# Total hours per year. Used in `funding_per_period × (HOURS_PER_YEAR /
+# interval_hours)` annualization; equals `(24/interval) × 365` rewritten
+# to avoid the float fraction.
+HOURS_PER_YEAR = Decimal("8760")
+# Minimum 7-day-avg funding ANNUALIZED (signed Decimal) for a carry
+# pick to survive validator + ranker. Compares against the **annualized**
+# rate to stay correct across 4h/8h/1h funding intervals — comparing
+# per-period rates would over-reject 4h coins whose per-period rate is
+# naturally ~½ of an 8h coin at the same annualized yield. 0.05475 =
+# 0.00005/8h × 1095 (3×365) — preserves the original "+5.5% gross
+# annualized" intent the spec was written around. Hedge case uses a
+# looser floor (`agent.validate.rules.FUNDING_FLOOR_HEDGE_ANNUAL`,
+# −0.1095 = −11%/year) because Earn APR there absorbs slightly-negative
+# funding; carry has no such cushion.
+FUNDING_FLOOR_CARRY_ANNUAL = Decimal("0.05475")
+# Minimum perp orderbook depth within ±50 bps of mark, USD. Below this
+# a carry-sized open/close would cross more than ~3 bps slippage and
+# eat the funding subsidy fast. $50k is the soft cutoff for "we can
+# round-trip a small-vault carry pick without market impact"; can scale
+# down once sizing model accounts for ordersize/depth more granularly.
+MIN_CARRY_DEPTH_USD = Decimal("50000")
+# Cap on the per-pick USD notional as a fraction of total book — both
+# protects the carry stack from concentration (one position blowing up
+# liquidation through min_notional) AND ensures the venue cap (`.3`)
+# can support the pick by sizing. The `(pick_usd ≤ X% × book)` rule is
+# also what lets us pre-reject coins whose `min_notional_usd` exceeds
+# this fraction (instrument so chunky we'd violate the venue cap just
+# clearing min).
+MAX_CARRY_NOTIONAL_FRACTION = Decimal("0.05")
+# Annualized friction estimate for carry round-trip: swap entry+exit
+# (taker ~10bps × 2) + perp open+close (~5bps × 2) + 1-2 entries per
+# month average ≈ 1.8% drag. Conservative placeholder; recalibrate in
+# `.6` smoke from realized P&L vs predicted carry.
+FUNDING_CARRY_FRICTION_ANNUAL = Decimal("0.018")
 _EARN_PERMISSION_RET_CODE = 10005
 
 # Stables-set used to guarantee USDC-equivalent picks always survive the
@@ -209,14 +260,28 @@ class PerpInfo(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     symbol: str  # e.g. "TONUSDT"
-    funding_rate_8h: Decimal | None = None  # signed; +0.0001 = +1 bps per 8h
-    # 7-day average funding rate (21 periods × 8h), signed. Smoother than
-    # `funding_rate_8h` for sizing decisions — single-period noise can
-    # flip sign while the regime is unchanged. Validator uses this for
-    # the "negative funding → exit pick" gate; prompt uses it for the
-    # funding-adjusted effective APR formula. None = endpoint failed or
-    # not enough history for the symbol (newly listed perp).
+    # Current per-period funding rate (signed). The "period" is
+    # `funding_interval_hours` — typically 8 but 4 is common (memecoins,
+    # high-vol perps), and some symbols ship 1h. The field name keeps
+    # `_8h` for backwards compat with existing readers (snapshots on
+    # disk, backtest fixtures); annualization MUST use the interval
+    # field below, NOT a hardcoded × 3 × 365.
+    funding_rate_8h: Decimal | None = None
+    # 7-day average funding rate (21 periods × interval_hours), signed.
+    # Smoother than `funding_rate_8h` for sizing decisions — single-
+    # period noise can flip sign while the regime is unchanged.
+    # Validator uses the annualized form of this for the "negative
+    # funding → exit pick" gate; prompt's effective-APR formula reads
+    # it through `_annual_funding` so 4h and 8h coins compare like for
+    # like. None = endpoint failed or not enough history for the symbol
+    # (newly listed perp).
     funding_rate_7d_avg: Decimal | None = None
+    # Funding-cadence period in whole hours. None = Bybit didn't echo
+    # the field; readers default to `DEFAULT_FUNDING_INTERVAL_HOURS`
+    # (8h). Added 2026-06-03 (`bybit-strategy-expansion.2/.4` fix) —
+    # prior code annualized via `× 3 × 365` everywhere, under-stating
+    # APR ~2× on 4h funding pairs.
+    funding_interval_hours: Decimal | None = None
     mark_price: Decimal | None = None
     # USD volume within ±50 bps of mark across both sides of the book.
     # Bigger → easier to enter/exit a hedge of intended size without slip.
@@ -1119,6 +1184,40 @@ def _all_coins_in_unified(accounts: list[dict[str, Any]]) -> dict[str, Decimal]:
     return out
 
 
+def _annual_funding(
+    per_period: Decimal | None, interval_hours: Decimal | None
+) -> Decimal | None:
+    """Annualize a per-period funding rate using its cadence interval.
+
+    `annual = per_period × (24/interval_hours) × 365 = per_period
+    × HOURS_PER_YEAR / interval_hours`. When `interval_hours` is None
+    (Bybit didn't echo `fundingIntervalHour` for the symbol), falls
+    back to `DEFAULT_FUNDING_INTERVAL_HOURS` (8h) — same behavior the
+    pre-2026-06-03 code had everywhere, made explicit.
+
+    Returns `None` when `per_period` is None or `interval_hours <= 0`.
+    """
+    if per_period is None:
+        return None
+    interval = interval_hours if interval_hours is not None else DEFAULT_FUNDING_INTERVAL_HOURS
+    if interval <= 0:
+        return None
+    return per_period * HOURS_PER_YEAR / interval
+
+
+def _parse_funding_interval(raw: str | None) -> Decimal | None:
+    """Bybit's `fundingIntervalHour` is documented as integer-string
+    (whole hours only — "8", "4", "1"). Returns Decimal or None on
+    missing/malformed so the caller can route through the default."""
+    if not raw:
+        return None
+    try:
+        value = Decimal(str(raw))
+    except (InvalidOperation, TypeError):
+        return None
+    return value if value > 0 else None
+
+
 async def _fetch_perp_info(
     client: BybitClient, coin: str, errors: list[str]
 ) -> tuple[str, PerpInfo | None]:
@@ -1203,10 +1302,18 @@ async def _fetch_perp_info(
     if min_qty is not None and mark is not None:
         min_notional = min_qty * mark
 
+    interval = _parse_funding_interval(ticker.fundingIntervalHour)
+    if interval is None:
+        errors.append(
+            f"perp_market[{coin}]: fundingIntervalHour missing — "
+            f"defaulting annualization to {DEFAULT_FUNDING_INTERVAL_HOURS}h"
+        )
+
     return coin, PerpInfo(
         symbol=symbol,
         funding_rate_8h=funding,
         funding_rate_7d_avg=funding_7d_avg,
+        funding_interval_hours=interval,
         mark_price=mark,
         orderbook_depth_50bps_usd=depth_usd,
         min_order_qty=min_qty,
@@ -1214,6 +1321,126 @@ async def _fetch_perp_info(
         qty_step=qty_step_d,
         max_leverage=max_lev,
     )
+
+
+def _select_carry_candidate_coins(
+    all_linear_tickers: list[LinearTicker],
+    exclude_coins: set[str],
+    cap: int,
+) -> list[str]:
+    """Pre-filter the full linear-perp ticker feed down to top-K carry
+    candidates by **annualized** single-period `fundingRate` (cheap
+    proxy for 7d avg before fan-out). Coins already in `exclude_coins`
+    (hedge candidates, held perps) are skipped — they'll get their
+    PerpInfo from the same fan-out anyway.
+
+    Annualization reads `fundingIntervalHour` per ticker (Bybit echoes
+    "4" / "8" / etc.); missing interval defaults to
+    `DEFAULT_FUNDING_INTERVAL_HOURS` (8h). Without this normalization,
+    a 4h coin at +0.0001/period (≈ +21.9% annualized) would rank below
+    an 8h coin at +0.00015/period (≈ +16.4% annualized) — wrong order.
+
+    Restrictions:
+    - USDT-quoted only (`symbol.endswith("USDT")`). Inverse + USDC perps
+      are different sizing models — out of scope for `.2`.
+    - Base coin NOT in `STABLES` (carry on USDT/USDC funding is a
+      different strategy class — defer).
+    - Annualized funding > `FUNDING_FLOOR_CARRY_ANNUAL` (positive carry
+      after friction floor). Coarse filter — accurate 7d avg comes
+      after `_fetch_perp_info`.
+
+    Ranked by annualized funding desc; the LLM eventually sees only
+    top-K of the 7d-avg-ranked list in `_build_funding_carry_products`.
+    """
+    candidates: list[tuple[Decimal, str]] = []
+    for t in all_linear_tickers:
+        if not t.symbol.endswith("USDT"):
+            continue
+        coin = t.symbol.removesuffix("USDT").upper()
+        if not coin or coin in STABLES or coin in exclude_coins:
+            continue
+        if not t.fundingRate:
+            continue
+        try:
+            rate = Decimal(t.fundingRate)
+        except (InvalidOperation, TypeError):
+            continue
+        interval = _parse_funding_interval(t.fundingIntervalHour)
+        annual = _annual_funding(rate, interval)
+        if annual is None or annual <= FUNDING_FLOOR_CARRY_ANNUAL:
+            continue
+        candidates.append((annual, coin))
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return [coin for _, coin in candidates[:cap]]
+
+
+def _build_funding_carry_products(
+    perp_market: dict[str, "PerpInfo"],
+    total_equity_usd: Decimal,
+) -> list[ProductSummary]:
+    """Build `products["FundingCarry"]` from the resolved `perp_market`.
+
+    Filters each coin against:
+    - coin NOT in `STABLES`
+    - `annualized(funding_rate_7d_avg, interval) ≥ FUNDING_FLOOR_CARRY_ANNUAL`
+      (7d avg, NOT single-period — noise can flip sign even when
+      regime is intact). Annualization respects each coin's
+      `funding_interval_hours` so 4h and 8h pairs compare like-for-like.
+    - `orderbook_depth_50bps_usd ≥ MIN_CARRY_DEPTH_USD` (can round-trip
+      a carry-sized open/close without burning the funding edge)
+    - `min_notional_usd ≤ total_equity × MAX_CARRY_NOTIONAL_FRACTION`
+      (we can clear the perp's min on a per-pick basis at the venue cap)
+
+    For each surviving coin computes
+    `effective_apr = annualized_funding − FUNDING_CARRY_FRICTION_ANNUAL`,
+    ranks desc, returns top-K. The interval is also surfaced in `notes`
+    so the LLM (and any downstream auditor) can spot 4h pairs without
+    re-reading `perp_market`.
+
+    `product_id` is the canonical USDT-perp symbol — the venue's `.3`
+    registry treats this as the pickable id.
+    """
+    if total_equity_usd <= 0:
+        return []
+    max_pick_usd = total_equity_usd * MAX_CARRY_NOTIONAL_FRACTION
+    rows: list[ProductSummary] = []
+    for coin, info in perp_market.items():
+        if coin in STABLES:
+            continue
+        if info.funding_rate_7d_avg is None:
+            continue
+        interval = info.funding_interval_hours or DEFAULT_FUNDING_INTERVAL_HOURS
+        gross_annual = _annual_funding(info.funding_rate_7d_avg, interval)
+        if gross_annual is None or gross_annual < FUNDING_FLOOR_CARRY_ANNUAL:
+            continue
+        depth = info.orderbook_depth_50bps_usd
+        if depth is None or depth < MIN_CARRY_DEPTH_USD:
+            continue
+        min_not = info.min_notional_usd
+        if min_not is None or min_not > max_pick_usd:
+            continue
+        effective_apr = gross_annual - FUNDING_CARRY_FRICTION_ANNUAL
+        rows.append(
+            ProductSummary(
+                category="FundingCarry",
+                product_id=info.symbol,
+                coin=coin,
+                effective_apr=effective_apr,
+                apr_source="funding_carry",
+                base_apr_string=str(gross_annual),
+                redeem_lockup_minutes=0,
+                notes=[
+                    f"gross_funding_apr={gross_annual:.4f}",
+                    f"funding_rate_7d_avg={info.funding_rate_7d_avg:+.6f}",
+                    f"funding_interval_hours={interval}",
+                    f"orderbook_depth_50bps_usd={depth:.0f}",
+                    f"min_notional_usd={min_not:.2f}",
+                    f"max_safe_notional_usd={max_pick_usd:.2f}",
+                ],
+            )
+        )
+    rows.sort(key=lambda r: r.effective_apr, reverse=True)
+    return rows[:FUNDING_CARRY_TOP_K]
 
 
 def _hedge_candidate_coins(
@@ -1535,6 +1762,17 @@ async def collect_snapshot(
     eth_task = asyncio.create_task(
         client.get_tickers(category="linear", symbol="ETHUSDT")
     )
+    # Full linear-perp ticker feed for funding-carry pre-selection
+    # (`bybit-strategy-expansion.2`). One call ≈ 1 round-trip, no symbol
+    # filter — returns ~500 tickers with `fundingRate` + `markPrice` per
+    # row. We use it to coarse-rank carry candidates by single-period
+    # 8h funding before fan-out, then `_fetch_perp_info` resolves the
+    # accurate 7d avg for the top-K. Failures degrade to empty list —
+    # carry products just don't get surfaced this cycle, rest of snapshot
+    # builds normally.
+    linear_tickers_task = asyncio.create_task(
+        client.get_tickers(category="linear")
+    )
     peg_task = asyncio.create_task(_fetch_usdc_peg())
 
     # Earn-permission gated (10005 expected on sandbox).
@@ -1638,6 +1876,16 @@ async def collect_snapshot(
                 )
     btc_tickers = await btc_task
     eth_tickers = await eth_task
+    # Full linear-perp ticker feed for carry pre-selection. On error we
+    # log + degrade to empty — fan-out below skips carry coins and
+    # `_build_funding_carry_products` returns `[]`.
+    try:
+        all_linear_tickers = await linear_tickers_task
+    except BaseException as e:  # noqa: BLE001
+        errors.append(
+            f"linear_tickers[all]: {type(e).__name__}: {e}"
+        )
+        all_linear_tickers = []
     usdc_peg = await peg_task
     earn_flex_positions = await earn_flex_pos_task
     earn_onchain_positions = await earn_onchain_pos_task
@@ -1903,6 +2151,18 @@ async def collect_snapshot(
         if coin not in seen_perp:
             perp_coins.append(coin)
             seen_perp.add(coin)
+    # Funding-carry pre-selection (`bybit-strategy-expansion.2`). Carry
+    # picks come from coins NOT already in the hedge/held set, surfaced
+    # by single-period 8h funding (coarse proxy); accurate 7d avg
+    # resolves in `_fetch_perp_info`. Appended AFTER hedge/held coins —
+    # both layers share the perp_market dict, no duplicate API calls.
+    carry_coins = _select_carry_candidate_coins(
+        all_linear_tickers, seen_perp, FUNDING_CARRY_PRESELECT_K
+    )
+    for coin in carry_coins:
+        if coin not in seen_perp:
+            perp_coins.append(coin)
+            seen_perp.add(coin)
     if perp_coins:
         perp_results = await asyncio.gather(
             *(_fetch_perp_info(client, c, errors) for c in perp_coins)
@@ -1912,6 +2172,15 @@ async def collect_snapshot(
         }
     else:
         perp_market = {}
+
+    # Funding-carry category. Filters + ranks coins from perp_market by
+    # friction-adjusted carry APR. Venue `bybit_funding_carry` (`.3`)
+    # binds to this category via `snapshot_category="FundingCarry"`;
+    # until that venue lands the data sits unused by the LLM (extra
+    # tokens, not a correctness bug).
+    carry_rows = _build_funding_carry_products(perp_market, total_equity)
+    if carry_rows:
+        products["FundingCarry"] = carry_rows
 
     # Market — take first ticker per symbol (single-symbol query returns one row)
     btc = btc_tickers[0] if btc_tickers else None

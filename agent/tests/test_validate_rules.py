@@ -30,16 +30,18 @@ from agent.sandbox.snapshot import (
     WalletSnapshot,
 )
 from agent.validate.rules import (
-    FUNDING_FLOOR_8H,
+    FUNDING_FLOOR_HEDGE_ANNUAL,
     PEG_STRESS_BPS,
     PEG_STRESS_STABLES_FLOOR,
     check_confidence,
     check_disabled_venues,
     check_effective_pick_cap,
+    check_funding_carry_floor,
     check_funding_rate_floor,
     check_hedges_for_non_usd_picks,
     check_lm_leverage_size_cap,
     check_lockup_cap,
+    check_no_double_carry_hedge,
     check_no_missing_apr_source,
     check_peg_stress,
     check_picks_required,
@@ -130,13 +132,23 @@ def _perp(
     mark: str = "2.0",
     min_notional: str = "0.5",
     funding_rate_7d_avg: str | None = None,
+    funding_interval_hours: str | None = None,
 ) -> PerpInfo:
+    """Build a PerpInfo for validator tests. `funding_interval_hours=None`
+    leaves the field unset, triggering the validator's 8h fallback (same
+    arithmetic the pre-2026-06-03 per-period code used). Pass `"4"` to
+    exercise 4h funding cadences (memecoin / high-vol perps)."""
     return PerpInfo(
         symbol=f"{coin.upper()}USDT",
         funding_rate_8h=Decimal("0.0001"),
         funding_rate_7d_avg=(
             Decimal(funding_rate_7d_avg)
             if funding_rate_7d_avg is not None
+            else None
+        ),
+        funding_interval_hours=(
+            Decimal(funding_interval_hours)
+            if funding_interval_hours is not None
             else None
         ),
         mark_price=Decimal(mark),
@@ -785,15 +797,27 @@ def test_check_funding_rate_floor_passes_when_missing() -> None:
 
 
 def test_check_funding_rate_floor_passes_at_threshold() -> None:
-    """Exactly at the floor passes (strict-less-than comparison)."""
+    """Exactly at the floor passes (strict-less-than comparison).
+
+    The floor is annualized (`FUNDING_FLOOR_HEDGE_ANNUAL = -10.95%/year`);
+    its per-period equivalent at the default 8h cadence is -0.0001 per
+    period. `_perp` doesn't set `funding_interval_hours`, so the
+    validator's `_annual_funding` falls back to 8h — same arithmetic
+    the pre-2026-06-03 per-period comparison did.
+    """
     s = _snapshot(
         onchain_products=_onchain_ton(),
         perp_market={
-            "TON": _perp("TON", funding_rate_7d_avg=str(FUNDING_FLOOR_8H))
+            "TON": _perp("TON", funding_rate_7d_avg="-0.0001")
         },
     )
     d = _hedged_decision(hedge_notional=-50.0)
     assert check_funding_rate_floor(d, s) == (True, None)
+    # Sanity: the rate above exactly equals the annualized floor when
+    # annualized at the 8h default. Guards against future floor changes.
+    assert float(Decimal("-0.0001") * Decimal("1095")) == pytest.approx(
+        FUNDING_FLOOR_HEDGE_ANNUAL
+    )
 
 
 def test_aggregate_validate_passes_hedged_non_usd_pick() -> None:
@@ -943,3 +967,365 @@ def test_pick_accepts_invalidate_at_override() -> None:
 def test_pick_omitting_invalidate_at_defaults_to_none() -> None:
     p = Pick(product_id="8", weight=1.0)
     assert p.invalidate_at is None
+
+
+# ─── Funding-carry rules (`bybit-strategy-expansion.4`) ─────────────────────
+
+
+def _carry_snapshot(
+    *,
+    carry_products: list[ProductSummary] | None = None,
+    perp_market: dict[str, PerpInfo] | None = None,
+    flex_products: list[ProductSummary] | None = None,
+    onchain_products: list[ProductSummary] | None = None,
+    total_equity_usd: str = "1000",
+    liquid_usdc_usd: str = "0",
+    liquid_usdt_usd: str = "0",
+) -> Snapshot:
+    """Variant of `_snapshot()` that also populates the FundingCarry
+    category. Default carry product surfaces TON with friction-adjusted
+    APR for the happy-path tests."""
+    snap = _snapshot(
+        flex_products=flex_products,
+        onchain_products=onchain_products,
+        perp_market=perp_market,
+        total_equity_usd=total_equity_usd,
+        liquid_usdc_usd=liquid_usdc_usd,
+        liquid_usdt_usd=liquid_usdt_usd,
+    )
+    if carry_products is not None:
+        snap.products["FundingCarry"] = carry_products
+    return snap
+
+
+def _carry_product(coin: str = "TON", apr: str = "0.20") -> ProductSummary:
+    return _product(
+        product_id=f"{coin}USDT",
+        category="FundingCarry",
+        coin=coin,
+        effective_apr=apr,
+        apr_source="funding_carry",
+    )
+
+
+def test_check_funding_carry_floor_passes_when_above_floor() -> None:
+    snap = _carry_snapshot(
+        carry_products=[_carry_product("TON")],
+        # 7d avg = 0.0001/8h ≈ +11% annualized, above +0.00005 floor.
+        perp_market={"TON": _perp("TON", funding_rate_7d_avg="0.0001")},
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.9),
+            _venue("bybit_funding_carry", 0.1, [("TONUSDT", 1.0)]),
+        ]
+    )
+    assert check_funding_carry_floor(d, snap) == (True, None)
+
+
+def test_check_funding_carry_floor_fails_below_floor() -> None:
+    snap = _carry_snapshot(
+        carry_products=[_carry_product("TON")],
+        # 7d avg = 0.00001/8h, well below +0.00005 floor.
+        perp_market={"TON": _perp("TON", funding_rate_7d_avg="0.00001")},
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.9),
+            _venue("bybit_funding_carry", 0.1, [("TONUSDT", 1.0)]),
+        ]
+    )
+    ok, msg = check_funding_carry_floor(d, snap)
+    assert ok is False
+    assert msg is not None and "below carry floor" in msg
+
+
+def test_check_funding_carry_floor_fails_when_perp_market_missing() -> None:
+    snap = _carry_snapshot(
+        carry_products=[_carry_product("TON")],
+        perp_market={},  # TON missing entirely
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.9),
+            _venue("bybit_funding_carry", 0.1, [("TONUSDT", 1.0)]),
+        ]
+    )
+    ok, msg = check_funding_carry_floor(d, snap)
+    assert ok is False
+    assert msg is not None and "funding_rate_7d_avg" in msg
+
+
+def test_check_funding_carry_floor_noop_when_no_carry_venue() -> None:
+    snap = _carry_snapshot()
+    d = _decision()  # default = cash + flex stable, no carry
+    assert check_funding_carry_floor(d, snap) == (True, None)
+
+
+def test_check_funding_carry_floor_message_keeps_precision() -> None:
+    """Regression: prior `.1f` formatting rounded annualized rate AND
+    floor to the same displayed value when the rate was just below the
+    floor, making the operator-facing rejection look self-contradictory
+    (`+5.5% below ... +5.5%`). `.3f` keeps enough digits to read the
+    margin."""
+    # 7d avg 0.0000500137/8h → annualized ≈ +5.476%, marginally below
+    # the +5.475% floor. Pre-fix print: "+5.5%" vs "+5.5%". Post-fix:
+    # "+5.476%" vs "+5.475%".
+    snap = _carry_snapshot(
+        carry_products=[_carry_product("TON")],
+        perp_market={"TON": _perp("TON", funding_rate_7d_avg="0.00004999")},
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.9),
+            _venue("bybit_funding_carry", 0.1, [("TONUSDT", 1.0)]),
+        ]
+    )
+    ok, msg = check_funding_carry_floor(d, snap)
+    assert ok is False
+    assert msg is not None
+    # `.3f` is wired — at minimum the message must NOT contain the old
+    # `+5.5%` collision; specifically the rate is displayed with three
+    # decimals (`+5.474%`).
+    assert "+5.474%" in msg, msg
+    assert "+5.475%" in msg, msg
+
+
+def test_check_funding_rate_floor_rejects_on_invalid_interval() -> None:
+    """Pre-fix the hedge funding-floor check silently passed any pick
+    whose annualization returned None (`_annual_funding` does so for
+    `interval <= 0`). That hid genuinely broken snapshot data — the
+    operator saw the pick approved instead of a data-quality error. Now
+    the validator surfaces it the same way `check_funding_carry_floor`
+    already does. A negative interval is the only realistic trigger
+    (the `or` fallback substitutes 0 with the 8h default), but the
+    handling must be defensive regardless."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={
+            "TON": _perp(
+                "TON",
+                funding_rate_7d_avg="0.0001",
+                funding_interval_hours="-4",
+            ),
+        },
+    )
+    d = _hedged_decision(hedge_notional=-50.0)
+    ok, msg = check_funding_rate_floor(d, s)
+    assert ok is False
+    assert msg is not None
+    assert "TON" in msg
+    assert "cannot annualize" in msg or "invalid" in msg
+
+
+def test_check_hedges_for_non_usd_picks_uses_decimal_on_borderline_size() -> None:
+    """`check_hedges_for_non_usd_picks` is now Decimal-based — a pick
+    sized EXACTLY at the perp `min_notional_usd` must pass without a
+    float-precision off-by-cents reject. Pre-fix the same case could
+    flip pass/fail depending on `total_book * float(weight)` rounding
+    at large notionals."""
+    # total_equity 100 × venue 1.0 × pick 1.0 = 100 USD pick → exactly
+    # equal to a 100 USD min_notional → passes (strict `<` comparison).
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={"TON": _perp("TON", min_notional="100.0")},
+    )
+    d = _hedged_decision(hedge_notional=-100.0, onchain_venue_weight=1.0)
+    assert check_hedges_for_non_usd_picks(d, s) == (True, None)
+
+
+def test_check_no_double_carry_hedge_passes_when_disjoint_coins() -> None:
+    snap = _carry_snapshot(
+        carry_products=[_carry_product("TON")],
+        onchain_products=[_product("26", "OnChain", coin="USDC")],
+        perp_market={"TON": _perp("TON", funding_rate_7d_avg="0.0001")},
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_onchain", 0.4, [("26", 1.0)]),
+            _venue("bybit_funding_carry", 0.1, [("TONUSDT", 1.0)]),
+        ]
+    )
+    assert check_no_double_carry_hedge(d, snap) == (True, None)
+
+
+def test_check_no_double_carry_hedge_fails_when_same_non_stable_coin() -> None:
+    """TON in carry venue AND TON in non-stable OnChain pick → would
+    open double perp short on TON."""
+    snap = _carry_snapshot(
+        carry_products=[_carry_product("TON")],
+        onchain_products=[_product("ton-prod", "OnChain", coin="TON")],
+        perp_market={"TON": _perp("TON", funding_rate_7d_avg="0.0001")},
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.4),
+            _venue("bybit_onchain", 0.4, [("ton-prod", 1.0)]),
+            _venue("bybit_funding_carry", 0.2, [("TONUSDT", 1.0)]),
+        ]
+    )
+    ok, msg = check_no_double_carry_hedge(d, snap)
+    assert ok is False
+    assert msg is not None and "TON" in msg
+
+
+def test_check_no_double_carry_hedge_ignores_stable_earn_overlap() -> None:
+    """Carry on TON + stable USDC Earn pick → no conflict (stable Earn
+    doesn't trigger an auto-hedge in the first place)."""
+    snap = _carry_snapshot(
+        carry_products=[_carry_product("TON")],
+        # Stable coin in flex venue — doesn't hedge.
+        flex_products=[_product("usdc-flex", "FlexibleSaving", coin="USDC")],
+        perp_market={"TON": _perp("TON", funding_rate_7d_avg="0.0001")},
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.4),
+            _venue("bybit_flex", 0.5, [("usdc-flex", 1.0)]),
+            _venue("bybit_funding_carry", 0.1, [("TONUSDT", 1.0)]),
+        ]
+    )
+    assert check_no_double_carry_hedge(d, snap) == (True, None)
+
+
+def test_check_no_double_carry_hedge_noop_when_no_carry_venue() -> None:
+    snap = _carry_snapshot()
+    d = _decision()  # default = cash + flex stable
+    assert check_no_double_carry_hedge(d, snap) == (True, None)
+
+
+def test_check_stable_spend_cap_counts_carry_picks() -> None:
+    """Carry pick alone overruns the liquid stable supply — `.4`
+    extension to capital-flow accounting must catch it.
+
+    Setup: $1000 book, $50 USDT supply. Carry pick at 10% of book =
+    $100 → spot $100 + perp margin $105 = $205, exceeds $50. Reject.
+    """
+    snap = _carry_snapshot(
+        carry_products=[_carry_product("TON")],
+        perp_market={"TON": _perp("TON", funding_rate_7d_avg="0.0001")},
+        total_equity_usd="1000",
+        liquid_usdc_usd="0",
+        liquid_usdt_usd="50",
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.9),
+            _venue("bybit_funding_carry", 0.1, [("TONUSDT", 1.0)]),
+        ]
+    )
+    ok, msg = check_stable_spend_cap(d, snap)
+    assert ok is False
+    assert msg is not None
+    assert "bybit_funding_carry/TONUSDT" in msg
+    assert "TON" in msg
+
+
+def test_check_stable_spend_cap_passes_carry_within_supply() -> None:
+    """Carry pick that fits in liquid stable supply passes. $1000 book,
+    $300 USDT supply, carry pick at 10% = $100 → spot $100 + perp $105
+    = $205 ≤ $300. Pass."""
+    snap = _carry_snapshot(
+        carry_products=[_carry_product("TON")],
+        perp_market={"TON": _perp("TON", funding_rate_7d_avg="0.0001")},
+        total_equity_usd="1000",
+        liquid_usdc_usd="0",
+        liquid_usdt_usd="300",
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.9),
+            _venue("bybit_funding_carry", 0.1, [("TONUSDT", 1.0)]),
+        ]
+    )
+    assert check_stable_spend_cap(d, snap) == (True, None)
+
+
+# ─── 4h funding annualization (`bybit-strategy-expansion.2/.4` fix) ─────────
+
+
+def test_check_funding_rate_floor_passes_4h_coin_at_annualized_floor() -> None:
+    """A 4h coin at -0.00005/period (annualized -10.95% = floor exactly)
+    passes. The pre-fix code compared per-period -0.00005 to per-period
+    floor -0.0001 → would pass too, but for the WRONG reason: it'd let
+    -0.00009/4h (-19.7% annualized) slip through as "above floor"
+    despite breaching the policy intent."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={
+            "TON": _perp(
+                "TON",
+                funding_rate_7d_avg="-0.00005",
+                funding_interval_hours="4",
+            )
+        },
+    )
+    d = _hedged_decision(hedge_notional=-50.0)
+    assert check_funding_rate_floor(d, s) == (True, None)
+
+
+def test_check_funding_rate_floor_rejects_4h_coin_below_annualized_floor() -> None:
+    """A 4h coin at -0.00009/period (annualized -19.7%) breaches floor.
+    Pre-fix bug: per-period -0.00009 vs per-period floor -0.0001 →
+    above floor → passed. Now correctly rejected."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={
+            "TON": _perp(
+                "TON",
+                funding_rate_7d_avg="-0.00009",
+                funding_interval_hours="4",
+            )
+        },
+    )
+    d = _hedged_decision(hedge_notional=-50.0)
+    ok, msg = check_funding_rate_floor(d, s)
+    assert ok is False
+    assert msg is not None and "annualized" in msg
+
+
+def test_check_funding_carry_floor_accepts_4h_coin_above_annualized_floor() -> None:
+    """4h coin at +0.00003/period (annualized 6.57%/year) above carry
+    floor 5.475%/year. Pre-fix code rejected this (per-period 0.00003 <
+    per-period 0.00005 floor)."""
+    snap = _carry_snapshot(
+        carry_products=[_carry_product("TON")],
+        perp_market={
+            "TON": _perp(
+                "TON",
+                funding_rate_7d_avg="0.00003",
+                funding_interval_hours="4",
+            )
+        },
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.9),
+            _venue("bybit_funding_carry", 0.1, [("TONUSDT", 1.0)]),
+        ]
+    )
+    assert check_funding_carry_floor(d, snap) == (True, None)
+
+
+def test_check_funding_carry_floor_rejects_4h_coin_below_annualized_floor() -> None:
+    """4h coin at +0.00002/period (annualized 4.38%) below floor."""
+    snap = _carry_snapshot(
+        carry_products=[_carry_product("TON")],
+        perp_market={
+            "TON": _perp(
+                "TON",
+                funding_rate_7d_avg="0.00002",
+                funding_interval_hours="4",
+            )
+        },
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.9),
+            _venue("bybit_funding_carry", 0.1, [("TONUSDT", 1.0)]),
+        ]
+    )
+    ok, msg = check_funding_carry_floor(d, snap)
+    assert ok is False
+    assert msg is not None and "below carry floor" in msg

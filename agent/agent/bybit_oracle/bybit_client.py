@@ -328,7 +328,19 @@ class LinearTicker(BaseModel):
     symbol: str
     lastPrice: str
     markPrice: str | None = None
-    fundingRate: str | None = None  # current 8h funding, signed decimal-string
+    # Current per-period funding rate, signed decimal-string. The
+    # "period" is `fundingIntervalHour` hours — typically 8h but 4h
+    # is common for high-vol or memecoin perps, and some symbols ship
+    # as 1h. Never divide / annualize by hardcoded 3 × 365 — read
+    # the interval first.
+    fundingRate: str | None = None
+    # Funding cadence in whole hours (Bybit currently only supports
+    # integer hours). Missing on some legacy symbols — callers should
+    # default to 8h when None and surface the assumption in errors so
+    # operator can investigate. Added 2026-06-03 per carry-venue work
+    # (`bybit-strategy-expansion.2/.4`); prior code assumed 8h
+    # globally, under-stating APR ~2× for 4h coins.
+    fundingIntervalHour: str | None = None
     nextFundingTime: str | None = None  # unix ms as string
     openInterestValue: str | None = None  # USD
     price24hPcnt: str | None = None  # 24h % change, signed decimal (0.01 = +1%)

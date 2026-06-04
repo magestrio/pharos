@@ -25,23 +25,35 @@ from agent.bybit_oracle.bybit_client import (
 )
 from agent.sandbox.snapshot import (
     ALPHA_MOMENTUM_HAIRCUT,
+    DEFAULT_FUNDING_INTERVAL_HOURS,
+    FUNDING_CARRY_FRICTION_ANNUAL,
+    FUNDING_CARRY_TOP_K,
+    FUNDING_FLOOR_CARRY_ANNUAL,
+    HOURS_PER_YEAR,
+    MAX_CARRY_NOTIONAL_FRACTION,
+    MIN_CARRY_DEPTH_USD,
     MOMENTUM_APR_CAP,
+    PerpInfo,
     SMART_LEVERAGE_MOMENTUM_HAIRCUT,
     ProductSummary,
     Snapshot,
     UsdcPegSnapshot,
     _advance_earn_summary,
     _alpha_summary,
+    _annual_funding,
+    _build_funding_carry_products,
     _flex_or_onchain_summary,
     _hold_to_earn_summary,
     _is_open_perp,
     _kline_period_return,
     _lm_summary,
     _momentum_apr,
+    _parse_funding_interval,
     _parse_percent,
     _rank,
     _safe_earn,
     _safe_perp_positions,
+    _select_carry_candidate_coins,
     _usdt_in_unified,
     collect_snapshot,
 )
@@ -992,3 +1004,313 @@ async def test_collect_snapshot_degrades_when_perp_positions_fail() -> None:
 
     assert snap.perp_positions == []
     assert any("perp_positions" in e for e in snap.errors)
+
+
+# ─── Funding-carry venue (`bybit-strategy-expansion.2`) ─────────────────────
+
+
+def _ticker(
+    coin_or_symbol: str,
+    funding: str | None,
+    interval_hours: str | None = "8",
+) -> LinearTicker:
+    """Build a `LinearTicker` for carry tests. `coin_or_symbol` may be a
+    bare coin (`"TON"` → `"TONUSDT"`) or a full symbol when the test
+    wants to exercise non-USDT/inverse filtering (`"BTCUSDC"`).
+    `interval_hours` defaults to `"8"` to keep the per-period rates the
+    pre-fix tests used semantically unchanged; 4h scenarios override."""
+    symbol = (
+        coin_or_symbol
+        if coin_or_symbol.endswith(("USDT", "USDC", "USD"))
+        else f"{coin_or_symbol}USDT"
+    )
+    return LinearTicker(
+        symbol=symbol,
+        lastPrice="1.0",
+        markPrice="1.0",
+        fundingRate=funding,
+        fundingIntervalHour=interval_hours,
+        nextFundingTime=None,
+        openInterestValue="1000000",
+    )
+
+
+def _info(
+    coin: str,
+    funding_7d: str | None,
+    depth_usd: str | None = "1000000",
+    min_notional_usd: str | None = "10",
+    interval_hours: str | None = "8",
+) -> PerpInfo:
+    """Shorthand `PerpInfo` builder for carry tests. Defaults are
+    permissive — high depth, tiny min_notional, 8h funding — so each
+    test can toggle one constraint at a time without rebuilding every
+    field. `interval_hours=None` exercises the
+    `DEFAULT_FUNDING_INTERVAL_HOURS` fallback path."""
+    return PerpInfo(
+        symbol=f"{coin}USDT",
+        funding_rate_8h=Decimal(funding_7d) if funding_7d else None,
+        funding_rate_7d_avg=Decimal(funding_7d) if funding_7d else None,
+        funding_interval_hours=(
+            Decimal(interval_hours) if interval_hours else None
+        ),
+        mark_price=Decimal("1.0"),
+        orderbook_depth_50bps_usd=Decimal(depth_usd) if depth_usd else None,
+        min_order_qty=Decimal("1"),
+        min_notional_usd=Decimal(min_notional_usd) if min_notional_usd else None,
+        qty_step=Decimal("1"),
+        max_leverage=Decimal("10"),
+    )
+
+
+def test_select_carry_candidates_ranks_by_funding_desc_and_caps() -> None:
+    tickers = [
+        _ticker("AAA", "0.0001"),
+        _ticker("BBB", "0.0003"),  # highest
+        _ticker("CCC", "0.0002"),
+    ]
+    out = _select_carry_candidate_coins(tickers, exclude_coins=set(), cap=2)
+    assert out == ["BBB", "CCC"]
+
+
+def test_select_carry_candidates_skips_below_floor() -> None:
+    # Floor is annualized (FUNDING_FLOOR_CARRY_ANNUAL ≈ +5.475%/year).
+    # At the default 8h cadence, per-period equivalents are:
+    #   +0.00005/8h → 5.475%/yr = floor exactly → skip (strict-greater)
+    #   +0.00001/8h → 1.095%/yr → skip
+    #   +0.0001/8h  → 10.95%/yr → keep
+    tickers = [
+        _ticker("AAA", "0.00005"),  # equals floor → skip
+        _ticker("BBB", "0.00001"),  # below → skip
+        _ticker("CCC", "0.0001"),   # above → keep
+    ]
+    assert _select_carry_candidate_coins(tickers, set(), 10) == ["CCC"]
+
+
+def test_select_carry_candidates_annualizes_per_interval() -> None:
+    """4h-funding coin with rate equal to an 8h coin earns ~2× annualized
+    (same per-period rate, twice as many periods/year). Ranker must
+    surface the 4h coin first when per-period rates tie."""
+    tickers = [
+        _ticker("EIGHT", "0.0001", interval_hours="8"),  # 10.95%/yr
+        _ticker("FOUR", "0.0001", interval_hours="4"),   # 21.90%/yr
+        _ticker("EIGHTBIG", "0.00015", interval_hours="8"),  # 16.4%/yr
+    ]
+    # 4h coin should rank above the 8h-big-rate one despite a lower
+    # per-period number.
+    assert _select_carry_candidate_coins(tickers, set(), 10) == [
+        "FOUR", "EIGHTBIG", "EIGHT"
+    ]
+
+
+def test_select_carry_candidates_defaults_to_8h_when_interval_missing() -> None:
+    """No `fundingIntervalHour` echoed → fallback to 8h. Same ranking
+    as if we'd sent "8" explicitly."""
+    tickers = [
+        _ticker("AAA", "0.0001", interval_hours=None),
+        _ticker("BBB", "0.0001", interval_hours="8"),
+    ]
+    out = _select_carry_candidate_coins(tickers, set(), 10)
+    assert set(out) == {"AAA", "BBB"}
+
+
+def test_select_carry_candidates_skips_non_usdt_and_stables() -> None:
+    tickers = [
+        _ticker("BTCUSDC", "0.0010"),  # USDC-quoted → skip
+        _ticker("USDTUSDT", "0.0010"), # stable base → skip
+        _ticker("USDCUSDT", "0.0010"), # stable base → skip
+        _ticker("ETHUSDT", "0.0010"),  # keep
+    ]
+    assert _select_carry_candidate_coins(tickers, set(), 10) == ["ETH"]
+
+
+def test_select_carry_candidates_skips_missing_funding_rate() -> None:
+    tickers = [
+        _ticker("AAA", None),       # None
+        _ticker("BBB", ""),         # empty
+        _ticker("CCC", "0.0001"),
+    ]
+    assert _select_carry_candidate_coins(tickers, set(), 10) == ["CCC"]
+
+
+def test_select_carry_candidates_respects_exclude_set() -> None:
+    tickers = [
+        _ticker("TONUSDT", "0.0003"),
+        _ticker("SOLUSDT", "0.0002"),
+    ]
+    # TON already in perp_coins (hedge candidate / held position) — don't
+    # double-list it, the same fan-out will collect its PerpInfo.
+    out = _select_carry_candidate_coins(tickers, {"TON"}, 10)
+    assert out == ["SOL"]
+
+
+def test_build_carry_products_happy_path() -> None:
+    perp_market = {"TON": _info("TON", "0.0002")}
+    rows = _build_funding_carry_products(perp_market, Decimal("10000"))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.category == "FundingCarry"
+    assert row.product_id == "TONUSDT"
+    assert row.coin == "TON"
+    assert row.apr_source == "funding_carry"
+    # gross = 0.0002 × 3 × 365 = 0.219, effective = 0.219 − 0.018 = 0.201
+    expected_gross = Decimal("0.0002") * 3 * 365
+    expected_effective = expected_gross - FUNDING_CARRY_FRICTION_ANNUAL
+    assert row.effective_apr == expected_effective
+    note_kinds = [n.split("=")[0] for n in row.notes]
+    assert "gross_funding_apr" in note_kinds
+    assert "funding_rate_7d_avg" in note_kinds
+    assert "orderbook_depth_50bps_usd" in note_kinds
+    assert "min_notional_usd" in note_kinds
+    assert "max_safe_notional_usd" in note_kinds
+
+
+def test_build_carry_products_skips_below_floor() -> None:
+    perp_market = {"AAA": _info("AAA", "0.00001")}  # below floor
+    assert _build_funding_carry_products(perp_market, Decimal("10000")) == []
+
+
+def test_build_carry_products_skips_missing_7d_avg() -> None:
+    perp_market = {"AAA": _info("AAA", None)}
+    assert _build_funding_carry_products(perp_market, Decimal("10000")) == []
+
+
+def test_build_carry_products_skips_thin_depth() -> None:
+    # MIN_CARRY_DEPTH_USD = $50k; $1k depth → skip
+    perp_market = {"AAA": _info("AAA", "0.0002", depth_usd="1000")}
+    assert _build_funding_carry_products(perp_market, Decimal("10000")) == []
+
+
+def test_build_carry_products_skips_oversized_min_notional() -> None:
+    # max_pick_usd = 10_000 × 5% = $500. min_notional=$600 → skip.
+    perp_market = {"AAA": _info("AAA", "0.0002", min_notional_usd="600")}
+    assert _build_funding_carry_products(perp_market, Decimal("10000")) == []
+
+
+def test_build_carry_products_skips_stables() -> None:
+    perp_market = {"USDC": _info("USDC", "0.0002")}
+    assert _build_funding_carry_products(perp_market, Decimal("10000")) == []
+
+
+def test_build_carry_products_ranks_desc_and_caps_top_k() -> None:
+    coins = [f"C{i:02d}" for i in range(FUNDING_CARRY_TOP_K + 5)]
+    # Funding rate ascending by index → reverse-rank should produce
+    # last coin first. Stays above floor (0.00005) for every i ≥ 0:
+    # base 0.0001 + i × 0.00001 → 0.0001 .. 0.00024.
+    perp_market = {
+        coin: _info(coin, f"{Decimal('0.0001') + Decimal(i) * Decimal('0.00001')}")
+        for i, coin in enumerate(coins)
+    }
+    rows = _build_funding_carry_products(perp_market, Decimal("100000"))
+    assert len(rows) == FUNDING_CARRY_TOP_K
+    # Top-ranked = highest funding rate (last coin built).
+    assert rows[0].coin == coins[-1]
+    # Strictly descending effective_apr.
+    aprs = [r.effective_apr for r in rows]
+    assert aprs == sorted(aprs, reverse=True)
+
+
+def test_build_carry_products_empty_when_no_equity() -> None:
+    perp_market = {"TON": _info("TON", "0.0002")}
+    assert _build_funding_carry_products(perp_market, Decimal(0)) == []
+
+
+def test_max_safe_notional_scales_with_equity() -> None:
+    # max_pick_usd = equity × MAX_CARRY_NOTIONAL_FRACTION = 100k × 5% = 5k.
+    # min_notional=$500 fits.
+    perp_market = {"TON": _info("TON", "0.0002", min_notional_usd="500")}
+    rows = _build_funding_carry_products(perp_market, Decimal("100000"))
+    assert len(rows) == 1
+    expected = Decimal("100000") * MAX_CARRY_NOTIONAL_FRACTION
+    note = next(n for n in rows[0].notes if n.startswith("max_safe_notional_usd="))
+    assert note == f"max_safe_notional_usd={expected:.2f}"
+    # And the same min_notional that JUST cleared 5k limit would be
+    # rejected at lower equity (sanity check on the gate math).
+    assert _build_funding_carry_products(perp_market, Decimal("5000")) == []
+    _ = MIN_CARRY_DEPTH_USD  # silence unused-import lint; covered by depth test
+
+
+# ─── Funding-interval annualization (`bybit-strategy-expansion.2/.4` fix) ──
+
+
+def test_annual_funding_eight_hour_default_multiplier() -> None:
+    """0.0001 per 8h × 1095 = 0.1095 — preserves the pre-fix arithmetic
+    for 8h coins."""
+    assert _annual_funding(Decimal("0.0001"), Decimal("8")) == Decimal("0.1095")
+
+
+def test_annual_funding_four_hour_doubles_per_period_yield() -> None:
+    """4h interval ⇒ 6 periods/day × 365 = 2190× multiplier. A 4h coin
+    at the same per-period rate as an 8h coin earns exactly 2× annual."""
+    eight = _annual_funding(Decimal("0.0001"), Decimal("8"))
+    four = _annual_funding(Decimal("0.0001"), Decimal("4"))
+    assert eight is not None and four is not None
+    assert four / eight == Decimal("2")
+
+
+def test_annual_funding_defaults_when_interval_missing() -> None:
+    """Bybit didn't echo `fundingIntervalHour` → fall back to 8h. Same
+    result as if caller passed `DEFAULT_FUNDING_INTERVAL_HOURS`."""
+    assert _annual_funding(Decimal("0.0001"), None) == _annual_funding(
+        Decimal("0.0001"), DEFAULT_FUNDING_INTERVAL_HOURS
+    )
+
+
+def test_annual_funding_returns_none_for_missing_rate() -> None:
+    assert _annual_funding(None, Decimal("8")) is None
+
+
+def test_annual_funding_uses_hours_per_year_constant() -> None:
+    """Sanity: HOURS_PER_YEAR = 24 × 365 = 8760."""
+    assert HOURS_PER_YEAR == Decimal("8760")
+
+
+def test_parse_funding_interval_accepts_whole_hour_strings() -> None:
+    assert _parse_funding_interval("8") == Decimal("8")
+    assert _parse_funding_interval("4") == Decimal("4")
+    assert _parse_funding_interval("1") == Decimal("1")
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "-1", "garbage"])
+def test_parse_funding_interval_rejects_missing_or_invalid(value) -> None:
+    assert _parse_funding_interval(value) is None
+
+
+def test_build_carry_products_accepts_four_hour_above_floor() -> None:
+    """A 4h coin at +0.00003/period (annualized ~6.57%/year) is ABOVE
+    the carry floor (~5.475%/year) even though its per-period rate
+    looks tiny. Pre-fix code would have rejected it (per-period below
+    +0.00005)."""
+    perp_market = {
+        "TON": _info("TON", "0.00003", interval_hours="4"),
+    }
+    rows = _build_funding_carry_products(perp_market, Decimal("10000"))
+    assert len(rows) == 1
+    row = rows[0]
+    # Annualized: 0.00003 × 2190 = 0.0657
+    expected_gross = Decimal("0.00003") * Decimal("2190")
+    expected_effective = expected_gross - FUNDING_CARRY_FRICTION_ANNUAL
+    assert row.effective_apr == expected_effective
+    assert any(n == "funding_interval_hours=4" for n in row.notes)
+
+
+def test_build_carry_products_rejects_four_hour_below_floor() -> None:
+    """4h coin at +0.00001/period (annualized ~2.19%) below floor."""
+    perp_market = {"AAA": _info("AAA", "0.00001", interval_hours="4")}
+    assert _build_funding_carry_products(perp_market, Decimal("10000")) == []
+
+
+def test_build_carry_products_defaults_to_8h_when_interval_missing() -> None:
+    """Missing interval → 8h fallback. Same APR as if `interval='8'`."""
+    miss = _info("TON", "0.0001", interval_hours=None)
+    explicit = _info("TON", "0.0001", interval_hours="8")
+    rows_miss = _build_funding_carry_products(
+        {"TON": miss}, Decimal("10000")
+    )
+    rows_exp = _build_funding_carry_products(
+        {"TON": explicit}, Decimal("10000")
+    )
+    assert rows_miss[0].effective_apr == rows_exp[0].effective_apr
+    # Interval surfaced in notes either way (fallback prints the default).
+    miss_note = next(n for n in rows_miss[0].notes if n.startswith("funding_interval_hours="))
+    assert miss_note == f"funding_interval_hours={DEFAULT_FUNDING_INTERVAL_HOURS}"

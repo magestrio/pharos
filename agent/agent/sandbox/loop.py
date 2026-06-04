@@ -54,8 +54,14 @@ from agent.sandbox.decide import (
     decide,
     write_decision,
 )
+from agent.sandbox.carry_state import (
+    DEFAULT_CARRY_STATE_PATH,
+    read_carry_state,
+    write_carry_state,
+)
 from agent.sandbox.execute import (
     DEFAULT_AUTO_APPROVE_MIN_CONFIDENCE,
+    apply_carry_results_to_state,
     diff_to_actions,
     execute_actions,
     request_approval,
@@ -348,9 +354,15 @@ async def run_one_cycle(
             outcome["result"] = "skipped:invalid"
             return outcome
 
-        # 4. Diff → actions
+        # 4. Diff → actions. Pre-load funding-carry state so the diff
+        # layer (a) sees existing carry positions and skips them in
+        # the Earn-hedge reconciliation, and (b) emits CLOSE actions
+        # for state-only coins (`bybit-strategy-expansion.5`).
+        carry_state = read_carry_state()
         snapshot_ts = snap_path.stem
-        actions = diff_to_actions(snap, decision, snapshot_ts)
+        actions = diff_to_actions(
+            snap, decision, snapshot_ts, carry_state=carry_state
+        )
         outcome["actions_planned"] = len(actions)
         outcome["stages"].append("diff")
         if not actions:
@@ -368,28 +380,60 @@ async def run_one_cycle(
                 effective_dry_run = True
         outcome["stages"].append("approval")
 
-        # 6. Execute
-        results = await execute_actions(
-            bybit_client,
-            actions,
-            snapshot_ts=snapshot_ts,
-            dry_run=effective_dry_run,
-        )
-        outcome["actions_executed"] = sum(1 for r in results if r.status == "ok")
-        outcome["actions"] = [
-            {
-                "kind": r.action.kind.value,
-                "category": r.action.category,
-                "product_id": r.action.product_id,
-                "coin": r.action.coin,
-                "amount": str(r.action.amount),
-                "status": r.status,
-                "error": r.error,
-            }
-            for r in results
-        ]
-        outcome["stages"].append("execute")
-        outcome["result"] = "executed" if not effective_dry_run else "ok"
+        # 6. Execute — wrapped in try/finally so the carry-state write
+        # runs even if the post-execute accounting (or any later code
+        # in this cycle) raises. Without this guard, a crash between
+        # `execute_actions` returning and the explicit carry-state
+        # write below would leave a real Bybit carry position open
+        # with no state record — next cycle's hedge layer would then
+        # see an orphan spot+perp pair and likely mis-classify it.
+        # Hard process crashes (OOM, SIGKILL) still bypass this; for
+        # truly transactional state we'd need per-action writes inside
+        # `execute_actions`, deferred for now.
+        results: list = []
+        try:
+            results = await execute_actions(
+                bybit_client,
+                actions,
+                snapshot_ts=snapshot_ts,
+                dry_run=effective_dry_run,
+            )
+            outcome["actions_executed"] = sum(
+                1 for r in results if r.status == "ok"
+            )
+            outcome["actions"] = [
+                {
+                    "kind": r.action.kind.value,
+                    "category": r.action.category,
+                    "product_id": r.action.product_id,
+                    "coin": r.action.coin,
+                    "amount": str(r.action.amount),
+                    "status": r.status,
+                    "error": r.error,
+                }
+                for r in results
+            ]
+            outcome["stages"].append("execute")
+            outcome["result"] = "executed" if not effective_dry_run else "ok"
+        finally:
+            # Roll forward carry state from the dispatch results (`.5`).
+            # Skipped on dry-run so a `--live` run is required to mutate
+            # the persisted positions ledger. Empty `results` (execute
+            # itself raised before producing anything) → nothing to roll
+            # forward.
+            if not effective_dry_run and results:
+                try:
+                    new_state = apply_carry_results_to_state(
+                        carry_state, results
+                    )
+                    if new_state.positions != carry_state.positions:
+                        write_carry_state(new_state)
+                        outcome.setdefault("stages", []).append(
+                            "carry_state_updated"
+                        )
+                except Exception as e:  # noqa: BLE001
+                    outcome["carry_state_error"] = f"{type(e).__name__}: {e}"
+                    log.warning("carry_state update failed: %s", e)
     except Exception as e:  # noqa: BLE001 — outermost guard
         outcome["error"] = f"{type(e).__name__}: {e}"
         outcome["result"] = "error"

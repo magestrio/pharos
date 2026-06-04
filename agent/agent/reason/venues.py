@@ -30,6 +30,7 @@ VenueId = Literal[
     "bybit_double_win",
     "bybit_alpha",
     "bybit_hold_to_earn",
+    "bybit_funding_carry",
 ]
 
 
@@ -220,6 +221,34 @@ VENUE_REGISTRY: dict[str, VenueMeta] = {
             "Hold-to-Earn may be a parallel subscribe path or just a "
             "marketing view of the same position; needs live-probe before "
             "execute wires."
+        ),
+    ),
+    "bybit_funding_carry": VenueMeta(
+        venue_id="bybit_funding_carry",
+        enabled=True,
+        max_weight=0.25,  # `.5` executor wired 2026-06-03
+        requires_picks=True,
+        snapshot_category="FundingCarry",
+        notes=(
+            "Bybit delta-neutral funding-rate carry — spot long + perp short "
+            "on a coin with positive 7d-avg funding. Yield = funding payment "
+            "the short receives (no Earn leg). Distinct from auto-hedge "
+            "(which is derived from non-stable bybit_flex/bybit_onchain "
+            "picks): carry is a STANDALONE venue, picks chosen here open "
+            "their own paired spot+perp position via OPEN_FUNDING_CARRY / "
+            "CLOSE_FUNDING_CARRY compound actions. Critical invariant (`.4` "
+            "validator): a single coin CANNOT appear in `bybit_funding_carry` "
+            "picks AND in non-stable Earn picks at the same time — would "
+            "double-open the short and double-lock margin. Snapshot surfaces "
+            "candidates in `products.FundingCarry` after friction-adjusted "
+            "ranking (annualized funding APR minus ~1.8% round-trip cost; "
+            "annualization respects each coin's funding_interval_hours). "
+            "Exit floor is annualized at +5.475%/year (vs −10.95%/year for "
+            "hedge case): without Earn APR as cushion, slightly-negative "
+            "funding flips carry to net cost. Persistent state in "
+            "`sandbox/state/funding_carry.json` tracks open positions so "
+            "the hedge layer doesn't auto-close carry perp shorts. "
+            "See `notes/bybit-funding-carry.md`."
         ),
     ),
     "bybit_alpha": VenueMeta(

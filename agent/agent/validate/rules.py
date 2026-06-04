@@ -24,7 +24,13 @@ from decimal import Decimal
 
 from agent.reason.schema import Decision, VenueAllocation
 from agent.reason.venues import VENUE_REGISTRY, VenueId
-from agent.sandbox.snapshot import ProductSummary, Snapshot
+from agent.sandbox.snapshot import (
+    DEFAULT_FUNDING_INTERVAL_HOURS,
+    FUNDING_FLOOR_CARRY_ANNUAL,
+    ProductSummary,
+    Snapshot,
+    _annual_funding,
+)
 
 MIN_CONFIDENCE = 0.4
 # Cap on a single non-stable product as fraction of TOTAL book.
@@ -380,9 +386,9 @@ def check_hedges_for_non_usd_picks(d: Decision, snapshot: Snapshot) -> Check:
     rejected here (would otherwise SKIP at executor and leave the
     underlying unhedged)."""
     perp_market = getattr(snapshot, "perp_market", None) or {}
-    # Decimal throughout — matches the executor's sizing math so a pick
-    # that passes here can't be rejected downstream by a cents-level
-    # rounding gap.
+    # Decimal throughout — matches executor's sizing math (execute.py
+    # `_funding_carry_targets` etc.) so a pick that passes here can't be
+    # rejected downstream by a cents-level rounding gap.
     total_book = snapshot.wallet.total_equity_usd
     bad: list[str] = []
     for venue_id, category in _AUTO_HEDGE_VENUES:
@@ -418,23 +424,32 @@ def check_hedges_for_non_usd_picks(d: Decision, snapshot: Snapshot) -> Check:
     return True, None
 
 
-# Per-8h funding-rate threshold below which a hedged short becomes net
-# cost over a typical hold. -0.0001/8h = -1 bp per period ≈ -11%
-# annualized. Operator hardcap pattern (CLAUDE.md): "7-day avg funding <
-# 0 → mandatory exit". We tighten the threshold from strict zero to
-# -10 bps annualized so single-period noise doesn't yank good picks.
-FUNDING_FLOOR_8H = -0.0001
+# Annualized 7d-avg funding floor for hedged non-stable Earn picks.
+# Below this rate the perp-short hedge becomes net cost over a typical
+# hold and erodes Earn APR. Operator hardcap pattern (CLAUDE.md):
+# "7-day avg funding < 0 → mandatory exit"; we tighten to roughly
+# −11%/year instead of strict zero so single-period noise doesn't yank
+# good picks. Annualized form (renamed 2026-06-03 from the per-period
+# `FUNDING_FLOOR_8H` constant): preserves the same intent for 8h coins
+# (−0.0001/8h × 1095 ≈ −0.1095) AND correctly evaluates 4h coins —
+# whose per-period rate is naturally ~½ the 8h equivalent at the same
+# annualized yield.
+FUNDING_FLOOR_HEDGE_ANNUAL = -0.1095
 
 
 def check_funding_rate_floor(d: Decision, snapshot: Snapshot) -> Check:
     """For each non-stable Earn pick (OnChain + FlexibleSaving), reject
-    if the perp pair's 7-day average funding rate is below
-    `FUNDING_FLOOR_8H`. We're short the perp to hedge; a persistently
-    negative funding rate means we PAY funding every period — the hedge
-    becomes net cost and erodes the Earn yield over time. Operator
-    change 2026-05-29: funding is part of yield, not just a soft
-    signal. Picks with missing 7d avg pass (no data, no signal); picks
-    with funding at-or-above floor pass."""
+    if the perp pair's 7-day average funding rate (annualized) is below
+    `FUNDING_FLOOR_HEDGE_ANNUAL`. We're short the perp to hedge; a
+    persistently negative funding rate means we PAY funding every
+    period — the hedge becomes net cost and erodes the Earn yield over
+    time. Operator change 2026-05-29: funding is part of yield, not
+    just a soft signal. Picks with missing 7d avg or missing perp data
+    pass (no signal); picks with funding at-or-above floor pass.
+    Annualization respects each coin's `funding_interval_hours` (4h /
+    8h / etc.), restated 2026-06-03 — prior `× 3 × 365` math
+    under-stated APR ~2× on 4h pairs and let some negative-funding
+    coins slip the floor."""
     perp_market = getattr(snapshot, "perp_market", None) or {}
     bad: list[str] = []
     for venue_id, category in _AUTO_HEDGE_VENUES:
@@ -452,18 +467,154 @@ def check_funding_rate_floor(d: Decision, snapshot: Snapshot) -> Check:
             info = perp_market.get(coin) or perp_market.get(coin.lower())
             if info is None or info.funding_rate_7d_avg is None:
                 continue
-            avg_8h = float(info.funding_rate_7d_avg)
-            if avg_8h < FUNDING_FLOOR_8H:
-                annualized_pct = avg_8h * 3 * 365 * 100
+            interval = (
+                info.funding_interval_hours or DEFAULT_FUNDING_INTERVAL_HOURS
+            )
+            annual = _annual_funding(info.funding_rate_7d_avg, interval)
+            if annual is None:
+                # Annualization fails only when `interval <= 0` — that's a
+                # broken snapshot, not a passing signal. Mirror the carry
+                # validator's strict handling instead of silently skipping.
+                bad.append(
+                    f"{venue_id}/{pick.product_id}({coin}): perp_market "
+                    f"funding_interval_hours={info.funding_interval_hours!r} "
+                    "invalid — cannot annualize funding floor"
+                )
+                continue
+            annual_f = float(annual)
+            if annual_f < FUNDING_FLOOR_HEDGE_ANNUAL:
                 bad.append(
                     f"{venue_id}/{pick.product_id}({coin}): 7d avg funding "
-                    f"{avg_8h:+.6f}/8h ({annualized_pct:+.1f}% annualized) "
-                    f"below floor {FUNDING_FLOOR_8H:+.6f}/8h — hedge net cost"
+                    f"{float(info.funding_rate_7d_avg):+.6f}/{interval}h "
+                    f"({annual_f * 100:+.3f}% annualized) below floor "
+                    f"{FUNDING_FLOOR_HEDGE_ANNUAL * 100:+.3f}%/year — hedge net cost"
                 )
     if bad:
         return False, (
             "non-USD Earn picks with negative 7d funding (exit "
             "required): " + " | ".join(bad)
+        )
+    return True, None
+
+
+# ─── Funding-carry rules (`bybit-strategy-expansion.4`) ────────────────────
+
+
+# Carry venue id. The pair `(venue_id, snapshot_category)` mirrors the
+# hedge layer's `_AUTO_HEDGE_VENUES`, but carry is intentionally NOT in
+# that tuple — its picks don't trigger auto-hedge (they ARE the hedge).
+_CARRY_VENUE_ID: str = "bybit_funding_carry"
+_CARRY_CATEGORY: str = "FundingCarry"
+
+
+def check_funding_carry_floor(d: Decision, snapshot: Snapshot) -> Check:
+    """Each `bybit_funding_carry` pick must have its perp pair's 7d-avg
+    funding rate **annualized** at or above `FUNDING_FLOOR_CARRY_ANNUAL`
+    (~+5.5%/year). The snapshot's carry builder already filters by this
+    threshold, but the validator restates the invariant defensively in
+    case (a) the LLM hallucinates a product_id outside the snapshot
+    (covered by `check_product_ids_in_snapshot`, but layered here for
+    clarity) or (b) downstream code adds a FundingCarry row without
+    going through `_build_funding_carry_products`. Missing perp_market
+    entry → reject (no way to price the carry without funding data).
+
+    Annualization reads each coin's `funding_interval_hours` so 4h /
+    8h / 1h pairs compare like-for-like — a 4h coin at +0.00003/period
+    (≈ +6.6%/year) is correctly accepted, while the pre-fix per-period
+    comparison would have rejected it as "below floor".
+    """
+    carry = d.venue(_CARRY_VENUE_ID)  # type: ignore[arg-type]
+    if carry is None or carry.weight <= 0 or not carry.picks:
+        return True, None
+    perp_market = getattr(snapshot, "perp_market", None) or {}
+    carry_products = {
+        p.product_id: p
+        for p in snapshot.products.get(_CARRY_CATEGORY, [])
+    }
+    bad: list[str] = []
+    for pick in carry.picks:
+        summary = carry_products.get(pick.product_id)
+        if summary is None:
+            # Caught by check_product_ids_in_snapshot; skip duplicate
+            # message here to keep error output focused.
+            continue
+        coin = summary.coin.upper()
+        info = perp_market.get(coin) or perp_market.get(coin.lower())
+        if info is None or info.funding_rate_7d_avg is None:
+            bad.append(
+                f"{pick.product_id}({coin}): perp_market funding_rate_7d_avg "
+                "missing — cannot validate carry floor"
+            )
+            continue
+        interval = (
+            info.funding_interval_hours or DEFAULT_FUNDING_INTERVAL_HOURS
+        )
+        annual = _annual_funding(info.funding_rate_7d_avg, interval)
+        if annual is None or annual < FUNDING_FLOOR_CARRY_ANNUAL:
+            annual_pct = float(annual) * 100 if annual is not None else float("nan")
+            floor_pct = float(FUNDING_FLOOR_CARRY_ANNUAL) * 100
+            bad.append(
+                f"{pick.product_id}({coin}): 7d avg funding "
+                f"{float(info.funding_rate_7d_avg):+.6f}/{interval}h "
+                f"({annual_pct:+.3f}% annualized) "
+                f"below carry floor {floor_pct:+.3f}%/year"
+            )
+    if bad:
+        return False, (
+            "funding-carry picks below floor (exit required): "
+            + " | ".join(bad)
+        )
+    return True, None
+
+
+def check_no_double_carry_hedge(d: Decision, snapshot: Snapshot) -> Check:
+    """A single coin cannot be carried in `bybit_funding_carry` AND
+    appear as a non-stable Earn pick (`bybit_onchain` / `bybit_flex`) in
+    the same decision. Both layers open a paired spot+perp short on
+    that coin; running both at once would double-lock USDT margin AND
+    double-open the short — neither catastrophic in isolation, but the
+    second short violates the "delta-neutral, sized to spot" invariant
+    that lets the executor reconcile per-coin. See
+    `notes/bybit-funding-carry.md`.
+    """
+    carry = d.venue(_CARRY_VENUE_ID)  # type: ignore[arg-type]
+    if carry is None or carry.weight <= 0 or not carry.picks:
+        return True, None
+    carry_products = {
+        p.product_id: p
+        for p in snapshot.products.get(_CARRY_CATEGORY, [])
+    }
+    carry_coins: set[str] = set()
+    for pick in carry.picks:
+        summary = carry_products.get(pick.product_id)
+        if summary is None:
+            continue
+        carry_coins.add(summary.coin.upper())
+    if not carry_coins:
+        return True, None
+
+    overlaps: list[str] = []
+    for venue_id, category in _AUTO_HEDGE_VENUES:
+        venue = d.venue(venue_id)  # type: ignore[arg-type]
+        if venue is None or venue.weight <= 0 or not venue.picks:
+            continue
+        idx = _snapshot_index(snapshot).get(category, {})
+        for pick in venue.picks:
+            summary = idx.get(pick.product_id)
+            if summary is None:
+                continue
+            coin = summary.coin.upper()
+            if coin in _STABLE_COINS:
+                continue
+            if coin in carry_coins:
+                overlaps.append(
+                    f"{coin} in {_CARRY_VENUE_ID} AND {venue_id}/{pick.product_id}"
+                )
+    if overlaps:
+        return False, (
+            "coin overlap between funding-carry and non-stable Earn picks "
+            "(would double-open perp short + double-lock margin): "
+            + " | ".join(overlaps)
         )
     return True, None
 
@@ -569,6 +720,30 @@ def check_stable_spend_cap(d: Decision, snapshot: Snapshot) -> Check:
                 f"{venue_id}/{pick.product_id}({coin})=${pick_usd:.2f}"
             )
 
+    # Funding-carry picks (`bybit-strategy-expansion.4`). Each carry
+    # pick opens its own paired spot Buy + perp short — same USDT
+    # outflow shape as a hedged non-stable Earn pick. Capital-flow
+    # accounting must include both layers or the carry venue would
+    # silently overrun the stable supply.
+    carry = d.venue(_CARRY_VENUE_ID)  # type: ignore[arg-type]
+    if carry is not None and carry.weight > 0 and carry.picks:
+        carry_idx = _snapshot_index(snapshot).get(_CARRY_CATEGORY, {})
+        for pick in carry.picks:
+            summary = carry_idx.get(pick.product_id)
+            if summary is None:
+                continue
+            coin = summary.coin.upper()
+            if coin in _STABLE_COINS:
+                continue
+            pick_usd = total_book * float(carry.weight) * float(pick.weight)
+            if pick_usd <= 0:
+                continue
+            perp_demand += pick_usd * _VALIDATOR_HEDGE_MARGIN_BUFFER
+            spot_demand += pick_usd
+            contributors.append(
+                f"{_CARRY_VENUE_ID}/{pick.product_id}({coin})=${pick_usd:.2f}"
+            )
+
     if not contributors:
         return True, None
 
@@ -623,6 +798,8 @@ def validate(decision: Decision, snapshot: Snapshot) -> tuple[bool, list[str]]:
         check_lm_leverage_size_cap,
         check_hedges_for_non_usd_picks,
         check_funding_rate_floor,
+        check_funding_carry_floor,
+        check_no_double_carry_hedge,
         check_stable_spend_cap,
     ]
     errors: list[str] = []
