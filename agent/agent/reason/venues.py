@@ -288,3 +288,44 @@ def disabled_venue_ids() -> list[str]:
     """Convenience for the prompt — listed so the LLM knows what NOT to
     allocate to without having to read the full metadata table."""
     return [v.venue_id for v in VENUE_REGISTRY.values() if not v.enabled]
+
+
+# ─── Derived constants for downstream modules ──────────────────────────────
+#
+# The validator and executor both partition venues into "basic earn"
+# (subscribe → spot+perp paired short via the auto-hedge layer) and
+# "funding-carry" (standalone delta-neutral). They used to hold their
+# own copies of the venue-id / snapshot-category strings — easy to
+# desync when renaming or adding a venue. Single source: VENUE_REGISTRY
+# entries below, with these top-level constants derived from them so
+# the registry stays the only place where the snapshot_category strings
+# need to match the snapshot.py product-category keys.
+
+CARRY_VENUE_ID: VenueId = "bybit_funding_carry"
+# Reads through the registry so a rename of `snapshot_category` in the
+# carry VenueMeta propagates automatically.
+CARRY_CATEGORY: str = VENUE_REGISTRY[CARRY_VENUE_ID].snapshot_category or "FundingCarry"
+
+# Venues whose non-stable picks trigger the auto-hedge layer
+# (paired perp short on the underlying). NOT including carry — carry
+# picks open their own paired spot+perp via OPEN_FUNDING_CARRY and must
+# stay out of the hedge reconciliation (`check_no_double_carry_hedge`
+# enforces no coin overlap between the two).
+HEDGE_VENUE_IDS: tuple[VenueId, ...] = ("bybit_onchain", "bybit_flex")
+
+# `(venue_id, snapshot_category)` tuples for the auto-hedge venues —
+# the validator and executor both iterate over this when sizing /
+# accounting for paired hedges. Built from the registry so a category
+# rename only requires touching the VenueMeta entry.
+HEDGE_VENUES: tuple[tuple[VenueId, str], ...] = tuple(
+    (vid, VENUE_REGISTRY[vid].snapshot_category)
+    for vid in HEDGE_VENUE_IDS
+    if VENUE_REGISTRY[vid].snapshot_category is not None
+)  # type: ignore[misc]
+
+# Snapshot-category strings for the auto-hedge venues. The executor
+# uses this set when checking whether a pick category should consume
+# the basic-earn (FUND / UNIFIED) flow vs an advance-earn flow.
+BASIC_EARN_CATEGORIES: frozenset[str] = frozenset(
+    cat for _vid, cat in HEDGE_VENUES
+)

@@ -23,7 +23,14 @@ from __future__ import annotations
 from decimal import Decimal
 
 from agent.reason.schema import Decision, VenueAllocation
-from agent.reason.venues import VENUE_REGISTRY, VenueId
+from agent.reason.venues import (
+    BASIC_EARN_CATEGORIES,
+    CARRY_CATEGORY,
+    CARRY_VENUE_ID,
+    HEDGE_VENUES,
+    VENUE_REGISTRY,
+    VenueId,
+)
 from agent.sandbox.snapshot import (
     DEFAULT_FUNDING_INTERVAL_HOURS,
     FUNDING_FLOOR_CARRY_ANNUAL,
@@ -157,7 +164,7 @@ def check_effective_pick_cap(d: Decision, snapshot: Snapshot) -> Check:
             # the strict cap regardless — their risk profile is not
             # comparable to a flat stable Earn product.
             stable_eligible = (
-                cat in ("FlexibleSaving", "OnChain")
+                cat in BASIC_EARN_CATEGORIES
                 and coin in _STABLE_COINS
             )
             cap = (
@@ -372,13 +379,11 @@ def _extract_max_leverage(summary: ProductSummary) -> int | None:
 
 
 # Earn venues whose non-stable picks must clear the auto-hedge
-# feasibility gate. Mirrors `execute._AUTO_HEDGE_CATEGORIES` — keeping
-# the two lists in lockstep is a soft contract; the test suite catches
-# drift via `test_aggregate_validate_passes_hedged_non_usd_pick`.
-_AUTO_HEDGE_VENUES: tuple[tuple[str, str], ...] = (
-    ("bybit_onchain", "OnChain"),
-    ("bybit_flex", "FlexibleSaving"),
-)
+# feasibility gate. Imported from `agent.reason.venues.HEDGE_VENUES` —
+# single source of truth so a rename of `snapshot_category` in
+# VENUE_REGISTRY propagates automatically and the validator can't drift
+# from the executor on which venues participate in auto-hedge.
+_AUTO_HEDGE_VENUES = HEDGE_VENUES
 
 
 def check_hedges_for_non_usd_picks(d: Decision, snapshot: Snapshot) -> Check:
@@ -504,11 +509,14 @@ def check_funding_rate_floor(d: Decision, snapshot: Snapshot) -> Check:
 # ─── Funding-carry rules (`bybit-strategy-expansion.4`) ────────────────────
 
 
-# Carry venue id. The pair `(venue_id, snapshot_category)` mirrors the
-# hedge layer's `_AUTO_HEDGE_VENUES`, but carry is intentionally NOT in
-# that tuple — its picks don't trigger auto-hedge (they ARE the hedge).
-_CARRY_VENUE_ID: str = "bybit_funding_carry"
-_CARRY_CATEGORY: str = "FundingCarry"
+# Carry venue id and snapshot category. The pair `(venue_id,
+# snapshot_category)` mirrors the hedge layer's `HEDGE_VENUES`, but
+# carry is intentionally NOT in that tuple — its picks don't trigger
+# auto-hedge (they ARE the hedge). Both come from
+# `agent.reason.venues` so the registry stays the only place where the
+# strings are written.
+_CARRY_VENUE_ID = CARRY_VENUE_ID
+_CARRY_CATEGORY = CARRY_CATEGORY
 
 
 def check_funding_carry_floor(d: Decision, snapshot: Snapshot) -> Check:
@@ -636,10 +644,11 @@ def _pick_usd_value(
         return 0.0
     idx = _snapshot_index(snapshot).get(category, {})
     target = coin.upper()
-    venue_id = {
-        "OnChain": "bybit_onchain",
-        "FlexibleSaving": "bybit_flex",
-    }.get(category)
+    # Reverse-map from snapshot_category back to venue_id. Built from
+    # HEDGE_VENUES so a new auto-hedge venue gets picked up
+    # automatically.
+    category_to_venue = {cat: vid for vid, cat in HEDGE_VENUES}
+    venue_id = category_to_venue.get(category)
     if not venue_id:
         return 0.0
     venue = d.venue(venue_id)  # type: ignore[arg-type]

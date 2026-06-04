@@ -41,6 +41,7 @@ from agent.bybit_oracle.bybit_client import (
     OnChainEarnProduct,
     PerpPosition,
 )
+from agent.reason.venues import CARRY_CATEGORY
 from agent.sandbox.on_chain import (
     AAVE_V3_POOL_ADDRESS,
     AaveV3UsdcState,
@@ -1430,7 +1431,7 @@ def _build_funding_carry_products(
         effective_apr = gross_annual - FUNDING_CARRY_FRICTION_ANNUAL
         rows.append(
             ProductSummary(
-                category="FundingCarry",
+                category=CARRY_CATEGORY,
                 product_id=info.symbol,
                 coin=coin,
                 effective_apr=effective_apr,
@@ -2188,7 +2189,7 @@ async def collect_snapshot(
     # tokens, not a correctness bug).
     carry_rows = _build_funding_carry_products(perp_market, total_equity)
     if carry_rows:
-        products["FundingCarry"] = carry_rows
+        products[CARRY_CATEGORY] = carry_rows
 
     # Market — take first ticker per symbol (single-symbol query returns one row)
     btc = btc_tickers[0] if btc_tickers else None

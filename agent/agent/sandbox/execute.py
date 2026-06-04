@@ -48,7 +48,12 @@ from agent.bybit_oracle.bybit_client import (
     TERMINAL_BAD_SPOT_STATUSES,
 )
 from agent.reason.schema import Decision, Pick, VenueAllocation
-from agent.reason.venues import VENUE_REGISTRY
+from agent.reason.venues import (
+    BASIC_EARN_CATEGORIES,
+    CARRY_CATEGORY,
+    CARRY_VENUE_ID,
+    VENUE_REGISTRY,
+)
 from agent.sandbox.carry_state import (
     CarryPositionRecord,
     CarryState,
@@ -94,8 +99,11 @@ _ACCOUNT_TYPE: dict[str, str] = {
 }
 
 # Bybit Earn categories the executor knows how to drive. LM + advance-
-# Earn are surfaced as out-of-scope skip actions.
-_BASIC_EARN_CATEGORIES: frozenset[str] = frozenset({"FlexibleSaving", "OnChain"})
+# Earn are surfaced as out-of-scope skip actions. Imported from
+# `agent.reason.venues.BASIC_EARN_CATEGORIES` so it can't drift from
+# the validator's auto-hedge venue list (single source: VENUE_REGISTRY's
+# `snapshot_category` for the hedge venues).
+_BASIC_EARN_CATEGORIES = BASIC_EARN_CATEGORIES
 
 # Snapshot category string for Liquidity Mining picks (`.47`). Held as a
 # constant so the diff and dispatch arms refer to the same string the
@@ -883,10 +891,10 @@ def _coin_from_perp_symbol(symbol: str) -> str:
 # perp short to neutralize. LM is excluded — it's a paired LP (the quote
 # side already hedges the base on average). Advance-Earn is excluded —
 # DualAssets / DiscountBuy / SmartLeverage / DoubleWin are structured
-# conditional products, not simple directional spot stakes.
-_AUTO_HEDGE_CATEGORIES: frozenset[str] = frozenset(
-    {"OnChain", "FlexibleSaving"}
-)
+# conditional products, not simple directional spot stakes. Same set as
+# `_BASIC_EARN_CATEGORIES` above — both ultimately derive from
+# `agent.reason.venues.HEDGE_VENUES`.
+_AUTO_HEDGE_CATEGORIES = BASIC_EARN_CATEGORIES
 
 
 def _auto_hedge_targets(
@@ -1886,12 +1894,12 @@ def _funding_carry_targets(
     instead of OnChain/Flex. Empty when the venue isn't picked or has
     no picks; coin keys are uppercase per executor convention.
     """
-    venue = decision.venue("bybit_funding_carry")  # type: ignore[arg-type]
+    venue = decision.venue(CARRY_VENUE_ID)  # type: ignore[arg-type]
     if venue is None or venue.weight <= 0 or not venue.picks:
         return {}
     carry_products = {
         p.product_id: p
-        for p in snapshot.products.get("FundingCarry", [])
+        for p in snapshot.products.get(CARRY_CATEGORY, [])
     }
     targets: dict[str, Decimal] = {}
     for pick in venue.picks:
@@ -2017,7 +2025,7 @@ def _funding_carry_diff(
             opens.append(
                 Action(
                     kind=ActionKind.OPEN_FUNDING_CARRY,
-                    category="FundingCarry",
+                    category=CARRY_CATEGORY,
                     product_id=info.symbol,
                     coin=coin,
                     amount=target,
@@ -2055,7 +2063,7 @@ def _funding_carry_diff(
             closes.append(
                 Action(
                     kind=ActionKind.CLOSE_FUNDING_CARRY,
-                    category="FundingCarry",
+                    category=CARRY_CATEGORY,
                     product_id=symbol,
                     coin=coin,
                     amount=existing.target_pick_usd,
