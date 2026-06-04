@@ -116,7 +116,7 @@ async def test_volatile_path_swaps_then_stakes(deposit_at_product_selected):
     client.place_spot_order.assert_awaited_once_with(
         symbol="ETHUSDC",
         side="Buy",
-        qty="100",
+        qty_quote="100",
         order_type="Market",
         order_link_id=_link_id(1, "swap"),
     )

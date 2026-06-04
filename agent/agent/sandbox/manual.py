@@ -655,17 +655,30 @@ def spot_order(
     price: str | None,
     live: bool,
 ) -> None:
-    """Place a spot order. Caller is responsible for lot-size / min-notional rules."""
+    """Place a spot order. Caller is responsible for lot-size / min-notional rules.
+
+    `qty` is auto-routed to `qty_base` or `qty_quote` based on
+    side+order_type — Buy Market expects quote (USDT); everything else
+    expects base (`.27` API).
+    """
     _require_live(live, "spot-order")
+
+    side_cap = side.capitalize()
+    order_type_cap = order_type.capitalize()
+    qty_kwargs: dict[str, str]
+    if side_cap == "Buy" and order_type_cap == "Market":
+        qty_kwargs = {"qty_quote": qty}
+    else:
+        qty_kwargs = {"qty_base": qty}
 
     async def run() -> None:
         async with _build_client(ctx.obj["env_file"]) as client:
             result = await client.place_spot_order(
                 symbol=symbol,
-                side=side.capitalize(),  # type: ignore[arg-type]
-                qty=qty,
-                order_type=order_type.capitalize(),  # type: ignore[arg-type]
+                side=side_cap,  # type: ignore[arg-type]
+                order_type=order_type_cap,  # type: ignore[arg-type]
                 price=price,
+                **qty_kwargs,  # type: ignore[arg-type]
             )
         _print(result)
         path = _capture("spot-order", result)

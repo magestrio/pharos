@@ -148,7 +148,7 @@ class SwapStakeExecutor:
         result = await self._client.place_spot_order(
             symbol=symbol,
             side="Buy",
-            qty=str(qty_usdc),
+            qty_quote=str(qty_usdc),
             order_type="Market",
             order_link_id=_link_id(tx_id, "swap"),
         )

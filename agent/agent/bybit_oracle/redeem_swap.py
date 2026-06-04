@@ -192,7 +192,7 @@ class RedeemSwapExecutor:
         result = await self._client.place_spot_order(
             symbol=symbol,
             side="Sell",
-            qty=str(qty),
+            qty_base=str(qty),
             order_type="Market",
             order_link_id=_link_id(tx_id, "swap-back"),
         )

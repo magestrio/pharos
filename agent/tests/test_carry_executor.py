@@ -507,7 +507,7 @@ async def test_dispatch_open_happy_path_sets_leverage_then_spot_then_perp() -> N
     spot_call = client.place_spot_order.await_args
     assert spot_call.kwargs["side"] == "Buy"
     assert spot_call.kwargs["symbol"] == "TONUSDT"
-    assert spot_call.kwargs["qty"] == "100"
+    assert spot_call.kwargs["qty_quote"] == "100"
     assert spot_call.kwargs["order_link_id"] == "lid_spot"
     # Perp Sell with base qty (=50) and tagged orderLinkId
     perp_call = client.place_perp_order.await_args
@@ -654,7 +654,7 @@ async def test_dispatch_close_happy_path() -> None:
     # Spot Sell with base qty
     spot_call = client.place_spot_order.await_args
     assert spot_call.kwargs["side"] == "Sell"
-    assert spot_call.kwargs["qty"] == "50"
+    assert spot_call.kwargs["qty_base"] == "50"
     # Perp Buy with reduce_only=True
     perp_call = client.place_perp_order.await_args
     assert perp_call.kwargs["side"] == "Buy"

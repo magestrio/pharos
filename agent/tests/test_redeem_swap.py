@@ -153,7 +153,7 @@ async def test_volatile_path_redeems_then_sells(db):
     client.place_spot_order.assert_awaited_once_with(
         symbol="ETHUSDC",
         side="Sell",
-        qty="0.025",
+        qty_base="0.025",
         order_type="Market",
         order_link_id=_link_id(1, "swap-back"),
     )
@@ -285,4 +285,4 @@ async def test_volatile_uses_credited_qty_not_requested_amount(db):
 
     # Sell order uses 0.0249 (credited), not 0.025 (requested).
     sell_call = client.place_spot_order.await_args
-    assert sell_call.kwargs["qty"] == "0.0249"
+    assert sell_call.kwargs["qty_base"] == "0.0249"

@@ -192,31 +192,295 @@ async def test_withdraw_targets_mantle_chain(captured):
     assert body["address"] == "0xdead"
 
 
+def _spot_instrument_response(
+    *,
+    symbol: str = "ETHUSDT",
+    base_precision: str = "0.00001",
+    quote_precision: str = "0.01",
+    min_order_qty: str = "0.00001",
+    max_order_qty: str = "100",
+    min_order_amt: str = "1",
+    max_order_amt: str = "1000000",
+) -> dict:
+    """Build a `/v5/market/instruments-info` payload for `validate_qty`
+    tests. Default values approximate ETHUSDT live shapes."""
+    return {
+        "list": [
+            {
+                "symbol": symbol,
+                "status": "Trading",
+                "lotSizeFilter": {
+                    "basePrecision": base_precision,
+                    "quotePrecision": quote_precision,
+                    "minOrderQty": min_order_qty,
+                    "maxOrderQty": max_order_qty,
+                    "minOrderAmt": min_order_amt,
+                    "maxOrderAmt": max_order_amt,
+                },
+            }
+        ]
+    }
+
+
+def _spot_route_responder(
+    *,
+    instrument: dict | None = None,
+    order_result: dict | None = None,
+):
+    """Path-based responder: instruments-info → `instrument`, order/create
+    → `order_result`. Used by tests that exercise `place_spot_order` end-
+    to-end with `validate_qty` pre-flight enabled."""
+    instrument = instrument or _spot_instrument_response()
+    order_result = order_result or {"orderId": "ord-test"}
+
+    def _responder(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/v5/market/instruments-info":
+            return _ok(instrument)
+        if req.url.path == "/v5/order/create":
+            return _ok(order_result)
+        return httpx.Response(404, json={"retCode": -1, "retMsg": "no route"})
+
+    return _responder
+
+
 @pytest.mark.asyncio
 async def test_place_spot_order_market(captured):
-    async with _client(captured, lambda _r: _ok({"orderId": "ord-9"})) as c:
-        result = await c.place_spot_order(symbol="ETHUSDT", side="Buy", qty="0.01")
+    # Buy Market: qty is denominated in quote coin (USDT) — $100 to
+    # spend on ETH at spot. Validates against minOrderAmt=1.
+    async with _client(
+        captured,
+        _spot_route_responder(order_result={"orderId": "ord-9"}),
+    ) as c:
+        result = await c.place_spot_order(
+            symbol="ETHUSDT", side="Buy", qty_quote="100.00"
+        )
 
     assert result.orderId == "ord-9"
-    body = json.loads(captured[0].content.decode())
-    assert body == {
+    # captured[0] is the instruments-info pre-flight, [1] is the order
+    order_body = json.loads(captured[1].content.decode())
+    assert order_body == {
         "category": "spot",
         "symbol": "ETHUSDT",
         "side": "Buy",
         "orderType": "Market",
-        "qty": "0.01",
+        "qty": "100.00",
     }
 
 
 @pytest.mark.asyncio
 async def test_place_spot_order_limit_includes_price(captured):
-    async with _client(captured, lambda _r: _ok({"orderId": "ord-10"})) as c:
+    async with _client(captured, _spot_route_responder()) as c:
         await c.place_spot_order(
-            symbol="ETHUSDT", side="Sell", qty="0.5", order_type="Limit", price="3500"
+            symbol="ETHUSDT",
+            side="Sell",
+            qty_base="0.5",
+            order_type="Limit",
+            price="3500",
         )
 
-    body = json.loads(captured[0].content.decode())
+    order_body = json.loads(captured[1].content.decode())
+    assert order_body["orderType"] == "Limit"
+    assert order_body["price"] == "3500"
+    assert order_body["qty"] == "0.50000"  # rounded to basePrecision=0.00001
+
+
+@pytest.mark.asyncio
+async def test_validate_qty_rounds_down_to_base_precision(captured):
+    async with _client(
+        captured,
+        _spot_route_responder(
+            instrument=_spot_instrument_response(base_precision="0.00001"),
+        ),
+    ) as c:
+        out = await c.validate_qty("ETHUSDT", Decimal("0.123456789"), side="Sell")
+
+    assert out == "0.12345"
+
+
+@pytest.mark.asyncio
+async def test_validate_qty_buy_market_uses_quote_precision(captured):
+    async with _client(
+        captured,
+        _spot_route_responder(
+            instrument=_spot_instrument_response(quote_precision="0.01"),
+        ),
+    ) as c:
+        out = await c.validate_qty(
+            "ETHUSDT", "100.999", side="Buy", order_type="Market"
+        )
+
+    assert out == "100.99"
+
+
+@pytest.mark.asyncio
+async def test_validate_qty_below_min_raises(captured):
+    async with _client(
+        captured,
+        _spot_route_responder(
+            instrument=_spot_instrument_response(
+                base_precision="0.00001", min_order_qty="0.0001"
+            ),
+        ),
+    ) as c:
+        with pytest.raises(ValueError, match="below"):
+            await c.validate_qty("ETHUSDT", Decimal("0.00005"), side="Sell")
+
+
+@pytest.mark.asyncio
+async def test_validate_qty_above_max_raises(captured):
+    async with _client(
+        captured,
+        _spot_route_responder(
+            instrument=_spot_instrument_response(
+                base_precision="0.00001", max_order_qty="10"
+            ),
+        ),
+    ) as c:
+        with pytest.raises(ValueError, match="above"):
+            await c.validate_qty("ETHUSDT", Decimal("50"), side="Sell")
+
+
+@pytest.mark.asyncio
+async def test_validate_qty_caches_per_symbol(captured):
+    async with _client(captured, _spot_route_responder()) as c:
+        await c.validate_qty("ETHUSDT", Decimal("0.1"), side="Sell")
+        await c.validate_qty("ETHUSDT", Decimal("0.2"), side="Sell")
+        await c.validate_qty("ETHUSDT", Decimal("0.3"), side="Sell")
+
+    instrument_calls = [
+        r for r in captured if r.url.path == "/v5/market/instruments-info"
+    ]
+    assert len(instrument_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_validate_qty_passes_through_when_no_instrument(captured):
+    """Bybit transient empty response shouldn't brick the loop —
+    degrade to passthrough with a warning."""
+
+    def _empty_then_ok(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/v5/market/instruments-info":
+            return _ok({"list": []})
+        return _ok({"orderId": "ord-x"})
+
+    async with _client(captured, _empty_then_ok) as c:
+        out = await c.validate_qty("WEIRDUSDT", "1.234567", side="Sell")
+
+    assert out == "1.234567"
+
+
+@pytest.mark.asyncio
+async def test_place_spot_order_rounds_qty_before_submit(captured):
+    """End-to-end: caller passes precision-busting qty, body sent to
+    Bybit carries the rounded value (170137 unreachable downstream)."""
+    async with _client(
+        captured,
+        _spot_route_responder(
+            instrument=_spot_instrument_response(base_precision="0.00001"),
+            order_result={"orderId": "ord-rounded"},
+        ),
+    ) as c:
+        await c.place_spot_order(
+            symbol="ETHUSDT", side="Sell", qty_base="0.123456789"
+        )
+
+    order_body = json.loads(captured[1].content.decode())
+    assert order_body["qty"] == "0.12345"
+
+
+# ─── .27 qty_base / qty_quote XOR ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_place_spot_order_buy_market_requires_qty_quote(captured):
+    """`.27`: Buy Market consumes USDT (quote) amount. Caller passing
+    `qty_base=...` to a Buy Market is ambiguous and must fail locally
+    before the HTTP round-trip (otherwise Bybit's qty semantics flip
+    the interpretation and we send the wrong size)."""
+    async with _client(captured, _spot_route_responder()) as c:
+        with pytest.raises(ValueError, match="qty_quote"):
+            await c.place_spot_order(
+                symbol="ETHUSDT", side="Buy", qty_base="0.01"
+            )
+
+
+@pytest.mark.asyncio
+async def test_place_spot_order_sell_requires_qty_base(captured):
+    """Mirror: Sell takes base coin. `qty_quote` on a Sell is ambiguous."""
+    async with _client(captured, _spot_route_responder()) as c:
+        with pytest.raises(ValueError, match="qty_base"):
+            await c.place_spot_order(
+                symbol="ETHUSDT", side="Sell", qty_quote="100"
+            )
+
+
+@pytest.mark.asyncio
+async def test_place_spot_order_buy_limit_requires_qty_base(captured):
+    """Buy Limit takes base coin (NOT quote — that's only Buy Market).
+    Easy to misremember, hence the XOR."""
+    async with _client(captured, _spot_route_responder()) as c:
+        with pytest.raises(ValueError, match="qty_base"):
+            await c.place_spot_order(
+                symbol="ETHUSDT",
+                side="Buy",
+                qty_quote="100",
+                order_type="Limit",
+                price="3500",
+            )
+
+
+@pytest.mark.asyncio
+async def test_place_spot_order_rejects_neither_qty(captured):
+    """Missing both qty kwargs → fail-fast with a clear message."""
+    async with _client(captured, _spot_route_responder()) as c:
+        with pytest.raises(ValueError, match="qty_quote"):
+            await c.place_spot_order(symbol="ETHUSDT", side="Buy")
+        with pytest.raises(ValueError, match="qty_base"):
+            await c.place_spot_order(symbol="ETHUSDT", side="Sell")
+
+
+@pytest.mark.asyncio
+async def test_place_spot_order_rejects_both_qty(captured):
+    """Passing both base AND quote is ambiguous — `validate_qty` would
+    silently pick one and the other goes ignored, masking a caller
+    bug. Fail loudly instead."""
+    async with _client(captured, _spot_route_responder()) as c:
+        with pytest.raises(ValueError, match="ambiguous"):
+            await c.place_spot_order(
+                symbol="ETHUSDT",
+                side="Buy",
+                qty_quote="100",
+                qty_base="0.01",
+            )
+        with pytest.raises(ValueError, match="ambiguous"):
+            await c.place_spot_order(
+                symbol="ETHUSDT",
+                side="Sell",
+                qty_base="0.5",
+                qty_quote="100",
+            )
+
+
+@pytest.mark.asyncio
+async def test_place_spot_order_buy_limit_with_qty_base_succeeds(captured):
+    """Buy Limit with `qty_base` is the correct shape — qty rounded by
+    `basePrecision`, order body carries `orderType=Limit` + price."""
+    async with _client(
+        captured,
+        _spot_route_responder(order_result={"orderId": "ord-buy-limit"}),
+    ) as c:
+        await c.place_spot_order(
+            symbol="ETHUSDT",
+            side="Buy",
+            qty_base="0.5",
+            order_type="Limit",
+            price="3500",
+        )
+
+    body = json.loads(captured[1].content.decode())
+    assert body["side"] == "Buy"
     assert body["orderType"] == "Limit"
+    assert body["qty"] == "0.50000"
     assert body["price"] == "3500"
 
 

@@ -376,10 +376,26 @@ class OrderbookSnapshot(BaseModel):
 
 
 class InstrumentLotSizeFilter(BaseModel):
+    """Lot-size constraints from `/v5/market/instruments-info`.
+
+    Spot and linear envelopes share the same field names where they
+    overlap (`min/maxOrderQty`), but spot additionally exposes
+    `basePrecision` / `quotePrecision` (decimal step on base vs quote
+    coin) and `min/maxOrderAmt` (quote-denominated notional bounds used
+    by Buy Market orders, where Bybit takes `qty` in quote coin). All
+    spot-only fields are optional so a linear payload still parses; the
+    `validate_qty` pre-flight on `BybitClient` reads whichever pair
+    applies to the side+orderType combination.
+    """
+
     model_config = ConfigDict(extra="ignore")
     maxOrderQty: str | None = None
     minOrderQty: str | None = None
     qtyStep: str | None = None
+    basePrecision: str | None = None
+    quotePrecision: str | None = None
+    minOrderAmt: str | None = None
+    maxOrderAmt: str | None = None
 
 
 class InstrumentLeverageFilter(BaseModel):
@@ -467,6 +483,11 @@ class BybitClient:
             transport=transport,
             timeout=timeout,
         )
+        # Per-symbol spot instrument cache for `validate_qty` pre-flight.
+        # Spot lot-size rules drift on the order of weeks; process-
+        # lifetime caching is sufficient and a daemon restart drops it
+        # anyway.
+        self._spot_instrument_cache: dict[str, "LinearInstrument"] = {}
 
     @classmethod
     def from_settings(
@@ -1664,24 +1685,176 @@ class BybitClient:
         )
         return data.get("result") or {}
 
+    async def _get_spot_instrument(self, symbol: str) -> LinearInstrument | None:
+        """Cached lookup of a spot symbol's instrument metadata. Returns
+        None when Bybit echoes an empty list — caller decides whether to
+        passthrough or hard-fail.
+        """
+        cached = self._spot_instrument_cache.get(symbol)
+        if cached is not None:
+            return cached
+        items = await self.get_instruments_info(category="spot", symbol=symbol)
+        if not items:
+            return None
+        instr = items[0]
+        self._spot_instrument_cache[symbol] = instr
+        return instr
+
+    async def validate_qty(
+        self,
+        symbol: str,
+        qty: Decimal | str,
+        *,
+        side: Side = "Sell",
+        order_type: Literal["Market", "Limit"] = "Market",
+    ) -> str:
+        """Round `qty` down to the spot symbol's lot-size precision and
+        check min/max, returning the validated qty as a decimal string.
+
+        Bybit V5 spot semantics:
+        - Buy Market → `qty` is **quote**-coin (USDT for ETHUSDT). Round
+          by `quotePrecision`, bounds-check against `min/maxOrderAmt`.
+        - everything else (Sell Market, Buy/Sell Limit) → `qty` is
+          **base**-coin. Round by `basePrecision`, bounds-check against
+          `min/maxOrderQty`.
+
+        Bybit rejects mismatched precision with `retCode=170137`; calling
+        this pre-flight keeps that error out of `place_spot_order`'s call
+        site so the Phase C executor doesn't crash mid-cycle.
+
+        Rounding is `ROUND_DOWN` (floor) so the validated qty never
+        exceeds caller's intent — important when `qty` is computed from
+        a balance + buffer.
+
+        Raises `ValueError` when the rounded qty falls below min or
+        above max. Degrades to passthrough (no rounding) with a warning
+        log when Bybit returns no instrument metadata or no precision
+        field — a transient Bybit-side hole shouldn't brick the loop.
+        """
+        instr = await self._get_spot_instrument(symbol)
+        if instr is None or instr.lotSizeFilter is None:
+            log.warning(
+                "validate_qty_no_instrument",
+                extra={"symbol": symbol, "qty": str(qty)},
+            )
+            return str(qty)
+
+        lf = instr.lotSizeFilter
+        qty_dec = qty if isinstance(qty, Decimal) else Decimal(str(qty))
+
+        use_quote = side == "Buy" and order_type == "Market"
+        if use_quote:
+            step_str = lf.quotePrecision
+            min_str = lf.minOrderAmt
+            max_str = lf.maxOrderAmt
+            denom = "quote"
+        else:
+            step_str = lf.basePrecision
+            min_str = lf.minOrderQty
+            max_str = lf.maxOrderQty
+            denom = "base"
+
+        if not step_str:
+            log.warning(
+                "validate_qty_no_precision",
+                extra={"symbol": symbol, "denom": denom, "qty": str(qty)},
+            )
+            return str(qty)
+
+        step = Decimal(step_str)
+        if step <= 0:
+            return str(qty)
+
+        # floor-to-step. Decimal arithmetic preserves the step's
+        # exponent so `format(rounded, "f")` produces a string with the
+        # right number of decimals without explicit quantize.
+        rounded = (qty_dec // step) * step
+
+        if min_str:
+            min_dec = Decimal(min_str)
+            if rounded < min_dec:
+                raise ValueError(
+                    f"qty {rounded} below {symbol} min_{denom}={min_dec} "
+                    f"(requested {qty_dec}, step {step})"
+                )
+        if max_str:
+            max_dec = Decimal(max_str)
+            if rounded > max_dec:
+                raise ValueError(
+                    f"qty {rounded} above {symbol} max_{denom}={max_dec}"
+                )
+
+        return format(rounded, "f")
+
     async def place_spot_order(
         self,
         symbol: str,
         side: Side,
-        qty: str,
+        *,
+        qty_base: str | Decimal | None = None,
+        qty_quote: str | Decimal | None = None,
         order_type: Literal["Market", "Limit"] = "Market",
         price: str | None = None,
         order_link_id: str | None = None,
     ) -> SpotOrderResult:
-        """Place a spot order. Caller is responsible for honoring per-symbol
-        lot size / min-notional rules — this client is a thin passthrough.
+        """Place a spot order with explicit base-vs-quote qty semantics
+        (`.27`).
+
+        Bybit V5 Spot Market is asymmetric: a Buy Market consumes a
+        quote-coin (USDT/USDC) amount, a Sell Market consumes a base-coin
+        (ETH/BTC) amount. Both Limit sides consume base-coin. Callers
+        used to remember this and pass `qty=...` raw — too easy to mix
+        up. The new API takes `qty_base` XOR `qty_quote` and rejects the
+        mismatched pairing locally before any HTTP round-trip:
+
+        - Buy Market  →  must supply `qty_quote` (USDT to spend)
+        - Buy Limit   →  must supply `qty_base`  (base coin to acquire)
+        - Sell Market →  must supply `qty_base`  (base coin to sell)
+        - Sell Limit  →  must supply `qty_base`  (base coin to sell)
+
+        The supplied qty is passed through `validate_qty` (lot-size
+        precision; `.25`) before submission so `retCode=170137` is
+        unreachable from a correctly-instrumented call.
+
+        Raises `ValueError` when (a) both or neither qty kwarg is set,
+        (b) the supplied qty doesn't match the side/order_type combo,
+        or (c) `validate_qty` rejects the qty as below min / above max.
         """
+        expects_quote = side == "Buy" and order_type == "Market"
+        if expects_quote:
+            if qty_quote is None:
+                raise ValueError(
+                    f"Buy Market on {symbol} expects qty_quote (USDT "
+                    "amount to spend); pass qty_quote=... not qty_base"
+                )
+            if qty_base is not None:
+                raise ValueError(
+                    f"Buy Market on {symbol} takes qty_quote only; "
+                    "qty_base supplied alongside is ambiguous"
+                )
+            raw_qty: str | Decimal = qty_quote
+        else:
+            if qty_base is None:
+                raise ValueError(
+                    f"{side} {order_type} on {symbol} expects qty_base "
+                    "(base-coin amount); pass qty_base=... not qty_quote"
+                )
+            if qty_quote is not None:
+                raise ValueError(
+                    f"{side} {order_type} on {symbol} takes qty_base "
+                    "only; qty_quote supplied alongside is ambiguous"
+                )
+            raw_qty = qty_base
+
+        validated_qty = await self.validate_qty(
+            symbol, raw_qty, side=side, order_type=order_type
+        )
         body: dict[str, Any] = {
             "category": "spot",
             "symbol": symbol,
             "side": side,
             "orderType": order_type,
-            "qty": qty,
+            "qty": validated_qty,
         }
         if price is not None:
             body["price"] = price
