@@ -3330,26 +3330,57 @@ async def _execute_one(
             sl = action.extra.get("stop_loss") if action.extra else None
             tp = action.extra.get("take_profit") if action.extra else None
             if sl is not None or tp is not None:
-                try:
-                    await client.set_trading_stop(
-                        action.product_id,
-                        stop_loss=sl,
-                        take_profit=tp,
-                    )
-                    response["stop_loss"] = sl
-                    response["take_profit"] = tp
-                except BybitAPIError as e:
-                    # Stop placement failure shouldn't fail the whole
-                    # perp open — log + carry on. Internal watcher
-                    # remains the safety net.
+                # Fix #8 (2026-06-04): one retry after a short backoff
+                # before falling back to watcher-only protection. SL
+                # failures are usually transient (price-band drift, race
+                # with the order's `New` → `PartiallyFilled` transition);
+                # a single retry catches most without spinning forever.
+                # Don't cancel the freshly-opened perp on failure — that
+                # would create a new exposure window and the watcher
+                # poll still covers the position.
+                last_err: BybitAPIError | None = None
+                attempt = 0
+                while attempt < 2:
+                    try:
+                        await client.set_trading_stop(
+                            action.product_id,
+                            stop_loss=sl,
+                            take_profit=tp,
+                        )
+                        response["stop_loss"] = sl
+                        response["take_profit"] = tp
+                        if attempt > 0:
+                            response["stop_loss_retry_succeeded"] = True
+                        last_err = None
+                        break
+                    except BybitAPIError as e:
+                        last_err = e
+                        attempt += 1
+                        if attempt < 2:
+                            log.warning(
+                                "set_trading_stop attempt %d failed for "
+                                "%s (sl=%s tp=%s): retCode=%s %s — "
+                                "retrying after backoff",
+                                attempt, action.product_id, sl, tp,
+                                e.ret_code, e.ret_msg,
+                            )
+                            await asyncio.sleep(1.0)
+                if last_err is not None:
+                    # Both attempts failed — log loudly, perp stays
+                    # open under watcher protection only. The
+                    # `stop_loss_error` key in the response surfaces in
+                    # the cycle log for operator visibility.
                     log.warning(
-                        "set_trading_stop failed for %s (sl=%s tp=%s): "
-                        "retCode=%s %s",
-                        action.product_id, sl, tp, e.ret_code, e.ret_msg,
+                        "set_trading_stop failed twice for %s (sl=%s "
+                        "tp=%s): retCode=%s %s — watcher is sole "
+                        "safety net for this perp until next cycle",
+                        action.product_id, sl, tp,
+                        last_err.ret_code, last_err.ret_msg,
                     )
                     response["stop_loss_error"] = (
-                        f"retCode={e.ret_code} {e.ret_msg}"
+                        f"retCode={last_err.ret_code} {last_err.ret_msg}"
                     )
+                    response["stop_loss_retry_exhausted"] = True
         elif action.kind == ActionKind.OPEN_FUNDING_CARRY:
             # Compound dispatch (`bybit-strategy-expansion.5`): spot Buy
             # + perp Sell as ONE atomic intent. Sequence:

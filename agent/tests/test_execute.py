@@ -3185,6 +3185,93 @@ async def test_execute_open_perp_short_skips_set_trading_stop_when_no_extras(
     client.set_trading_stop.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_execute_open_perp_short_retries_set_trading_stop_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Fix #8 (2026-06-04): a transient set_trading_stop failure (e.g.
+    price-band drift right after the perp opens) gets a second attempt
+    after a short backoff. Tests cover both branches: retry succeeds,
+    retry exhausted (perp stays open under watcher fallback)."""
+    from agent.bybit_oracle.bybit_client import SpotOrderResult as PerpOrderResult
+    # Stub asyncio.sleep so the 1s backoff doesn't actually wait.
+    import agent.sandbox.execute as exec_mod
+    monkeypatch.setattr(exec_mod.asyncio, "sleep", AsyncMock(return_value=None))
+
+    client = AsyncMock()
+    client.set_leverage.return_value = None
+    client.place_perp_order.return_value = PerpOrderResult(
+        orderId="perp-101", orderLinkId="sandbox-h-101",
+    )
+    # First attempt raises, second succeeds.
+    client.set_trading_stop = AsyncMock(
+        side_effect=[
+            BybitAPIError(110007, "Insufficient margin", "/v5/position/trading-stop"),
+            None,
+        ]
+    )
+    action = Action(
+        kind=ActionKind.OPEN_PERP_SHORT,
+        category="Perp", product_id="TONUSDT", coin="TON",
+        amount=Decimal("4.1"),
+        order_link_id="sandbox-h-101",
+        reason="short TON",
+        extra={"stop_loss": "2.60", "take_profit": "1.40"},
+    )
+    results = await execute_actions(
+        client, [action], snapshot_ts="20260604T120000Z",
+        dry_run=False, executions_dir=tmp_path,
+    )
+    assert results[0].status == "ok"
+    assert client.set_trading_stop.await_count == 2
+    response = results[0].response or {}
+    assert response.get("stop_loss") == "2.60"
+    assert response.get("stop_loss_retry_succeeded") is True
+    assert "stop_loss_error" not in response
+
+
+@pytest.mark.asyncio
+async def test_execute_open_perp_short_surfaces_sl_error_after_both_attempts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When both set_trading_stop attempts fail, the perp stays open
+    (cancelling it would create a fresh exposure window) and the
+    `stop_loss_error` + `stop_loss_retry_exhausted` keys surface so
+    the operator sees the gap in the cycle log. Watcher remains the
+    fallback safety net."""
+    from agent.bybit_oracle.bybit_client import SpotOrderResult as PerpOrderResult
+    import agent.sandbox.execute as exec_mod
+    monkeypatch.setattr(exec_mod.asyncio, "sleep", AsyncMock(return_value=None))
+
+    client = AsyncMock()
+    client.set_leverage.return_value = None
+    client.place_perp_order.return_value = PerpOrderResult(
+        orderId="perp-102", orderLinkId="sandbox-h-102",
+    )
+    persistent_err = BybitAPIError(
+        110007, "Insufficient margin", "/v5/position/trading-stop"
+    )
+    client.set_trading_stop = AsyncMock(side_effect=persistent_err)
+    action = Action(
+        kind=ActionKind.OPEN_PERP_SHORT,
+        category="Perp", product_id="TONUSDT", coin="TON",
+        amount=Decimal("4.1"),
+        order_link_id="sandbox-h-102",
+        reason="short TON",
+        extra={"stop_loss": "2.60", "take_profit": "1.40"},
+    )
+    results = await execute_actions(
+        client, [action], snapshot_ts="20260604T120001Z",
+        dry_run=False, executions_dir=tmp_path,
+    )
+    # Perp open succeeded — SL failure must NOT fail the whole action.
+    assert results[0].status == "ok"
+    assert client.set_trading_stop.await_count == 2
+    response = results[0].response or {}
+    assert "110007" in response.get("stop_loss_error", "")
+    assert response.get("stop_loss_retry_exhausted") is True
+
+
 # ─── Atomic redeem+close-pair guard (2026-06-03) ───────────────────────────
 
 
