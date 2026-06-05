@@ -50,10 +50,12 @@ from agent.bybit_oracle.bybit_client import BybitClient
 from agent.reason.schema import Decision
 from agent.sandbox.decide import (
     DECISION_DIR,
-    _load_latest_prior_decision,
+    _collect_recently_invalidated,
+    _load_recent_prior_decisions,
     decide,
     write_decision,
 )
+from agent.sandbox.onchain_writer import OnchainWriter
 from agent.sandbox.carry_state import (
     DEFAULT_CARRY_STATE_PATH,
     read_carry_state,
@@ -177,6 +179,118 @@ _CRITICAL_PROBE_ENDPOINTS: frozenset[str] = frozenset(
 )
 
 log = logging.getLogger(__name__)
+
+
+async def _anchor_onchain(
+    decision: Decision,
+    outcome: dict[str, Any],
+) -> None:
+    """Best-effort: write `recordDecision` to DecisionLog and (if the
+    cooldown is up) `updateReputation` on the canonical 8004 oracle.
+
+    Reads config from env on every cycle so a hot-reloaded `.env.local`
+    is picked up after restart. Anything missing → silently no-op.
+    Results land in `outcome["onchain"]` for downstream telemetry.
+    """
+    writer = await asyncio.to_thread(OnchainWriter.from_env)
+    if writer is None:
+        return
+
+    snap_name = outcome.get("snapshot_filename") or ""
+    # Hydrate the decision dict from disk so we get the canonical
+    # `_meta.written_at` + any IPFS cid sidecars that `write_decision`
+    # baked in. Falls back to the in-memory Decision dump on read error.
+    decision_dict: dict[str, Any]
+    decision_path_name = outcome.get("decision_filename") or ""
+    decision_path = DECISION_DIR / decision_path_name if decision_path_name else None
+    if decision_path and decision_path.exists():
+        try:
+            decision_dict = json.loads(decision_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            decision_dict = decision.model_dump()
+    else:
+        decision_dict = decision.model_dump()
+
+    anchor: dict[str, Any] = {}
+    tx_hash = await asyncio.to_thread(
+        writer.record_decision, decision_dict, snap_name
+    )
+    if tx_hash:
+        anchor["decision_tx"] = tx_hash
+        log.info("decision anchored on-chain: tx=%s", tx_hash)
+
+    rep_tx = await asyncio.to_thread(writer.update_reputation)
+    if rep_tx:
+        anchor["reputation_tx"] = rep_tx
+        log.info("reputation updated on-chain: tx=%s", rep_tx)
+
+    if anchor:
+        outcome["onchain"] = anchor
+        outcome.setdefault("stages", []).append("anchor_onchain")
+
+
+def _drop_picks_into_cash(
+    decision_dict: dict[str, Any],
+    blocked_pids: set[str],
+) -> tuple[dict[str, Any], list[str]]:
+    """Remove every pick whose `product_id` is in `blocked_pids` and roll
+    its weight into `cash_usdc`. Returns `(new_decision_dict, dropped)`
+    where `dropped` is the list of pids that were actually removed (so
+    the caller can log + add notes).
+
+    Same rescale logic as `_build_auto_close_decision` (kept-pick weights
+    rescale within their venue; venue weight shrinks proportionally;
+    fully-emptied venues collapse to cash). Validator still runs on the
+    output as a safety net.
+    """
+    new_venues: list[dict[str, Any]] = []
+    cash_addition = 0.0
+    dropped: list[str] = []
+    for v in decision_dict.get("venues", []) or []:
+        picks = v.get("picks", []) or []
+        venue_weight = float(v.get("weight", 0))
+        if not picks:
+            new_venues.append(dict(v))
+            continue
+        kept = []
+        for p in picks:
+            pid = str(p.get("product_id", ""))
+            if pid in blocked_pids:
+                dropped.append(pid)
+            else:
+                kept.append(p)
+        if len(kept) == len(picks):
+            new_venues.append(dict(v))
+            continue
+        if not kept:
+            cash_addition += venue_weight
+            continue
+        kept_sum = sum(float(p.get("weight", 0)) for p in kept)
+        if kept_sum <= 0:
+            cash_addition += venue_weight
+            continue
+        new_venue_weight = venue_weight * kept_sum
+        cash_addition += venue_weight - new_venue_weight
+        rescaled = [
+            {**p, "weight": float(p.get("weight", 0)) / kept_sum} for p in kept
+        ]
+        new_venues.append(
+            {**v, "weight": new_venue_weight, "picks": rescaled}
+        )
+
+    if cash_addition > 0:
+        cash_seen = False
+        for v in new_venues:
+            if v.get("venue_id") == "cash_usdc":
+                v["weight"] = float(v.get("weight", 0)) + cash_addition
+                cash_seen = True
+                break
+        if not cash_seen:
+            new_venues.append(
+                {"venue_id": "cash_usdc", "weight": cash_addition, "picks": []}
+            )
+    new_decision = {**decision_dict, "venues": new_venues}
+    return new_decision, dropped
 
 
 def _build_auto_close_decision(
@@ -395,8 +509,13 @@ async def run_one_cycle(
         # cost. Per-coin events fan out to the matching pick(s) and
         # roll freed weight to cash. Falls through to the LLM path
         # when no eligible event is present.
-        prior = _load_latest_prior_decision()
-        auto_close = _build_auto_close_decision(prior, wake_events)
+        #
+        # `mainnet-operations.4` memory layer: load up to MEMORY_DEPTH
+        # priors (oldest → newest) for the LLM path; auto-close only
+        # cares about the latest, taken as `priors[-1]`.
+        priors = _load_recent_prior_decisions()
+        latest_prior = priors[-1] if priors else None
+        auto_close = _build_auto_close_decision(latest_prior, wake_events)
         usage = None  # set only on the LLM path; auto-close skips Anthropic
         if auto_close is not None:
             log.info(
@@ -409,11 +528,34 @@ async def run_one_cycle(
             decision, usage = await decide(
                 raw_snapshot,
                 client=anthropic_client,
-                prior_decision=prior,
+                prior_decisions=priors,
                 wake_events=wake_events,
             )
             outcome["usage"] = usage.to_dict()
             outcome["estimated_cost_usd"] = float(usage.estimated_cost_usd)
+            # Cooldown filter — strip any pick whose product_id was
+            # auto-closed within PICK_INVALIDATE_COOLDOWN_MIN. Hard gate
+            # so even if the LLM ignores the COOLDOWN ACTIVE banner in
+            # the prompt, ping-pong re-entry doesn't reach the executor.
+            cooldown = _collect_recently_invalidated(priors or [])
+            if cooldown:
+                blocked_pids = set(cooldown.keys())
+                filtered_dict, dropped = _drop_picks_into_cash(
+                    decision.model_dump(), blocked_pids
+                )
+                if dropped:
+                    notes_list = filtered_dict.setdefault("notes", [])
+                    notes_list.append(
+                        f"cooldown_filter dropped re-picked pids: "
+                        f"{','.join(sorted(set(dropped)))}"
+                    )
+                    log.warning(
+                        "cooldown filter: LLM re-picked recently-invalidated "
+                        "pids %s — rolled into cash_usdc",
+                        sorted(set(dropped)),
+                    )
+                    decision = Decision.model_validate(filtered_dict)
+                    outcome["cooldown_dropped"] = sorted(set(dropped))
         decision_path = write_decision(
             decision,
             snap_path,
@@ -556,6 +698,17 @@ async def run_one_cycle(
                     log.exception(
                         "carry_state update failed — HALT created"
                     )
+
+        # 7. Anchor on-chain — best-effort. The decision file + Postgres
+        # row remain the source of truth; the on-chain log is the public
+        # audit trail (DecisionLog.recordDecision + ReputationOracle
+        # heartbeat). Failure here MUST NOT abort the cycle: any RPC
+        # blip, gas spike, or revert just warns and moves on.
+        try:
+            await _anchor_onchain(decision, outcome)
+        except Exception as e:  # noqa: BLE001
+            outcome.setdefault("onchain_error", f"{type(e).__name__}: {e}")
+            log.warning("on-chain anchoring failed (non-fatal): %s", e)
     except Exception as e:  # noqa: BLE001 — outermost guard
         outcome["error"] = f"{type(e).__name__}: {e}"
         outcome["result"] = "error"

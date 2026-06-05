@@ -1,7 +1,7 @@
 "use client";
 
 import { ConnectButton } from "@rainbow-me/rainbowkit";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { formatUnits, parseUnits } from "viem";
 import {
   useAccount,
@@ -127,6 +127,13 @@ function Eyebrow({ children }: { children: React.ReactNode }) {
 }
 
 function MintForm() {
+  // Mount-gate: SSR has no wallet / no on-chain reads. Server may also
+  // see a different .env snapshot than the cached client bundle. Render
+  // the PreDeployNotice placeholder on first paint, then swap to the
+  // real form after mount — guarantees SSR/client HTML matches.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
   const { address, isConnected } = useAccount();
   const [input, setInput] = useState("");
   const parsed = parseAmountSafe(input);
@@ -163,7 +170,7 @@ function MintForm() {
     chainId: VUSDC_CHAIN_ID,
   });
 
-  if (!isVUsdcConfigured) {
+  if (!mounted || !isVUsdcConfigured) {
     return <PreDeployNotice action="mint" />;
   }
 
@@ -240,6 +247,10 @@ function MintForm() {
 }
 
 function RedeemForm() {
+  // See MintForm: mount-gate so the first paint matches SSR output.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
   const { address, isConnected } = useAccount();
   const [input, setInput] = useState("");
   const parsed = parseAmountSafe(input);
@@ -268,7 +279,7 @@ function RedeemForm() {
     chainId: VUSDC_CHAIN_ID,
   });
 
-  if (!isVUsdcConfigured) {
+  if (!mounted || !isVUsdcConfigured) {
     return <PreDeployNotice action="redeem" />;
   }
 

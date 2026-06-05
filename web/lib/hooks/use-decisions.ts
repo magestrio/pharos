@@ -8,6 +8,7 @@ import {
   useDecisionEvents,
   type OnChainDecisionEvent,
 } from "@/lib/hooks/use-decision-events";
+import { useIsMounted } from "@/lib/hooks/use-is-mounted";
 
 const MATCH_WINDOW_SEC = 90;
 
@@ -155,10 +156,14 @@ function decisionFromCycle(cycle: CycleSummary, nowMs: number): Decision {
  * the agent cycle history — no on-chain join, no mock data.
  */
 export function useDecisions(): DecisionsResult {
+  const mounted = useIsMounted();
   const eventsQuery = useDecisionEvents();
   const cyclesQuery = useCycles({ limit: 50 });
 
   return useMemo<DecisionsResult>(() => {
+    if (!mounted) {
+      return { decisions: [], isLoading: false, isError: false, isLive: false };
+    }
     const cycles = cyclesQuery.data ?? [];
     const nowMs = Date.now();
     if (!eventsQuery.isLive) {
@@ -180,5 +185,5 @@ export function useDecisions(): DecisionsResult {
       isError: eventsQuery.isError || cyclesQuery.isError,
       isLive: true,
     };
-  }, [eventsQuery.events, eventsQuery.isLive, eventsQuery.isLoading, eventsQuery.isError, cyclesQuery.data, cyclesQuery.isLoading, cyclesQuery.isError]);
+  }, [mounted, eventsQuery.events, eventsQuery.isLive, eventsQuery.isLoading, eventsQuery.isError, cyclesQuery.data, cyclesQuery.isLoading, cyclesQuery.isError]);
 }

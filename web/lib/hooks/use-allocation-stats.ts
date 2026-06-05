@@ -4,6 +4,7 @@ import { useMemo } from "react";
 import { type Allocation } from "@/lib/data";
 import { useCycleDetail, useCycles, usePortfolio } from "@/lib/agent-store-context";
 import type { PositionRow } from "@/lib/agent-api";
+import { useIsMounted } from "@/lib/hooks/use-is-mounted";
 
 const REFETCH_INTERVAL_MS = 30_000;
 
@@ -37,12 +38,12 @@ const VENUE_META: Record<
   aave_v3_usdc: {
     label: "Aave V3 USDC",
     sub: "lending · on-chain",
-    color: "#00FF88",
+    color: "#F5B400",
   },
   aave_v3_weth: {
     label: "Aave V3 WETH",
     sub: "lending · on-chain",
-    color: "#22E37A",
+    color: "#FFC533",
   },
   bybit_flex: {
     label: "Bybit Flexible Earn",
@@ -259,13 +260,14 @@ function buildFromPositions(
 }
 
 export function useAllocationStats(): AllocationStats {
+  const mounted = useIsMounted();
   const portfolioQuery = usePortfolio();
   return useMemo<AllocationStats>(() => {
-    if (portfolioQuery.isLoading && !portfolioQuery.data) {
+    if (!mounted || (portfolioQuery.isLoading && !portfolioQuery.data)) {
       return {
         rows: [],
         totalUsdc: 0,
-        isLoading: true,
+        isLoading: !mounted ? false : true,
         isError: false,
         isLive: false,
         source: "empty",
@@ -279,7 +281,7 @@ export function useAllocationStats(): AllocationStats {
     const positions = portfolioQuery.data?.positions ?? [];
     const totalEquityUsd = parseTotalEquityUsd(portfolioQuery.data?.wallet);
     return buildFromPositions(positions, totalEquityUsd);
-  }, [portfolioQuery.data, portfolioQuery.isLoading]);
+  }, [mounted, portfolioQuery.data, portfolioQuery.isLoading]);
 }
 
 // ─── planned-vs-actual divergence (separate hook, separate panel) ───
@@ -302,6 +304,7 @@ export interface PlannedVsActual {
 }
 
 export function usePlannedVsActual(): PlannedVsActual {
+  const mounted = useIsMounted();
   const portfolioQuery = usePortfolio();
   const cyclesQuery = useCycles({ limit: 1 });
   const latestCycle = cyclesQuery.data?.[0] ?? null;
@@ -311,7 +314,7 @@ export function usePlannedVsActual(): PlannedVsActual {
     const venues = (detailQuery.data?.decision as
       | { venues?: Array<{ venue_id?: string; weight?: number }> }
       | undefined)?.venues;
-    if (!latestCycle || !Array.isArray(venues) || venues.length === 0) {
+    if (!mounted || !latestCycle || !Array.isArray(venues) || venues.length === 0) {
       return {
         rows: [],
         cycleTs: latestCycle?.cycle_ts ?? null,
@@ -380,6 +383,7 @@ export function usePlannedVsActual(): PlannedVsActual {
       hasGap,
     };
   }, [
+    mounted,
     latestCycle,
     detailQuery.data,
     portfolioQuery.data,

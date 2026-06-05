@@ -1,21 +1,22 @@
 "use client";
 
 import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { useWaitForTransactionReceipt, useWriteContract } from "wagmi";
 
 import {
-  ACTIVE_HEDGES,
-  ALLOCATIONS,
   ATTESTOR,
-  BYBIT_SUB,
-  DECISIONS,
+  CAPITAL_SERIES,
   EXCHANGE_RATE_SERIES,
   HEDGE_LIFETIME_FUNDING,
+  INITIAL_CAPITAL_USD,
   VAULT,
   type Allocation,
 } from "@/lib/data";
 import Link from "next/link";
 import { useCycles, usePortfolio, useRecentEvents } from "@/lib/agent-store-context";
+import { usePortfolio as useLivePortfolio } from "@/lib/live";
+import type { LivePortfolio } from "@/lib/live";
 import type { CycleSummary, EventRow, PositionRow } from "@/lib/agent-api";
 import {
   REPUTATION_ORACLE_ADDRESS,
@@ -28,6 +29,7 @@ import { useActiveHedges } from "@/lib/hooks/use-active-hedges";
 import {
   useAllocationStats,
   usePlannedVsActual,
+  type AllocationRow,
   type AllocationStats,
 } from "@/lib/hooks/use-allocation-stats";
 import {
@@ -42,9 +44,11 @@ import {
 import { useVaultStats, type VaultStats } from "@/lib/hooks/use-vault-stats";
 import { MINT_REDEEM_ANCHOR, MintRedeemPanel } from "@/components/mint-redeem-panel";
 import {
+  Button,
   Card,
   DonutChart,
   ErrorPanel,
+  Eyebrow,
   HashChip,
   Icon,
   LineChart,
@@ -63,9 +67,11 @@ export function VaultCard() {
       <HeroBlock stats={stats} />
       <StatsRow stats={stats} />
       <MintRedeemPanel />
-      {/* Exchange rate chart needs the on-chain vUSDC contract — hidden
-          until Phase B deploy. Showing a mock series here is dishonest. */}
-      {stats.exchangeRate !== undefined && <ExchangeRateSection stats={stats} />}
+      {/* Capital-growth section pulls its own series from
+          /api/capital-history — real per-cycle equity reconstructed
+          from store positions, falls back to a clear empty state when
+          there's not enough history yet. */}
+      <CapitalGrowthSection stats={stats} />
       <AllocationSection stats={stats} allocation={allocation} />
       <PlannedVsActualSection />
       <AttestorAndHedgesSection />
@@ -77,46 +83,50 @@ export function VaultCard() {
 
 function HeroBlock({ stats }: { stats: VaultStats }) {
   return (
-    <section className="grid grid-cols-1 lg:grid-cols-3 gap-6 lg:gap-8 items-start">
-      <div className="lg:col-span-2 space-y-6">
+    <section className="relative grid grid-cols-1 lg:grid-cols-3 gap-8 lg:gap-10 items-start">
+      <div
+        aria-hidden
+        className="glow-amber-soft pointer-events-none absolute -top-24 -left-24 w-[640px] h-[420px]"
+      />
+      <div className="relative lg:col-span-2 space-y-7">
         <HeroBadgeLine />
-        <div className="space-y-4">
-          <h1 className="text-[40px] sm:text-[52px] lg:text-[60px] leading-[1.02] font-semibold tracking-tight text-white">
-            <span className="font-mono text-neon">vUSDC</span>
-            <span className="text-dim-400"> — </span>AI-Managed
+        <div className="space-y-5">
+          <h1 className="font-serif text-[44px] sm:text-[60px] lg:text-[76px] leading-[0.98] tracking-[-0.025em] text-white">
+            <span className="font-mono text-accent align-middle text-[0.72em] mr-2">
+              vUSDC
+            </span>
+            <span className="text-dim-500 font-normal">—</span> AI-Managed
             <br />
-            Yield-Bearing USDC<span className="text-neon">.</span>
+            Yield-Bearing USDC
+            <span className="font-mono text-accent">.</span>
           </h1>
-          <p className="text-[15px] sm:text-base text-dim-300 max-w-2xl leading-relaxed">
-            Mint USDC, receive vUSDC. The exchange rate grows as our agent allocates across
-            <span className="text-white"> Aave V3</span> and{" "}
-            <span className="text-white">Bybit Earn (200+ products)</span> with delta-neutral hedging on volatile
-            positions. Every decision logged on-chain. Reputation verifiable through ERC-8004.
+          <p className="text-[16px] sm:text-[17px] text-dim-300 max-w-[58ch] leading-[1.55]">
+            Mint USDC, receive vUSDC. The exchange rate grows as our agent allocates across{" "}
+            <span className="font-serif italic text-white">Aave V3</span> and{" "}
+            <span className="font-serif italic text-white">Bybit Earn</span> (200+ products) with
+            delta-neutral hedging on volatile positions. Every decision logged on-chain. Reputation
+            verifiable through ERC-8004.
           </p>
-          <div className="flex flex-wrap items-center gap-3 pt-2">
-            <a
-              href={MINT_REDEEM_ANCHOR}
-              className="group inline-flex items-center gap-2 bg-neon text-black px-4 h-10 rounded-sm text-[13px] font-medium hover:bg-neon-soft transition-colors"
-            >
+          <div className="flex flex-wrap items-center gap-3 pt-3">
+            <Button variant="primary" href={MINT_REDEEM_ANCHOR}>
               Mint vUSDC
-              <Icon.Arrow className="-mr-1 transition-transform group-hover:translate-x-0.5" />
-            </a>
-            <a
-              href={MINT_REDEEM_ANCHOR}
-              className="inline-flex items-center gap-2 bg-transparent border border-ink-500 text-white px-4 h-10 rounded-sm text-[13px] font-medium hover:border-ink-400 hover:bg-ink-800 transition-colors"
-            >
+              <Icon.Arrow className="transition-transform group-hover:translate-x-0.5" />
+            </Button>
+            <Button variant="secondary" href={MINT_REDEEM_ANCHOR}>
               <Icon.Block /> View Live Vault
-            </a>
-            <div className="hidden md:flex items-center gap-2 ml-2 pl-3 border-l border-ink-600 text-[11px] text-dim-400 font-mono">
-              <span>Deployed</span>
-              <span className="text-white">{VAULT.inception}</span>
-              <span className="text-dim-600">·</span>
-              <span className="text-white">{stats.daysLive}d live</span>
-            </div>
+            </Button>
+          </div>
+          <div className="hidden md:flex items-center gap-3 pt-1 font-mono text-[10.5px] uppercase tracking-[0.18em] text-dim-500">
+            <span>Deployed</span>
+            <span className="text-white tabular">{VAULT.inception}</span>
+            <span className="h-2.5 w-px bg-dim-600/70" />
+            <span className="text-white tabular">{stats.daysLive}d live</span>
+            <span className="h-2.5 w-px bg-dim-600/70" />
+            <span>Mantle Mainnet</span>
           </div>
         </div>
       </div>
-      <div className="lg:col-span-1">
+      <div className="relative lg:col-span-1">
         <div className="lg:sticky lg:top-24">
           {/* ReputationNFTCard reads ReputationOracle on-chain; the oracle
               is deferred to Phase B, and rendering the mock score (1247
@@ -140,26 +150,26 @@ function HeroBadgeLine() {
     : null;
 
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-2 font-mono text-[11.5px] uppercase tracking-[0.14em]">
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 font-mono text-[11px] uppercase tracking-[0.16em]">
       <span className="text-white font-semibold">VAULT8004</span>
-      <span className="text-dim-600">│</span>
-      <span className="text-dim-300">
-        ERC-8004 <span className="text-white">#{VAULT_AGENT_ID}</span>
+      <span className="h-2.5 w-px bg-dim-600/70" />
+      <span className="text-dim-400">
+        ERC-8004 <span className="text-accent">#{VAULT_AGENT_ID}</span>
       </span>
       {repLabel !== null && (
         <>
-          <span className="text-dim-600">│</span>
-          <span className="text-dim-300">
-            Reputation <span className="text-white">{repLabel}</span>
+          <span className="h-2.5 w-px bg-dim-600/70" />
+          <span className="text-dim-400">
+            Reputation <span className="text-white tabular">{repLabel}</span>
           </span>
         </>
       )}
-      <span className="text-dim-600">│</span>
-      <span className="inline-flex items-center gap-2 text-neon">
+      <span className="h-2.5 w-px bg-dim-600/70" />
+      <span className="inline-flex items-center gap-2 text-accent">
         <LiveDot /> Live
       </span>
-      <span className="text-dim-600">│</span>
-      <span className="text-dim-300">Mantle Mainnet</span>
+      <span className="h-2.5 w-px bg-dim-600/70" />
+      <span className="text-dim-400">Mantle Mainnet</span>
     </div>
   );
 }
@@ -231,66 +241,74 @@ function ReputationNFTCard() {
   return (
     <div className="relative">
       <div
-        className="absolute -inset-[1px] rounded-md pointer-events-none"
-        style={{ background: "radial-gradient(120% 80% at 50% 0%, rgba(0,255,136,0.18), transparent 60%)" }}
+        className="absolute -inset-[2px] rounded-lg pointer-events-none"
+        style={{
+          background:
+            "radial-gradient(120% 80% at 50% 0%, rgba(245,180,0,0.25), transparent 60%)",
+        }}
       />
-      <div className="relative bg-ink-900 border border-ink-500/80 rounded-md overflow-hidden">
-        <div className="flex items-center justify-between px-4 py-2.5 border-b border-ink-600/70 bg-ink-850">
-          <div className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-[0.16em] text-dim-400">
-            <span className="w-1.5 h-1.5 rounded-sm bg-neon"></span>
+      <div className="relative bg-gradient-to-b from-ink-850 to-ink-900 border border-ink-500/70 rounded-md overflow-hidden shadow-card-premium ring-1 ring-inset ring-white/[0.04]">
+        <div
+          aria-hidden
+          className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-accent/40 to-transparent pointer-events-none"
+        />
+        <div className="flex items-center justify-between px-4 py-2.5 border-b border-ink-600/60 bg-ink-900/50">
+          <Eyebrow tone="dim" className="flex items-center gap-2">
+            <span className="w-1.5 h-1.5 rounded-sm bg-accent shadow-[0_0_8px_rgba(245,180,0,0.6)]"></span>
             ERC-8004 Reputation
-          </div>
-          <div className="text-[10px] font-mono text-dim-500">TOKEN #001</div>
+          </Eyebrow>
+          <div className="text-[10px] font-mono text-dim-500 tracking-[0.16em]">TOKEN #001</div>
         </div>
 
-        <div className="p-5 pb-4 bg-dots">
-          <div className="text-[10.5px] font-mono uppercase tracking-[0.18em] text-dim-500 mb-3">
+        <div className="p-6 pb-5 bg-dots relative">
+          <Eyebrow tone="dim" className="mb-4">
             {rep.isLive ? "Annualized APR" : "Score"}
-          </div>
+          </Eyebrow>
           <div className="flex items-baseline gap-2">
-            <div className="font-mono text-[56px] leading-none font-semibold text-white tabular tracking-tight">
+            <div className="font-serif text-[88px] leading-[0.85] font-semibold text-white tabular tracking-[-0.04em]">
               {liveScoreLabel ?? VAULT.reputation}
             </div>
-            <div className="text-dim-500 font-mono text-lg tabular">
+            <div className="text-dim-500 font-mono text-[18px] tabular self-start mt-3">
               {rep.isLive ? "ERC-8004" : "/ 1000"}
             </div>
           </div>
-          <div className="mt-4 h-[3px] bg-ink-700 overflow-hidden rounded-sm">
-            <div className="h-full bg-neon transition-all duration-700" style={{ width: pct + "%" }} />
+          <div className="mt-5 h-[5px] bg-ink-700 overflow-hidden rounded-full">
+            <div
+              className="h-full rounded-full bg-gradient-to-r from-accent-dim via-accent to-accent-soft transition-all duration-700 shadow-[0_0_12px_rgba(245,180,0,0.45)]"
+              style={{ width: pct + "%" }}
+            />
           </div>
-          <div className="mt-2 flex items-center justify-between text-[10.5px] font-mono">
-            <span className="text-dim-500">
+          <div className="mt-3 flex items-center justify-between text-[10.5px] font-mono">
+            <span className="text-dim-500 uppercase tracking-[0.18em]">
               {rep.isLive ? "Updates" : "Decile rank"}
             </span>
-            <span className="text-neon">
-              {rep.isLive ? (rep.updateCount ?? 0) : "TOP 16%"}
-            </span>
+            <Tag tone="accent">{rep.isLive ? `${rep.updateCount ?? 0}` : "TOP 16%"}</Tag>
           </div>
         </div>
 
-        <div className="grid grid-cols-2 border-t border-ink-600/70">
+        <div className="grid grid-cols-2 gap-px bg-ink-600/40 border-t border-ink-600/60">
           <MetricCell label="Sharpe" value={VAULT.sharpe.toFixed(2)} />
-          <MetricCell label="Max DD" value={VAULT.maxDD.toFixed(1) + "%"} border="left" />
-          <MetricCell label="Win Rate" value={VAULT.winRate + "%"} border="top" />
-          <MetricCell label="Decisions" value={String(VAULT.decisions)} border="top left" />
+          <MetricCell label="Max DD" value={VAULT.maxDD.toFixed(1) + "%"} />
+          <MetricCell label="Win Rate" value={VAULT.winRate + "%"} />
+          <MetricCell label="Decisions" value={String(VAULT.decisions)} />
         </div>
 
-        <div className="border-t border-ink-600/70 bg-ink-850 p-4 space-y-3">
+        <div className="border-t border-ink-600/60 bg-ink-900/40 p-4 space-y-3">
           <button
             onClick={onUpdate}
             disabled={buttonDisabled}
-            className={`w-full inline-flex items-center justify-center gap-2 px-3 h-10 rounded-sm text-[12.5px] font-mono tracking-[0.08em] uppercase font-medium transition-all
+            className={`w-full inline-flex items-center justify-center gap-2 px-4 h-11 rounded-[3px] font-mono tracking-[0.14em] uppercase text-[12px] font-semibold transition-all
               ${
                 updateReceipt.isSuccess
-                  ? "bg-neon text-black border border-neon"
+                  ? "bg-accent text-[#1B1300] shadow-[inset_0_1px_0_rgba(255,255,255,0.3),0_0_0_1px_rgba(245,180,0,0.6)]"
                   : buttonDisabled
-                    ? "bg-ink-700 border border-ink-500 text-dim-300 cursor-not-allowed"
-                    : "bg-neon/10 border border-neon/40 text-neon hover:bg-neon/20"
+                    ? "bg-ink-800 border border-ink-600 text-dim-400 cursor-not-allowed"
+                    : "bg-accent text-[#1B1300] shadow-[inset_0_1px_0_rgba(255,255,255,0.3),0_0_0_1px_rgba(245,180,0,0.6),0_8px_24px_-10px_rgba(245,180,0,0.45)] hover:bg-accent-soft active:translate-y-px"
               }`}
           >
-            {!rep.isLive && <>[ Update Reputation ]</>}
+            {!rep.isLive && <span className="btn-bracket">Update Reputation</span>}
             {rep.isLive && !isSubmitting && !updateReceipt.isSuccess && rep.canUpdate && (
-              <>[ Update Reputation ]</>
+              <span className="btn-bracket">Update Reputation</span>
             )}
             {rep.isLive && !isSubmitting && !updateReceipt.isSuccess && !rep.canUpdate && (
               <>Next update in {formatCountdown(rep.secondsUntilNext)}</>
@@ -320,7 +338,7 @@ function ReputationNFTCard() {
             )}
             {rep.isLive && !update.data && previewLabel && rep.canUpdate && (
               <div className="text-dim-300 leading-relaxed">
-                Next call sets score to <span className="text-neon">{previewLabel}</span>{" "}
+                Next call sets score to <span className="text-accent">{previewLabel}</span>{" "}
                 from {liveScoreLabel ?? "—"} (annualized over {Math.round((rep.previewElapsedSec ?? 0) / 86400)}d).
               </div>
             )}
@@ -355,7 +373,7 @@ function ReputationNFTCard() {
             )}
             {updateReceipt.isSuccess && update.data && (
               <div className="space-y-1 fade-up">
-                <div className="flex items-center gap-2 text-neon">
+                <div className="flex items-center gap-2 text-accent">
                   <LiveDot /> Confirmed
                 </div>
                 <div className="text-dim-400">
@@ -407,21 +425,19 @@ function ProgressLine({ label }: { label: string }) {
         <span className="text-dim-500">RPC →</span>
       </div>
       <div className="mt-1 h-[2px] bg-ink-700 overflow-hidden rounded-sm">
-        <div className="h-full bg-neon bar-fill"></div>
+        <div className="h-full bg-accent bar-fill"></div>
       </div>
     </div>
   );
 }
 
-function MetricCell({ label, value, border = "" }: { label: string; value: string; border?: string }) {
-  const borderCls = [
-    border.includes("top") ? "border-t" : "",
-    border.includes("left") ? "border-l" : "",
-  ].join(" ");
+function MetricCell({ label, value }: { label: string; value: string; border?: string }) {
   return (
-    <div className={`p-3.5 ${borderCls} border-ink-600/70`}>
-      <div className="text-[9.5px] font-mono uppercase tracking-[0.18em] text-dim-500">{label}</div>
-      <div className="font-mono text-xl text-white mt-1 tabular">{value}</div>
+    <div className="p-4 bg-ink-900/60">
+      <Eyebrow tone="dim">{label}</Eyebrow>
+      <div className="font-serif text-[28px] leading-none text-white mt-2 tabular tracking-[-0.02em]">
+        {value}
+      </div>
     </div>
   );
 }
@@ -491,49 +507,136 @@ function StatsRow({ stats }: { stats: VaultStats }) {
   );
 }
 
-function ExchangeRateSection({ stats }: { stats: VaultStats }) {
-  const exchangeRate = stats.exchangeRate ?? VAULT.exchangeRate;
+type CapitalPoint = { ts: string; equityUsd: number };
+
+function useCapitalHistory(limit = 60) {
+  return useQuery<{ points: CapitalPoint[] }>({
+    queryKey: ["capital-history", limit],
+    queryFn: async () => {
+      const res = await fetch(`/api/capital-history?limit=${limit}`, {
+        cache: "no-store",
+      });
+      if (!res.ok) throw new Error(`capital-history → ${res.status}`);
+      return res.json();
+    },
+    refetchInterval: 60_000,
+    staleTime: 30_000,
+  });
+}
+
+function CapitalGrowthSection({ stats: _stats }: { stats: VaultStats }) {
+  // Real series — each point is `Σ positions[cycle].amount_usd` for one
+  // historical cycle. No mock fallback: when the agent hasn't logged
+  // enough cycles yet, the chart renders an honest empty state instead
+  // of a fabricated curve.
+  const live = useLivePortfolio();
+  const history = useCapitalHistory(60);
+  const points = history.data?.points ?? [];
+  const fmtUsd = (v: number) => {
+    if (Math.abs(v) >= 1_000_000) return "$" + (v / 1_000_000).toFixed(4) + "M";
+    if (Math.abs(v) >= 1_000) return "$" + (v / 1_000).toFixed(2) + "k";
+    return "$" + v.toFixed(2);
+  };
+
+  // Splice the live current-equity point onto the end of the series so
+  // the curve always lands on the snapshot the dashboard headline shows.
+  const liveEquity = live.data?.total_equity_usd;
+  const lastHistoryTs = points.length > 0 ? points[points.length - 1].ts : null;
+  const series: CapitalPoint[] = [...points];
+  if (
+    Number.isFinite(liveEquity) &&
+    (lastHistoryTs === null ||
+      lastHistoryTs !== new Date().toISOString().slice(0, 19) + "Z")
+  ) {
+    series.push({ ts: new Date().toISOString(), equityUsd: liveEquity ?? 0 });
+  }
+
+  const startUsd = series.length > 0 ? series[0].equityUsd : 0;
+  const endUsd = series.length > 0 ? series[series.length - 1].equityUsd : 0;
+  const gainUsd = endUsd - startUsd;
+  const gainPct = startUsd > 0 ? (gainUsd / startUsd) * 100 : 0;
+  const startDate = series.length > 0 ? series[0].ts.slice(0, 10) : "—";
+
+  const numericSeries = series.map((p) => p.equityUsd);
+  const enoughForChart = numericSeries.length >= 3;
+
   return (
     <section>
       <SectionHead
-        eyebrow="vUSDC / USDC Exchange Rate"
-        title="21-day monotonic appreciation"
-        subtitle="Every share of vUSDC redeems for more USDC than the day before. The rate only moves one direction by design — yield is realised, never marked-to-market."
+        eyebrow="Vault Capital · USD"
+        title="Equity over time"
+        subtitle="Each point is the total USD value of positions held at that cycle, reconstructed from the on-chain decision log. The latest point is the live snapshot."
         right={
-          <div className="hidden md:flex items-center gap-3 font-mono text-[12px]">
-            <div className="flex items-center gap-2">
-              <span className="text-dim-500 uppercase tracking-[0.14em] text-[10px]">D0</span>
-              <span className="text-dim-300 tabular">{EXCHANGE_RATE_SERIES[0].toFixed(5)}</span>
-            </div>
-            <span className="text-dim-600">→</span>
-            <div className="flex items-center gap-2">
-              <span className="text-dim-500 uppercase tracking-[0.14em] text-[10px]">
-                D{EXCHANGE_RATE_SERIES.length - 1}
+          enoughForChart && (
+            <div className="hidden md:flex items-center gap-3 font-mono text-[12px]">
+              <div className="flex items-center gap-2">
+                <span className="text-dim-500 uppercase tracking-[0.14em] text-[10px]">
+                  {startDate}
+                </span>
+                <span className="text-dim-300 tabular">{fmtUsd(startUsd)}</span>
+              </div>
+              <span className="text-dim-600">→</span>
+              <div className="flex items-center gap-2">
+                <span className="text-dim-500 uppercase tracking-[0.14em] text-[10px]">
+                  now
+                </span>
+                <span
+                  className={`tabular ${gainUsd >= 0 ? "text-accent" : "text-danger"}`}
+                >
+                  {fmtUsd(endUsd)}
+                </span>
+              </div>
+              <span className="text-dim-600">·</span>
+              <span
+                className={`tabular ${gainUsd >= 0 ? "text-accent" : "text-danger"}`}
+              >
+                {gainUsd >= 0 ? "+" : ""}
+                {fmtUsd(gainUsd)} ({gainPct >= 0 ? "+" : ""}
+                {gainPct.toFixed(2)}%)
               </span>
-              <span className="text-neon tabular">{exchangeRate.toFixed(5)}</span>
             </div>
-            <span className="text-dim-600">·</span>
-            <span className="text-neon tabular">+{((exchangeRate - 1) * 10000).toFixed(0)} bps</span>
-          </div>
+          )
         }
       />
       <Card className="p-5 sm:p-6">
-        <div className="h-[240px] sm:h-[280px] -mx-2">
-          <LineChart
-            series={EXCHANGE_RATE_SERIES}
-            color="#00FF88"
-            fillColor="rgba(0,255,136,0.12)"
-            label="vusdcrate"
-            baseline={1.0}
-            width={1200}
-            height={280}
-            pad={{ t: 18, r: 16, b: 26, l: 56 }}
-          />
-        </div>
+        {history.isLoading && !history.data && (
+          <div className="h-[240px] flex items-center justify-center font-mono text-[12px] text-dim-500">
+            loading capital history…
+          </div>
+        )}
+        {!history.isLoading && !enoughForChart && (
+          <div className="h-[240px] flex flex-col items-center justify-center gap-2 font-mono text-[12px] text-dim-400 text-center px-6">
+            <span className="text-dim-500 uppercase tracking-[0.16em] text-[10px]">
+              not enough cycles yet
+            </span>
+            <span>
+              {points.length} historical {points.length === 1 ? "point" : "points"} ·
+              live equity {liveEquity !== undefined ? fmtUsd(liveEquity) : "—"}
+            </span>
+            <span className="text-dim-500">
+              Chart fills in once the agent logs at least 3 cycles with positions.
+            </span>
+          </div>
+        )}
+        {enoughForChart && (
+          <div className="h-[240px] sm:h-[280px] -mx-2">
+            <LineChart
+              series={numericSeries}
+              color="#F5B400"
+              label="capitalusd"
+              baseline={startUsd}
+              width={1200}
+              height={280}
+              pad={{ t: 18, r: 16, b: 26, l: 72 }}
+              yFormat={fmtUsd}
+            />
+          </div>
+        )}
       </Card>
     </section>
   );
 }
+
 
 const BYBIT_SUB_PALETTE = ["#5B8FF9", "#7AA5FB", "#A6BEFC", "#345FC2"] as const;
 
@@ -558,6 +661,606 @@ function portfolioToBybitSubRows(positions: PositionRow[]): Allocation[] {
   });
 }
 
+// ─── Grouped allocation: trades vs passive earn vs cash ──────────────
+//
+// Positions arrive as a flat venue-level list. For the dashboard the
+// useful unit is a "trade" — a base leg + its hedge — not a venue. We
+// pair perp shorts with same-coin earn legs into one delta-neutral
+// trade card; stable earns with no hedge become "passive earn";
+// idle USDC becomes the cash buffer.
+//
+// Data sources (merged):
+//   • `/api/portfolio` (live Bybit snapshot) — every active earn
+//     position row + Spot/Funding holdings. The store-cycle row often
+//     only saves a single OnChain Earn record per coin even when Bybit
+//     holds three sub-orders — live is the only honest source for the
+//     full earn breakdown.
+//   • agent-store `/portfolio/current` — perp positions (hedge legs).
+//     Live `/api/portfolio` doesn't include perp side; the store does.
+// We rebuild `positions[]` from both so the grouping operates on the
+// real, complete set.
+
+const EARN_CATEGORY_TO_VENUE: Record<string, string> = {
+  FlexibleSaving: "bybit_flex",
+  Flexible: "bybit_flex",
+  OnChain: "bybit_onchain",
+  "On-Chain Earn": "bybit_onchain",
+  LiquidityMining: "bybit_lm",
+  LM: "bybit_lm",
+  DiscountBuy: "bybit_discount_buy",
+  DualAsset: "bybit_dual_asset",
+  HoldToEarn: "bybit_hold_to_earn",
+  "Easy Earn": "bybit_flex",
+};
+
+function categoryToVenue(category: string | undefined | null): string {
+  if (!category) return "bybit_flex";
+  return EARN_CATEGORY_TO_VENUE[category] ?? "bybit_flex";
+}
+
+// Bybit's `holdings[].equity` is the COIN AMOUNT, not USD — even when
+// `valuationCurrency: USD` sits on the parent account. For non-stables
+// we have to derive the unit price ourselves. We do it per-account:
+//   USD-priced totalEquity − Σ(stable amounts at $1)
+//     ÷ amount of the remaining non-stable coin
+// works exactly when an account has zero/one non-stable bucket.
+const STABLE_COINS = new Set<string>([
+  "USDC",
+  "USDT",
+  "USD1",
+  "USDE",
+  "USDTB",
+  "USDP",
+  "BUSD",
+  "DAI",
+  "FDUSD",
+  "USDR",
+  "PYUSD",
+]);
+
+function isStable(coin: string): boolean {
+  return STABLE_COINS.has(coin.toUpperCase());
+}
+
+type AccountHolding = { coin: string; equity: number; category?: string };
+type AccountLike = {
+  accountType: string;
+  totalEquity: number;
+  holdings?: AccountHolding[];
+};
+
+/**
+ * Best-effort coin → USD price map derived from per-account totalEquity.
+ * Stables are pinned at $1. For each account we deduct the stable
+ * portion from `totalEquity` and divide the remainder across the
+ * non-stable holdings. The single-non-stable case (Earn account holding
+ * just TON next to a stable) yields an exact price; the multi-coin case
+ * falls back to an amount-weighted average — better than zero.
+ */
+function derivePrices(accounts: AccountLike[]): Map<string, number> {
+  const prices = new Map<string, number>();
+  // Pin stables.
+  for (const acct of accounts) {
+    for (const h of acct.holdings ?? []) {
+      if (isStable(h.coin)) prices.set(h.coin, 1);
+    }
+  }
+  for (const acct of accounts) {
+    const holdings = acct.holdings ?? [];
+    if (holdings.length === 0) continue;
+    const stableUsd = holdings
+      .filter((h) => isStable(h.coin))
+      .reduce((s, h) => s + (Number.isFinite(h.equity) ? h.equity : 0), 0);
+    const nonStables = holdings.filter(
+      (h) => !isStable(h.coin) && Number.isFinite(h.equity) && h.equity > 0,
+    );
+    const remainder = (acct.totalEquity ?? 0) - stableUsd;
+    if (remainder <= 0 || nonStables.length === 0) continue;
+    if (nonStables.length === 1) {
+      const h = nonStables[0];
+      if (h.equity > 0) prices.set(h.coin, remainder / h.equity);
+    } else {
+      // Multi-coin non-stable bucket — fall back to a single
+      // amount-weighted price applied uniformly. Imprecise but better
+      // than 0; only kicks in for messy accounts (Unified spot dust).
+      const totalAmt = nonStables.reduce((s, h) => s + h.equity, 0);
+      const avg = remainder / totalAmt;
+      for (const h of nonStables) {
+        if (!prices.has(h.coin)) prices.set(h.coin, avg);
+      }
+    }
+  }
+  return prices;
+}
+
+/**
+ * Rebuild a complete `positions[]` from the live Bybit snapshot, with
+ * accurate USD per position. Bybit returns `active_earn_positions[]`
+ * with coin amounts but no per-row USD; we infer it from the Earn
+ * account's `holdings[coin].equity` — the authoritative USD figure —
+ * and split it across same-coin rows proportionally to `amount`. Spot
+ * balances (USDT/USDC in UnifiedTrading + Funding) become cash rows.
+ * Perp legs are taken from the agent-store positions because Bybit's
+ * portfolio endpoint omits the derivatives side.
+ */
+function buildPositionsFromLive(
+  live: LivePortfolio | undefined,
+  storePositions: PositionRow[],
+): PositionRow[] {
+  const out: PositionRow[] = [];
+  if (!live) return storePositions;
+
+  const accounts = (live.accounts ?? []) as AccountLike[];
+  const prices = derivePrices(accounts);
+  const priceOf = (coin: string): number => prices.get(coin) ?? (isStable(coin) ? 1 : 0);
+
+  // 1. Earn positions — every active_earn_positions row gets its own
+  //    PositionRow. USD = amount × derived price. Stables resolve
+  //    exactly; non-stables (TON) use the per-account price inferred
+  //    from `accounts[Earn].totalEquity`.
+  for (const ep of live.active_earn_positions ?? []) {
+    const usd = ep.amount * priceOf(ep.coin);
+    out.push({
+      venue: categoryToVenue(ep.category),
+      product_id: ep.productId,
+      coin: ep.coin,
+      amount: String(ep.amount),
+      amount_usd: usd.toFixed(4),
+    });
+  }
+
+  // 2. Cash buffer = stable holdings from non-Earn accounts. We skip
+  //    non-stables here because (a) their USD value is approximate at
+  //    best for spot dust, and (b) "cash" semantically means liquidity
+  //    ready to deploy into yield, which is only stables.
+  const cashByCoin = new Map<string, number>();
+  for (const acct of accounts) {
+    if (acct.accountType.toLowerCase().includes("earn")) continue;
+    for (const h of acct.holdings ?? []) {
+      if (!isStable(h.coin)) continue;
+      const prev = cashByCoin.get(h.coin) ?? 0;
+      cashByCoin.set(h.coin, prev + (Number.isFinite(h.equity) ? h.equity : 0));
+    }
+  }
+  for (const [coin, amount] of cashByCoin.entries()) {
+    if (amount < 0.5) continue;
+    const venue = coin === "USDC" ? "cash_usdc" : `cash_${coin.toLowerCase()}`;
+    const usd = amount * priceOf(coin); // stables → 1:1 USD
+    out.push({
+      venue,
+      product_id: coin,
+      coin,
+      amount: String(amount),
+      amount_usd: usd.toFixed(4),
+    });
+  }
+
+  // 3. Perp legs — only the store knows about derivatives. Live
+  //    `/api/portfolio` omits the perp side entirely.
+  for (const p of storePositions) {
+    if (p.venue === "perp") out.push(p);
+  }
+
+  return out;
+}
+
+// Donut palette — aligned with the per-leg colours used inside trade
+// cards: gold/amber for base earn venues, blue for perp hedge legs (we
+// no longer show them in the donut but the legend item uses the same
+// hue), neutral grey for cash buffer.
+const ALLOC_VENUE_META: Record<
+  string,
+  { label: string; sub: string; color: string }
+> = {
+  aave_v3_usdc: { label: "Aave V3 USDC", sub: "lending · on-chain", color: "#F5B400" },
+  aave_v3_weth: { label: "Aave V3 WETH", sub: "lending · on-chain", color: "#FFC533" },
+  bybit_flex: { label: "Bybit Flexible Earn", sub: "stable yield", color: "#F5B400" },
+  bybit_onchain: { label: "Bybit OnChain Earn", sub: "staked / hedged", color: "#D9A005" },
+  bybit_lm: { label: "Bybit Liquidity Mining", sub: "CPMM LP", color: "#FFC533" },
+  bybit_discount_buy: { label: "Bybit DiscountBuy", sub: "range payoff", color: "#E8B428" },
+  bybit_dual_asset: { label: "Bybit DualAsset", sub: "either-side delivery", color: "#C99500" },
+  bybit_hold_to_earn: { label: "Bybit Hold-to-Earn", sub: "stables", color: "#B89800" },
+  bybit_alpha: { label: "Bybit Alpha Farm", sub: "DEX exposure", color: "#A88500" },
+  perp: { label: "Bybit USDT-Perp", sub: "hedge leg · off-book", color: "#5B8FF9" },
+  cash_usdc: { label: "Cash buffer", sub: "idle · liquidity", color: "#3F4860" },
+};
+
+const ALLOC_FALLBACK_PALETTE = [
+  "#5B8FF9",
+  "#7AA5FB",
+  "#A6BEFC",
+  "#9C7BFB",
+  "#B488FB",
+  "#7BCBFB",
+  "#FBBF24",
+  "#345FC2",
+];
+
+const VENUE_KIND_LABELS: Record<string, string> = {
+  bybit_onchain: "OnChain Stake",
+  bybit_flex: "Flexible Earn",
+  bybit_lm: "Liquidity Mining",
+  bybit_discount_buy: "DiscountBuy",
+  bybit_dual_asset: "DualAsset",
+  bybit_hold_to_earn: "Hold-to-Earn",
+  bybit_alpha: "Alpha Farm",
+  aave_v3_usdc: "Aave Supply",
+  aave_v3_weth: "Aave Supply",
+};
+
+type HedgedTrade = {
+  coin: string;
+  baseLegs: PositionRow[];
+  perp: PositionRow;
+  baseUsd: number;
+  perpUsd: number;
+  baseQty: number;
+  perpQty: number;
+};
+
+type PassivePosition = {
+  key: string;
+  coin: string;
+  venue: string;
+  productId: string;
+  amountUsd: number;
+  amount: number;
+};
+
+type CashRow = {
+  coin: string;
+  amountUsd: number;
+  amount: number;
+};
+
+function numStr(value: string | null | undefined): number {
+  if (!value) return 0;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function groupPositions(positions: PositionRow[]): {
+  trades: HedgedTrade[];
+  passive: PassivePosition[];
+  cash: CashRow[];
+} {
+  const byCoin = new Map<string, PositionRow[]>();
+  const cashMap = new Map<string, { amount: number; amountUsd: number }>();
+
+  for (const p of positions) {
+    if (p.venue.startsWith("cash_")) {
+      const coin = p.coin ?? p.venue.replace(/^cash_/, "").toUpperCase();
+      const prev = cashMap.get(coin) ?? { amount: 0, amountUsd: 0 };
+      prev.amount += numStr(p.amount);
+      prev.amountUsd += numStr(p.amount_usd);
+      cashMap.set(coin, prev);
+      continue;
+    }
+    const key = p.coin ?? "_nocoin";
+    if (!byCoin.has(key)) byCoin.set(key, []);
+    byCoin.get(key)!.push(p);
+  }
+
+  const trades: HedgedTrade[] = [];
+  const passive: PassivePosition[] = [];
+
+  for (const [coin, rows] of byCoin.entries()) {
+    const perp = rows.find((r) => r.venue === "perp");
+    const earns = rows.filter((r) => r.venue !== "perp");
+    if (perp && earns.length > 0) {
+      const baseUsd = earns.reduce((s, e) => s + numStr(e.amount_usd), 0);
+      const baseQty = earns.reduce((s, e) => s + numStr(e.amount), 0);
+      const perpUsd = Math.abs(numStr(perp.amount_usd));
+      const perpQty = Math.abs(numStr(perp.amount));
+      trades.push({
+        coin,
+        baseLegs: earns,
+        perp,
+        baseUsd,
+        perpUsd,
+        baseQty,
+        perpQty,
+      });
+    } else {
+      for (const e of earns) {
+        passive.push({
+          key: `${e.venue}/${e.product_id}/${e.coin ?? ""}`,
+          coin: coin === "_nocoin" ? (e.coin ?? "—") : coin,
+          venue: e.venue,
+          productId: e.product_id,
+          amountUsd: numStr(e.amount_usd),
+          amount: numStr(e.amount),
+        });
+      }
+    }
+  }
+
+  trades.sort((a, b) => b.baseUsd + b.perpUsd - (a.baseUsd + a.perpUsd));
+  passive.sort((a, b) => b.amountUsd - a.amountUsd);
+  const cash: CashRow[] = Array.from(cashMap.entries())
+    .map(([coin, v]) => ({ coin, amount: v.amount, amountUsd: v.amountUsd }))
+    .sort((a, b) => b.amountUsd - a.amountUsd);
+
+  return { trades, passive, cash };
+}
+
+function kindLabel(venue: string): string {
+  return VENUE_KIND_LABELS[venue] ?? venue.replace(/^bybit_/, "Bybit ");
+}
+
+function fmtQty(qty: number, coin: string): string {
+  const digits = qty >= 100 ? 2 : qty >= 1 ? 3 : 6;
+  return `${qty.toFixed(digits)} ${coin}`;
+}
+
+function fmtUsdShort(usd: number, opts: { sign?: boolean } = {}): string {
+  const sign = opts.sign && usd > 0 ? "+" : usd < 0 ? "-" : "";
+  const abs = Math.abs(usd);
+  if (abs >= 1_000_000) return `${sign}$${(abs / 1_000_000).toFixed(2)}M`;
+  if (abs >= 10_000) return `${sign}$${(abs / 1_000).toFixed(1)}k`;
+  if (abs >= 1_000) return `${sign}$${(abs / 1_000).toFixed(2)}k`;
+  return `${sign}$${abs.toFixed(2)}`;
+}
+
+// Hedge tolerance band for the Net-Δ gauge. Inside ±2% the trade is
+// treated as effectively neutral; ±2-10% is the operator-acceptable
+// drift band (next cycle will re-hedge); beyond ±10% the position is
+// exposed and the gauge turns red.
+const NEUTRAL_BAND = 0.02;
+const DRIFT_BAND = 0.1;
+
+function TradeCard({ trade, totalUsd }: { trade: HedgedTrade; totalUsd: number }) {
+  // Headline = base leg USD only. The hedge perp lives off-book as
+  // margin against the base, so adding them would double-count and the
+  // percent-of-book figure would diverge from the dollar figure.
+  const pctOfBook = totalUsd > 0 ? (trade.baseUsd / totalUsd) * 100 : 0;
+  const venues = Array.from(new Set(trade.baseLegs.map((l) => l.venue)));
+  const baseLabel = venues.length === 1 ? kindLabel(venues[0]) : "Multi-leg base";
+  // Same `product_id` repeated across sub-orders just means one
+  // product, multiple top-ups. Deduplicate and show count instead.
+  const uniqueProductIds = Array.from(
+    new Set(trade.baseLegs.map((l) => l.product_id).filter(Boolean)),
+  );
+  const subOrderCount = trade.baseLegs.length;
+
+  // Net delta in coin units. Store rows may save perp.amount as the
+  // raw notional (always positive) instead of a signed short, so we
+  // force the hedge leg negative here: net = base − |perp|.
+  const netDelta = trade.baseQty - Math.abs(numStr(trade.perp.amount));
+  const driftFrac = Math.abs(netDelta) / Math.max(trade.baseQty, 0.0001);
+  const driftPct = driftFrac * 100;
+  const status: "neutral" | "drift" | "exposed" =
+    driftFrac < NEUTRAL_BAND
+      ? "neutral"
+      : driftFrac < DRIFT_BAND
+        ? "drift"
+        : "exposed";
+  const statusLabel = {
+    neutral: "Δ NEUTRAL",
+    drift: "Δ DRIFT",
+    exposed: "Δ EXPOSED",
+  }[status];
+  const statusTone: "pos" | "warn" | "red" = {
+    neutral: "pos" as const,
+    drift: "warn" as const,
+    exposed: "red" as const,
+  }[status];
+  const statusTitle = {
+    neutral: `Within ±${(NEUTRAL_BAND * 100).toFixed(0)}% tolerance — treated as delta-neutral.`,
+    drift: `Drift ${driftPct.toFixed(1)}% — within operator band (±${(DRIFT_BAND * 100).toFixed(0)}%). Re-hedge next cycle.`,
+    exposed: `Drift ${driftPct.toFixed(1)}% — beyond ±${(DRIFT_BAND * 100).toFixed(0)}% band. Position is directionally exposed until re-hedge.`,
+  }[status];
+
+  const netUsd =
+    Math.abs(netDelta) * (trade.baseUsd / Math.max(trade.baseQty, 0.0001));
+
+  return (
+    <div className="relative bg-gradient-to-b from-ink-850 to-ink-900 border border-ink-600/70 rounded-md overflow-hidden shadow-card-lift">
+      <div
+        aria-hidden
+        className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-accent/30 to-transparent pointer-events-none"
+      />
+      <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-ink-600/50 bg-ink-900/40">
+        <div className="flex items-center gap-3">
+          <span className="inline-flex items-center justify-center min-w-[44px] h-[26px] px-2 rounded-sm bg-accent/[0.10] border border-accent/30 text-accent font-mono text-[11px] tracking-[0.06em]">
+            {trade.coin}
+          </span>
+          <Tag tone={statusTone} className="cursor-help">
+            <span title={statusTitle}>{statusLabel}</span>
+          </Tag>
+        </div>
+        <div className="text-right">
+          <div className="font-serif tabular text-[20px] text-white leading-none tracking-[-0.02em]">
+            {fmtUsdShort(trade.baseUsd)}
+          </div>
+          <Eyebrow tone="dim" className="mt-1">
+            {pctOfBook.toFixed(1)}% of book
+          </Eyebrow>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-px bg-ink-600/30">
+        <div className="bg-ink-900 px-4 py-3.5 border-l-2 border-accent/40">
+          <Eyebrow tone="accent" className="mb-1.5">
+            Base leg · in book
+          </Eyebrow>
+          <div className="text-[13px] text-white">{baseLabel}</div>
+          <div className="text-[11px] font-mono text-dim-500 mt-0.5">
+            {uniqueProductIds.length > 0 && (
+              <>
+                product {uniqueProductIds.map((id) => `#${id}`).join(", ")}
+                {subOrderCount > uniqueProductIds.length && (
+                  <span className="text-dim-600">
+                    {" "}
+                    · {subOrderCount} sub-orders
+                  </span>
+                )}
+              </>
+            )}
+          </div>
+          <div className="mt-2 flex items-baseline justify-between gap-2">
+            <span className="font-mono text-[12px] text-dim-300 tabular">
+              {fmtQty(trade.baseQty, trade.coin)}
+            </span>
+            <span className="font-mono text-[13px] text-white tabular">
+              {fmtUsdShort(trade.baseUsd)}
+            </span>
+          </div>
+        </div>
+
+        <div className="bg-ink-900 px-4 py-3.5 border-l-2 border-elec/40">
+          <Eyebrow tone="dim" className="mb-1.5 text-elec">
+            Hedge leg · off-book
+          </Eyebrow>
+          <div className="text-[13px] text-white">USDT-Perp short</div>
+          <div className="text-[11px] font-mono text-dim-500 mt-0.5">
+            {trade.coin}USDT · isolated · perp margin
+          </div>
+          <div className="mt-2 flex items-baseline justify-between gap-2">
+            <span className="font-mono text-[12px] text-dim-300 tabular">
+              -{fmtQty(trade.perpQty, trade.coin)}
+            </span>
+            <span className="font-mono text-[13px] text-white tabular">
+              {fmtUsdShort(trade.perpUsd)}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div className="px-4 py-3 bg-ink-900/40 border-t border-ink-600/40 space-y-2">
+        <div className="flex items-center justify-between">
+          <Eyebrow tone="dim">
+            Net delta · |drift| {driftPct.toFixed(1)}%
+          </Eyebrow>
+          <span
+            className={`font-mono text-[12px] tabular ${
+              status === "neutral"
+                ? "text-pos"
+                : status === "drift"
+                  ? "text-warn"
+                  : "text-danger"
+            }`}
+          >
+            {netDelta >= 0 ? "+" : ""}
+            {netDelta.toFixed(3)} {trade.coin} ≈ {fmtUsdShort(netUsd)}
+          </span>
+        </div>
+        <ToleranceGauge driftFrac={driftFrac} signed={netDelta} />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Visual hedge-tolerance gauge. The bar is split into three zones:
+ *   • green band:  ±NEUTRAL_BAND (treated as neutral)
+ *   • amber band:  NEUTRAL_BAND → DRIFT_BAND (operator-acceptable drift)
+ *   • red zone:    beyond DRIFT_BAND (directionally exposed)
+ * A vertical needle marks the current drift; the tick at center is
+ * the perfectly-hedged 0.0 reference.
+ */
+function ToleranceGauge({
+  driftFrac,
+  signed,
+}: {
+  driftFrac: number;
+  signed: number;
+}) {
+  // Map ±DRIFT_BAND (10%) to ±45% of bar width; beyond that we clamp
+  // to the outer 5% so the needle stays visible in the "exposed" zone.
+  const direction = signed >= 0 ? 1 : -1;
+  const clamped = Math.min(driftFrac, DRIFT_BAND * 1.5);
+  const halfPct = Math.min((clamped / (DRIFT_BAND * 1.5)) * 50, 50);
+  const needleLeft = 50 + direction * halfPct;
+  // Zone widths as percentages of bar width.
+  const neutralHalf = (NEUTRAL_BAND / (DRIFT_BAND * 1.5)) * 50;
+  const driftHalf = (DRIFT_BAND / (DRIFT_BAND * 1.5)) * 50;
+
+  return (
+    <div className="relative h-2 rounded-full overflow-hidden bg-ink-700">
+      {/* Red zones (extremes) */}
+      <span className="absolute inset-y-0 left-0 bg-danger/30" style={{ width: `${50 - driftHalf}%` }} />
+      <span className="absolute inset-y-0 right-0 bg-danger/30" style={{ width: `${50 - driftHalf}%` }} />
+      {/* Amber drift band */}
+      <span
+        className="absolute inset-y-0 bg-warn/30"
+        style={{ left: `${50 - driftHalf}%`, width: `${driftHalf - neutralHalf}%` }}
+      />
+      <span
+        className="absolute inset-y-0 bg-warn/30"
+        style={{ left: `${50 + neutralHalf}%`, width: `${driftHalf - neutralHalf}%` }}
+      />
+      {/* Neutral band */}
+      <span
+        className="absolute inset-y-0 bg-pos/40"
+        style={{ left: `${50 - neutralHalf}%`, width: `${neutralHalf * 2}%` }}
+      />
+      {/* Center reference tick */}
+      <span className="absolute top-0 bottom-0 left-1/2 w-px bg-white/30" />
+      {/* Needle */}
+      <span
+        className="absolute top-[-2px] bottom-[-2px] w-[2px] bg-white shadow-[0_0_6px_rgba(255,255,255,0.6)]"
+        style={{ left: `calc(${needleLeft}% - 1px)` }}
+      />
+    </div>
+  );
+}
+
+function SummaryStat({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: string;
+  tone: "accent" | "pos" | "neutral";
+}) {
+  const toneCls = {
+    accent: "text-accent",
+    pos: "text-pos",
+    neutral: "text-white",
+  }[tone];
+  return (
+    <div className="bg-ink-900 px-3 py-2.5 text-center">
+      <Eyebrow tone="dim" className="!text-[9.5px]">
+        {label}
+      </Eyebrow>
+      <div className={`font-mono tabular text-[13px] mt-1 ${toneCls}`}>{value}</div>
+    </div>
+  );
+}
+
+function PassiveRow({
+  pos,
+  totalUsd,
+}: {
+  pos: PassivePosition;
+  totalUsd: number;
+}) {
+  const pct = totalUsd > 0 ? (pos.amountUsd / totalUsd) * 100 : 0;
+  return (
+    <div className="flex items-center gap-4 px-4 py-3 bg-ink-900 border border-ink-600/60 rounded-md hover:border-ink-500 transition-colors">
+      <span className="inline-flex items-center justify-center min-w-[44px] h-[24px] px-2 rounded-sm bg-pos/[0.10] border border-pos/30 text-pos font-mono text-[10.5px] tracking-[0.06em]">
+        {pos.coin}
+      </span>
+      <div className="flex-1 min-w-0">
+        <div className="text-[13.5px] text-white">{kindLabel(pos.venue)}</div>
+        <div className="text-[11px] font-mono text-dim-500 mt-0.5 truncate">
+          #{pos.productId} · {fmtQty(pos.amount, pos.coin)}
+        </div>
+      </div>
+      <div className="text-right shrink-0">
+        <div className="font-mono text-[13px] text-white tabular">
+          {fmtUsdShort(pos.amountUsd)}
+        </div>
+        <div className="font-mono text-[10.5px] text-dim-500 tabular">
+          {pct.toFixed(1)}%
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AllocationSection({
   stats,
   allocation,
@@ -565,80 +1268,217 @@ function AllocationSection({
   stats: VaultStats;
   allocation: AllocationStats;
 }) {
-  const rows = allocation.rows;
-  // Real allocation total first; on-chain TVL as a secondary signal
-  // (Phase B). No mock fallback — let the donut center read "—" if
-  // there's genuinely no data yet.
-  const tvlUsdc = allocation.totalUsdc || stats.tvlUsdc;
+  const storeQuery = usePortfolio();
+  const liveQuery = useLivePortfolio();
+  const positions = buildPositionsFromLive(
+    liveQuery.data,
+    storeQuery.data?.positions ?? [],
+  );
+  // Live snapshot total is authoritative when present (it sums every
+  // account; store rows can omit sub-positions). Fall back to the store
+  // / mock chain in that order.
+  const tvlUsdc =
+    liveQuery.data?.total_equity_usd ??
+    allocation.totalUsdc ??
+    stats.tvlUsdc ??
+    0;
+  const { trades, passive, cash } = groupPositions(positions);
+  const cashUsdTotal = cash.reduce((s, c) => s + c.amountUsd, 0);
+  const empty = trades.length === 0 && passive.length === 0 && cashUsdTotal === 0;
+
+  // Donut + legend share the merged `positions[]` so the chart never
+  // diverges from the grouped cards on the right. Aggregate USD by
+  // venue (cash_* coins fold into one "Cash buffer" bucket) and derive
+  // percentages off `tvlUsdc` so the slices match the snapshot total.
+  const donutSource: AllocationRow[] = (() => {
+    if (positions.length === 0) return allocation.rows;
+    const usdByVenue = new Map<string, number>();
+    for (const p of positions) {
+      // Perp is the hedge leg, not a capital allocation — including it
+      // would double-count the base leg and overstate TVL.
+      if (p.venue === "perp") continue;
+      const usd = numStr(p.amount_usd);
+      if (usd <= 0) continue;
+      const k = p.venue.startsWith("cash_") ? "cash_usdc" : p.venue;
+      usdByVenue.set(k, (usdByVenue.get(k) ?? 0) + usd);
+    }
+    const total = Array.from(usdByVenue.values()).reduce((s, v) => s + v, 0) || tvlUsdc;
+    return Array.from(usdByVenue.entries())
+      .sort((a, b) => b[1] - a[1])
+      .map(([venue, valueUsdc], idx) => {
+        const meta = ALLOC_VENUE_META[venue] ?? {
+          label: venue,
+          sub: "off-chain",
+          color: ALLOC_FALLBACK_PALETTE[idx % ALLOC_FALLBACK_PALETTE.length],
+        };
+        const pct = total > 0 ? Math.round((valueUsdc / total) * 1000) / 10 : 0;
+        return {
+          key: venue,
+          label: meta.label,
+          sub: meta.sub,
+          color: meta.color,
+          pct,
+          apy: 0,
+          notional: Math.round(valueUsdc),
+          valueUsdc,
+        };
+      });
+  })();
 
   return (
     <section>
       <SectionHead
         eyebrow="Current Allocation · live portfolio"
-        title="Capital distribution across venues"
-        subtitle="Single source of truth — positions from the latest /portfolio/current snapshot. Each Bybit sub-product (Flexible Earn, Liquidity Mining, OnChain, DiscountBuy, DualAsset, Hold-to-Earn) is its own line — independent products with different APR sources and execution paths."
+        title="Capital distribution"
+        subtitle={
+          <>
+            TVL = base earn + cash buffer. Perp hedge margin is shown paired
+            with its base inside each trade (off-book — adding it would
+            double-count exposure).
+          </>
+        }
       />
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
-        <div className="lg:col-span-2 bg-ink-900 border border-ink-600/70 rounded-md p-6 flex flex-col items-center justify-center">
+        <div className="lg:col-span-2 bg-gradient-to-b from-ink-850 to-ink-900 border border-ink-600/70 rounded-md p-6 flex flex-col items-center shadow-card-lift">
           <DonutChart
-            data={rows.map((a) => ({ pct: a.pct, color: a.color, label: a.key }))}
+            data={donutSource.map((a) => ({ pct: a.pct, color: a.color, label: a.key }))}
             size={220}
             thickness={18}
             centerValue={tvlUsdc ? formatTvl(tvlUsdc) : "—"}
             centerLabel="TVL · USD"
           />
           <div className="mt-5 grid grid-cols-1 gap-2 w-full">
-            {rows.length === 0 && (
+            {donutSource.length === 0 && (
               <div className="text-[11px] font-mono text-dim-500 text-center py-4">
                 No positions held — agent fully in cash this cycle.
               </div>
             )}
-            {rows.map((a) => (
+            {donutSource.map((a) => (
               <div key={a.key} className="flex items-center gap-2 text-[11px] font-mono">
-                <span className="w-2 h-2 rounded-sm shrink-0" style={{ background: a.color }} />
+                <span
+                  className="w-2 h-2 rounded-sm shrink-0"
+                  style={{ background: a.color }}
+                />
                 <span className="text-dim-300 truncate">{a.label}</span>
                 <span className="text-white tabular ml-auto">{a.pct}%</span>
               </div>
             ))}
+            {/* Hedge margin sits OUTSIDE the donut percentages because it
+                represents perp collateral, not capital exposure. Show it
+                explicitly so the reader sees it isn't missing — just
+                accounted for separately. */}
+            {trades.length > 0 && (
+              <div className="flex items-center gap-2 text-[11px] font-mono pt-2 mt-1 border-t border-ink-600/40">
+                <span className="w-2 h-2 rounded-sm shrink-0 bg-elec border border-dashed border-elec/60" />
+                <span className="text-dim-300 truncate">Perp hedge margin</span>
+                <span className="text-elec tabular ml-auto">
+                  {fmtUsdShort(
+                    trades.reduce((s, t) => s + t.perpUsd, 0),
+                  )}{" "}
+                  off-book
+                </span>
+              </div>
+            )}
+          </div>
+
+          <div className="mt-6 w-full grid grid-cols-3 gap-px bg-ink-600/40 rounded-md overflow-hidden border border-ink-600/60">
+            {(() => {
+              const hedgedUsd = trades.reduce((s, t) => s + t.baseUsd, 0);
+              const passiveUsd = passive.reduce((s, p) => s + p.amountUsd, 0);
+              return (
+                <>
+                  <SummaryStat label="Hedged" value={fmtUsdShort(hedgedUsd)} tone="accent" />
+                  <SummaryStat label="Passive" value={fmtUsdShort(passiveUsd)} tone="pos" />
+                  <SummaryStat label="Cash" value={fmtUsdShort(cashUsdTotal)} tone="neutral" />
+                </>
+              );
+            })()}
           </div>
         </div>
 
-        <div className="lg:col-span-3 bg-ink-900 border border-ink-600/70 rounded-md overflow-hidden">
-          <div className="grid grid-cols-12 text-[10px] uppercase tracking-[0.16em] font-mono text-dim-500 border-b border-ink-600/70 px-4 py-2.5 bg-ink-850">
-            <div className="col-span-5">Venue</div>
-            <div className="col-span-3 text-right">Weight</div>
-            <div className="col-span-4 text-right">Notional</div>
-          </div>
-          {rows.length === 0 && (
-            <div className="px-4 py-6 text-center text-[12px] font-mono text-dim-500">
+        <div className="lg:col-span-3 space-y-5">
+          {empty && (
+            <div className="bg-ink-900 border border-ink-600/70 rounded-md px-4 py-8 text-center text-[12px] font-mono text-dim-500">
               No live positions yet.
             </div>
           )}
-          {rows.map((a, i) => (
-            <div
-              key={a.key}
-              className={`grid grid-cols-12 items-center px-4 py-3.5 ${
-                i !== rows.length - 1 ? "border-b border-ink-600/40" : ""
-              }`}
-            >
-              <div className="col-span-5 flex items-center gap-3">
-                <span className="w-1.5 h-8 rounded-sm shrink-0" style={{ background: a.color }} />
-                <div className="min-w-0">
-                  <div className="text-white text-sm font-medium">{a.label}</div>
-                  <div className="text-[11px] text-dim-500 font-mono">{a.sub}</div>
-                </div>
+
+          {trades.length > 0 && (
+            <div className="space-y-3">
+              <div className="flex items-baseline justify-between">
+                <Eyebrow tone="accent">
+                  Delta-neutral trades · {trades.length}
+                </Eyebrow>
+                <span className="text-[11px] font-mono text-dim-500 tabular">
+                  base + hedge per row
+                </span>
               </div>
-              <div className="col-span-3 text-right">
-                <div className="font-mono text-white text-sm tabular">{a.pct}%</div>
-                <div className="mt-1 h-[2px] bg-ink-700 rounded-sm overflow-hidden">
-                  <div className="h-full" style={{ width: a.pct + "%", background: a.color }} />
-                </div>
-              </div>
-              <div className="col-span-4 text-right font-mono text-sm text-white tabular">
-                ${a.notional.toLocaleString("en-US", { maximumFractionDigits: 0 })}
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
+                {trades.map((t) => (
+                  <TradeCard key={t.coin} trade={t} totalUsd={tvlUsdc} />
+                ))}
               </div>
             </div>
-          ))}
+          )}
+
+          {passive.length > 0 && (
+            <div className="space-y-3">
+              <div className="flex items-baseline justify-between">
+                <Eyebrow tone="accent">
+                  Passive earn · {passive.length}
+                </Eyebrow>
+                <span className="text-[11px] font-mono text-dim-500 tabular">
+                  stable yield, no hedge required
+                </span>
+              </div>
+              <div className="space-y-2">
+                {passive.map((p) => (
+                  <PassiveRow key={p.key} pos={p} totalUsd={tvlUsdc} />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {cash.length > 0 && (
+            <div className="space-y-3">
+              <div className="flex items-baseline justify-between">
+                <Eyebrow tone="accent">
+                  Cash buffer · {cash.length} coin{cash.length === 1 ? "" : "s"}
+                </Eyebrow>
+                <span className="text-[11px] font-mono text-dim-500 tabular">
+                  idle liquidity, instantly deployable
+                </span>
+              </div>
+              <div className="space-y-2">
+                {cash.map((c) => (
+                  <div
+                    key={c.coin}
+                    className="flex items-center gap-4 px-4 py-3 bg-ink-900 border border-ink-600/60 rounded-md"
+                  >
+                    <span className="inline-flex items-center justify-center min-w-[52px] h-[26px] px-2 rounded-sm bg-dim-600/30 border border-dim-500/40 text-dim-300 font-mono text-[10.5px] tracking-[0.06em]">
+                      {c.coin}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-[13.5px] text-white">Cash {c.coin}</div>
+                      <div className="text-[11px] font-mono text-dim-500 mt-0.5 truncate">
+                        Bybit wallet · {fmtQty(c.amount, c.coin)}
+                      </div>
+                    </div>
+                    <div className="text-right shrink-0">
+                      <div className="font-mono text-[15px] text-white tabular">
+                        {fmtUsdShort(c.amountUsd)}
+                      </div>
+                      <div className="font-mono text-[10.5px] text-dim-500 tabular mt-0.5">
+                        {tvlUsdc > 0
+                          ? `${((c.amountUsd / tvlUsdc) * 100).toFixed(1)}%`
+                          : "—"}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </section>
@@ -933,17 +1773,6 @@ function cycleToRecentRow(cycle: CycleSummary): RecentRow {
   };
 }
 
-function mockToRecentRow(d: (typeof DECISIONS)[number]): RecentRow {
-  return {
-    key: d.id,
-    href: null,
-    ago: d.ago,
-    summary: d.summary,
-    risk: d.risk,
-    confidence: d.confidence,
-  };
-}
-
 function eventToneClasses(severity: string): string {
   switch (severity) {
     case "red":
@@ -1112,11 +1941,11 @@ function RecentWatcherEventsWidget() {
 function RecentDecisionsPreview() {
   const cyclesQuery = useCycles({ limit: 5 });
   const cycles = cyclesQuery.data ?? [];
-  const recent: RecentRow[] =
-    cycles.length > 0
-      ? cycles.slice(0, 5).map(cycleToRecentRow)
-      : DECISIONS.slice(0, 5).map(mockToRecentRow);
+  const recent: RecentRow[] = cycles.slice(0, 5).map(cycleToRecentRow);
   const showError = cyclesQuery.isError && cycles.length === 0;
+  const showLoading = cyclesQuery.isLoading && recent.length === 0;
+  const showEmpty =
+    !showLoading && !showError && recent.length === 0;
 
   return (
     <section>
@@ -1141,6 +1970,20 @@ function RecentDecisionsPreview() {
         />
       )}
       <Card className="overflow-hidden">
+        {showLoading && (
+          <div className="px-4 sm:px-5 py-3.5 space-y-2">
+            <SkeletonRow width="70%" />
+            <SkeletonRow width="60%" />
+            <SkeletonRow width="65%" />
+            <SkeletonRow width="55%" />
+            <SkeletonRow width="65%" />
+          </div>
+        )}
+        {showEmpty && (
+          <div className="px-4 sm:px-5 py-5 text-center text-[12px] font-mono text-dim-400">
+            No cycles recorded yet — the agent will populate this once the first loop completes.
+          </div>
+        )}
         {recent.map((r, i) => {
           const className = `flex items-center gap-4 px-4 sm:px-5 py-3.5 ${
             i !== recent.length - 1 ? "border-b border-ink-600/40" : ""

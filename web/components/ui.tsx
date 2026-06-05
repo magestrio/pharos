@@ -25,7 +25,7 @@ export function truncHash(h: string, head = 6, tail = 4): string {
   return h.slice(0, head) + "…" + h.slice(-tail);
 }
 
-export function LiveDot({ color = "#00FF88", size = 8 }: { color?: string; size?: number }) {
+export function LiveDot({ color = "#F5B400", size = 8 }: { color?: string; size?: number }) {
   return (
     <span
       className="inline-block rounded-full live-dot"
@@ -87,7 +87,20 @@ export function HashChip({
   );
 }
 
-type Tone = "neutral" | "green" | "blue" | "red" | "warn" | "mono";
+// `green` is kept as an alias on the amber tone — existing callsites
+// using `tone="green"` for "active / agent / live" semantics keep working
+// and inherit the new brand colour. `pos` is the new explicit tone for
+// "positive delta" (price up, profitable cycle) using teal so up/down
+// stays semantically distinct from brand.
+type Tone =
+  | "neutral"
+  | "accent"
+  | "green"
+  | "pos"
+  | "blue"
+  | "red"
+  | "warn"
+  | "mono";
 
 export function Tag({
   children,
@@ -100,7 +113,9 @@ export function Tag({
 }) {
   const tones: Record<Tone, string> = {
     neutral: "bg-ink-700/60 text-dim-300 border-ink-500/60",
-    green: "bg-neon/10 text-neon border-neon/30",
+    accent: "bg-accent/10 text-accent border-accent/30",
+    green: "bg-accent/10 text-accent border-accent/30",
+    pos: "bg-pos/10 text-pos border-pos/30",
     blue: "bg-elec/10 text-elec border-elec/30",
     red: "bg-danger/10 text-danger border-danger/30",
     warn: "bg-warn/10 text-warn border-warn/30",
@@ -112,6 +127,94 @@ export function Tag({
     >
       {children}
     </span>
+  );
+}
+
+/**
+ * Small mono-uppercase label used above headlines, beside numbers, on
+ * card tops. Replaces ad-hoc `text-[10.5px] uppercase tracking-...` spans
+ * scattered across the codebase.
+ */
+export function Eyebrow({
+  children,
+  className = "",
+  tone = "neutral",
+}: {
+  children: ReactNode;
+  className?: string;
+  tone?: "neutral" | "accent" | "dim";
+}) {
+  const toneCls =
+    tone === "accent" ? "text-accent" : tone === "dim" ? "text-dim-500" : "text-dim-400";
+  return (
+    <div
+      className={`font-mono text-[10.5px] uppercase tracking-[0.18em] ${toneCls} ${className}`}
+    >
+      {children}
+    </div>
+  );
+}
+
+/**
+ * Single primitive for all CTAs. Three variants, one shape system, so
+ * buttons across the app share weight/spacing/typography. `primary` is
+ * the brand amber pill with subtle inner highlight and an outer halo
+ * appearing on hover; `secondary` is the ghost outline; `terminal` is
+ * the data-control variant used for filters and expand/collapse.
+ */
+export function Button({
+  children,
+  variant = "primary",
+  href,
+  onClick,
+  type,
+  className = "",
+  active = false,
+  size,
+}: {
+  children: ReactNode;
+  variant?: "primary" | "secondary" | "terminal" | "ghost";
+  href?: string;
+  onClick?: () => void;
+  type?: "button" | "submit";
+  className?: string;
+  active?: boolean;
+  size?: "sm" | "md" | "lg";
+}) {
+  const heightBy = {
+    primary: size === "lg" ? "h-12" : "h-11",
+    secondary: size === "lg" ? "h-12" : "h-11",
+    terminal: size === "sm" ? "h-8" : "h-9",
+    ghost: "h-8",
+  } as const;
+
+  const base =
+    "group relative inline-flex items-center justify-center gap-2 select-none font-mono uppercase tracking-[0.12em] text-[12.5px] transition-all";
+
+  const variantCls: Record<typeof variant, string> = {
+    primary: `bg-accent text-[#1B1300] font-semibold px-5 rounded-[3px] shadow-[inset_0_1px_0_rgba(255,255,255,0.30),0_0_0_1px_rgba(245,180,0,0.6),0_8px_24px_-10px_rgba(245,180,0,0.45)] hover:bg-accent-soft hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.35),0_0_0_1px_rgba(255,197,51,0.7),0_10px_30px_-8px_rgba(245,180,0,0.55)] active:translate-y-px ${heightBy.primary}`,
+    secondary: `bg-transparent border border-ink-500 text-white px-5 rounded-[3px] hover:border-accent/60 hover:bg-accent/[0.06] hover:text-accent active:translate-y-px ${heightBy.secondary}`,
+    terminal: `border border-ink-600/70 bg-ink-900 text-dim-300 px-3 rounded-[3px] hover:text-white hover:bg-ink-800 ${
+      active
+        ? "border-accent/50 bg-accent/[0.07] text-accent hover:bg-accent/[0.09] hover:text-accent"
+        : ""
+    } ${heightBy.terminal}`,
+    ghost: `text-dim-400 hover:text-accent normal-case tracking-normal text-[12px] px-1 ${heightBy.ghost}`,
+  };
+
+  const cls = `${base} ${variantCls[variant]} ${className}`;
+
+  if (href) {
+    return (
+      <a href={href} className={cls}>
+        {children}
+      </a>
+    );
+  }
+  return (
+    <button type={type ?? "button"} onClick={onClick} className={cls}>
+      {children}
+    </button>
   );
 }
 
@@ -178,7 +281,7 @@ export function ErrorPanel({
   );
 }
 
-type StatTone = "neutral" | "green" | "blue" | "red";
+type StatTone = "neutral" | "accent" | "green" | "pos" | "blue" | "red";
 
 export function StatCard({
   label,
@@ -195,22 +298,31 @@ export function StatCard({
   tone?: StatTone;
   mono?: boolean;
 }) {
+  // `green` aliased to `accent` so legacy callsites pick up the new amber
+  // hue. `pos` is teal — reserved for explicit positive-delta semantics.
   const toneCls: Record<StatTone, string> = {
     neutral: "text-white",
-    green: "text-neon",
+    accent: "text-accent",
+    green: "text-accent",
+    pos: "text-pos",
     blue: "text-elec",
     red: "text-danger",
   };
   return (
-    <div className="bg-ink-900 border border-ink-600/70 rounded-md p-4 sm:p-5 relative overflow-hidden">
-      <div className="text-[10.5px] uppercase tracking-[0.16em] text-dim-500 mb-2 flex items-center justify-between">
+    <div
+      className="relative overflow-hidden bg-gradient-to-b from-ink-850 to-ink-900 border border-ink-600/70 rounded-md p-4 sm:p-5 shadow-card-lift
+                 before:content-[''] before:absolute before:inset-x-0 before:top-0 before:h-px before:bg-gradient-to-r before:from-transparent before:via-white/[0.07] before:to-transparent"
+    >
+      <Eyebrow tone="dim" className="mb-2 flex items-center justify-between">
         <span>{label}</span>
-      </div>
+      </Eyebrow>
       <div
-        className={`${mono ? "font-mono" : ""} text-2xl sm:text-[28px] leading-none font-semibold tabular ${toneCls[tone]}`}
+        className={`${mono ? "font-mono" : "font-serif"} text-2xl sm:text-[30px] leading-none font-semibold tabular ${toneCls[tone]}`}
       >
         {value}
-        {suffix && <span className="text-dim-400 text-base ml-0.5 font-normal">{suffix}</span>}
+        {suffix && (
+          <span className="text-dim-400 text-base ml-0.5 font-normal font-sans">{suffix}</span>
+        )}
       </div>
       {sub && <div className="mt-2 text-[11px] text-dim-400 font-mono tabular">{sub}</div>}
     </div>
@@ -294,7 +406,7 @@ export function LineChart({
   series,
   width = 600,
   height = 220,
-  color = "#00FF88",
+  color = "#F5B400",
   baseline = 1000,
   pad = { t: 16, r: 16, b: 24, l: 40 },
   showAxis = true,
@@ -467,7 +579,7 @@ export function LineChart({
 
 export function Sparkline({
   series,
-  color = "#00FF88",
+  color = "#F5B400",
   width = 120,
   height = 28,
 }: {
@@ -501,14 +613,14 @@ export function Ticker({
 }) {
   const doubled = [...items, ...items];
   return (
-    <div className="border-y border-ink-600/60 bg-ink-900/80 backdrop-blur no-scroll-x">
-      <div className="ticker-track flex gap-8 py-2 whitespace-nowrap">
+    <div className="border-y border-ink-600/60 bg-ink-900/60 backdrop-blur no-scroll-x">
+      <div className="ticker-track flex gap-10 py-2.5 whitespace-nowrap">
         {doubled.map((it, i) => (
           <div key={i} className="flex items-center gap-2 text-[11px] font-mono shrink-0">
-            <span className="text-dim-500 uppercase tracking-[0.12em]">{it.k}</span>
+            <span className="text-dim-500 uppercase tracking-[0.14em]">{it.k}</span>
             <span className="text-white tabular">{it.v}</span>
-            <span className={`tabular ${it.up ? "text-neon" : "text-danger"}`}>{it.d}</span>
-            <span className="text-ink-500">|</span>
+            <span className={`tabular ${it.up ? "text-pos" : "text-danger"}`}>{it.d}</span>
+            <span className="text-accent/25 px-1">│</span>
           </div>
         ))}
       </div>
@@ -528,13 +640,19 @@ export function SectionHead({
   right?: ReactNode;
 }) {
   return (
-    <div className="flex items-end justify-between gap-4 mb-4">
+    <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4 mb-5">
       <div>
-        {eyebrow && (
-          <div className="text-[10.5px] uppercase tracking-[0.18em] text-dim-500 font-mono mb-1.5">{eyebrow}</div>
+        {eyebrow && <Eyebrow tone="accent" className="mb-2">{eyebrow}</Eyebrow>}
+        {title && (
+          <div className="font-serif text-[26px] sm:text-[32px] leading-[1.05] tracking-[-0.015em] text-white">
+            {title}
+          </div>
         )}
-        {title && <div className="text-lg sm:text-xl text-white font-semibold">{title}</div>}
-        {subtitle && <div className="text-sm text-dim-400 mt-1 max-w-2xl">{subtitle}</div>}
+        {subtitle && (
+          <div className="text-[14px] sm:text-[15px] text-dim-400 mt-2 max-w-2xl leading-[1.55]">
+            {subtitle}
+          </div>
+        )}
       </div>
       {right}
     </div>
@@ -543,51 +661,56 @@ export function SectionHead({
 
 type IconProps = SVGProps<SVGSVGElement>;
 
+// All icons share a 1.5px stroke for visual consistency. Earlier the set
+// mixed 1.6/1.8/2.0/2.2/2.4 which read as inconsistent next to the new
+// editorial typography.
+const ICON_STROKE = "1.5";
+
 export const Icon = {
   Wallet: (p: IconProps) => (
-    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" {...p}>
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={ICON_STROKE} strokeLinecap="round" strokeLinejoin="round" {...p}>
       <path d="M21 12V7a2 2 0 0 0-2-2H5a2 2 0 0 0 0 4h16v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7" />
       <path d="M17 12h.01" />
     </svg>
   ),
   Arrow: (p: IconProps) => (
-    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" {...p}>
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={ICON_STROKE} strokeLinecap="round" strokeLinejoin="round" {...p}>
       <path d="M5 12h14M13 5l7 7-7 7" />
     </svg>
   ),
   Ext: (p: IconProps) => (
-    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" {...p}>
+    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth={ICON_STROKE} strokeLinecap="round" strokeLinejoin="round" {...p}>
       <path d="M7 17 17 7M9 7h8v8" />
     </svg>
   ),
   Check: (p: IconProps) => (
-    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" {...p}>
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...p}>
       <path d="M5 12l5 5L20 7" />
     </svg>
   ),
   Chev: (p: IconProps) => (
-    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...p}>
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={ICON_STROKE} strokeLinecap="round" strokeLinejoin="round" {...p}>
       <path d="m9 18 6-6-6-6" />
     </svg>
   ),
   Spinner: (p: IconProps) => (
-    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" {...p}>
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" {...p}>
       <path d="M21 12a9 9 0 1 1-6.219-8.56" />
     </svg>
   ),
   Filter: (p: IconProps) => (
-    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" {...p}>
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={ICON_STROKE} strokeLinecap="round" strokeLinejoin="round" {...p}>
       <path d="M22 3H2l8 9.46V19l4 2v-8.54L22 3z" />
     </svg>
   ),
   Search: (p: IconProps) => (
-    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" {...p}>
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={ICON_STROKE} strokeLinecap="round" strokeLinejoin="round" {...p}>
       <circle cx="11" cy="11" r="7" />
       <path d="m21 21-4.3-4.3" />
     </svg>
   ),
   Robot: (p: IconProps) => (
-    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" {...p}>
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth={ICON_STROKE} strokeLinecap="round" strokeLinejoin="round" {...p}>
       <rect x="3" y="8" width="18" height="12" rx="2" />
       <path d="M12 8V4M9 4h6" />
       <circle cx="9" cy="14" r="1.5" />
@@ -595,25 +718,30 @@ export const Icon = {
     </svg>
   ),
   User: (p: IconProps) => (
-    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" {...p}>
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth={ICON_STROKE} strokeLinecap="round" strokeLinejoin="round" {...p}>
       <circle cx="12" cy="8" r="4" />
       <path d="M4 21a8 8 0 0 1 16 0" />
     </svg>
   ),
   Sigma: (p: IconProps) => (
-    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" {...p}>
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={ICON_STROKE} strokeLinecap="round" strokeLinejoin="round" {...p}>
       <path d="M6 4h12v3L12 12l6 5v3H6" />
     </svg>
   ),
   Bolt: (p: IconProps) => (
-    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" {...p}>
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={ICON_STROKE} strokeLinecap="round" strokeLinejoin="round" {...p}>
       <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" />
     </svg>
   ),
   Block: (p: IconProps) => (
-    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" {...p}>
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={ICON_STROKE} strokeLinecap="round" strokeLinejoin="round" {...p}>
       <path d="m12 2 9 4.9v10.2L12 22 3 17.1V6.9z" />
       <path d="M3.27 6.96 12 12.01l8.73-5.05M12 22.08V12" />
+    </svg>
+  ),
+  Sparkle: (p: IconProps) => (
+    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth={ICON_STROKE} strokeLinecap="round" strokeLinejoin="round" {...p}>
+      <path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.5 5.5l2.8 2.8M15.7 15.7l2.8 2.8M5.5 18.5l2.8-2.8M15.7 8.3l2.8-2.8" />
     </svg>
   ),
 };

@@ -145,8 +145,8 @@ async def test_run_one_cycle_happy_path_dry_run(tmp_path: Path) -> None:
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
         patch(
-            "agent.sandbox.loop._load_latest_prior_decision",
-            lambda: None,
+            "agent.sandbox.loop._load_recent_prior_decisions",
+            lambda: [],
         ),
         patch(
             "agent.sandbox.loop.decide",
@@ -184,7 +184,7 @@ async def test_run_one_cycle_validator_failure_short_circuits(tmp_path: Path) ->
     with (
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(bad_decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -214,7 +214,7 @@ async def test_run_one_cycle_no_actions_when_book_zero(tmp_path: Path) -> None:
     with (
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -361,7 +361,7 @@ async def test_run_one_cycle_trips_halt_when_carry_state_write_fails(
             "agent.sandbox.loop.write_snapshot",
             lambda s: tmp_path / "snap.json",
         ),
-        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -432,7 +432,7 @@ async def test_run_one_cycle_live_without_approval_downgrades(tmp_path: Path) ->
     with (
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -494,7 +494,7 @@ async def test_run_loop_once_executes_single_cycle(tmp_path: Path) -> None:
         ),
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -616,7 +616,7 @@ async def test_run_loop_continues_on_informational_probe_failure(tmp_path: Path)
         ),
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -728,7 +728,7 @@ async def test_run_one_cycle_stamps_wake_reason_heartbeat(tmp_path: Path) -> Non
     with (
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -761,7 +761,7 @@ async def test_run_one_cycle_passes_wake_events_through(tmp_path: Path) -> None:
     with (
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
         patch("agent.sandbox.loop.decide", decide_mock),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -800,7 +800,7 @@ async def test_run_one_cycle_updates_watcher_baseline(tmp_path: Path) -> None:
     with (
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(bad_decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -879,7 +879,7 @@ async def test_run_loop_watcher_wakes_early_on_p0_event(tmp_path: Path) -> None:
         ),
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
         patch("agent.sandbox.loop.decide", _decide),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -954,7 +954,7 @@ async def test_run_loop_watcher_disabled_by_default(tmp_path: Path) -> None:
         ),
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -1079,7 +1079,7 @@ async def test_e2e_price_drop_drives_event_driven_cycle(
         ),
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
         patch("agent.sandbox.loop.decide", _decide),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -1177,7 +1177,7 @@ async def test_run_loop_continues_when_db_record_cycle_raises(
         ),
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_latest_prior_decision", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",

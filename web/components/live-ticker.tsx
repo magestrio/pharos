@@ -4,6 +4,7 @@ import { useMemo } from "react";
 
 import { Ticker } from "@/components/ui";
 import { useBybitEarn, usePortfolio, useSnapshot } from "@/lib/live";
+import { useIsMounted } from "@/lib/hooks/use-is-mounted";
 
 type TickerItem = { k: string; v: string; d: string; up: boolean };
 
@@ -11,11 +12,13 @@ type TickerItem = { k: string; v: string; d: string; up: boolean };
 // default — showing mock ticker items behind real data is exactly the
 // kind of dishonest UI we're stripping out.
 export function LiveTicker({ fallback: _fallback }: { fallback?: TickerItem[] } = {}) {
+  const mounted = useIsMounted();
   const snapshot = useSnapshot();
   const portfolio = usePortfolio();
   const flex = useBybitEarn({ category: "FlexibleSaving", limit: 3 });
 
   const items = useMemo<TickerItem[]>(() => {
+    if (!mounted) return [];
     const out: TickerItem[] = [];
 
     if (portfolio.data) {
@@ -91,7 +94,7 @@ export function LiveTicker({ fallback: _fallback }: { fallback?: TickerItem[] } 
     }
 
     return out;
-  }, [snapshot.data, portfolio.data, flex.data]);
+  }, [mounted, snapshot.data, portfolio.data, flex.data]);
 
   return <Ticker items={items} />;
 }

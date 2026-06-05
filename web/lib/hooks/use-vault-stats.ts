@@ -4,6 +4,17 @@ import { useReadContracts } from "wagmi";
 import { useCycles, usePortfolio } from "@/lib/agent-store-context";
 import { VAULT } from "@/lib/data";
 import { VUSDC_ABI, VUSDC_ADDRESS, VUSDC_CHAIN_ID, isVUsdcConfigured } from "@/lib/contracts";
+import { useIsMounted } from "@/lib/hooks/use-is-mounted";
+
+const SSR_PLACEHOLDER_STATS: VaultStats = {
+  tvlUsdc: undefined,
+  exchangeRate: undefined,
+  cumReturnPct: undefined,
+  daysLive: 0,
+  isLoading: false,
+  isError: false,
+  isLive: false,
+};
 
 const EXCHANGE_RATE_SCALE = 1_000_000_000_000_000_000n; // 1e18
 const USDC_SCALE = 1_000_000n; // 1e6 — vUSDC + USDC raw units
@@ -44,6 +55,10 @@ function parseTotalEquityUsd(wallet: Record<string, unknown> | null | undefined)
 }
 
 export function useVaultStats(): VaultStats {
+  // SSR/first-render gate. `Date.now()` and wagmi data both diverge
+  // server-vs-client; freeze to a placeholder for the first paint.
+  const mounted = useIsMounted();
+
   const portfolioQuery = usePortfolio();
   const cyclesQuery = useCycles({ limit: 50 });
 
@@ -74,11 +89,15 @@ export function useVaultStats(): VaultStats {
       },
     ],
     query: {
-      enabled: isVUsdcConfigured,
+      enabled: mounted && isVUsdcConfigured,
       refetchInterval: REFETCH_INTERVAL_MS,
       refetchOnWindowFocus: true,
     },
   });
+
+  if (!mounted) {
+    return SSR_PLACEHOLDER_STATS;
+  }
 
   // No on-chain contract yet: surface the live off-chain numbers we
   // actually have, leave exchangeRate/cumReturnPct undefined (their

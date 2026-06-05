@@ -6,6 +6,7 @@ import {
   isReputationOracleConfigured,
   reputationOracleContract,
 } from "@/lib/contracts";
+import { useIsMounted } from "@/lib/hooks/use-is-mounted";
 
 const REFETCH_INTERVAL_MS = 30_000;
 
@@ -30,7 +31,28 @@ export interface ReputationState {
   isLive: boolean;
 }
 
+// Returned during SSR + the very first client render, so the
+// hydration tree matches whatever the server emitted (server has no
+// wagmi data and no wall clock — we MUST NOT diverge here).
+const SSR_PLACEHOLDER: ReputationState = {
+  lastScoreBps: null,
+  previewScoreBps: null,
+  previewElapsedSec: null,
+  lastUpdateTimestamp: null,
+  minIntervalSec: 3600,
+  secondsUntilNext: 0,
+  canUpdate: false,
+  updateCount: null,
+  isLoading: false,
+  isLive: false,
+};
+
 export function useReputation(): ReputationState {
+  // Gate every dynamic value (wagmi result, Date.now-derived state)
+  // behind a post-mount flag so SSR and the first client render emit
+  // an identical tree.
+  const mounted = useIsMounted();
+
   const query = useReadContracts({
     allowFailure: true,
     contracts: [
@@ -42,31 +64,24 @@ export function useReputation(): ReputationState {
       { ...reputationOracleContract, functionName: "updateCount" },
     ],
     query: {
-      enabled: isReputationOracleConfigured,
+      enabled: mounted && isReputationOracleConfigured,
       refetchInterval: REFETCH_INTERVAL_MS,
     },
   });
 
-  // Tick once per second to drive the countdown UI without re-fetching.
-  const [nowSec, setNowSec] = useState(() => Math.floor(Date.now() / 1000));
+  // Tick once per second to drive the countdown UI. Initialize to 0
+  // (deterministic on the server) and set the real wall clock after
+  // mount; otherwise `Date.now()` in the initializer diverges
+  // server-vs-client.
+  const [nowSec, setNowSec] = useState(0);
   useEffect(() => {
+    setNowSec(Math.floor(Date.now() / 1000));
     const id = setInterval(() => setNowSec(Math.floor(Date.now() / 1000)), 1000);
     return () => clearInterval(id);
   }, []);
 
-  if (!isReputationOracleConfigured) {
-    return {
-      lastScoreBps: null,
-      previewScoreBps: null,
-      previewElapsedSec: null,
-      lastUpdateTimestamp: null,
-      minIntervalSec: 3600,
-      secondsUntilNext: 0,
-      canUpdate: false,
-      updateCount: null,
-      isLoading: false,
-      isLive: false,
-    };
+  if (!mounted || !isReputationOracleConfigured) {
+    return SSR_PLACEHOLDER;
   }
 
   const [

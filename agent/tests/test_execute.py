@@ -1954,7 +1954,9 @@ def test_diff_swap_emitted_when_usdt_short_for_open_hedge() -> None:
 
 
 def test_diff_no_swap_when_usdt_already_sufficient() -> None:
-    """Existing $60 USDT covers the buffered $52.50 requirement."""
+    """Existing $60 USDT covers the buffered $52.50 requirement.
+    Narrowed assertion (`.60`): only checks no `Sell USDCUSDT` shortfall
+    swap; a `Buy USDCUSDT` excess sweep may emit on the residue."""
     snap = _snapshot(
         total_equity_usd="100",
         usdt_available_usd="60",
@@ -1962,7 +1964,13 @@ def test_diff_no_swap_when_usdt_already_sufficient() -> None:
     )
     d = _decision_with_hedge(hedge_notional=-50.0)
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
-    assert not [a for a in actions if a.kind == ActionKind.SWAP_SPOT]
+    sells = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "USDCUSDT"
+        and a.side == "Sell"
+    ]
+    assert sells == []
 
 
 def test_diff_swap_credits_margin_released_by_closes() -> None:
@@ -1993,9 +2001,17 @@ def test_diff_swap_credits_margin_released_by_closes() -> None:
         expected_blended_apr_pct=10.0,
     )
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
-    swaps = [a for a in actions if a.kind == ActionKind.SWAP_SPOT]
-    # required = 30 * 1.05 = 31.5; available = 0 + 40 (closed) = 40 → no swap.
-    assert swaps == []
+    sells = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "USDCUSDT"
+        and a.side == "Sell"
+    ]
+    # required = 30 * 1.05 = 31.5; available = 0 + 40 (closed) = 40 → no
+    # hedge_swap Sell shortfall. `.60` excess sweep (Buy USDCUSDT) on the
+    # ~$8.50 residue is allowed — that's the new sweep path; this test
+    # only guards the close-credit logic in `_swap_actions_for_hedges`.
+    assert sells == []
 
 
 def test_diff_no_swap_when_no_hedges_planned() -> None:
@@ -2041,7 +2057,9 @@ def test_diff_swap_suppressed_below_min_threshold() -> None:
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
     hedge_swaps = [
         a for a in actions
-        if a.kind == ActionKind.SWAP_SPOT and a.product_id == "USDCUSDT"
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "USDCUSDT"
+        and a.side == "Sell"
     ]
     assert not hedge_swaps
 
@@ -2076,6 +2094,145 @@ def test_diff_sequence_redeems_closes_swaps_opens_subscribes() -> None:
     open_idx = kinds.index(ActionKind.OPEN_PERP_SHORT)
     sub_idx = kinds.index(ActionKind.SUBSCRIBE_EARN)
     assert redeem_idx < swap_idx < open_idx < sub_idx
+
+
+# ─── USDT-excess sweep (.60) ───────────────────────────────────────────────
+
+
+def _usdt_flex_product(product_id: str = "888", apr: str = "0.05") -> ProductSummary:
+    """Flex USDT stable product — drives a USDT-denominated SUBSCRIBE_EARN
+    so the sweep test can exercise the `usdt_subscribe_demand` term."""
+    return ProductSummary(
+        category="FlexibleSaving",
+        product_id=product_id,
+        coin="USDT",
+        effective_apr=Decimal(apr),
+        apr_source="apy_e8",
+    )
+
+
+def test_diff_usdt_excess_swept_to_usdc_when_no_demand() -> None:
+    """Idle USDT with no consumers (perp margin, Buy demand, USDT
+    subscribes all zero) → emit one `Buy USDCUSDT` sweep sized to
+    `liquid_usdt_usd`. Canonical case: USDT FlexibleSaving payout sits
+    on the sub-account between cycles."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        liquid_usdt_usd="50",
+    )
+    d = _decision([_venue("cash_usdc", 1.0)])
+    actions = diff_to_actions(snap, d, snapshot_ts="20260604T120000Z")
+    sweeps = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "USDCUSDT"
+        and a.side == "Buy"
+    ]
+    assert len(sweeps) == 1
+    s = sweeps[0]
+    assert s.coin == "USDC"
+    assert s.amount == Decimal("50.00")
+    # Sweep must sit after subscribes so USDT consumers fire first.
+    kinds = [a.kind for a in actions]
+    assert kinds[-1] == ActionKind.SWAP_SPOT
+
+
+def test_diff_usdt_excess_no_sweep_when_hedge_consumes_supply() -> None:
+    """Liquid USDT consumed by perp margin + non-stable Buy demand →
+    excess negative → no sweep (and `_swap_actions_for_hedges` fires
+    instead to cover the shortfall)."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        liquid_usdt_usd="50",
+        perp_market={"TON": _perp("TON", mark="2.0")},
+        onchain_products=[_TON_PRODUCT],
+    )
+    d = _decision_with_hedge(hedge_notional=-50.0)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260604T120000Z")
+    buys = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "USDCUSDT"
+        and a.side == "Buy"
+    ]
+    assert buys == []
+    # And the shortfall path DID fire (Sell USDCUSDT).
+    sells = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "USDCUSDT"
+        and a.side == "Sell"
+    ]
+    assert len(sells) == 1
+
+
+def test_diff_usdt_excess_reduced_by_usdt_subscribe_demand() -> None:
+    """Liquid USDT $70 - USDT-stable Flex subscribe $50 = $20 excess →
+    sweep $20. Verifies the `usdt_subscribe_demand` subtraction."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        liquid_usdt_usd="70",
+        flex_products=[_usdt_flex_product("888")],
+    )
+    # Wallet already has USDT for the subscribe → earn_swaps emits no
+    # USDC→USDT Sell leg (would otherwise mask the sweep math).
+    snap.wallet.unified_coin_balances = {"USDT": Decimal("70")}
+    d = _decision([
+        _venue("cash_usdc", 0.5),
+        _venue("bybit_flex", 0.5, [("888", 1.0)]),
+    ])
+    actions = diff_to_actions(snap, d, snapshot_ts="20260604T120000Z")
+    sweeps = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "USDCUSDT"
+        and a.side == "Buy"
+    ]
+    assert len(sweeps) == 1
+    assert sweeps[0].amount == Decimal("20.00")
+
+
+def test_diff_usdt_excess_below_threshold_suppressed() -> None:
+    """Excess < MIN_SWAP_USDC ($5) → suppress sweep. Mirrors the Sell-side
+    sub-threshold guard in `_swap_actions_for_hedges`; Bybit per-pair
+    min-notional + fees make a sub-$5 round-trip uneconomic."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        liquid_usdt_usd="4.50",
+    )
+    d = _decision([_venue("cash_usdc", 1.0)])
+    actions = diff_to_actions(snap, d, snapshot_ts="20260604T120000Z")
+    sweeps = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "USDCUSDT"
+        and a.side == "Buy"
+    ]
+    assert sweeps == []
+
+
+def test_diff_usdt_excess_credits_close_released_margin() -> None:
+    """CLOSE_PERP releases USDT margin into the available pool → excess
+    sweep includes it. Symmetric to `_swap_actions_for_hedges` which
+    credits closes against required."""
+    snap = _snapshot(
+        total_equity_usd="200",
+        liquid_usdt_usd="0",
+        perp_market={"TON": _perp("TON", mark="2.0")},
+        # Existing TON short to close; no new opens (decision is all cash).
+        perp_positions=[_short_pos("TON", size="20", position_value="40.00")],
+    )
+    d = _decision([_venue("cash_usdc", 1.0)])
+    actions = diff_to_actions(snap, d, snapshot_ts="20260604T120000Z")
+    sweeps = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "USDCUSDT"
+        and a.side == "Buy"
+    ]
+    assert len(sweeps) == 1
+    # close_notional = 20 × $2 = $40; no demand → excess $40 → sweep $40.
+    assert sweeps[0].amount == Decimal("40.00")
 
 
 @pytest.mark.asyncio

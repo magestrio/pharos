@@ -8,6 +8,15 @@
     "fetch-data": "uv run --directory agent python -m agent.data.cli",
     "safe:tx": "pnpm --filter @vault8004/safe-ops run tx",
     "safe:set-uri": "pnpm --filter @vault8004/safe-ops run set-agent-uri",
-    "safe:register": "pnpm --filter @vault8004/safe-ops run register-agent"
+    "safe:register": "pnpm --filter @vault8004/safe-ops run register-agent",
+    "start": "bash scripts/vault.sh start",
+    "stop": "bash scripts/vault.sh stop",
+    "restart": "bash scripts/vault.sh restart",
+    "status": "bash scripts/vault.sh status",
+    "logs": "bash scripts/vault.sh logs",
+    "agent:run": "bash scripts/vault.sh agent:run",
+    "agent:loop": "bash scripts/vault.sh agent:loop",
+    "db:reset": "bash scripts/vault.sh db:reset",
+    "contracts:deploy": "bash scripts/vault.sh contracts:deploy"
   }
 }

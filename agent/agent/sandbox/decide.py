@@ -25,7 +25,7 @@ import argparse
 import asyncio
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -43,6 +43,27 @@ MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 4096
 TOOL_NAME = "submit_decision"
 DECISION_DIR = Path(__file__).parent / "decisions"
+# Duplicated from `agent.sandbox.loop.CYCLE_LOG` to avoid an import
+# cycle (loop imports decide, not the reverse). Keep in lockstep —
+# both must point at the same cycle history file.
+CYCLE_LOG = Path(__file__).parent / "cycle_log.jsonl"
+
+# How many prior decisions to feed Claude per cycle (`mainnet-operations.4`).
+# 3 is the sweet spot — enough to surface trajectory ("I held SOL basis
+# for 2 cycles, funding flipped, now closing"), but bounded so the user
+# message stays under ~1.5KB of prior context. Bump only if cache-read
+# pricing changes enough to make 5+ cycle history affordable per cycle.
+PRIOR_DECISIONS_DEFAULT_N = 3
+
+# Cooldown for auto-closed picks: once `_build_auto_close_decision`
+# fires for product X, re-picking the same X within this window is
+# blocked deterministically (regardless of what the LLM proposes). The
+# window has to outlast the watcher poll interval (default 120s) plus
+# a few LLM cycles, otherwise we get ping-pong: LLM picks → invalidate
+# → LLM picks → invalidate, burning gas + Bybit fees each round.
+# 2h is conservative; if APR recovers earlier and operator wants to
+# re-enter, they bounce the agent.
+PICK_INVALIDATE_COOLDOWN_MIN = 120
 
 # Prompt-cache TTL on the system block. Anthropic's `ephemeral` cache
 # defaults to 5min; the explicit `"1h"` extends that to 60min at the
@@ -279,7 +300,7 @@ def _format_wake_events(events: list[dict[str, Any]]) -> str:
 
 def _build_user_message(
     snapshot: dict[str, Any],
-    prior_decision: dict[str, Any] | None = None,
+    prior_decisions: list[dict[str, Any]] | None = None,
     wake_events: list[dict[str, Any]] | None = None,
 ) -> str:
     snapshot = _trim_snapshot_for_llm(snapshot)
@@ -295,24 +316,46 @@ def _build_user_message(
         f"as JSON. Submit your decision via the `{TOOL_NAME}` tool — do not "
         "output free text outside the tool call."
     )
-    if prior_decision is not None:
-        prior_summary = _summarize_prior_decision(prior_decision)
-        if prior_summary:
+    # Cooldown banner — surfaces auto-closed product_ids that are still
+    # in the no-re-pick window. LLM is told NOT to re-select them; a
+    # deterministic filter in loop.py also strips them post-decide as a
+    # safety net (so even if Claude ignores the banner, the picks don't
+    # reach the executor).
+    cooldown = _collect_recently_invalidated(prior_decisions or [])
+    if cooldown:
+        bullets = []
+        for pid, meta in sorted(cooldown.items()):
+            coin = meta.get("coin") or "?"
+            closed = meta.get("closed_at", "?")
+            eligible = meta.get("eligible_at", "?")
+            bullets.append(
+                f"- product_id={pid} ({coin}) — auto-closed at {closed}; "
+                f"re-pick allowed after {eligible}"
+            )
+        parts.append(
+            "COOLDOWN ACTIVE — DO NOT re-pick these products (a watcher "
+            "auto-closed them; ping-pong re-entry burns fees + slippage):\n"
+            + "\n".join(bullets)
+        )
+    if prior_decisions:
+        history = _summarize_prior_decisions(prior_decisions)
+        if history:
             parts.append(
-                "Last cycle's decision (for whipsaw discipline — large "
-                "reshuffles need a clear signal change to justify):\n"
-                + prior_summary
+                "Recent decisions (oldest → newest, for whipsaw discipline + "
+                "trajectory continuity — large reshuffles need a clear signal "
+                "change to justify; track whether prior theses played out):\n"
+                + history
             )
     parts.append(f"```json\n{payload}\n```")
     return "\n\n".join(parts)
 
 
 def _summarize_prior_decision(decision: dict[str, Any]) -> str:
-    """One-paragraph human-readable digest of a prior decision: the
-    allocation, the picks (id only), confidence, validator outcome (so
-    Claude can correct rejected decisions instead of repeating them),
-    and the thesis. Keeps the user message short while giving the model
-    enough to detect whipsaw vs informed shifts."""
+    """One-paragraph human-readable digest of a single prior decision:
+    timestamp, allocation, picks (id only), confidence, validator outcome
+    (so Claude can correct rejected decisions instead of repeating them),
+    and the thesis (truncated). Building block for
+    `_summarize_prior_decisions`."""
     venues = decision.get("venues", [])
     if not venues:
         return ""
@@ -326,52 +369,235 @@ def _summarize_prior_decision(decision: dict[str, Any]) -> str:
             if picks
             else ""
         )
-        venue_lines.append(f"  - {vid}={w:.2%}{(' picks=' + pick_str) if pick_str else ''}")
+        venue_lines.append(f"    - {vid}={w:.2%}{(' picks=' + pick_str) if pick_str else ''}")
     conf = decision.get("confidence")
     thesis = (decision.get("thesis") or "").strip()
-    if len(thesis) > 400:
-        thesis = thesis[:400] + "…"
+    # Per-cycle thesis cap is tight (300 chars) — N cycles ×  full 400-char
+    # thesis would balloon the user message; the venue/pick lines already
+    # carry the structural intent, the thesis adds intent in plain text.
+    if len(thesis) > 300:
+        thesis = thesis[:300] + "…"
+    # Timestamp from `_meta.snapshot_filename` (`<ts>.json`) — best stable
+    # source. Falls back to `_meta.written_at` then "?" if neither present.
+    meta = decision.get("_meta") or {}
+    snap_name = meta.get("snapshot_filename") or ""
+    ts = snap_name.removesuffix(".json") or meta.get("written_at") or "?"
     # Validator outcome — `_meta` sidecar is the source of truth. If the
     # prior was rejected, surface the errors prominently so Claude
     # corrects rather than repeats. (`.47` follow-up 2026-05-29: cycles
     # were repeating the same min_notional/funding violations because
     # this summary hid the failure.)
-    meta = decision.get("_meta") or {}
     validator = meta.get("_validator") or decision.get("_validator") or {}
     validator_ok = validator.get("ok")
     validator_errors = validator.get("errors") or []
     validator_line = ""
     if validator_ok is False or validator_errors:
         validator_line = (
-            "\n  ❌ VALIDATOR REJECTED prior decision — DO NOT repeat the "
-            "same picks/sizing:\n    - "
-            + "\n    - ".join(str(e) for e in validator_errors)
+            "\n    ❌ VALIDATOR REJECTED — DO NOT repeat the same "
+            "picks/sizing:\n      - "
+            + "\n      - ".join(str(e) for e in validator_errors)
         )
     elif validator_ok is True:
-        validator_line = "\n  ✓ validator passed"
+        validator_line = "\n    ✓ validator passed"
+    # Execution outcome from `cycle_log.jsonl` (joined by
+    # `_load_recent_prior_decisions`). Different from validator outcome:
+    # validator can pass and yet the cycle gets halted (drawdown), or
+    # the executor can partially fill (Bybit retCode on one action).
+    # Surfacing both gives Claude the full "what did I plan vs what
+    # actually happened" picture.
+    outcome = decision.get("_cycle_outcome") or {}
+    result = outcome.get("result")
+    actions_executed = outcome.get("actions_executed")
+    actions_planned = outcome.get("actions_planned")
+    outcome_line = ""
+    if result:
+        bits = [f"result={result}"]
+        if actions_executed is not None and actions_planned is not None:
+            bits.append(f"{actions_executed}/{actions_planned} actions filled")
+        outcome_line = "\n    cycle outcome: " + " · ".join(bits)
+    head = f"  [{ts}]"
     return (
-        "\n".join(venue_lines)
-        + (f"\n  confidence={conf}" if conf is not None else "")
+        head
+        + "\n"
+        + "\n".join(venue_lines)
+        + (f"\n    confidence={conf}" if conf is not None else "")
         + validator_line
-        + (f"\n  thesis: {thesis}" if thesis else "")
+        + outcome_line
+        + (f"\n    thesis: {thesis}" if thesis else "")
     )
+
+
+def _summarize_prior_decisions(decisions: list[dict[str, Any]]) -> str:
+    """Multi-cycle digest. Renders each decision via
+    `_summarize_prior_decision` and joins with blank-line separators.
+    Empty / no-venue entries are skipped so a sparse history doesn't
+    print holes. Input order is preserved — caller should pass oldest →
+    newest so the trajectory reads naturally."""
+    chunks: list[str] = []
+    for d in decisions:
+        s = _summarize_prior_decision(d)
+        if s:
+            chunks.append(s)
+    return "\n\n".join(chunks)
+
+
+def _collect_recently_invalidated(
+    priors: list[dict[str, Any]],
+    ttl_minutes: int = PICK_INVALIDATE_COOLDOWN_MIN,
+    now: datetime | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Extract `{product_id: {coin, closed_at, reason}}` from auto-close
+    decisions in `priors` that are still inside the cooldown window.
+
+    Walks priors (any order) and for each one that has at least one
+    `notes` entry of the form `auto_close:<pid>`, records the pid plus
+    the timestamp from `_meta.written_at`. When multiple auto-closes
+    happened for the same pid (loop firing several times before fix),
+    the LATEST `closed_at` wins.
+
+    Picks older than `ttl_minutes` are dropped. Returns `{}` when no
+    in-window auto-close is found — caller skips the cooldown block.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    out: dict[str, dict[str, Any]] = {}
+    for d in priors:
+        notes = d.get("notes") or []
+        if not isinstance(notes, list):
+            continue
+        meta = d.get("_meta") or {}
+        written_at = meta.get("written_at")
+        if not written_at:
+            continue
+        try:
+            closed_at = datetime.fromisoformat(str(written_at).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if closed_at.tzinfo is None:
+            closed_at = closed_at.replace(tzinfo=UTC)
+        age = (now - closed_at).total_seconds() / 60.0
+        if age > ttl_minutes:
+            continue
+        # Pull coin name from wake_events if present — purely cosmetic
+        # but lets the LLM see "MOVE (497)" not just "497".
+        coin = ""
+        for ev in meta.get("wake_events") or []:
+            if ev.get("kind") == "pick_invalidated" and ev.get("coin"):
+                coin = str(ev["coin"]).upper()
+                break
+        for n in notes:
+            if not isinstance(n, str) or not n.startswith("auto_close:"):
+                continue
+            pid = n.removeprefix("auto_close:").strip()
+            if not pid:
+                continue
+            prior = out.get(pid)
+            if prior is None or closed_at > prior["_closed_at_dt"]:
+                out[pid] = {
+                    "coin": coin or (prior or {}).get("coin", ""),
+                    "closed_at": closed_at.isoformat(),
+                    "_closed_at_dt": closed_at,
+                    "eligible_at": (
+                        closed_at
+                        + timedelta(minutes=ttl_minutes)
+                    ).isoformat(),
+                }
+    # Strip internal-only key before returning to caller.
+    for v in out.values():
+        v.pop("_closed_at_dt", None)
+    return out
+
+
+def _load_recent_prior_decisions(
+    decisions_dir: Path = DECISION_DIR,
+    n: int = PRIOR_DECISIONS_DEFAULT_N,
+    cycle_log_path: Path | None = CYCLE_LOG,
+) -> list[dict[str, Any]]:
+    """Return up to `n` most recent decision files under `decisions_dir`,
+    ordered oldest → newest (so the resulting list reads as a trajectory
+    when concatenated). Decision files are named `<UTC-ts>.json` so a
+    lexicographic sort matches chronological order.
+
+    Each returned dict is annotated with `_cycle_filename` and, when
+    `cycle_log_path` is set and a matching line exists, `_cycle_outcome`
+    (a slice of the cycle_log entry: `result`, `actions_planned`,
+    `actions_executed`, `wake_reason`). This lets the prompt surface
+    not just what was planned but how it actually played out — Claude
+    sees "result=halted" or "executed 2/5 actions" and can reason about
+    whether to retry, escalate, or back off.
+
+    Returns `[]` when the directory is missing or empty. Files that fail
+    to JSON-decode are silently skipped (corrupt disk row shouldn't break
+    the cycle); only valid rows count toward `n`. Pass
+    `cycle_log_path=None` to skip the outcome join (used by tests that
+    don't write a cycle log).
+    """
+    if not decisions_dir.is_dir() or n <= 0:
+        return []
+    files = sorted(p for p in decisions_dir.glob("*.json"))
+    if not files:
+        return []
+    out: list[dict[str, Any]] = []
+    # Walk newest-first, decode, accumulate up to `n`, then reverse so
+    # caller gets oldest → newest.
+    for path in reversed(files):
+        try:
+            d = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        d["_cycle_filename"] = path.name
+        out.append(d)
+        if len(out) >= n:
+            break
+    out = list(reversed(out))
+
+    if cycle_log_path is None or not cycle_log_path.is_file() or not out:
+        return out
+
+    # Build a {decision_filename: outcome_slice} map ONCE per call. The
+    # log is small (one line per cycle, 4h heartbeat → ~6 lines/day), so
+    # a full scan is cheap and we don't need to index. Keys come from
+    # `decision_filename` first (loop.py writes this field for LLM and
+    # auto-close paths alike), with `snapshot_filename` as a fallback
+    # for older entries that pre-date the field.
+    wanted: set[str] = {d["_cycle_filename"] for d in out}
+    outcomes: dict[str, dict[str, Any]] = {}
+    try:
+        for raw in cycle_log_path.read_text().splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                entry = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            key = entry.get("decision_filename") or entry.get("snapshot_filename")
+            if key in wanted:
+                outcomes[key] = {
+                    "result": entry.get("result"),
+                    "actions_planned": entry.get("actions_planned"),
+                    "actions_executed": entry.get("actions_executed"),
+                    "wake_reason": entry.get("wake_reason"),
+                }
+    except OSError:
+        return out
+    for d in out:
+        match = outcomes.get(d["_cycle_filename"])
+        if match is not None:
+            d["_cycle_outcome"] = match
+    return out
 
 
 def _load_latest_prior_decision(
     decisions_dir: Path = DECISION_DIR,
 ) -> dict[str, Any] | None:
-    """Return the most recent decision file under `decisions_dir`, or
-    None if the directory is empty. The decision files are named
-    `<UTC-ts>.json` so a lexicographic sort matches chronological order."""
-    if not decisions_dir.is_dir():
-        return None
-    files = sorted(p for p in decisions_dir.glob("*.json"))
-    if not files:
-        return None
-    try:
-        return json.loads(files[-1].read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
+    """Single-decision convenience wrapper for callers that only need the
+    most recent prior (e.g. `_build_auto_close_decision` in loop.py — the
+    auto-close fast-path mutates the latest decision deterministically;
+    earlier cycles are irrelevant). Returns None when no priors exist.
+    """
+    recent = _load_recent_prior_decisions(decisions_dir, n=1)
+    return recent[-1] if recent else None
 
 
 def _extract_tool_input(response: anthropic.types.Message) -> dict[str, Any]:
@@ -394,7 +620,7 @@ async def decide(
     snapshot: dict[str, Any],
     client: anthropic.AsyncAnthropic | None = None,
     system_prompt: str | None = None,
-    prior_decision: dict[str, Any] | None = None,
+    prior_decisions: list[dict[str, Any]] | None = None,
     wake_events: list[dict[str, Any]] | None = None,
 ) -> tuple[Decision, DecisionUsage]:
     """Run one decision cycle. Returns `(Decision, DecisionUsage)` — the
@@ -402,10 +628,12 @@ async def decide(
     the call (`.39`). The runtime cost tracker reads the usage tuple
     member and joins it into the cycle log.
 
-    `prior_decision`, when provided, is summarized and prepended to the
-    user message so the model can detect whipsaw and respect the "move
-    slowly" discipline in the prompt. Pass `None` to skip (first cycle
-    or intentional cold start).
+    `prior_decisions` (`mainnet-operations.4` memory layer), when
+    provided, is rendered oldest → newest as a compact multi-cycle
+    digest and prepended to the user message so the model can detect
+    whipsaw, respect the "move slowly" discipline in the prompt, and
+    track whether earlier theses played out. Pass `None` or `[]` to skip
+    (first cycle / intentional cold start).
 
     `wake_events`, when present, signals that this cycle was triggered
     by the event watcher (`event-driven-rebalance.2`) rather than the
@@ -430,7 +658,7 @@ async def decide(
             {
                 "role": "user",
                 "content": _build_user_message(
-                    snapshot, prior_decision, wake_events=wake_events
+                    snapshot, prior_decisions, wake_events=wake_events
                 ),
             }
         ],
@@ -507,12 +735,12 @@ def _main() -> None:
 
     raw_snapshot = json.loads(args.snapshot.read_text())
     snap = Snapshot.model_validate(raw_snapshot)
-    prior = _load_latest_prior_decision()
+    priors = _load_recent_prior_decisions()
 
     async def run() -> None:
         async with anthropic.AsyncAnthropic() as client:
             decision, usage = await decide(
-                raw_snapshot, client=client, prior_decision=prior
+                raw_snapshot, client=client, prior_decisions=priors
             )
         result = validate(decision, snap)
         path = write_decision(

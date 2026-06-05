@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useState } from "react";
 
 import { CONTRACTS } from "@/lib/data";
-import { HashChip, Icon, LiveDot } from "@/components/ui";
+import { Button, Eyebrow, HashChip, Icon, LiveDot } from "@/components/ui";
 import { LiveTicker } from "@/components/live-ticker";
 import { DecisionLog } from "@/components/screens/decision-log";
 import { VaultCard } from "@/components/screens/vault-card";
@@ -60,55 +60,71 @@ function ShellBody({
           WebkitMaskImage: "linear-gradient(to bottom, black 0%, transparent 70%)",
         }}
       />
+      <div
+        className="fixed inset-0 bg-noise pointer-events-none opacity-60"
+        aria-hidden
+      />
+      <div
+        className="fixed top-0 inset-x-0 h-[40vh] pointer-events-none"
+        aria-hidden
+        style={{
+          background:
+            "radial-gradient(80% 100% at 50% 0%, rgba(245,180,0,0.05), transparent 70%)",
+        }}
+      />
 
       <header className="relative z-20 border-b border-ink-600/60 bg-ink-950/85 backdrop-blur sticky top-0">
         <div className="max-w-[1440px] mx-auto px-4 sm:px-6 lg:px-8 h-14 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <Logo />
             <div className="hidden md:flex items-center gap-2 pl-3 border-l border-ink-600 text-[11px] font-mono">
-              <span className="text-dim-500 uppercase tracking-[0.14em]">v1.0.4</span>
+              <span className="text-dim-500 uppercase tracking-[0.16em]">v1.0.4</span>
               <span className="text-dim-600">·</span>
-              <span className="text-dim-400">Mantle Mainnet</span>
-              <span className="inline-flex items-center gap-1.5 text-neon ml-1">
+              <span className="text-dim-400 uppercase tracking-[0.14em]">Mantle Mainnet</span>
+              <span className="inline-flex items-center gap-1.5 text-accent ml-1">
                 <LiveDot size={6} />
               </span>
             </div>
           </div>
 
-          <nav className="hidden md:flex items-center gap-1 bg-ink-900 border border-ink-600/70 rounded-sm p-1">
+          <nav className="hidden md:flex items-center gap-1 bg-ink-900/60 border border-ink-600/70 rounded-[3px] p-1">
             {TABS.map((t) => (
               <button
                 key={t.id}
                 onClick={() => setTab(t.id)}
-                className={`px-3.5 h-8 rounded-sm text-[12.5px] font-medium transition-colors
-                  ${tab === t.id ? "bg-ink-700 text-white" : "text-dim-300 hover:text-white hover:bg-ink-800"}`}
+                className={`relative px-4 h-8 rounded-[2px] text-[12px] font-mono uppercase tracking-[0.12em] transition-colors
+                  ${
+                    tab === t.id
+                      ? "bg-accent/[0.10] text-accent"
+                      : "text-dim-300 hover:text-white hover:bg-ink-800"
+                  }`}
               >
                 {t.label}
+                {tab === t.id && (
+                  <span className="absolute bottom-[-5px] left-3 right-3 h-[2px] bg-accent rounded-full shadow-[0_0_8px_rgba(245,180,0,0.6)]" />
+                )}
               </button>
             ))}
           </nav>
 
           <div className="flex items-center gap-2">
             <Link
-              className="hidden lg:inline-flex items-center gap-1.5 px-3 h-8 border border-ink-600/70 rounded-sm bg-ink-900 text-[11.5px] font-mono text-dim-300 hover:text-white"
+              className="hidden lg:inline-flex items-center gap-1.5 px-3 h-8 border border-ink-600/70 rounded-[3px] bg-ink-900 text-[11px] font-mono uppercase tracking-[0.14em] text-dim-300 hover:text-accent hover:border-accent/40 transition-colors"
               href="/history"
             >
-              <span className="text-dim-500">HISTORY</span>
-              <Icon.Ext />
+              History <Icon.Ext />
             </Link>
             <a
-              className="hidden lg:inline-flex items-center gap-1.5 px-3 h-8 border border-ink-600/70 rounded-sm bg-ink-900 text-[11.5px] font-mono text-dim-300 hover:text-white"
+              className="hidden lg:inline-flex items-center gap-1.5 px-3 h-8 border border-ink-600/70 rounded-[3px] bg-ink-900 text-[11px] font-mono uppercase tracking-[0.14em] text-dim-300 hover:text-accent hover:border-accent/40 transition-colors"
               href="#"
             >
-              <span className="text-dim-500">DOCS</span>
-              <Icon.Ext />
+              Docs <Icon.Ext />
             </a>
             <a
-              className="hidden lg:inline-flex items-center gap-1.5 px-3 h-8 border border-ink-600/70 rounded-sm bg-ink-900 text-[11.5px] font-mono text-dim-300 hover:text-white"
+              className="hidden lg:inline-flex items-center gap-1.5 px-3 h-8 border border-ink-600/70 rounded-[3px] bg-ink-900 text-[11px] font-mono uppercase tracking-[0.14em] text-dim-300 hover:text-accent hover:border-accent/40 transition-colors"
               href="#"
             >
-              <span className="text-dim-500">GH</span>
-              <Icon.Ext />
+              GH <Icon.Ext />
             </a>
             <ConnectWalletButton />
           </div>
@@ -119,11 +135,13 @@ function ShellBody({
             <button
               key={t.id}
               onClick={() => setTab(t.id)}
-              className={`flex-1 h-10 text-[12px] font-medium transition-colors border-r last:border-r-0 border-ink-600/60
-                ${tab === t.id ? "text-white bg-ink-800" : "text-dim-300 bg-ink-950"}`}
+              className={`flex-1 h-10 text-[12px] font-mono uppercase tracking-[0.12em] transition-colors border-r last:border-r-0 border-ink-600/60
+                ${tab === t.id ? "text-accent bg-accent/[0.08]" : "text-dim-300 bg-ink-950"}`}
             >
               {t.short}
-              {tab === t.id && <div className="h-[2px] bg-neon mt-1 mx-3" />}
+              {tab === t.id && (
+                <div className="h-[2px] bg-accent mt-1 mx-3 rounded-full" />
+              )}
             </button>
           ))}
         </div>
@@ -144,19 +162,26 @@ function ShellBody({
 function Logo() {
   return (
     <a href="#" className="flex items-center gap-2.5 group">
-      <div className="relative w-7 h-7 grid place-items-center bg-ink-900 border border-ink-500 rounded-sm">
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#00FF88" strokeWidth="2" strokeLinejoin="round">
+      <div className="relative w-8 h-8 grid place-items-center bg-gradient-to-b from-ink-850 to-ink-900 border border-accent/30 rounded-[3px] shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#F5B400" strokeWidth="1.8" strokeLinejoin="round">
           <path d="M12 3 21 7.5v9L12 21 3 16.5v-9z" />
-          <circle cx="12" cy="12" r="2.5" fill="#00FF88" stroke="none" />
+          <circle cx="12" cy="12" r="2.5" fill="#F5B400" stroke="none" />
         </svg>
         <span
-          className="absolute -inset-px rounded-sm pointer-events-none"
-          style={{ boxShadow: "inset 0 0 12px rgba(0,255,136,0.2)" }}
+          className="absolute -inset-px rounded-[3px] pointer-events-none"
+          style={{ boxShadow: "inset 0 0 14px rgba(245,180,0,0.25)" }}
         />
       </div>
       <div className="leading-none">
-        <div className="font-mono text-[13px] text-white font-semibold tracking-tight">VAULT8004</div>
-        <div className="font-mono text-[9.5px] text-dim-500 tracking-[0.18em] uppercase mt-0.5">ERC-8004 · #001</div>
+        <div className="font-serif italic text-[10px] text-accent tracking-tight mb-0.5">
+          vUSDC
+        </div>
+        <div className="font-mono text-[12.5px] text-white font-semibold tracking-tight">
+          VAULT8004
+        </div>
+        <div className="font-mono text-[9px] text-dim-500 tracking-[0.18em] uppercase mt-0.5">
+          ERC-8004 · #001
+        </div>
       </div>
     </a>
   );
@@ -173,9 +198,9 @@ function ConnectWalletButton() {
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
         onClick={() => setConnected(false)}
-        className="inline-flex items-center gap-2 px-3 h-8 bg-ink-900 border border-neon/40 rounded-sm text-[12px] font-mono text-white"
+        className="inline-flex items-center gap-2 px-3 h-9 bg-ink-900 border border-accent/40 rounded-[3px] text-[11px] font-mono uppercase tracking-[0.12em] text-white hover:bg-ink-800"
       >
-        <span className="w-2 h-2 rounded-full bg-neon live-dot" />
+        <span className="w-2 h-2 rounded-full bg-accent live-dot" />
         <span className="tabular">{hover ? "Disconnect" : addr}</span>
       </button>
     );
@@ -183,7 +208,7 @@ function ConnectWalletButton() {
   return (
     <button
       onClick={() => setConnected(true)}
-      className="inline-flex items-center gap-2 px-3.5 h-8 bg-neon text-black rounded-sm text-[12px] font-semibold hover:bg-neon-soft transition-colors"
+      className="inline-flex items-center gap-2 px-4 h-9 bg-accent text-[#1B1300] rounded-[3px] text-[11px] font-mono font-bold uppercase tracking-[0.14em] shadow-[inset_0_1px_0_rgba(255,255,255,0.3),0_0_0_1px_rgba(245,180,0,0.5),0_6px_18px_-8px_rgba(245,180,0,0.45)] hover:bg-accent-soft active:translate-y-px transition-all"
     >
       <Icon.Wallet />
       Connect Wallet
@@ -193,23 +218,31 @@ function ConnectWalletButton() {
 
 function Footer() {
   return (
-    <footer className="relative border-t border-ink-600/60 mt-12">
-      <div className="max-w-[1440px] mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <footer className="relative border-t border-ink-600/60 mt-16">
+      <div className="max-w-[1440px] mx-auto px-4 sm:px-6 lg:px-8 py-10">
         <div className="mb-6">
-          <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-dim-500 mb-3">
-            Deployed contracts · Mantle Mainnet
+          <div className="mb-4 flex items-baseline gap-3">
+            <Eyebrow tone="accent">Deployed contracts</Eyebrow>
+            <span className="font-serif italic text-[14px] text-dim-300">Mantle Mainnet</span>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-px bg-ink-600/40 border border-ink-600/70 rounded-md overflow-hidden">
             {CONTRACTS.map((c) => (
-              <div key={c.label} className="bg-ink-900 px-4 py-2.5 flex items-center justify-between gap-3">
+              <div
+                key={c.label}
+                className="bg-ink-900 px-4 py-3 flex items-center justify-between gap-3"
+              >
                 <div className="min-w-0">
-                  <div className="text-[9.5px] font-mono uppercase tracking-[0.14em] text-dim-500 flex items-center gap-1.5">
+                  <div className="text-[9.5px] font-mono uppercase tracking-[0.16em] text-dim-500 flex items-center gap-1.5">
                     {c.label}
                     {c.placeholder && (
-                      <span className="text-warn/70 normal-case tracking-normal text-[9px]">[mainnet pending]</span>
+                      <span className="text-warn/70 normal-case tracking-normal text-[9px]">
+                        [mainnet pending]
+                      </span>
                     )}
                     {c.sub && (
-                      <span className="text-dim-600 normal-case tracking-normal text-[9px]">{c.sub}</span>
+                      <span className="text-dim-600 normal-case tracking-normal text-[9px]">
+                        {c.sub}
+                      </span>
                     )}
                   </div>
                 </div>
@@ -219,22 +252,24 @@ function Footer() {
           </div>
         </div>
 
-        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 text-[11px] font-mono text-dim-500 pt-4 border-t border-ink-600/40">
+        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 text-[11px] font-mono text-dim-500 pt-5 border-t border-ink-600/40">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-            <span className="text-dim-300">Vault8004 · vUSDC</span>
+            <span className="text-white font-semibold tracking-[0.05em]">Vault8004 · vUSDC</span>
             <span className="text-dim-600">·</span>
             <span>ERC-8004 · Mantle Mainnet</span>
             <span className="text-dim-600">·</span>
-            <span>Built for Mantle Turing Test Hackathon 2026</span>
+            <span className="font-serif italic text-dim-400 normal-case tracking-normal">
+              Built for Mantle Turing Test Hackathon 2026
+            </span>
           </div>
           <div className="flex items-center gap-4">
             <span>
               Block <span className="text-dim-300 tabular">#4,219,847</span>
             </span>
             <span>
-              Latency <span className="text-neon tabular">142ms</span>
+              Latency <span className="text-pos tabular">142ms</span>
             </span>
-            <span className="inline-flex items-center gap-1.5">
+            <span className="inline-flex items-center gap-1.5 text-accent">
               <LiveDot size={6} /> RPC OK
             </span>
           </div>

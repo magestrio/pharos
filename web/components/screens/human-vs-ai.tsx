@@ -72,8 +72,8 @@ export function HumanVsAi() {
           rationale={AI_STATS.rationale}
           series={AI_SERIES}
           stats={AI_STATS}
-          color="#00FF88"
-          fillColor="rgba(0,255,136,0.16)"
+          color="#F5B400"
+          fillColor="rgba(245,180,0,0.18)"
           highlight
         />
       </div>
@@ -259,8 +259,8 @@ function OverlayChart() {
         <LineChart
           series={AI_SERIES}
           compareSeries={HUMAN_SERIES}
-          color="#00FF88"
-          fillColor="rgba(0,255,136,0.12)"
+          color="#F5B400"
+          fillColor="rgba(245,180,0,0.14)"
           compareColor="#7A8499"
           label="overlay"
           baseline={1_000_000}

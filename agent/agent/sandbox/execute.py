@@ -917,6 +917,22 @@ def diff_to_actions(
         total_book_usd=total_book_usd,
     )
 
+    # `.60` — USDT-excess sweep. After all USDT consumers are sized
+    # (hedge margin, non-stable Buy swaps, USDT-stable subscribes), if
+    # liquid USDT + close-released margin still exceeds demand by ≥
+    # MIN_SWAP_USDC, convert the residue back to USDC. Symmetric to the
+    # `.33` shortfall path; pairs with `.49`'s orphan-spot → USDC routing
+    # to keep the vault re-rebased to USDC each cycle.
+    usdt_excess_swaps = _swap_actions_for_usdt_excess(
+        snapshot,
+        hedge_opens,
+        hedge_closes,
+        subscribes,
+        snapshot_ts,
+        idx_offset=carry_offset + len(carry_closes) + len(carry_opens),
+        extra_usdt_demand=buy_usdt_demand,
+    )
+
     return (
         redeems
         + carry_closes
@@ -928,6 +944,7 @@ def diff_to_actions(
         + hedge_opens
         + carry_opens
         + subscribes
+        + usdt_excess_swaps
         + skips
     )
 
@@ -3256,6 +3273,115 @@ def _swap_actions_for_hedges(
                 f"${extra_usdt_demand:.2f}) - liquid USDT "
                 f"${snapshot.wallet.liquid_usdt_usd:.2f} - closes "
                 f"${close_notional:.2f}"
+            ),
+        )
+    ]
+
+
+def _swap_actions_for_usdt_excess(
+    snapshot: Snapshot,
+    hedge_opens: list[Action],
+    hedge_closes: list[Action],
+    subscribes: list[Action],
+    snapshot_ts: str,
+    *,
+    idx_offset: int,
+    extra_usdt_demand: Decimal = Decimal(0),
+) -> list[Action]:
+    """Mirror of `_swap_actions_for_hedges` (`.60`): when post-cycle USDT
+    supply exceeds demand by ≥ `MIN_SWAP_USDC`, sweep the excess back to
+    USDC via a single `USDCUSDT` Buy (qty_quote=USDT amount).
+
+    USDT accumulates on the sub-account after USDT-denominated Earn
+    payouts (FlexibleSaving USDT, advance-Earn USDT settlements that
+    didn't knockout) and sits idle unless manually swept. `.49` covered
+    BTC/ETH/SOL → USDC direct routing for orphan spot post-DiscountBuy;
+    this is the symmetric stable-side case.
+
+    Excess
+        = snapshot.wallet.liquid_usdt_usd
+          + sum(close notional)               # margin released by closes
+          − sum(open notional × HEDGE_MARGIN_BUFFER)   # perp margin demand
+          − extra_usdt_demand                 # planned Buy swaps on {coin}USDT
+          − sum(USDT-stable subscribe amount) # USDT consumed by stable subs
+
+    By construction this is the negation of `_swap_actions_for_hedges`'s
+    shortfall: when that function emits a swap, excess is ≤ 0 and we
+    no-op; when it returns empty AND there's leftover USDT, we sweep.
+
+    The sweep uses Bybit's `USDCUSDT` pair with `side="Buy"`. Bybit Spot
+    Buy uses quote-coin qty, so `amount` is the USDT amount to spend
+    (treated 1:1 with USDC received — stable pair, bps-level spread).
+    Same pair as the hedge swap so liquidity is known good.
+
+    Returns an empty list when:
+      - the residual excess is below `MIN_SWAP_USDC`,
+      - excess is non-positive (demand ≥ supply).
+
+    Not accounted for (deliberate MVP scope; under-sweep is safe, the
+    next cycle re-evaluates):
+      - `_orphan_spot_sell_actions` USDT inflow for non-`.49`-whitelist
+        coins (TON, LIT, …) → under-sweep.
+      - Funding-carry OPEN consuming USDT margin → could over-sweep if
+        carry runs in the same cycle. Rare co-occurrence; tracked.
+    """
+    open_notional = Decimal(0)
+    for a in hedge_opens:
+        if a.kind != ActionKind.OPEN_PERP_SHORT:
+            continue
+        info = snapshot.perp_market.get(a.coin) or snapshot.perp_market.get(
+            a.coin.upper()
+        )
+        if info is None or info.mark_price is None or info.mark_price <= 0:
+            continue
+        open_notional += a.amount * info.mark_price
+
+    close_notional = Decimal(0)
+    for a in hedge_closes:
+        if a.kind != ActionKind.CLOSE_PERP:
+            continue
+        info = snapshot.perp_market.get(a.coin) or snapshot.perp_market.get(
+            a.coin.upper()
+        )
+        if info is None or info.mark_price is None or info.mark_price <= 0:
+            continue
+        close_notional += a.amount * info.mark_price
+
+    usdt_subscribe_demand = sum(
+        (
+            a.amount
+            for a in subscribes
+            if a.kind in (ActionKind.SUBSCRIBE_EARN, ActionKind.SUBSCRIBE_LM)
+            and (a.coin or "").upper() == "USDT"
+        ),
+        Decimal(0),
+    )
+
+    perp_margin = open_notional * HEDGE_MARGIN_BUFFER
+    required = perp_margin + extra_usdt_demand + usdt_subscribe_demand
+    available = snapshot.wallet.liquid_usdt_usd + close_notional
+    excess = available - required
+
+    if excess < MIN_SWAP_USDC:
+        return []
+
+    qty = excess.quantize(Decimal("0.01"))
+    return [
+        Action(
+            kind=ActionKind.SWAP_SPOT,
+            category="Spot",
+            product_id="USDCUSDT",
+            coin="USDC",  # destination coin of the swap
+            amount=qty,  # USDT to spend — Bybit Buy uses quote-coin qty
+            side="Buy",
+            order_link_id=_order_link_id(snapshot_ts, idx_offset),
+            reason=(
+                f"sweep {qty} USDT → USDC: liquid USDT "
+                f"${snapshot.wallet.liquid_usdt_usd:.2f} + closes "
+                f"${close_notional:.2f} - perp margin "
+                f"${perp_margin:.2f} (with {HEDGE_MARGIN_BUFFER:.0%} "
+                f"buffer) - non-stable Buy ${extra_usdt_demand:.2f} - "
+                f"USDT subscribes ${usdt_subscribe_demand:.2f}"
             ),
         )
     ]

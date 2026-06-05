@@ -201,10 +201,10 @@ function Sparkline({ points }: { points: ReputationHistoryPoint[] }) {
       {min < 0 && (
         <line x1={padX} x2={width - padX} y1={zeroY} y2={zeroY} stroke="#3F4860" strokeDasharray="2 3" />
       )}
-      <path d={areaD} fill="rgba(0,255,136,0.10)" />
-      <path d={pathD} fill="none" stroke="#00FF88" strokeWidth={1.5} />
+      <path d={areaD} fill="rgba(245,180,0,0.12)" />
+      <path d={pathD} fill="none" stroke="#F5B400" strokeWidth={1.5} />
       {points.map((p, i) => (
-        <circle key={p.updateIndex} cx={padX + i * stepX} cy={yFor(p.scoreBps)} r={2.5} fill="#00FF88" />
+        <circle key={p.updateIndex} cx={padX + i * stepX} cy={yFor(p.scoreBps)} r={2.5} fill="#F5B400" />
       ))}
     </svg>
   );

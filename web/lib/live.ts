@@ -121,8 +121,14 @@ export function useBybitEarn(params?: { category?: string; coin?: string; limit?
 }
 
 export function usePortfolio() {
+  // Keyed under `live-portfolio` (not `portfolio`) to avoid a cache
+  // collision with `agent-store-context.usePortfolio`, which hits
+  // `/api/store/portfolio` and exposes a different shape (`Portfolio`
+  // vs `LivePortfolio`). React Query was deduping the two queries and
+  // serving whichever fetched first, which made `live.accounts` and
+  // `live.active_earn_positions` undefined inside AllocationSection.
   return useQuery({
-    queryKey: ["portfolio"],
+    queryKey: ["live-portfolio"],
     queryFn: () => getJson<LivePortfolio>("/api/portfolio"),
     refetchInterval: POLL_INTERVAL_MS,
     staleTime: POLL_INTERVAL_MS / 2,

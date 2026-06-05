@@ -7,7 +7,7 @@ import { useDecisions } from "@/lib/hooks/use-decisions";
 import { useCycleDetail } from "@/lib/agent-store-context";
 import type { CycleDetail, EventRow, ExecutionRow } from "@/lib/agent-api";
 import { ipfsGateway, mantleExplorerTx } from "@/lib/explorer";
-import { HashChip, Icon, SectionHead, Tag } from "@/components/ui";
+import { Button, Eyebrow, HashChip, Icon, SectionHead, Tag } from "@/components/ui";
 import { ThesisView } from "@/components/thesis-view";
 
 export function DecisionLog() {
@@ -48,39 +48,38 @@ export function DecisionLog() {
         <RiskFlagLegend />
 
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
-          <div className="flex flex-wrap items-center gap-1.5 bg-ink-900 border border-ink-600/70 rounded-sm p-1">
+          <div className="flex flex-wrap items-center gap-2">
             {(
               [
                 { id: "all", label: "All", count: decisions.length },
                 { id: "week", label: "This Week", count: decisions.filter((d) => !d.ago.includes("d")).length },
                 {
                   id: "conf",
-                  label: "High Confidence",
+                  label: "High Conf",
                   count: decisions.filter((d) => d.confidence >= 0.7).length,
                 },
                 { id: "profit", label: "Profitable", count: decisions.filter((d) => d.profitable).length },
               ] as const
             ).map((t) => (
-              <button
+              <Button
                 key={t.id}
+                variant="terminal"
+                size="sm"
+                active={filter === t.id}
                 onClick={() => setFilter(t.id)}
-                className={`px-3 h-8 rounded-sm text-[12px] font-mono inline-flex items-center gap-2 transition-colors
-                  ${
-                    filter === t.id
-                      ? "bg-ink-700 text-white"
-                      : "text-dim-300 hover:text-white hover:bg-ink-800"
-                  }`}
               >
                 {t.label}
-                <span className={`text-[10.5px] tabular ${filter === t.id ? "text-neon" : "text-dim-500"}`}>
-                  {t.count}
+                <span
+                  className={`text-[10px] tabular tracking-normal ${filter === t.id ? "text-accent" : "text-dim-500"}`}
+                >
+                  · {t.count}
                 </span>
-              </button>
+              </Button>
             ))}
           </div>
 
           <div className="flex items-center gap-2">
-            <div className="hidden md:flex items-center gap-2 px-3 h-9 border border-ink-600/70 rounded-sm bg-ink-900 text-[12px] font-mono text-dim-400 min-w-[220px]">
+            <div className="hidden md:flex items-center gap-2 px-3 h-9 border border-ink-600/70 rounded-[3px] bg-ink-900 text-[12px] font-mono text-dim-400 min-w-[220px]">
               <Icon.Search />
               <input
                 type="text"
@@ -89,22 +88,16 @@ export function DecisionLog() {
               />
               <span className="text-dim-600 text-[10px]">⌘K</span>
             </div>
-            <button
-              onClick={expandAll}
-              className="px-2.5 h-9 border border-ink-600/70 rounded-sm bg-ink-900 text-[11px] font-mono text-dim-300 hover:text-white hover:bg-ink-800"
-            >
+            <Button variant="terminal" size="sm" onClick={expandAll}>
               Expand all
-            </button>
-            <button
-              onClick={collapseAll}
-              className="px-2.5 h-9 border border-ink-600/70 rounded-sm bg-ink-900 text-[11px] font-mono text-dim-300 hover:text-white hover:bg-ink-800"
-            >
+            </Button>
+            <Button variant="terminal" size="sm" onClick={collapseAll}>
               Collapse
-            </button>
+            </Button>
           </div>
         </div>
 
-        <div className="grid grid-cols-2 lg:grid-cols-5 gap-px bg-ink-600/60 border border-ink-600/70 rounded-md overflow-hidden">
+        <div className="grid grid-cols-2 lg:grid-cols-5 gap-px bg-ink-600/40 border border-ink-600/70 rounded-md overflow-hidden">
           <SummaryCell label="Showing" value={`${filtered.length} / ${decisions.length}`} />
           <SummaryCell
             label="Avg confidence"
@@ -113,7 +106,7 @@ export function DecisionLog() {
           <SummaryCell
             label="Profitable"
             value={`${filtered.filter((d) => d.profitable).length} / ${filtered.length}`}
-            tone="green"
+            tone="pos"
           />
           <SummaryCell
             label="Avg exec time"
@@ -124,10 +117,10 @@ export function DecisionLog() {
           <SummaryCell
             label="Risk distribution"
             value={
-              <span className="font-mono tabular">
-                <span className="text-neon">{filtered.filter((d) => d.risk === "LOW").length}L</span>
+              <span className="font-serif tabular">
+                <span className="text-pos">{filtered.filter((d) => d.risk === "LOW").length}L</span>
                 <span className="text-dim-500"> · </span>
-                <span className="text-warn">{filtered.filter((d) => d.risk === "MED").length}M</span>
+                <span className="text-accent">{filtered.filter((d) => d.risk === "MED").length}M</span>
                 <span className="text-dim-500"> · </span>
                 <span className="text-danger">{filtered.filter((d) => d.risk === "HIGH").length}H</span>
               </span>
@@ -137,7 +130,7 @@ export function DecisionLog() {
       </div>
 
       <div className="relative">
-        <div className="absolute top-0 bottom-0 left-[42px] sm:left-[156px] w-px bg-ink-600/60 pointer-events-none" />
+        <div className="absolute top-0 bottom-0 left-[42px] sm:left-[156px] w-px bg-gradient-to-b from-accent/40 via-ink-600/60 to-transparent pointer-events-none" />
 
         <div className="space-y-2">
           {filtered.map((d, i) => (
@@ -162,13 +155,22 @@ function SummaryCell({
 }: {
   label: string;
   value: React.ReactNode;
-  tone?: "green" | "blue";
+  tone?: "pos" | "accent" | "blue";
 }) {
-  const t = tone === "green" ? "text-neon" : tone === "blue" ? "text-elec" : "text-white";
+  const t =
+    tone === "pos"
+      ? "text-pos"
+      : tone === "accent"
+        ? "text-accent"
+        : tone === "blue"
+          ? "text-elec"
+          : "text-white";
   return (
-    <div className="bg-ink-900 px-4 py-3">
-      <div className="text-[9.5px] uppercase tracking-[0.18em] font-mono text-dim-500">{label}</div>
-      <div className={`font-mono tabular text-base mt-1 ${t}`}>{value}</div>
+    <div className="bg-ink-900 px-4 py-4">
+      <Eyebrow tone="dim">{label}</Eyebrow>
+      <div className={`font-serif tabular text-[22px] leading-none mt-2 tracking-[-0.02em] ${t}`}>
+        {value}
+      </div>
     </div>
   );
 }
@@ -184,7 +186,10 @@ function DecisionItem({
   onToggle: () => void;
   first: boolean;
 }) {
-  const riskTone: "green" | "warn" | "red" = d.risk === "LOW" ? "green" : d.risk === "MED" ? "warn" : "red";
+  // Risk LOW reads better as teal `pos` — green = "low risk, safe" stays
+  // intuitive, and we free amber up for brand accents.
+  const riskTone: "pos" | "warn" | "red" =
+    d.risk === "LOW" ? "pos" : d.risk === "MED" ? "warn" : "red";
   const summaryHasNoOp = /held|no-op/i.test(d.summary);
   // Off-chain rich detail fetched lazily — only when the row is open
   // and the join produced a cycle_ts (live row, not a mock fallback).
@@ -198,10 +203,14 @@ function DecisionItem({
           <span className="text-dim-500">{d.ts.split(" ")[1]}</span>
         </div>
         <div className="sm:hidden font-mono text-[10px] text-dim-500 tabular text-right pr-1">{d.ago}</div>
-        <div className="absolute top-[18px] left-[42px] sm:left-[156px] -translate-x-1/2 z-10">
+        <div className="absolute top-[20px] left-[42px] sm:left-[156px] -translate-x-1/2 z-10">
           <div
-            className={`w-3 h-3 rounded-full border-2 ${
-              open ? "bg-neon border-neon" : first ? "bg-ink-900 border-neon" : "bg-ink-900 border-ink-500"
+            className={`w-3 h-3 rounded-full border-2 transition-all ${
+              open
+                ? "bg-accent border-accent shadow-[0_0_12px_rgba(245,180,0,0.6)]"
+                : first
+                  ? "bg-ink-900 border-accent"
+                  : "bg-ink-900 border-ink-500"
             }`}
           />
         </div>
@@ -214,24 +223,24 @@ function DecisionItem({
           className={`w-full text-left bg-ink-900 border rounded-md transition-all
             ${
               open
-                ? "border-neon/40 shadow-[0_0_0_1px_rgba(0,255,136,0.15)]"
-                : "border-ink-600/70 hover:border-ink-500"
+                ? "border-accent/40 shadow-[0_0_0_1px_rgba(245,180,0,0.18),0_8px_24px_-12px_rgba(245,180,0,0.30)] bg-gradient-to-b from-ink-850/80 to-ink-900"
+                : "border-ink-600/70 hover:border-ink-500 hover:bg-ink-900/80"
             }`}
         >
-          <div className="flex items-center gap-3 sm:gap-4 px-4 sm:px-5 py-3.5">
+          <div className="flex items-center gap-3 sm:gap-4 px-4 sm:px-5 py-4">
             <HashChip hash={d.full || d.id} head={6} tail={4} />
-            <div className="hidden sm:block text-dim-600 font-mono text-[11px]">{d.ago}</div>
-            <div className="flex-1 text-sm sm:text-[15px] text-white min-w-0 truncate">
+            <div className="hidden sm:block text-dim-600 font-mono text-[10.5px] tabular">{d.ago}</div>
+            <div className="flex-1 text-[15px] sm:text-[17px] leading-snug text-white min-w-0 line-clamp-2">
               {summaryHasNoOp ? <span className="text-dim-300">{d.summary}</span> : d.summary}
             </div>
-            <Tag tone={riskTone}>RISK: {d.risk}</Tag>
+            <Tag tone={riskTone}>RISK · {d.risk}</Tag>
             <Tag tone="mono" className="hidden md:inline-flex">
-              EXEC: {d.exec}
+              EXEC · {d.exec}
             </Tag>
             <ConfidenceBadge value={d.confidence} />
             <span
-              className={`hidden sm:inline-flex items-center gap-1.5 text-[12px] font-mono transition-colors ${
-                open ? "text-neon" : "text-dim-400"
+              className={`hidden sm:inline-flex items-center gap-1.5 text-[11px] font-mono uppercase tracking-[0.14em] transition-colors ${
+                open ? "text-accent" : "text-dim-400"
               }`}
             >
               {open ? "Hide" : "Read"} rationale
@@ -254,14 +263,24 @@ function DecisionItem({
 
 function ConfidenceBadge({ value }: { value: number }) {
   const pct = Math.round(value * 100);
-  const color = value >= 0.75 ? "#00FF88" : value >= 0.6 ? "#F7B955" : "#7A8499";
+  // High-confidence = brand amber (this is the agent's "I'm sure"),
+  // medium = warn ochre, low = dim. Threshold 0.6/0.75 matches the
+  // legend the validator uses internally.
+  const color = value >= 0.75 ? "#F5B400" : value >= 0.6 ? "#F7B955" : "#7A8499";
   return (
-    <div className="hidden lg:flex items-center gap-2 font-mono text-[11px] text-dim-400">
-      <span className="text-dim-500 uppercase tracking-[0.14em] text-[9.5px]">conf</span>
-      <div className="w-12 h-1 bg-ink-700 rounded-sm overflow-hidden">
-        <div className="h-full" style={{ width: pct + "%", background: color }} />
+    <div className="hidden lg:flex items-center gap-2.5 font-mono text-[11px] text-dim-400">
+      <span className="text-dim-500 uppercase tracking-[0.16em] text-[9.5px]">conf</span>
+      <div className="w-20 h-1.5 bg-ink-700 rounded-full overflow-hidden">
+        <div
+          className="h-full rounded-full transition-all duration-500"
+          style={{
+            width: pct + "%",
+            background: `linear-gradient(90deg, ${color}55, ${color})`,
+            boxShadow: `0 0 8px ${color}55`,
+          }}
+        />
       </div>
-      <span className="tabular w-7 text-right" style={{ color }}>
+      <span className="tabular text-[12px] w-8 text-right" style={{ color }}>
         {value.toFixed(2)}
       </span>
     </div>
@@ -315,48 +334,48 @@ function DecisionThesis({
     .filter((f): f is NonNullable<typeof f> => Boolean(f));
   return (
     <div className="border-t border-ink-600/40 bg-ink-850/60 rounded-b-md fade-up">
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-px bg-ink-600/40">
-        <div className="lg:col-span-2 bg-ink-900 p-5 sm:p-6">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-px bg-ink-600/30">
+        <div className="lg:col-span-2 bg-ink-900 p-6 sm:p-8 space-y-7">
           {expectsDetail && events.length > 0 && (
-            <div className="mb-5">
-              <WatcherEventsBlock
-                events={events.slice(0, 5)}
-                title="Events that triggered this cycle"
-              />
-            </div>
+            <WatcherEventsBlock
+              events={events.slice(0, 5)}
+              title="Events that triggered this cycle"
+            />
           )}
-          <div>
-            <div className="text-[10.5px] font-mono uppercase tracking-[0.18em] text-dim-500 mb-2">
-              Thesis
-            </div>
+          <div className="space-y-2.5">
+            <Eyebrow tone="accent">TL;DR</Eyebrow>
+            <p className="font-serif text-[18px] leading-[1.4] text-white border-l-2 border-accent pl-4 max-w-[68ch]">
+              {d.summary}
+            </p>
+          </div>
+          <div className="max-w-[68ch]">
             <ThesisView body={thesisBody} />
           </div>
-          <div className="mt-5">
+          <div>
             <ThesisBlock
               title="Risk flags"
               body={d.risks}
-              accent={d.risks === "None." ? "green" : "warn"}
+              accent={d.risks === "None." ? "pos" : "warn"}
             />
             {flagsMeta.length > 0 && (
-              <div className="mt-2 flex flex-wrap gap-1.5">
+              <div className="mt-3 flex flex-wrap gap-1.5">
                 {flagsMeta.map((f) => (
-                  <span
-                    key={f.key}
-                    className="inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded-sm border border-warn/30 bg-warn/10 text-warn font-mono text-[10px]"
-                  >
+                  <Tag key={f.key} tone="warn">
                     <span className="opacity-70">⚑</span>
                     {f.key}
-                  </span>
+                  </Tag>
                 ))}
               </div>
             )}
           </div>
-          <div className="mt-5">
-            <ThesisBlock title="Allora signal used" body={d.allora} accent="elec" />
-          </div>
+          {d.allora && d.allora.trim() !== "—" && d.allora.trim() !== "" && (
+            <div>
+              <ThesisBlock title="Allora signal used" body={d.allora} accent="elec" />
+            </div>
+          )}
 
           {expectsDetail && (
-            <div className="mt-6 space-y-5">
+            <div className="space-y-6 pt-2">
               {detailLoading && !detail && (
                 <div className="text-[11px] font-mono text-dim-500">loading off-chain detail…</div>
               )}
@@ -366,17 +385,24 @@ function DecisionThesis({
             </div>
           )}
         </div>
-        <div className="bg-ink-900 p-5 sm:p-6 space-y-4">
+        <div className="bg-ink-900 p-6 sm:p-7 space-y-5">
           <div>
-            <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-dim-500 mb-2">Confidence</div>
-            <div className="flex items-baseline gap-2">
-              <div className="font-mono text-3xl text-white tabular">{d.confidence.toFixed(2)}</div>
-              <div className="text-[11px] text-dim-500 font-mono">/ 1.00</div>
+            <Eyebrow tone="dim">Confidence</Eyebrow>
+            <div className="flex items-baseline gap-2 mt-2">
+              <div className="font-serif text-[44px] leading-none text-white tabular tracking-[-0.03em]">
+                {d.confidence.toFixed(2)}
+              </div>
+              <div className="text-[12px] text-dim-500 font-mono">/ 1.00</div>
             </div>
-            <div className="mt-2 h-1.5 bg-ink-700 rounded-sm overflow-hidden">
-              <div className="h-full bg-neon" style={{ width: d.confidence * 100 + "%" }} />
+            <div className="mt-3 h-2 bg-ink-700 rounded-full overflow-hidden">
+              <div
+                className="h-full rounded-full bg-gradient-to-r from-accent-dim via-accent to-accent-soft shadow-[0_0_10px_rgba(245,180,0,0.45)]"
+                style={{ width: d.confidence * 100 + "%" }}
+              />
             </div>
-            <div className="mt-2 text-[10.5px] text-dim-500 font-mono">policy threshold 0.55</div>
+            <div className="mt-2 text-[10.5px] text-dim-500 font-mono uppercase tracking-[0.16em]">
+              policy threshold 0.55
+            </div>
           </div>
 
           <div className="border-t border-ink-600/40 pt-4 space-y-2.5">
@@ -394,7 +420,7 @@ function DecisionThesis({
               href={mantleExplorerTx(d.tx)}
               target="_blank"
               rel="noopener noreferrer"
-              className="mt-2 inline-flex items-center gap-1.5 text-[12px] font-mono text-elec hover:text-elec-soft"
+              className="mt-2 inline-flex items-center gap-1.5 text-[12px] font-mono text-elec hover:text-elec-soft uppercase tracking-[0.14em]"
             >
               Verify on Mantle Explorer <Icon.Ext />
             </a>
@@ -438,7 +464,7 @@ function VenueAllocationsBlock({
             <div key={id} className="bg-ink-850/60 border border-ink-600/40 rounded-sm overflow-hidden">
               <div className="flex items-center justify-between px-3 py-2 bg-ink-900/40 border-b border-ink-600/40">
                 <span className="text-[12.5px] text-white">{venueLabel(id)}</span>
-                <span className="font-mono text-[11px] text-neon tabular">
+                <span className="font-mono text-[11px] text-accent tabular">
                   {(weight * 100).toFixed(1)}%
                 </span>
               </div>
@@ -482,7 +508,7 @@ function ExecutionsBlock({ executions }: { executions: ExecutionRow[] }) {
       <div className="space-y-1.5">
         {executions.map((e) => {
           const tone =
-            e.status === "success" ? "text-neon" : e.status === "error" ? "text-danger" : "text-dim-300";
+            e.status === "success" ? "text-pos" : e.status === "error" ? "text-danger" : "text-dim-300";
           const kind =
             typeof e.action === "object" && e.action !== null && "kind" in e.action
               ? String((e.action as { kind?: unknown }).kind ?? "action")
@@ -490,11 +516,11 @@ function ExecutionsBlock({ executions }: { executions: ExecutionRow[] }) {
           return (
             <div
               key={e.idx}
-              className="flex items-start gap-3 text-[12px] font-mono bg-ink-850/40 border border-ink-600/30 rounded-sm px-3 py-1.5"
+              className="flex items-start gap-3 text-[12px] font-mono bg-ink-850/40 border border-ink-600/30 rounded-sm px-3 py-2"
             >
               <span className="text-dim-500 tabular w-5 text-right">{e.idx}</span>
               <span className="text-dim-300 flex-1 min-w-0 truncate">{kind}</span>
-              <span className={`uppercase text-[10.5px] tracking-[0.14em] ${tone}`}>{e.status}</span>
+              <span className={`uppercase text-[10px] tracking-[0.16em] ${tone}`}>{e.status}</span>
               {e.error && (
                 <span className="text-[10.5px] text-danger/80 max-w-[40%] truncate" title={e.error}>
                   {e.error}
@@ -555,7 +581,7 @@ function ValidatorStatusBlock({
     <div>
       <SubBlockTitle>Validator</SubBlockTitle>
       {ok ? (
-        <div className="text-[12px] font-mono text-neon">validator passed — all hard caps respected</div>
+        <div className="text-[12px] font-mono text-pos">validator passed — all hard caps respected</div>
       ) : (
         <div className="space-y-1.5">
           <div className="text-[12px] font-mono text-danger">validator rejected · {errors.length} issue(s)</div>
@@ -574,11 +600,7 @@ function ValidatorStatusBlock({
 }
 
 function SubBlockTitle({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="text-[10.5px] font-mono uppercase tracking-[0.18em] text-dim-500 mb-2">
-      {children}
-    </div>
-  );
+  return <Eyebrow tone="accent" className="mb-3">{children}</Eyebrow>;
 }
 
 function ThesisBlock({
@@ -588,18 +610,18 @@ function ThesisBlock({
 }: {
   title: string;
   body: string;
-  accent?: "white" | "green" | "elec" | "warn";
+  accent?: "white" | "pos" | "elec" | "warn";
 }) {
   const colors = {
     white: "text-white",
-    green: "text-neon",
+    pos: "text-pos",
     elec: "text-elec",
     warn: "text-warn",
   };
   return (
     <div>
-      <div className="text-[10.5px] font-mono uppercase tracking-[0.18em] text-dim-500 mb-2">{title}</div>
-      <div className={`text-[14px] leading-relaxed ${colors[accent]}`}>{body}</div>
+      <Eyebrow tone="dim" className="mb-2">{title}</Eyebrow>
+      <div className={`text-[14px] leading-[1.55] ${colors[accent]}`}>{body}</div>
     </div>
   );
 }
@@ -631,32 +653,28 @@ function RiskFlagLegend() {
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className="w-full flex items-center justify-between px-4 py-2.5 text-left hover:bg-ink-850/60"
+        className="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-ink-850/60"
       >
-        <div className="flex items-center gap-2.5">
-          <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-dim-500">
-            Risk flag taxonomy
+        <div className="flex items-center gap-3">
+          <Eyebrow tone="accent">Risk flag taxonomy</Eyebrow>
+          <span className="text-[12.5px] text-dim-300">
+            {RISK_FLAGS.length} flags monitored continuously
           </span>
-          <span className="text-[12px] text-dim-300">{RISK_FLAGS.length} flags monitored continuously</span>
         </div>
         <Icon.Chev className={`text-dim-400 transition-transform ${open ? "rotate-90" : ""}`} />
       </button>
       {open && (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-px bg-ink-600/40 border-t border-ink-600/60 fade-up">
           {RISK_FLAGS.map((f) => (
-            <div key={f.key} className="bg-ink-900 px-4 py-3">
+            <div key={f.key} className="bg-ink-900 px-4 py-3.5">
               <div className="flex items-start justify-between gap-3">
                 <div className="font-mono text-[12px] text-white">{f.key}</div>
-                <span
-                  className={`text-[9.5px] font-mono uppercase tracking-[0.14em] ${
-                    f.tone === "red" ? "text-danger" : "text-warn"
-                  }`}
-                >
+                <Tag tone={f.tone === "red" ? "red" : "warn"}>
                   {f.tone === "red" ? "halt" : "warn"}
-                </span>
+                </Tag>
               </div>
-              <div className="text-[12px] text-dim-300 mt-0.5">{f.label}</div>
-              <div className="text-[10.5px] text-dim-500 font-mono mt-1">{f.thresh}</div>
+              <div className="text-[13px] text-dim-300 mt-1.5 leading-snug">{f.label}</div>
+              <div className="text-[10.5px] text-dim-500 font-mono mt-1.5">{f.thresh}</div>
             </div>
           ))}
         </div>

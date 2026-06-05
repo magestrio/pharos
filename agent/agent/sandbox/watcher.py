@@ -157,9 +157,10 @@ def _read_latest_decision(
     decisions_dir: Path = DEFAULT_DECISIONS_DIR,
 ) -> dict[str, Any] | None:
     """Return the most recent decision JSON in `decisions_dir`, or None.
-    Mirrors `agent.sandbox.decide._load_latest_prior_decision` but kept
-    self-contained to avoid the watcher importing the LLM-orchestration
-    module (and its anthropic dependency)."""
+    Mirrors `agent.sandbox.decide._load_latest_prior_decision` (the
+    single-prior convenience wrapper) but kept self-contained to avoid
+    the watcher importing the LLM-orchestration module (and its
+    anthropic dependency)."""
     if not decisions_dir.is_dir():
         return None
     files = sorted(p for p in decisions_dir.glob("*.json"))

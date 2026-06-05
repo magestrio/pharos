@@ -12,6 +12,7 @@ import {
   VUSDC_CHAIN_ID,
   bybitAttestorContract,
 } from "@/lib/contracts";
+import { useIsMounted } from "@/lib/hooks/use-is-mounted";
 
 const REFETCH_INTERVAL_MS = 30_000;
 const WARN_THRESHOLD_SEC = 30 * 60; // 30 minutes — soft alert
@@ -70,6 +71,9 @@ function pickAddress(
 }
 
 export function useAttestorHealth(): AttestorHealthState {
+  // Mount-gate so SSR and the first client render emit the same tree.
+  const mounted = useIsMounted();
+
   const publicClient = usePublicClient({ chainId: VUSDC_CHAIN_ID });
   const isConfigured = BYBIT_ATTESTOR_ADDRESS !== ZERO_ADDRESS;
 
@@ -82,7 +86,7 @@ export function useAttestorHealth(): AttestorHealthState {
       { ...bybitAttestorContract, functionName: "attestedBalance" },
     ],
     query: {
-      enabled: isConfigured,
+      enabled: mounted && isConfigured,
       refetchInterval: REFETCH_INTERVAL_MS,
     },
   });
@@ -102,18 +106,19 @@ export function useAttestorHealth(): AttestorHealthState {
       });
       return logs.length;
     },
-    enabled: isConfigured && !!publicClient,
+    enabled: mounted && isConfigured && !!publicClient,
     refetchInterval: REFETCH_INTERVAL_MS,
     staleTime: 5_000,
   });
 
-  const [nowSec, setNowSec] = useState(() => Math.floor(Date.now() / 1000));
+  const [nowSec, setNowSec] = useState(0);
   useEffect(() => {
+    setNowSec(Math.floor(Date.now() / 1000));
     const id = setInterval(() => setNowSec(Math.floor(Date.now() / 1000)), 1000);
     return () => clearInterval(id);
   }, []);
 
-  if (!isConfigured) {
+  if (!mounted || !isConfigured) {
     return {
       lastAttestationSec: null,
       lagSec: 0,
