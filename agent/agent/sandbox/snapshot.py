@@ -1076,13 +1076,27 @@ def _lm_liquidation_distance_pct(pos: dict[str, Any]) -> Decimal | None:
     return (cur_d - liq_d) / cur_d
 
 
+def _rank_key(s: ProductSummary) -> Decimal:
+    """Ranking key: dead-time-adjusted APR when surfaced
+    (`effective_apr_net_holding`), else gross `effective_apr`. Ranking by
+    net means a high-headline product whose subscribe warmup + redeem
+    processing eats most of a weekly hold doesn't out-rank a flatter but
+    instantly-liquid one. Products without dead-time fall back to gross,
+    so existing FlexibleSaving ordering is unchanged."""
+    return (
+        s.effective_apr_net_holding
+        if s.effective_apr_net_holding is not None
+        else s.effective_apr
+    )
+
+
 def _rank(
     products: list[ProductSummary],
     top_k: int = TOP_K,
     must_include: Callable[[ProductSummary], bool] | None = None,
 ) -> list[ProductSummary]:
-    """Sort by effective APR descending, cap at top_k. Stable sort —
-    ties preserve Bybit's listing order.
+    """Sort by dead-time-adjusted APR descending (`_rank_key`), cap at
+    top_k. Stable sort — ties preserve Bybit's listing order.
 
     `must_include`: optional predicate that promotes matching products
     into the result regardless of APR rank. Used to guarantee USDC-set
@@ -1090,14 +1104,14 @@ def _rank(
     a hedge-free / unleveraged pick available even when alt-coin APRs
     dominate the top of the list.
     """
-    by_apr = sorted(products, key=lambda s: s.effective_apr, reverse=True)
+    by_apr = sorted(products, key=_rank_key, reverse=True)
     if must_include is None:
         return by_apr[:top_k]
     must = [p for p in by_apr if must_include(p)]
     must_ids = {p.product_id for p in must}
     rest = [p for p in by_apr if p.product_id not in must_ids][:top_k]
     merged = must + rest
-    return sorted(merged, key=lambda s: s.effective_apr, reverse=True)
+    return sorted(merged, key=_rank_key, reverse=True)
 
 
 async def _measure_realized_apr(

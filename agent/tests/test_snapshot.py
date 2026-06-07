@@ -492,6 +492,23 @@ def test_rank_caps_at_top_k():
     assert [p.product_id for p in ranked] == ["0.07", "0.06", "0.05"]
 
 
+def test_rank_uses_net_apr_when_present():
+    """A high-headline product whose dead-time crushes the net rate must
+    rank BELOW a lower-headline product that accrues/redeems instantly."""
+    high_gross = ProductSummary(
+        category="OnChain", product_id="high-gross", coin="ETH",
+        effective_apr=Decimal("0.30"), apr_source="estimate_apr",
+        effective_apr_net_holding=Decimal("0.08"),  # dead-time eats it
+    )
+    flat_liquid = ProductSummary(
+        category="FlexibleSaving", product_id="flat-liquid", coin="USDC",
+        effective_apr=Decimal("0.15"), apr_source="estimate_apr",
+        # no dead-time → net falls back to gross 0.15
+    )
+    ranked = _rank([high_gross, flat_liquid], top_k=10)
+    assert [p.product_id for p in ranked] == ["flat-liquid", "high-gross"]
+
+
 # ─── _safe_earn ─────────────────────────────────────────────────────────────
 
 

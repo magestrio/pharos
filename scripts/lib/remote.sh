@@ -8,11 +8,23 @@ _VAULT_REMOTE_LOADED=1
 
 source "$VAULT_ROOT/scripts/lib/common.sh"
 
+# Shared SSH opts. Adds `-i $HETZNER_SSH_KEY` (default ~/.ssh/hetzner_ed25519)
+# when that key exists — the Hetzner box authorizes a dedicated deploy key
+# that is NOT one of ssh's default identities, so without this an empty
+# ssh-agent / fresh shell gets "Permission denied (publickey)".
+_hetzner_ssh_opts() {
+  local key="${HETZNER_SSH_KEY:-$HOME/.ssh/hetzner_ed25519}"
+  local opts="-o BatchMode=yes -o ConnectTimeout=10"
+  [[ -f "$key" ]] && opts="$opts -i $key"
+  printf '%s' "$opts"
+}
+
 remote_ssh() {
   require_var HETZNER_HOST
   local user="${HETZNER_USER:-root}"
   local cmd=$1
-  ssh -o BatchMode=yes -o ConnectTimeout=10 "$user@$HETZNER_HOST" "$cmd"
+  # shellcheck disable=SC2086
+  ssh $(_hetzner_ssh_opts) "$user@$HETZNER_HOST" "$cmd"
 }
 
 remote_compose() {
@@ -57,7 +69,7 @@ remote_sync() {
   )
   log_info "rsync → $user@$HETZNER_HOST:$repo_dir (excl: .env*, *.pem, .git, node_modules, .venv, build/runtime)"
   rsync -az --delete "${excludes[@]}" \
-    -e "ssh -o BatchMode=yes -o ConnectTimeout=10" \
+    -e "ssh $(_hetzner_ssh_opts)" \
     "$VAULT_ROOT/" "$user@$HETZNER_HOST:$repo_dir/"
   log_info "sync done"
 }
@@ -65,6 +77,7 @@ remote_sync() {
 remote_check() {
   require_var HETZNER_HOST
   local user="${HETZNER_USER:-root}"
-  ssh -o BatchMode=yes -o ConnectTimeout=5 "$user@$HETZNER_HOST" true \
+  # shellcheck disable=SC2086
+  ssh $(_hetzner_ssh_opts) "$user@$HETZNER_HOST" true \
     || die "cannot reach $user@$HETZNER_HOST via SSH (check key, host, network)"
 }

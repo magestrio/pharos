@@ -4,7 +4,7 @@
   "scripts": {
     "build:contracts": "cd contracts && forge build && node scripts/export-abi.js",
     "dev:web": "pnpm --filter web dev",
-    "dev:agent": "uv run --directory agent python -m agent.main",
+    "dev:agent": "bash scripts/vault.sh agent:loop",
     "fetch-data": "uv run --directory agent python -m agent.data.cli",
     "safe:tx": "pnpm --filter @vault8004/safe-ops run tx",
     "safe:set-uri": "pnpm --filter @vault8004/safe-ops run set-agent-uri",
