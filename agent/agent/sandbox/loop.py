@@ -359,6 +359,8 @@ _MIN_NEW_ACTION_USD = 0.50
 def _clamp_to_liquid_budget(
     decision_dict: dict[str, Any],
     snapshot: Snapshot,
+    *,
+    decide_captured_at: str | None = None,
 ) -> tuple[dict[str, Any], list[str], str | None]:
     """Deterministic backstop (`bybit-sandbox.67`): the LLM repeatedly
     over-commits NEW Earn deployment past the liquid budget even after the
@@ -375,7 +377,36 @@ def _clamp_to_liquid_budget(
     MIN) are never touched — only fresh/grown picks. Per-category, with
     the shared-pool looseness documented on `check_stable_earn_funding`;
     this is an upstream nudge, the validator is the hard gate.
+
+    Freshness contract (`bybit-sandbox.69`): the budget read below comes
+    from `snapshot.wallet`, so `snapshot` MUST be the cycle's fresh
+    snapshot — the SAME object whose serialization was fed to `decide()`,
+    so the budget clamped here equals the advisory budget the LLM saw.
+    Today that holds (one `collect_snapshot` per cycle). If a future
+    snapshot-lifecycle refactor ever caches/reuses snapshots, pass
+    `decide_captured_at` (the `captured_at` of the snapshot decide saw):
+    on a mismatch the clamp degrades to a safe no-op (skip + warn) rather
+    than clamping against a stale budget. Never raises — a hard failure in
+    the cycle hot path would take down the heartbeat over a refactor slip.
     """
+    if decide_captured_at is not None:
+        fresh = False
+        try:
+            decided_at = datetime.fromisoformat(
+                decide_captured_at.replace("Z", "+00:00")
+            )
+            fresh = decided_at == snapshot.captured_at
+        except (ValueError, TypeError, AttributeError):
+            fresh = False
+        if not fresh:
+            log.warning(
+                "liquid clamp: snapshot captured_at (%s) != the snapshot "
+                "decide saw (%s) — skipping clamp to avoid a stale budget "
+                "(.69 freshness guard)",
+                snapshot.captured_at, decide_captured_at,
+            )
+            return decision_dict, [], None
+
     wallet = snapshot.wallet
     total_book = float(wallet.total_equity_usd)
     liquid_stables = float(wallet.liquid_stables_usd)
@@ -717,7 +748,11 @@ async def run_one_cycle(
             # validator reject. Runs after the cooldown drop (both are
             # post-decide, pre-validate); validator still gates the result.
             clamped_dict, clamp_dropped, clamp_note = _clamp_to_liquid_budget(
-                decision.model_dump(), snap
+                decision.model_dump(), snap,
+                # `.69` freshness guard: tie the clamp budget to the exact
+                # snapshot decide() saw, so a future snapshot-reuse refactor
+                # degrades to a safe no-op instead of a stale clamp.
+                decide_captured_at=raw_snapshot.get("captured_at"),
             )
             if clamp_dropped:
                 notes_list = clamped_dict.setdefault("notes", [])

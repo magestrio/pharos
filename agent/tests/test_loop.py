@@ -227,6 +227,47 @@ def test_clamp_noop_when_within_budget() -> None:
     assert dropped == []
 
 
+def _overbudget_ton_decision() -> Decision:
+    return Decision(
+        thesis="over-commit a fresh TON OnChain pick past the liquid budget.",
+        venues=[
+            VenueAllocation(venue_id="cash_usdc", weight=0.8),
+            VenueAllocation(venue_id="bybit_onchain", weight=0.2,
+                            picks=[Pick(product_id="8", weight=1.0)]),  # $20 new
+        ],
+        hedges=[], confidence=0.7, risk_flags=[], notes=[],
+        expected_blended_apr_pct=5.0,
+    )
+
+
+def test_clamp_skips_when_snapshot_stale() -> None:
+    """`.69` freshness guard: when the snapshot fed to decide() and the one
+    clamped against diverge (a future snapshot-reuse refactor), skip the
+    clamp rather than use a stale budget — even on an over-budget pick that
+    would otherwise be dropped."""
+    from agent.sandbox.loop import _clamp_to_liquid_budget
+    snap = _snapshot_with_ton(liquid_usdc="6")
+    new_dict, dropped, note = _clamp_to_liquid_budget(
+        _overbudget_ton_decision().model_dump(), snap,
+        decide_captured_at="2020-01-01T00:00:00+00:00",  # != snap.captured_at
+    )
+    assert dropped == []
+    assert note is None
+
+
+def test_clamp_runs_when_snapshot_fresh() -> None:
+    """`.69`: a matching `decide_captured_at` (the snapshot decide saw)
+    leaves the clamp active — the over-budget pick is still dropped. Guards
+    against the freshness check mis-firing on a normal cycle."""
+    from agent.sandbox.loop import _clamp_to_liquid_budget
+    snap = _snapshot_with_ton(liquid_usdc="6")
+    new_dict, dropped, note = _clamp_to_liquid_budget(
+        _overbudget_ton_decision().model_dump(), snap,
+        decide_captured_at=snap.captured_at.isoformat(),
+    )
+    assert dropped == ["8"]
+
+
 def _decision_with_risk_flag() -> Decision:
     return Decision(
         thesis="risk-off; flagging cycle to abort intentionally.",
