@@ -19,6 +19,7 @@ import pytest
 from agent.bybit_oracle.bybit_client import (
     BybitAPIError,
     EarnOrderResult,
+    OrderHistoryEntry,
     PerpPosition,
     SpotOrderResult,
 )
@@ -30,6 +31,7 @@ from agent.sandbox.execute import (
     diff_to_actions,
     execute_actions,
     reconcile_executions,
+    verify_executions_against_bybit,
     _enforce_usdt_budget,
     _order_link_id,
 )
@@ -4465,6 +4467,113 @@ def test_reconcile_executions_errors_capped_at_ten(tmp_path: Path) -> None:
     assert summary["total"] == 25
     assert summary["counts"]["error"] == 25
     assert len(summary["errors"]) == 10
+
+
+# ─── .59 verify_executions_against_bybit ──────────────────────────────────
+
+
+def _landed(order_id: str = "o1") -> list[OrderHistoryEntry]:
+    return [OrderHistoryEntry(orderId=order_id, orderStatus="Filled")]
+
+
+@pytest.mark.asyncio
+async def test_verify_executions_missing_file(tmp_path: Path) -> None:
+    """No executions log → empty result, no Bybit calls. Mirrors the
+    reconcile read-only contract."""
+    client = AsyncMock()
+    result = await verify_executions_against_bybit(
+        "20260605T100000Z", client, executions_dir=tmp_path
+    )
+    assert result["exists"] is False
+    assert result["checked"] == 0
+    assert result["counts"] == {}
+    client.get_order_history.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_verify_executions_classifies_against_history(tmp_path: Path) -> None:
+    """The four confirmable outcomes + the unconfirmable bucket. The
+    `open_perp_short` row logged `error` but its order DID land on Bybit —
+    that's the double-spend trap a naive retry would spring, so it must
+    classify `confirmed-landed`, not `no-trace`."""
+    ts = "20260605T110000Z"
+    _write_exec_log(
+        tmp_path / f"{ts}.jsonl",
+        [
+            {"action": {"kind": "swap_spot", "product_id": "USDCUSDT",
+                        "order_link_id": "olid-0"}, "status": "ok"},
+            {"action": {"kind": "open_perp_short", "product_id": "TONUSDT",
+                        "order_link_id": "olid-1"}, "status": "error"},
+            {"action": {"kind": "close_perp", "product_id": "ETHUSDT",
+                        "order_link_id": "olid-2"}, "status": "error"},
+            {"action": {"kind": "swap_spot", "product_id": "USDCUSD1",
+                        "order_link_id": "olid-3"}, "status": "ok"},
+            {"action": {"kind": "subscribe_earn", "product_id": "1131",
+                        "order_link_id": "olid-4"}, "status": "ok"},
+        ],
+    )
+
+    landed_ids = {"olid-0", "olid-1"}
+    calls: list[tuple[str, str, str | None]] = []
+
+    def _history(*, category: str, order_link_id: str, symbol: str | None):
+        calls.append((category, order_link_id, symbol))
+        return _landed() if order_link_id in landed_ids else []
+
+    client = AsyncMock()
+    client.get_order_history.side_effect = _history
+
+    result = await verify_executions_against_bybit(
+        ts, client, executions_dir=tmp_path
+    )
+
+    assert result["checked"] == 4
+    assert result["unconfirmable"] == 1
+    assert result["counts"] == {
+        "confirmed-landed": 2,  # olid-0 (ok), olid-1 (logged error but landed)
+        "no-trace": 1,          # olid-2 (error, no Bybit trace)
+        "desync": 1,            # olid-3 (logged ok, no Bybit trace)
+    }
+    # Earn was never queried — no order-history endpoint for it.
+    assert "olid-4" not in {c[1] for c in calls}
+    # Category routing: spot for swaps, linear for perps.
+    by_id = {c[1]: c[0] for c in calls}
+    assert by_id["olid-0"] == "spot"
+    assert by_id["olid-1"] == "linear"
+    assert by_id["olid-2"] == "linear"
+
+
+@pytest.mark.asyncio
+async def test_verify_executions_query_error_does_not_abort(tmp_path: Path) -> None:
+    """A transient history-lookup failure on one row is recorded as
+    `query-error` and the scan keeps going — one bad lookup can't blind
+    the whole reconcile."""
+    ts = "20260605T120000Z"
+    _write_exec_log(
+        tmp_path / f"{ts}.jsonl",
+        [
+            {"action": {"kind": "swap_spot", "product_id": "USDCUSDT",
+                        "order_link_id": "olid-0"}, "status": "ok"},
+            {"action": {"kind": "close_perp", "product_id": "ETHUSDT",
+                        "order_link_id": "olid-1"}, "status": "error"},
+        ],
+    )
+
+    def _history(*, category: str, order_link_id: str, symbol: str | None):
+        if order_link_id == "olid-0":
+            raise BybitAPIError(10001, "rate limited", "/v5/order/history")
+        return []
+
+    client = AsyncMock()
+    client.get_order_history.side_effect = _history
+
+    result = await verify_executions_against_bybit(
+        ts, client, executions_dir=tmp_path
+    )
+
+    assert result["checked"] == 2
+    assert result["counts"]["query-error"] == 1
+    assert result["counts"]["no-trace"] == 1
 
 
 def test_hedge_kept_while_onchain_redeem_unbonding() -> None:

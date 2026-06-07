@@ -4763,6 +4763,141 @@ def reconcile_executions(
     return result
 
 
+# Action kinds whose order actually lands on Bybit's order book and is
+# therefore confirmable by `orderLinkId` against `/v5/order/history`
+# (`bybit-sandbox.59`). Earn / LM / advance-Earn / Alpha subscribes have
+# NO order-history endpoint — they can only be confirmed via *positions*,
+# which is ambiguous (a position may pre-date this cycle), so they're left
+# in the `unconfirmable` bucket rather than guessed at.
+_ORDER_HISTORY_CATEGORY: dict[ActionKind, str] = {
+    ActionKind.SWAP_SPOT: "spot",
+    ActionKind.OPEN_PERP_SHORT: "linear",
+    ActionKind.CLOSE_PERP: "linear",
+}
+
+
+async def verify_executions_against_bybit(
+    snapshot_ts: str,
+    client: BybitClient,
+    executions_dir: Path = EXECUTIONS_DIR,
+) -> dict[str, Any]:
+    """Cross-check a cycle's executions log against live Bybit order-history
+    by `orderLinkId` (`bybit-sandbox.59`).
+
+    Strictly READ-ONLY: it answers "did each confirmable action's order
+    actually land on Bybit?" and classifies the answer — it does NOT retry
+    anything. Auto-retry stays deliberately unbuilt because a blind replay
+    inside Bybit's ~30-min `orderLinkId` dedup window can double-spend when a
+    response landed just before the crash; this verifier is the prerequisite
+    that removes that ambiguity for the kinds Bybit lets us confirm.
+
+    Only `SWAP_SPOT` / `OPEN_PERP_SHORT` / `CLOSE_PERP` are confirmable —
+    they hit `/v5/order/create` and show up in `/v5/order/history`. Earn /
+    LM / advance-Earn / Alpha have no order-history endpoint and land in the
+    `unconfirmable` bucket.
+
+    Per-action classification:
+      - `confirmed-landed`: an order with this `orderLinkId` exists on Bybit
+        (regardless of what the log row says — a logged `error` whose order
+        nonetheless landed is exactly the double-spend trap a naive retry
+        would trigger).
+      - `no-trace`: no Bybit order, and the log row is `error`/missing — a
+        genuine retry candidate (surfaced, NOT retried).
+      - `desync`: no Bybit order, but the log row claims `ok` — an anomaly
+        worth an operator's eyes.
+      - `query-error`: the history lookup itself failed (transient API
+        error); recorded so one bad lookup can't abort the scan.
+
+    Returns
+    -------
+    dict with `snapshot_ts`, `exists`, `checked` (confirmable rows queried),
+    `unconfirmable` (rows skipped), `counts` ({classification → count}), and
+    `actions` (per-row detail: order_link_id, kind, product_id, log_status,
+    bybit_landed, classification).
+    """
+    log_path = executions_dir / f"{snapshot_ts}.jsonl"
+    result: dict[str, Any] = {
+        "snapshot_ts": snapshot_ts,
+        "path": str(log_path),
+        "exists": log_path.is_file(),
+        "checked": 0,
+        "unconfirmable": 0,
+        "counts": {},
+        "actions": [],
+    }
+    if not result["exists"]:
+        return result
+
+    counts: dict[str, int] = {}
+    actions: list[dict[str, Any]] = []
+    for raw in log_path.read_text().splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            counts["malformed"] = counts.get("malformed", 0) + 1
+            continue
+        action_block = row.get("action") or {}
+        try:
+            kind = ActionKind(action_block.get("kind"))
+        except ValueError:
+            kind = None
+        category = _ORDER_HISTORY_CATEGORY.get(kind) if kind else None
+        if category is None:
+            result["unconfirmable"] += 1
+            continue
+
+        order_link_id = action_block.get("order_link_id") or ""
+        symbol = action_block.get("product_id") or None
+        log_status = str(row.get("status") or "unknown")
+
+        try:
+            history = await client.get_order_history(
+                category=category,
+                order_link_id=order_link_id,
+                symbol=symbol,
+            )
+            landed = len(history) > 0
+        except BybitAPIError as exc:
+            classification = "query-error"
+            landed = None
+            counts[classification] = counts.get(classification, 0) + 1
+            actions.append({
+                "order_link_id": order_link_id,
+                "kind": kind.value,
+                "product_id": symbol,
+                "log_status": log_status,
+                "bybit_landed": landed,
+                "classification": classification,
+                "error": str(exc),
+            })
+            result["checked"] += 1
+            continue
+
+        if landed:
+            classification = "confirmed-landed"
+        elif log_status == "ok":
+            classification = "desync"
+        else:
+            classification = "no-trace"
+        counts[classification] = counts.get(classification, 0) + 1
+        actions.append({
+            "order_link_id": order_link_id,
+            "kind": kind.value,
+            "product_id": symbol,
+            "log_status": log_status,
+            "bybit_landed": landed,
+            "classification": classification,
+        })
+        result["checked"] += 1
+
+    result["counts"] = counts
+    result["actions"] = actions
+    return result
+
+
 def _dry_run_payload(action: Action) -> dict[str, Any]:
     if action.kind == ActionKind.OPEN_PERP_SHORT:
         return {

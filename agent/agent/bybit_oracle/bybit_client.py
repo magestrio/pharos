@@ -278,6 +278,29 @@ class SpotOrderStatusList(BaseModel):
     items: list[SpotOrderStatus] = Field(default_factory=list, alias="list")
 
 
+class OrderHistoryEntry(BaseModel):
+    """One row from `/v5/order/history` — the post-mortem order endpoint
+    `get_spot_order_status` references. Unlike `/v5/order/realtime`, history
+    retains terminal orders, so a query by the client-supplied `orderLinkId`
+    confirms whether an action's order actually reached Bybit after a crash
+    (`bybit-sandbox.59` reconcile)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    orderId: str
+    orderLinkId: str | None = None
+    orderStatus: str
+    side: str | None = None
+    symbol: str | None = None
+    qty: str = "0"
+    cumExecQty: str = "0"
+
+
+class OrderHistoryList(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+    items: list[OrderHistoryEntry] = Field(default_factory=list, alias="list")
+
+
 class BybitOrderError(RuntimeError):
     """A spot order reached a terminal non-Filled state (Cancelled, Rejected,
     PartiallyFilledCancelled, Deactivated). Caller should advance FSM to
@@ -1590,6 +1613,37 @@ class BybitClient:
                 f"order {order_id} not found in realtime (likely already finalized)"
             )
         return parsed.result.items[0]
+
+    async def get_order_history(
+        self,
+        *,
+        category: str,
+        order_link_id: str,
+        symbol: str | None = None,
+    ) -> list[OrderHistoryEntry]:
+        """Look up finalized orders by the client-supplied `orderLinkId` via
+        `/v5/order/history`. Unlike `get_spot_order_status` (realtime, which
+        drops orders seconds after they finalize), history retains terminal
+        orders — so this is the post-mortem lookup that confirms whether a
+        planned action's order actually reached Bybit after a crash.
+
+        `category` is `"spot"` or `"linear"`. Returns all matching rows
+        (normally 0 or 1); an empty list means no order carrying that
+        `orderLinkId` ever landed. Read-only — the caller (`bybit-sandbox.59`
+        reconcile) decides what to do with the answer; this method NEVER
+        retries or mutates state.
+        """
+        data = await self._request(
+            "GET",
+            "/v5/order/history",
+            params={
+                "category": category,
+                "orderLinkId": order_link_id,
+                "symbol": symbol,
+            },
+        )
+        parsed = BybitResponse[OrderHistoryList].model_validate(data)
+        return parsed.result.items if parsed.result else []
 
     async def poll_spot_order_filled(
         self,

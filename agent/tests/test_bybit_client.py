@@ -690,6 +690,43 @@ async def test_get_spot_order_status_empty_list_raises(captured):
 
 
 @pytest.mark.asyncio
+async def test_get_order_history_queries_by_link_id(captured):
+    """`.59` post-mortem lookup: hits `/v5/order/history` filtered by the
+    client-supplied `orderLinkId`, returns the parsed rows."""
+    payload = {
+        "list": [
+            {"orderId": "ord-9", "orderLinkId": "olid-7",
+             "orderStatus": "Filled", "side": "Sell",
+             "symbol": "ETHUSDT", "qty": "0.1", "cumExecQty": "0.1"}
+        ]
+    }
+    async with _client(captured, lambda _r: _ok(payload)) as c:
+        rows = await c.get_order_history(
+            category="linear", order_link_id="olid-7", symbol="ETHUSDT"
+        )
+
+    assert len(rows) == 1
+    assert rows[0].orderLinkId == "olid-7"
+    assert rows[0].orderStatus == "Filled"
+    req = captured[0]
+    assert req.url.path == "/v5/order/history"
+    assert dict(req.url.params) == {
+        "category": "linear", "orderLinkId": "olid-7", "symbol": "ETHUSDT"
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_order_history_empty_returns_empty_list(captured):
+    """No order ever carried that `orderLinkId` → empty list (not an
+    error). The reconcile caller reads this as 'never landed'."""
+    async with _client(captured, lambda _r: _ok({"list": []})) as c:
+        rows = await c.get_order_history(
+            category="spot", order_link_id="olid-missing"
+        )
+    assert rows == []
+
+
+@pytest.mark.asyncio
 async def test_poll_spot_order_filled_returns_qty(captured):
     responses = iter([
         _order_status("New"),
