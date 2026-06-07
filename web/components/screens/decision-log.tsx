@@ -11,7 +11,7 @@ import { Button, Eyebrow, HashChip, Icon, SectionHead, Tag } from "@/components/
 import { ThesisView } from "@/components/thesis-view";
 
 export function DecisionLog() {
-  const { decisions } = useDecisions();
+  const { decisions, isLoading } = useDecisions();
   const [filter, setFilter] = useState<"all" | "week" | "conf" | "profit">("all");
   const [openIds, setOpenIds] = useState<Set<string>>(() => {
     return decisions.length > 0 ? new Set([decisions[0].id]) : new Set();
@@ -133,6 +133,15 @@ export function DecisionLog() {
         <div className="absolute top-0 bottom-0 left-[42px] sm:left-[156px] w-px bg-gradient-to-b from-accent/40 via-ink-600/60 to-transparent pointer-events-none" />
 
         <div className="space-y-2">
+          {filtered.length === 0 && (
+            <div className="ml-[42px] sm:ml-[156px] bg-ink-900 border border-ink-600/70 rounded-md px-5 py-8 text-center text-[12px] font-mono text-dim-400">
+              {isLoading
+                ? "Loading agent decisions…"
+                : decisions.length === 0
+                  ? "No decisions recorded yet — the log fills in once the agent completes its first cycle."
+                  : "No decisions match this filter."}
+            </div>
+          )}
           {filtered.map((d, i) => (
             <DecisionItem
               key={d.id}
@@ -299,6 +308,27 @@ type DecisionBlob = {
   _meta?: { _validator?: { ok?: boolean; errors?: string[] } };
 };
 
+/**
+ * Extract product_ids that the deterministic cooldown filter stripped
+ * post-LLM (`bybit-sandbox.61`). The filter annotates `decision.notes`
+ * with `"cooldown_filter dropped re-picked pids: 497,123"` whenever it
+ * fires. Returns [] when no such note is present.
+ */
+function cooldownPidsFromNotes(notes: string[] | undefined): string[] {
+  if (!notes) return [];
+  for (const n of notes) {
+    if (typeof n !== "string") continue;
+    const m = /^cooldown_filter dropped re-picked pids:\s*(.+)$/.exec(n);
+    if (m) {
+      return m[1]
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
+  }
+  return [];
+}
+
 function asDecisionBlob(value: Record<string, unknown> | null | undefined): DecisionBlob | null {
   if (!value || typeof value !== "object") return null;
   return value as DecisionBlob;
@@ -332,6 +362,7 @@ function DecisionThesis({
   const flagsMeta = flagKeys
     .map((k) => RISK_FLAGS.find((r) => r.key === k))
     .filter((f): f is NonNullable<typeof f> => Boolean(f));
+  const cooldownPids = cooldownPidsFromNotes(blob?.notes);
   return (
     <div className="border-t border-ink-600/40 bg-ink-850/60 rounded-b-md fade-up">
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-px bg-ink-600/30">
@@ -371,6 +402,26 @@ function DecisionThesis({
           {d.allora && d.allora.trim() !== "—" && d.allora.trim() !== "" && (
             <div>
               <ThesisBlock title="Allora signal used" body={d.allora} accent="elec" />
+            </div>
+          )}
+
+          {cooldownPids.length > 0 && (
+            <div>
+              <Eyebrow tone="accent">Cooldown skip</Eyebrow>
+              <p className="mt-2 text-[13px] text-dim-200 leading-relaxed max-w-[68ch]">
+                The LLM tried to re-pick {cooldownPids.length === 1 ? "a product" : "products"} that
+                the watcher just auto-closed. The deterministic filter dropped{" "}
+                {cooldownPids.length === 1 ? "it" : "them"} and rolled the weight to
+                cash to avoid ping-pong on Bybit fees + slippage.
+              </p>
+              <div className="mt-3 flex flex-wrap gap-1.5">
+                {cooldownPids.map((pid) => (
+                  <Tag key={pid} tone="warn">
+                    <span className="opacity-70">⏱</span>
+                    COOLDOWN · {pid}
+                  </Tag>
+                ))}
+              </div>
             </div>
           )}
 

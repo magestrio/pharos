@@ -8,7 +8,7 @@ import {
   ReputationOracleABI,
   VUSDCABI,
 } from "@vault8004/abi";
-import { mantle } from "wagmi/chains";
+import { ACTIVE_CHAIN } from "@/lib/chains";
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as const;
 
@@ -71,7 +71,7 @@ export const VAULT_AGENT_ID: bigint = (() => {
   }
 })();
 
-export const VUSDC_CHAIN_ID = mantle.id;
+export const VUSDC_CHAIN_ID = ACTIVE_CHAIN.id;
 export const VUSDC_ABI = VUSDCABI;
 
 export const isVUsdcConfigured = VUSDC_ADDRESS !== ZERO_ADDRESS;

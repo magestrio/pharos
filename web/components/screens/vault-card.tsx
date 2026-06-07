@@ -4,15 +4,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useWaitForTransactionReceipt, useWriteContract } from "wagmi";
 
-import {
-  ATTESTOR,
-  CAPITAL_SERIES,
-  EXCHANGE_RATE_SERIES,
-  HEDGE_LIFETIME_FUNDING,
-  INITIAL_CAPITAL_USD,
-  VAULT,
-  type Allocation,
-} from "@/lib/data";
+import { type Allocation } from "@/lib/data";
 import Link from "next/link";
 import { useCycles, usePortfolio, useRecentEvents } from "@/lib/agent-store-context";
 import { usePortfolio as useLivePortfolio } from "@/lib/live";
@@ -58,6 +50,10 @@ import {
   StatCard,
   Tag,
 } from "@/components/ui";
+
+// 2-of-3 Gnosis Safe owner / attestor signer — canonical address from
+// CLAUDE.md, a real static fact (not an env-driven deploy artifact).
+const SAFE_OWNER_ADDRESS = "0x4dc4a70Ae02d7ca2F3A06b1231b3A9312d82a037";
 
 export function VaultCard() {
   const stats = useVaultStats();
@@ -117,10 +113,12 @@ function HeroBlock({ stats }: { stats: VaultStats }) {
             </Button>
           </div>
           <div className="hidden md:flex items-center gap-3 pt-1 font-mono text-[10.5px] uppercase tracking-[0.18em] text-dim-500">
-            <span>Deployed</span>
-            <span className="text-white tabular">{VAULT.inception}</span>
+            <span>Agent</span>
+            <span className="text-white tabular">Claude Sonnet 4.6</span>
             <span className="h-2.5 w-px bg-dim-600/70" />
-            <span className="text-white tabular">{stats.daysLive}d live</span>
+            <span className="text-white tabular">
+              {stats.daysLive > 0 ? `${stats.daysLive}d live` : "—"}
+            </span>
             <span className="h-2.5 w-px bg-dim-600/70" />
             <span>Mantle Mainnet</span>
           </div>
@@ -206,23 +204,22 @@ function ReputationNFTCardLive() {
 
 function ReputationNFTCard() {
   const rep = useReputation();
+  const decisionsCount = useCycles({ limit: 50 }).data?.length ?? 0;
   const update = useWriteContract();
   const updateReceipt = useWaitForTransactionReceipt({
     hash: update.data,
     chainId: VUSDC_CHAIN_ID,
   });
 
-  // Score for the big number: live bps when configured, else mock.
-  // VAULT.reputation is in the legacy 0-1000 range; map to a comparable
-  // visual using `pct` so the bar fills sensibly in both modes.
+  // This card only renders when `rep.isLive` (the non-live branch shows
+  // ReputationNFTCardLive's placeholder), so every value here is real
+  // on-chain data — no mock fallback.
   const liveScoreBps = rep.lastScoreBps;
   const liveScoreLabel = liveScoreBps !== null ? formatBpsAsPct(liveScoreBps) : null;
-  const mockPct = (VAULT.reputation / VAULT.reputationMax) * 100;
   // Cap live bar at +50% APR (5000 bps) for visual scaling; anything
   // above pegs. Clamp at 0 for negative (underwater) scores.
-  const livePct =
-    liveScoreBps !== null ? Math.max(0, Math.min(100, (liveScoreBps / 5000) * 100)) : null;
-  const pct = livePct ?? mockPct;
+  const pct =
+    liveScoreBps !== null ? Math.max(0, Math.min(100, (liveScoreBps / 5000) * 100)) : 0;
 
   const previewBps = rep.previewScoreBps;
   const previewLabel = previewBps !== null ? formatBpsAsPct(previewBps) : null;
@@ -262,14 +259,14 @@ function ReputationNFTCard() {
 
         <div className="p-6 pb-5 bg-dots relative">
           <Eyebrow tone="dim" className="mb-4">
-            {rep.isLive ? "Annualized APR" : "Score"}
+            Annualized APR
           </Eyebrow>
           <div className="flex items-baseline gap-2">
             <div className="font-serif text-[88px] leading-[0.85] font-semibold text-white tabular tracking-[-0.04em]">
-              {liveScoreLabel ?? VAULT.reputation}
+              {liveScoreLabel ?? "—"}
             </div>
             <div className="text-dim-500 font-mono text-[18px] tabular self-start mt-3">
-              {rep.isLive ? "ERC-8004" : "/ 1000"}
+              ERC-8004
             </div>
           </div>
           <div className="mt-5 h-[5px] bg-ink-700 overflow-hidden rounded-full">
@@ -279,18 +276,20 @@ function ReputationNFTCard() {
             />
           </div>
           <div className="mt-3 flex items-center justify-between text-[10.5px] font-mono">
-            <span className="text-dim-500 uppercase tracking-[0.18em]">
-              {rep.isLive ? "Updates" : "Decile rank"}
-            </span>
-            <Tag tone="accent">{rep.isLive ? `${rep.updateCount ?? 0}` : "TOP 16%"}</Tag>
+            <span className="text-dim-500 uppercase tracking-[0.18em]">Updates</span>
+            <Tag tone="accent">{rep.updateCount ?? 0}</Tag>
           </div>
         </div>
 
+        {/* Sharpe / Max DD / Win Rate are realized-performance metrics —
+            no live source exists yet (needs vUSDC exchangeRate history),
+            so they render "—" rather than fabricated numbers. Decisions
+            is the real cycle count. */}
         <div className="grid grid-cols-2 gap-px bg-ink-600/40 border-t border-ink-600/60">
-          <MetricCell label="Sharpe" value={VAULT.sharpe.toFixed(2)} />
-          <MetricCell label="Max DD" value={VAULT.maxDD.toFixed(1) + "%"} />
-          <MetricCell label="Win Rate" value={VAULT.winRate + "%"} />
-          <MetricCell label="Decisions" value={String(VAULT.decisions)} />
+          <MetricCell label="Sharpe" value="—" />
+          <MetricCell label="Max DD" value="—" />
+          <MetricCell label="Win Rate" value="—" />
+          <MetricCell label="Decisions" value={String(decisionsCount)} />
         </div>
 
         <div className="border-t border-ink-600/60 bg-ink-900/40 p-4 space-y-3">
@@ -1276,7 +1275,7 @@ function AllocationSection({
   );
   // Live snapshot total is authoritative when present (it sums every
   // account; store rows can omit sub-positions). Fall back to the store
-  // / mock chain in that order.
+  // allocation total, then vault-stats equity, in that order.
   const tvlUsdc =
     liveQuery.data?.total_equity_usd ??
     allocation.totalUsdc ??
@@ -1521,17 +1520,52 @@ function AttestorAndHedgesSection() {
 function AttestorHealthCard() {
   const health = useAttestorHealth();
 
-  // Derived display strings — prefer live values, fall back to mock.
-  const lagMin = health.isLive ? Math.floor(health.lagSec / 60) : ATTESTOR.lastPushMin;
-  const lagSubMin = health.isLive && health.lagSec < 60;
+  // No on-chain attestor contract wired yet → show an honest placeholder
+  // rather than mock lag/push numbers. The attestor address itself is a
+  // real static fact (the 2-of-3 Safe), so we still surface it.
+  if (!health.isLive) {
+    return (
+      <div className="bg-ink-900 border border-ink-600/70 rounded-md overflow-hidden h-full flex flex-col">
+        <div className="flex items-center justify-between px-4 py-2.5 border-b border-ink-600/70 bg-ink-850">
+          <div className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-[0.16em] text-dim-400">
+            <span className="w-1.5 h-1.5 rounded-sm bg-warn/70"></span>
+            Bybit Attestor Health
+          </div>
+          <span className="text-[10px] font-mono text-dim-400">NO DATA</span>
+        </div>
+        <div className="p-5 space-y-4 flex-1 text-[12px] text-dim-300 leading-relaxed">
+          <p>
+            The BybitAttestor contract isn&apos;t deployed on mainnet yet — once
+            live, this panel shows the real attestation lag, push count, and
+            freeze status read straight from the chain.
+          </p>
+          <div className="space-y-2 text-[11px] font-mono pt-1">
+            <div className="flex items-center justify-between">
+              <span className="text-dim-500 uppercase tracking-[0.14em] text-[9.5px]">Attestor (Safe)</span>
+              <HashChip hash={SAFE_OWNER_ADDRESS} head={6} tail={4} />
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-dim-500 uppercase tracking-[0.14em] text-[9.5px]">Control</span>
+              <span className="text-dim-300">2-of-3 Gnosis Safe</span>
+            </div>
+          </div>
+        </div>
+        <div className="border-t border-ink-600/70 bg-ink-850 px-4 py-2.5 text-[11px] font-mono text-dim-500">
+          If lag &gt; 60m, vault freezes new allocations.
+        </div>
+      </div>
+    );
+  }
+
+  // Live path — every value below is read from the on-chain attestor.
+  const lagMin = Math.floor(health.lagSec / 60);
+  const lagSubMin = health.lagSec < 60;
   const warnMin = Math.floor(health.warnThresholdSec / 60);
   const criticalMin = Math.floor(health.criticalThresholdSec / 60);
-  const pushStreak = health.isLive ? (health.pushCount ?? "—") : ATTESTOR.consecutivePushes;
-  const attestorAddr = health.attestorAddress ?? ATTESTOR.safeAddress;
-  const cadence = health.isLive
-    ? formatHeartbeatShort(health.heartbeatSec)
-    : ATTESTOR.pushFrequency;
-  const status = health.isLive ? health.status : ATTESTOR.status;
+  const pushStreak = health.pushCount ?? "—";
+  const attestorAddr = health.attestorAddress ?? SAFE_OWNER_ADDRESS;
+  const cadence = formatHeartbeatShort(health.heartbeatSec);
+  const status = health.status;
   const statusTone =
     status === "HEALTHY"
       ? "text-neon"
@@ -1576,12 +1610,7 @@ function AttestorHealthCard() {
             <div className="h-1.5 bg-ink-700 rounded-sm overflow-hidden">
               <div
                 className={`h-full transition-all ${barTone}`}
-                style={{
-                  width:
-                    (health.isLive
-                      ? lagPct
-                      : Math.min(100, (ATTESTOR.lastPushMin / ATTESTOR.criticalThreshold) * 100)) + "%",
-                }}
+                style={{ width: lagPct + "%" }}
               />
             </div>
             <div className="flex items-center justify-between mt-1.5 text-[9.5px] font-mono">
@@ -1599,9 +1628,7 @@ function AttestorHealthCard() {
           </div>
           <div className="bg-ink-900 px-3 py-2.5">
             <div className="text-[9.5px] font-mono uppercase tracking-[0.16em] text-dim-500">Lagged 24h</div>
-            <div className="font-mono text-base text-neon tabular mt-1">
-              {health.isLive ? "—" : ATTESTOR.laggedPushesLast24h}
-            </div>
+            <div className="font-mono text-base text-neon tabular mt-1">—</div>
           </div>
         </div>
 
@@ -1612,7 +1639,7 @@ function AttestorHealthCard() {
           </div>
           <div className="flex items-center justify-between">
             <span className="text-dim-500 uppercase tracking-[0.14em] text-[9.5px]">Control</span>
-            <span className="text-dim-300">{ATTESTOR.multisig}</span>
+            <span className="text-dim-300">2-of-3 Gnosis Safe</span>
           </div>
           <div className="flex items-center justify-between">
             <span className="text-dim-500 uppercase tracking-[0.14em] text-[9.5px]">Cadence</span>
@@ -1723,7 +1750,7 @@ function HedgeTransparencyCard() {
       </div>
       <div className="border-t border-ink-600/70 bg-ink-850 px-4 py-2.5 flex items-center justify-between text-[11px] font-mono">
         <span className="text-dim-500 uppercase tracking-[0.14em] text-[9.5px]">Lifetime funding harvested</span>
-        <span className="text-neon tabular">+${HEDGE_LIFETIME_FUNDING.toFixed(2)}</span>
+        <span className="text-dim-400 tabular">—</span>
       </div>
     </div>
   );

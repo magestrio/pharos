@@ -1,0 +1,27 @@
+# Controls what the Vercel CLI uploads when deploying the web app from the
+# monorepo root. Presence of this file makes Vercel ignore .gitignore for
+# uploads, so the standard build artifacts are listed here explicitly.
+#
+# Keep the pnpm workspace root (pnpm-lock.yaml, pnpm-workspace.yaml,
+# package.json) + web + packages/* so `pnpm install` resolves workspace:*
+# deps and builds web. Drop everything the frontend build does not need.
+
+.git
+node_modules
+**/node_modules
+**/.next
+**/out
+**/.venv
+**/__pycache__
+
+# Local-dev env symlinks point at absolute paths on the dev machine and dangle
+# on Vercel (Next chokes statting web/.env). Production env comes from the
+# Vercel project settings (AGENT_API_URL), not these files.
+.env
+.env.local
+*.env
+
+# Non-web monorepo subtrees — not imported by the frontend build.
+agent
+contracts
+data

@@ -2,7 +2,6 @@
 
 import { useReadContracts } from "wagmi";
 import { useCycles, usePortfolio } from "@/lib/agent-store-context";
-import { VAULT } from "@/lib/data";
 import { VUSDC_ABI, VUSDC_ADDRESS, VUSDC_CHAIN_ID, isVUsdcConfigured } from "@/lib/contracts";
 import { useIsMounted } from "@/lib/hooks/use-is-mounted";
 
@@ -38,12 +37,6 @@ function deriveDaysLiveFromCycles(firstCycleStartedAt: string | undefined): numb
   return Math.max(0, Math.floor((Date.now() - t) / MS_PER_DAY));
 }
 
-function deriveDaysLiveFromInception(): number {
-  const inception = Date.parse(VAULT.inception);
-  if (Number.isNaN(inception)) return VAULT.daysLive;
-  return Math.max(0, Math.floor((Date.now() - inception) / MS_PER_DAY));
-}
-
 function parseTotalEquityUsd(wallet: Record<string, unknown> | null | undefined): number | null {
   if (!wallet || typeof wallet !== "object") return null;
   const raw =
@@ -69,8 +62,8 @@ export function useVaultStats(): VaultStats {
   const cycles = cyclesQuery.data ?? [];
   const firstCycleStartedAt =
     cycles.length > 0 ? cycles[cycles.length - 1].started_at : undefined;
-  const liveDaysLive = deriveDaysLiveFromCycles(firstCycleStartedAt);
-  const daysLive = liveDaysLive ?? deriveDaysLiveFromInception();
+  // No cycles yet → 0 days live. We do not invent an inception date.
+  const daysLive = deriveDaysLiveFromCycles(firstCycleStartedAt) ?? 0;
 
   const query = useReadContracts({
     allowFailure: true,

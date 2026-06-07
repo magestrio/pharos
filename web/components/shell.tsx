@@ -2,14 +2,56 @@
 
 import Link from "next/link";
 import { useState } from "react";
+import { useConnectModal } from "@rainbow-me/rainbowkit";
+import { useAccount, useDisconnect } from "wagmi";
 
-import { CONTRACTS } from "@/lib/data";
 import { Button, Eyebrow, HashChip, Icon, LiveDot } from "@/components/ui";
 import { LiveTicker } from "@/components/live-ticker";
 import { DecisionLog } from "@/components/screens/decision-log";
 import { VaultCard } from "@/components/screens/vault-card";
 import { StoreProvider } from "@/lib/agent-store-context";
 import type { CycleSummary, Portfolio } from "@/lib/agent-api";
+import {
+  BYBIT_ATTESTOR_ADDRESS,
+  CAPITAL_MANAGER_ADDRESS,
+  DECISION_LOG_ADDRESS,
+  IDENTITY_REGISTRY_ADDRESS,
+  REPUTATION_ORACLE_ADDRESS,
+  REPUTATION_REGISTRY_ADDRESS,
+  VUSDC_ADDRESS,
+  isDecisionLogConfigured,
+  isReputationOracleConfigured,
+  isVUsdcConfigured,
+} from "@/lib/contracts";
+import { mantleExplorerAddress } from "@/lib/explorer";
+
+// Gnosis Safe (2-of-3) that owns the agent NFT + signs attestations.
+// Canonical address from CLAUDE.md — not an env-driven deploy artifact.
+const SAFE_OWNER_ADDRESS = "0x4dc4a70Ae02d7ca2F3A06b1231b3A9312d82a037";
+
+type ContractEntry = {
+  label: string;
+  hash: string;
+  pending?: boolean;
+  sub?: string;
+};
+
+// Deployed-contract footer rows, sourced from @/lib/contracts (real
+// addresses or 0x0 → "[mainnet pending]"). No mock placeholders.
+const FOOTER_CONTRACTS: ContractEntry[] = [
+  { label: "vUSDC TOKEN", hash: VUSDC_ADDRESS, pending: !isVUsdcConfigured },
+  { label: "CAPITAL MANAGER", hash: CAPITAL_MANAGER_ADDRESS },
+  { label: "DECISION LOG", hash: DECISION_LOG_ADDRESS, pending: !isDecisionLogConfigured },
+  {
+    label: "REPUTATION ORACLE",
+    hash: REPUTATION_ORACLE_ADDRESS,
+    pending: !isReputationOracleConfigured,
+  },
+  { label: "BYBIT ATTESTOR", hash: BYBIT_ATTESTOR_ADDRESS },
+  { label: "ERC-8004 REPUTATION", hash: REPUTATION_REGISTRY_ADDRESS },
+  { label: "ERC-8004 IDENTITY", hash: IDENTITY_REGISTRY_ADDRESS },
+  { label: "GNOSIS SAFE OWNER", hash: SAFE_OWNER_ADDRESS, sub: "2-of-3" },
+];
 
 // "Human vs AI" tab removed pending mainnet-operations.3 (Human PM
 // baseline) — no real comparison data yet, mocking it is dishonest.
@@ -114,18 +156,6 @@ function ShellBody({
             >
               History <Icon.Ext />
             </Link>
-            <a
-              className="hidden lg:inline-flex items-center gap-1.5 px-3 h-8 border border-ink-600/70 rounded-[3px] bg-ink-900 text-[11px] font-mono uppercase tracking-[0.14em] text-dim-300 hover:text-accent hover:border-accent/40 transition-colors"
-              href="#"
-            >
-              Docs <Icon.Ext />
-            </a>
-            <a
-              className="hidden lg:inline-flex items-center gap-1.5 px-3 h-8 border border-ink-600/70 rounded-[3px] bg-ink-900 text-[11px] font-mono uppercase tracking-[0.14em] text-dim-300 hover:text-accent hover:border-accent/40 transition-colors"
-              href="#"
-            >
-              GH <Icon.Ext />
-            </a>
             <ConnectWalletButton />
           </div>
         </div>
@@ -188,27 +218,30 @@ function Logo() {
 }
 
 function ConnectWalletButton() {
-  const [connected, setConnected] = useState(false);
   const [hover, setHover] = useState(false);
-  const addr = "0x9F3a...87bC";
+  const { address, isConnected } = useAccount();
+  const { openConnectModal } = useConnectModal();
+  const { disconnect } = useDisconnect();
 
-  if (connected) {
+  if (isConnected && address) {
+    const short = `${address.slice(0, 6)}…${address.slice(-4)}`;
     return (
       <button
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
-        onClick={() => setConnected(false)}
+        onClick={() => disconnect()}
         className="inline-flex items-center gap-2 px-3 h-9 bg-ink-900 border border-accent/40 rounded-[3px] text-[11px] font-mono uppercase tracking-[0.12em] text-white hover:bg-ink-800"
       >
         <span className="w-2 h-2 rounded-full bg-accent live-dot" />
-        <span className="tabular">{hover ? "Disconnect" : addr}</span>
+        <span className="tabular">{hover ? "Disconnect" : short}</span>
       </button>
     );
   }
   return (
     <button
-      onClick={() => setConnected(true)}
-      className="inline-flex items-center gap-2 px-4 h-9 bg-accent text-[#1B1300] rounded-[3px] text-[11px] font-mono font-bold uppercase tracking-[0.14em] shadow-[inset_0_1px_0_rgba(255,255,255,0.3),0_0_0_1px_rgba(245,180,0,0.5),0_6px_18px_-8px_rgba(245,180,0,0.45)] hover:bg-accent-soft active:translate-y-px transition-all"
+      onClick={() => openConnectModal?.()}
+      disabled={!openConnectModal}
+      className="inline-flex items-center gap-2 px-4 h-9 bg-accent text-[#1B1300] rounded-[3px] text-[11px] font-mono font-bold uppercase tracking-[0.14em] shadow-[inset_0_1px_0_rgba(255,255,255,0.3),0_0_0_1px_rgba(245,180,0,0.5),0_6px_18px_-8px_rgba(245,180,0,0.45)] hover:bg-accent-soft active:translate-y-px transition-all disabled:opacity-50"
     >
       <Icon.Wallet />
       Connect Wallet
@@ -226,7 +259,7 @@ function Footer() {
             <span className="font-serif italic text-[14px] text-dim-300">Mantle Mainnet</span>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-px bg-ink-600/40 border border-ink-600/70 rounded-md overflow-hidden">
-            {CONTRACTS.map((c) => (
+            {FOOTER_CONTRACTS.map((c) => (
               <div
                 key={c.label}
                 className="bg-ink-900 px-4 py-3 flex items-center justify-between gap-3"
@@ -234,7 +267,7 @@ function Footer() {
                 <div className="min-w-0">
                   <div className="text-[9.5px] font-mono uppercase tracking-[0.16em] text-dim-500 flex items-center gap-1.5">
                     {c.label}
-                    {c.placeholder && (
+                    {c.pending && (
                       <span className="text-warn/70 normal-case tracking-normal text-[9px]">
                         [mainnet pending]
                       </span>
@@ -246,7 +279,18 @@ function Footer() {
                     )}
                   </div>
                 </div>
-                <HashChip hash={c.hash} head={6} tail={4} />
+                {c.pending ? (
+                  <span className="text-[10px] font-mono text-dim-600">not deployed</span>
+                ) : (
+                  <a
+                    href={mantleExplorerAddress(c.hash)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="hover:text-white"
+                  >
+                    <HashChip hash={c.hash} head={6} tail={4} />
+                  </a>
+                )}
               </div>
             ))}
           </div>
@@ -263,14 +307,8 @@ function Footer() {
             </span>
           </div>
           <div className="flex items-center gap-4">
-            <span>
-              Block <span className="text-dim-300 tabular">#4,219,847</span>
-            </span>
-            <span>
-              Latency <span className="text-pos tabular">142ms</span>
-            </span>
             <span className="inline-flex items-center gap-1.5 text-accent">
-              <LiveDot size={6} /> RPC OK
+              <LiveDot size={6} /> Mantle Mainnet
             </span>
           </div>
         </div>
