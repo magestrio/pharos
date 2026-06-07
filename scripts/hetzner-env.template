@@ -10,9 +10,11 @@
 #
 # Generate POSTGRES_PASSWORD with:   openssl rand -hex 24
 #
-# This file omits every on-chain credential (PRIVATE_KEY, SAFE_SIGNER_*_KEY,
-# AGENT_PRIVATE_KEY, etc.) because the off-chain agent loop on Hetzner does
-# not need them. Keep them off the prod box for blast-radius reasons.
+# The agent anchors each decision on-chain (DecisionLog) + heartbeats
+# ReputationOracle, so the prod box DOES need PRIVATE_KEY + the two log
+# addresses below. Keep the deployer-only extras (SAFE_SIGNER_*_KEY) OFF
+# the box for blast-radius reasons — the single operational PRIVATE_KEY
+# (== agent EOA) is all the loop needs.
 
 # --- Compose / infra ---
 POSTGRES_PASSWORD=<REPLACE_WITH_openssl_rand_hex_24>
@@ -24,6 +26,15 @@ BYBIT_RSA_HOST_PATH=/etc/vault8004/bybit-rsa.pem
 MANTLE_RPC_URL=https://rpc.mantle.xyz
 # SAFE address: 0x4dc4a70Ae02d7ca2F3A06b1231b3A9312d82a037 (vault8004 mainnet)
 MANTLE_VAULT_ADDRESS=0x4dc4a70Ae02d7ca2F3A06b1231b3A9312d82a037
+
+# --- On-chain anchoring (DecisionLog + ReputationOracle) ---
+# Operational EOA key (== agent EOA; must equal DecisionLog.agent()).
+PRIVATE_KEY=<REPLACE_agent_eoa_private_key>
+# Agent identity NFT tokenId.
+AGENT_ID=99
+# Deployed contracts (Mantle mainnet).
+DECISION_LOG_ADDRESS=0xB55dc4C5B671d49bcEcded622167f850D41f0176
+REPUTATION_ORACLE_ADDRESS=0x25AdCb463a5E2EeF2077dd9DD42832e1245B973c
 
 # --- Bybit (off-chain yield ops) ---
 # Public API key string from Bybit (RSA auth).

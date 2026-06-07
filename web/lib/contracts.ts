@@ -62,7 +62,10 @@ export const IDENTITY_REGISTRY_ADDRESS = M.erc8004IdentityRegistry;
 export const REPUTATION_REGISTRY_ADDRESS = M.erc8004ReputationRegistry;
 
 export const VAULT_AGENT_ID: bigint = (() => {
-  const raw = process.env.NEXT_PUBLIC_VAULT_AGENT_ID;
+  // Canonical NEXT_PUBLIC_AGENT_ID; fall back to the legacy
+  // NEXT_PUBLIC_VAULT_AGENT_ID so a not-yet-updated Vercel env still works.
+  const raw =
+    process.env.NEXT_PUBLIC_AGENT_ID ?? process.env.NEXT_PUBLIC_VAULT_AGENT_ID;
   if (!raw) return 99n;
   try {
     return BigInt(raw);

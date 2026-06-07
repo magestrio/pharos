@@ -252,7 +252,7 @@ def test_from_settings_requires_private_key():
     from agent.bybit_oracle.config import OracleSettings
 
     cfg = OracleSettings(_env_file=None)
-    with pytest.raises(RuntimeError, match="MANTLE_ATTESTOR_PRIVATE_KEY"):
+    with pytest.raises(RuntimeError, match="ATTESTOR_PRIVATE_KEY"):
         ChainWriter.from_settings(cfg=cfg)
 
 

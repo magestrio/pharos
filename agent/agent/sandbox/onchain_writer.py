@@ -162,7 +162,7 @@ class OnchainWriter:
 
     @classmethod
     def from_env(cls) -> OnchainWriter | None:
-        pk = os.environ.get("AGENT_PRIVATE_KEY")
+        pk = os.environ.get("PRIVATE_KEY")
         rpc = os.environ.get("MANTLE_RPC_URL")
         dlog_addr = os.environ.get("DECISION_LOG_ADDRESS")
         oracle_addr = os.environ.get("REPUTATION_ORACLE_ADDRESS")
@@ -171,7 +171,7 @@ class OnchainWriter:
         if not (pk and rpc and dlog_addr and agent_id_raw):
             log.info(
                 "onchain writer disabled: missing one of "
-                "AGENT_PRIVATE_KEY, MANTLE_RPC_URL, DECISION_LOG_ADDRESS, AGENT_ID"
+                "PRIVATE_KEY, MANTLE_RPC_URL, DECISION_LOG_ADDRESS, AGENT_ID"
             )
             return None
         if dlog_addr == _ZERO_ADDRESS:
@@ -209,7 +209,7 @@ class OnchainWriter:
             onchain_agent = decision_log.functions.agent().call()
             if onchain_agent.lower() != account.address.lower():
                 log.warning(
-                    "DecisionLog.agent=%s != AGENT_PRIVATE_KEY=%s — "
+                    "DecisionLog.agent=%s != PRIVATE_KEY addr=%s — "
                     "writer disabled (every recordDecision would revert)",
                     onchain_agent,
                     account.address,

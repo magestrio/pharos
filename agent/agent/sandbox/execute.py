@@ -157,20 +157,20 @@ _ALPHA_PAY_TOKEN_CODE: str = "CEX_1"  # USDT
 # Default slippage tolerance for alpha purchases. 0.01 = 1%; tight enough
 # that we don't take a haircut on calm tokens, loose enough that mid-vol
 # tokens don't fail with `slippage too tight` rejections. The user can
-# override via `VAULT_ALPHA_SLIPPAGE` env var if Bybit's `slippage` field
-# in the quote response suggests a different floor for a specific token.
-_ALPHA_DEFAULT_SLIPPAGE: str = os.getenv("VAULT_ALPHA_SLIPPAGE", "0.01")
+# override via `VAULT8004_ALPHA_SLIPPAGE` env var if Bybit's `slippage`
+# field in the quote response suggests a different floor for a token.
+_ALPHA_DEFAULT_SLIPPAGE: str = os.getenv("VAULT8004_ALPHA_SLIPPAGE", "0.01")
 
 # Alpha execute gate (`.54`). Off by default — `.14` smoke test is the
 # blocking guard, AND the Alpha endpoints have NOT been live-probed
 # against the sandbox sub-account as of 2026-05-29. When False, the diff
 # emits SKIP_OUT_OF_SCOPE for any AlphaFarm target so the live loop
-# stays clean. Flip via env `VAULT_ALPHA_EXEC_ENABLED=1` once you've
+# stays clean. Flip via env `VAULT8004_ALPHA_EXEC_ENABLED=1` once you've
 # (a) closed `.14`, (b) live-probed `/v5/alpha/trade/biz-token-list` +
 # `/v5/alpha/trade/biz-token-price-list` + `/v5/alpha/asset`, (c)
 # confirmed the sub-account has Alpha permission and at least one
 # pickable token surfaces in the snapshot.
-ALPHA_EXEC_ENABLED: bool = os.getenv("VAULT_ALPHA_EXEC_ENABLED", "0") == "1"
+ALPHA_EXEC_ENABLED: bool = os.getenv("VAULT8004_ALPHA_EXEC_ENABLED", "0") == "1"
 
 
 class ActionKind(StrEnum):
@@ -1577,7 +1577,7 @@ def _alpha_action_for_target(
 
     if not ALPHA_EXEC_ENABLED:
         # Gate is off — emit SKIP so the plan shows the intent without
-        # firing a live API call. Operator flips VAULT_ALPHA_EXEC_ENABLED
+        # firing a live API call. Operator flips VAULT8004_ALPHA_EXEC_ENABLED
         # to enable. Per `.54` safety: this guards the `.14` smoke test.
         verb = "purchase" if delta > 0 else "redeem"
         return Action(
@@ -1590,7 +1590,7 @@ def _alpha_action_for_target(
             reason=(
                 f"AlphaFarm/{token_code}: would {verb} ${abs(delta):.2f} "
                 f"(current ${current_usd:.2f} → target ${target_usd:.2f}); "
-                "skipped because VAULT_ALPHA_EXEC_ENABLED is off (`.54` "
+                "skipped because VAULT8004_ALPHA_EXEC_ENABLED is off (`.54` "
                 "safety: live-probe + `.14` smoke close required first)"
             ),
         )

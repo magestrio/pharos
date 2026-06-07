@@ -1225,7 +1225,7 @@ def _alpha_position(
 
 
 def test_diff_alpha_pick_emits_skip_when_gate_off(monkeypatch) -> None:
-    """Default state: VAULT_ALPHA_EXEC_ENABLED unset → gate is False →
+    """Default state: VAULT8004_ALPHA_EXEC_ENABLED unset → gate is False →
     Alpha picks should NOT fire live API calls during the `.14` smoke."""
     monkeypatch.setattr("agent.sandbox.execute.ALPHA_EXEC_ENABLED", False)
     snap = _snapshot(
@@ -1241,7 +1241,7 @@ def test_diff_alpha_pick_emits_skip_when_gate_off(monkeypatch) -> None:
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
     skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
     assert any(
-        a.category == "AlphaFarm" and "VAULT_ALPHA_EXEC_ENABLED" in a.reason
+        a.category == "AlphaFarm" and "VAULT8004_ALPHA_EXEC_ENABLED" in a.reason
         for a in skips
     ), f"expected gate SKIP, got: {[a.reason for a in skips]}"
     assert not any(

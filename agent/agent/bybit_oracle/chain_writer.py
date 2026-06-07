@@ -120,10 +120,10 @@ class ChainWriter:
         w3: Web3 | None = None,
     ) -> ChainWriter:
         cfg = cfg or settings
-        key = cfg.MANTLE_ATTESTOR_PRIVATE_KEY.get_secret_value()
+        key = cfg.ATTESTOR_PRIVATE_KEY.get_secret_value()
         if not key:
             raise RuntimeError(
-                "MANTLE_ATTESTOR_PRIVATE_KEY is required to push on-chain txs"
+                "ATTESTOR_PRIVATE_KEY is required to push on-chain txs"
             )
         account: LocalAccount = Account.from_key(key)
         w3 = w3 or Web3(Web3.HTTPProvider(cfg.MANTLE_RPC_URL))
@@ -132,7 +132,7 @@ class ChainWriter:
             account=account,
             contract_address=cfg.BYBIT_ATTESTOR_ADDRESS,
             abi=load_bybit_attestor_abi(),
-            usdc_address=cfg.MANTLE_USDC_ADDRESS,
+            usdc_address=cfg.USDC_ADDRESS,
             chain_id=cfg.MANTLE_CHAIN_ID,
             gas_buffer=cfg.MANTLE_GAS_BUFFER,
             receipt_timeout=cfg.MANTLE_TX_RECEIPT_TIMEOUT,

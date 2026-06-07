@@ -35,15 +35,15 @@ address constant LB_ROUTER = 0x013e138EF6008ae5FDFDE29700e3f2Bc61d21E3a;
 
 /// @notice Two-phase deployment for the post-pivot vUSDC architecture.
 ///
-/// Phase A — VUSDC_ADDR env unset:
+/// Phase A — VUSDC_ADDRESS env unset:
 ///   Deploys CapitalManager + adapters + setAgent. Deployer remains owner so
 ///   the wiring of vUSDC (which is deployed in a separate epic) can be done
 ///   atomically with `setVusdc` + ownership transfer in Phase B.
 ///
-/// Phase B — VUSDC_ADDR env set:
-///   Re-running with VUSDC_ADDR after vUSDC is live: the script (assuming the
-///   manager is still owned by the broadcaster) will call `setVusdc(VUSDC_ADDR)`
-///   one-shot, then transfer ownership to SAFE_OWNER.
+/// Phase B — VUSDC_ADDRESS env set:
+///   Re-running with VUSDC_ADDRESS after vUSDC is live: the script (assuming the
+///   manager is still owned by the broadcaster) will call `setVusdc(VUSDC_ADDRESS)`
+///   one-shot, then transfer ownership to SAFE_ADDRESS.
 ///
 /// The wiring of an already-deployed CapitalManager (just setVusdc + transfer)
 /// belongs in a follow-up script under the `vusdc-token` / `mainnet-deploy`
@@ -51,7 +51,7 @@ address constant LB_ROUTER = 0x013e138EF6008ae5FDFDE29700e3f2Bc61d21E3a;
 contract Deploy is Script {
     function run() external {
         address deployer = vm.envAddress("DEPLOYER_ADDRESS");
-        address safeOwner = vm.envAddress("SAFE_OWNER");
+        address safeOwner = vm.envAddress("SAFE_ADDRESS");
         address registry8004 = vm.envOr("REGISTRY_8004", address(0));
         uint256 agentId = vm.envOr("AGENT_ID", uint256(1));
         // AGENT_ADDRESS = operational EOA that calls allocate/deallocate.
@@ -64,13 +64,13 @@ contract Deploy is Script {
         address attestorAddress = vm.envOr("ATTESTOR_ADDRESS", deployer);
         // vUSDC token address. If unset, the deploy stops short of setVusdc +
         // transferOwnership so a follow-up phase can wire vUSDC atomically.
-        address vusdcAddr = vm.envOr("VUSDC_ADDR", address(0));
+        address vusdcAddr = vm.envOr("VUSDC_ADDRESS", address(0));
 
         console.log("DEPLOYER_ADDRESS:   ", deployer);
-        console.log("SAFE_OWNER:         ", safeOwner);
+        console.log("SAFE_ADDRESS:         ", safeOwner);
         console.log("AGENT_ADDRESS:      ", agentAddress);
         console.log("ATTESTOR_ADDRESS:   ", attestorAddress);
-        console.log("VUSDC_ADDR:         ", vusdcAddr);
+        console.log("VUSDC_ADDRESS:         ", vusdcAddr);
         if (agentAddress == deployer) {
             console.log("WARN: agentAddress == deployer. Set AGENT_ADDRESS env var before mainnet broadcast.");
         }
@@ -78,7 +78,7 @@ contract Deploy is Script {
             console.log("WARN: attestorAddress == deployer. Set ATTESTOR_ADDRESS env var (the Safe) before mainnet broadcast.");
         }
         if (vusdcAddr == address(0)) {
-            console.log("INFO: VUSDC_ADDR unset - Phase A (deployer remains owner; setVusdc + transfer deferred).");
+            console.log("INFO: VUSDC_ADDRESS unset - Phase A (deployer remains owner; setVusdc + transfer deferred).");
         }
 
         vm.startBroadcast();
@@ -164,7 +164,7 @@ contract Deploy is Script {
             decisionLog.transferOwnership(safeOwner);
             console.log("Ownership transferred to Safe:", safeOwner);
         } else {
-            console.log("Ownership NOT transferred (Phase A). Re-run with VUSDC_ADDR set.");
+            console.log("Ownership NOT transferred (Phase A). Re-run with VUSDC_ADDRESS set.");
         }
 
         vm.stopBroadcast();
