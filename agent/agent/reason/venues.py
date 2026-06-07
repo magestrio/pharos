@@ -329,3 +329,12 @@ HEDGE_VENUES: tuple[tuple[VenueId, str], ...] = tuple(
 BASIC_EARN_CATEGORIES: frozenset[str] = frozenset(
     cat for _vid, cat in HEDGE_VENUES
 )
+
+# Earn categories whose REDEEM does NOT credit the freed coin within a
+# cycle (`bybit-sandbox.63`). OnChain stakes/redemptions sit in `Processing`
+# for ~4 days, so a same-cycle subscribe funded by that freed coin can't be
+# funded (180016) — the validator must not count it as freed and the
+# executor must defer the dependent subscribe. FlexibleSaving redeems credit
+# in <1min and are NOT here. Add LM / advance-Earn only if they prove to
+# delay-settle. Single source of truth for execute.py + validate/rules.py.
+SLOW_SETTLE_CATEGORIES: frozenset[str] = frozenset({"OnChain"})

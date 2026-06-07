@@ -29,6 +29,7 @@ from agent.reason.venues import (
     CARRY_CATEGORY,
     CARRY_VENUE_ID,
     HEDGE_VENUES,
+    SLOW_SETTLE_CATEGORIES,
     VENUE_REGISTRY,
     VenueId,
 )
@@ -949,9 +950,10 @@ def check_stable_earn_funding(d: Decision, snapshot: Snapshot) -> Check:
         USDC subscribe only from USDC (no swap) and swaps USDC→coin for
         other stables. So a cross-coin rotation it passes may still 180016
         at execute. Over-credits supply → permissive.
-      • Freed counts any non-`Processing` reduce/drop, but an OnChain
-        stable redeem may not settle within the cycle. Over-credits →
-        permissive.
+      • Freed counts only non-`Processing` reduce/drops that settle within
+        the cycle — slow OnChain redeems (~4d) are excluded (`.63`), so a
+        rotation funded by one is correctly seen as unfundable here and
+        deferred by the executor.
       • Shared pool with the non-stable side (`check_stable_spend_cap`):
         each subtracts the pool independently, so a kept non-stable +
         large new stable could overrun. Rare on small vaults.
@@ -996,8 +998,13 @@ def check_stable_earn_funding(d: Decision, snapshot: Snapshot) -> Check:
             coin = info["coin"] if info else target_coin
             contributors.append(f"{key[0]}/{key[1]}({coin or '?'})=+${delta:.2f}")
         elif -delta >= _MIN_ACTION_USDC:
-            # Reduced or dropped — frees its REDEEMABLE portion only.
-            freed += min(held - target, redeemable)
+            # Reduced or dropped — frees its REDEEMABLE portion only, and
+            # only if it settles within the cycle. A slow-settling OnChain
+            # redeem (`bybit-sandbox.63`, ~4d Processing) can't fund a
+            # same-cycle subscribe, so it doesn't count as freed — matching
+            # the executor's `_redeem_settles_in_cycle` credit exclusion.
+            if key[0] not in SLOW_SETTLE_CATEGORIES:
+                freed += min(held - target, redeemable)
 
     if new_spend < _MIN_ACTION_USDC:
         return True, None

@@ -2517,6 +2517,67 @@ def test_diff_usdc_funding_and_sweep_have_unique_order_link_ids() -> None:
     assert len(olids) == len(set(olids)), f"duplicate orderLinkId: {olids}"
 
 
+def _redeem(category: str, coin: str, amount: str, pid: str = "26") -> Action:
+    return Action(
+        kind=ActionKind.REDEEM_EARN, category=category, product_id=pid,
+        coin=coin, amount=Decimal(amount), order_link_id="r", reason="redeem",
+    )
+
+
+def _subscribe(category: str, coin: str, amount: str, pid: str = "1") -> Action:
+    return Action(
+        kind=ActionKind.SUBSCRIBE_EARN, category=category, product_id=pid,
+        coin=coin, amount=Decimal(amount), order_link_id="s", reason="subscribe",
+    )
+
+
+def test_defer_subscribe_funded_by_slow_onchain_redeem() -> None:
+    """`.63`: a USDC subscribe fundable only by a SLOW OnChain USDC redeem
+    (won't credit this cycle) is deferred to SKIP — not emitted to 180016."""
+    from agent.sandbox.execute import _defer_subscribes_awaiting_slow_redeem
+    snap = _snapshot(total_equity_usd="100", liquid_usdc_usd="5")
+    out, deferred = _defer_subscribes_awaiting_slow_redeem(
+        snap,
+        [_subscribe("FlexibleSaving", "USDC", "40")],
+        [_redeem("OnChain", "USDC", "40")],
+        [],
+    )
+    assert deferred == {"USDC"}
+    assert out[0].kind == ActionKind.SKIP_OUT_OF_SCOPE
+    assert "deferred" in out[0].reason
+
+
+def test_no_defer_when_redeem_settles_in_cycle() -> None:
+    """`.63`: a FlexibleSaving (fast, <1min) redeem funds the subscribe in
+    cycle — no defer even with low liquid."""
+    from agent.sandbox.execute import _defer_subscribes_awaiting_slow_redeem
+    snap = _snapshot(total_equity_usd="100", liquid_usdc_usd="5")
+    out, deferred = _defer_subscribes_awaiting_slow_redeem(
+        snap,
+        [_subscribe("OnChain", "USDC", "40")],
+        [_redeem("FlexibleSaving", "USDC", "40")],
+        [],
+    )
+    assert deferred == set()
+    assert out[0].kind == ActionKind.SUBSCRIBE_EARN
+
+
+def test_no_defer_when_liquid_covers_subscribe() -> None:
+    """`.63`: even with a slow OnChain redeem pending, a subscribe covered
+    by liquid alone proceeds — the guard fires only for the part actually
+    waiting on the slow redeem."""
+    from agent.sandbox.execute import _defer_subscribes_awaiting_slow_redeem
+    snap = _snapshot(total_equity_usd="100", liquid_usdc_usd="50")
+    out, deferred = _defer_subscribes_awaiting_slow_redeem(
+        snap,
+        [_subscribe("FlexibleSaving", "USDC", "40")],
+        [_redeem("OnChain", "USDC", "40")],
+        [],
+    )
+    assert deferred == set()
+    assert out[0].kind == ActionKind.SUBSCRIBE_EARN
+
+
 @pytest.mark.asyncio
 async def test_execute_swap_spot_dry_run(tmp_path: Path) -> None:
     client = AsyncMock()

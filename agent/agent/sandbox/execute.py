@@ -52,6 +52,7 @@ from agent.reason.venues import (
     BASIC_EARN_CATEGORIES,
     CARRY_CATEGORY,
     CARRY_VENUE_ID,
+    SLOW_SETTLE_CATEGORIES,
     VENUE_REGISTRY,
 )
 from agent.sandbox.carry_state import (
@@ -130,6 +131,125 @@ _BASIC_EARN_CATEGORIES = BASIC_EARN_CATEGORIES
 # constant so the diff and dispatch arms refer to the same string the
 # venue registry uses (`bybit_lm.snapshot_category="LiquidityMining"`).
 _LM_CATEGORY: str = "LiquidityMining"
+
+def _redeem_settles_in_cycle(action: "Action") -> bool:
+    """False for a REDEEM_EARN whose category settles slower than a cycle
+    (OnChain ~4d Processing, per `SLOW_SETTLE_CATEGORIES`) — its freed coin
+    must NOT be credited toward in-cycle funding. True for fast-settling
+    redeems and non-redeems."""
+    if action.kind != ActionKind.REDEEM_EARN:
+        return True
+    return action.category not in SLOW_SETTLE_CATEGORIES
+
+
+def _liquid_for_coin(wallet: Any, coin: str) -> "Decimal":
+    """Spendable wallet balance for `coin` this cycle. USDC/USDT use the
+    UNIFIED+FUND `liquid_*_usd` fields (the executor can pull FUND→UNIFIED);
+    other coins read the UNIFIED balance map."""
+    cu = (coin or "").upper()
+    if cu == "USDC":
+        return wallet.liquid_usdc_usd
+    if cu == "USDT":
+        return wallet.liquid_usdt_usd
+    return wallet.unified_coin_balances.get(coin, Decimal(0))
+
+
+def _defer_subscribes_awaiting_slow_redeem(
+    snapshot: "Snapshot",
+    subscribes: list["Action"],
+    redeems: list["Action"],
+    earn_swaps: list["Action"],
+) -> tuple[list["Action"], set[str]]:
+    """`bybit-sandbox.63`: defer (→ SKIP) the SUBSCRIBE_EARNs that can only
+    be funded by a SLOW-settling same-coin redeem (OnChain ~4d Processing),
+    whose freed coin won't credit this cycle.
+
+    Fires ONLY for coins that have a slow pending redeem — so a normal cycle
+    (no OnChain redeem) is completely untouched. Per coin, fund the net-new
+    subscribes from `liquid + in-cycle (fast) redeems + funding-swap inflow`
+    smallest-first; the overflow is deferred (it re-appears next cycle once
+    the redeem credits) instead of 180016'ing at execution and leaving the
+    capital suspended. The cross-coin swap-funded case is already handled by
+    the budget cascade (slow redeems are excluded from `redeem_credit` when
+    sizing swaps); this is the same-coin direct-funding complement.
+
+    Returns `(subscribes, deferred_coins)`.
+    """
+    slow_by_coin: dict[str, Decimal] = {}
+    fast_by_coin: dict[str, Decimal] = {}
+    for a in redeems:
+        if a.kind != ActionKind.REDEEM_EARN or not a.coin:
+            continue
+        bucket = fast_by_coin if _redeem_settles_in_cycle(a) else slow_by_coin
+        bucket[a.coin] = bucket.get(a.coin, Decimal(0)) + a.amount
+    if not slow_by_coin:
+        return subscribes, set()
+
+    # Funding-swap inflow per target coin (swaps were sized excluding slow
+    # redeems, so this is real liquid-backed supply). Treat the swap amount
+    # as ~USD inflow of its target coin — exact for stables, ≈ for the
+    # USDT-quoted non-stable Buy (USD value of coin received).
+    swap_in_by_coin: dict[str, Decimal] = {}
+    for a in earn_swaps:
+        if a.kind == ActionKind.SWAP_SPOT and a.coin:
+            swap_in_by_coin[a.coin] = (
+                swap_in_by_coin.get(a.coin, Decimal(0)) + a.amount
+            )
+
+    # Only coins with a slow pending redeem are at risk.
+    subs_by_coin: dict[str, list[Action]] = {}
+    for a in subscribes:
+        if (
+            a.kind == ActionKind.SUBSCRIBE_EARN
+            and a.coin in slow_by_coin
+            and a.amount > 0
+        ):
+            subs_by_coin.setdefault(a.coin, []).append(a)
+    if not subs_by_coin:
+        return subscribes, set()
+
+    to_defer: set[int] = set()
+    deferred_coins: set[str] = set()
+    for coin, subs in subs_by_coin.items():
+        avail = (
+            _liquid_for_coin(snapshot.wallet, coin)
+            + fast_by_coin.get(coin, Decimal(0))
+            + swap_in_by_coin.get(coin, Decimal(0))
+        )
+        # Smallest-first: fund what the available pool covers, defer the
+        # rest (those are the ones waiting on the slow redeem).
+        for a in sorted(subs, key=lambda x: x.amount):
+            if a.amount <= avail:
+                avail -= a.amount
+            else:
+                to_defer.add(id(a))
+                deferred_coins.add(coin)
+    if not to_defer:
+        return subscribes, set()
+
+    out: list[Action] = []
+    for a in subscribes:
+        if id(a) in to_defer:
+            slow_amt = slow_by_coin.get(a.coin, Decimal(0))
+            out.append(
+                Action(
+                    kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                    category=a.category,
+                    product_id=a.product_id,
+                    coin=a.coin,
+                    amount=a.amount,
+                    order_link_id=a.order_link_id,
+                    reason=(
+                        f"{a.category}/{a.product_id} ({a.coin}): deferred — "
+                        f"funded by a slow OnChain redeem (${slow_amt:.2f} "
+                        f"settling ~4d), not creditable this cycle; re-picks "
+                        f"once it credits (avoids 180016 + suspended capital)"
+                    ),
+                )
+            )
+        else:
+            out.append(a)
+    return out, deferred_coins
 
 # Bybit LM deposits the quote side of a max_leverage=1 LP pair from the
 # UNIFIED wallet (where Earn redemptions and spot swaps also land). FUND
@@ -950,6 +1070,41 @@ def diff_to_actions(
             idx_offset=len(all_pids) + len(hedge_closes) + len(hedge_opens),
             extra_usdt_demand=buy_usdt_demand,
         )
+
+    # `.63` defer pass: same-coin subscribes that can only be funded by a
+    # slow OnChain redeem (won't credit this cycle) are converted to SKIP
+    # so we don't burn a doomed 180016 and leave capital suspended — the
+    # pick re-appears next cycle once the redeem settles. Fires only when a
+    # slow redeem of that coin is pending, so normal cycles are untouched.
+    # The cross-coin swap-funded case is handled by the budget cascade
+    # (slow redeems excluded from `redeem_credit`); this is the complement.
+    subscribes, deferred_coins = _defer_subscribes_awaiting_slow_redeem(
+        snapshot, subscribes, redeems, earn_swaps
+    )
+    if deferred_coins:
+        # Cascade paired perps: a deferred non-stable subscribe would leave
+        # its OPEN_PERP_SHORT naked, same as the budget-cascade guards.
+        new_hedge_opens = []
+        for a in hedge_opens:
+            if a.kind == ActionKind.OPEN_PERP_SHORT and a.coin in deferred_coins:
+                new_hedge_opens.append(
+                    Action(
+                        kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                        category=a.category,
+                        product_id=a.product_id,
+                        coin=a.coin,
+                        amount=a.amount,
+                        order_link_id=a.order_link_id,
+                        reason=(
+                            f"hedge {a.coin}: paired Earn subscribe deferred "
+                            f"(awaiting slow OnChain redeem, .63); skipping "
+                            f"perp open to avoid naked short"
+                        ),
+                    )
+                )
+            else:
+                new_hedge_opens.append(a)
+        hedge_opens = new_hedge_opens
 
     # Defensive orphan-cleanup: sells UNIFIED-wallet non-stable balance
     # that EXCEEDS the post-cycle perp short coverage. Critically does
@@ -3275,9 +3430,17 @@ def _swap_actions_for_earn_picks(
     # `_swap_actions_for_hedges`. Without this we'd double-fund a
     # rebalance (e.g. redeem $13 USD1 then swap USDC → USDT to
     # subscribe USDT, while the USD1 just sits idle).
+    #
+    # `.63`: slow-settling (OnChain ~4d Processing) redeems are EXCLUDED —
+    # their freed coin won't credit this cycle, so crediting it would
+    # under-size the swap and the dependent subscribe would 180016 at
+    # execution. Excluding them sizes the swap from real liquid; an
+    # unfundable swap is then dropped by the budget pass, cascading the
+    # dependent subscribe to a SKIP (deferred to the cycle the redeem
+    # actually settles).
     redeem_credit_per_coin: dict[str, Decimal] = {}
     for a in redeem_actions:
-        if a.kind != ActionKind.REDEEM_EARN:
+        if a.kind != ActionKind.REDEEM_EARN or not _redeem_settles_in_cycle(a):
             continue
         redeem_credit_per_coin[a.coin] = (
             redeem_credit_per_coin.get(a.coin, Decimal(0)) + a.amount

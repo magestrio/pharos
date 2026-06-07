@@ -1145,6 +1145,32 @@ def test_check_stable_earn_funding_processing_source_not_freeable() -> None:
     assert "freed-by-redeem $0.00" in (msg or "")
 
 
+def test_check_stable_earn_funding_slow_onchain_redeem_not_freeable() -> None:
+    """`.63`: dropping a SETTLED (redeemable) OnChain stable still doesn't
+    free capital this cycle — an OnChain redeem settles ~4d out, so it can't
+    fund a same-cycle subscribe. Validator must exclude it (mirrors the
+    executor defer). Same shape as `allows_funded_rotation` but the freed
+    source is OnChain (slow) instead of FlexibleSaving (fast) → must REJECT."""
+    s = _snapshot(
+        flex_products=[_product("1131", "FlexibleSaving", coin="USD1", effective_apr="0.0085")],
+        onchain_products=_stable_onchain_products(),
+        total_equity_usd="78",
+        liquid_usdc_usd="6",
+        liquid_usdt_usd="0",
+        # held USDC OnChain $40, SETTLED (redeemable) — but OnChain is slow.
+        earn_positions=[_held("OnChain", "26", "USDC", "40")],
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.49),
+            _venue("bybit_flex", 0.51, [("1131", 1.0)]),  # +$40 new USD1, only $6 liquid
+        ]
+    )
+    ok, msg = check_stable_earn_funding(d, s)
+    assert not ok
+    assert "freed-by-redeem $0.00" in (msg or "")
+
+
 def test_check_stable_earn_funding_holds_pass() -> None:
     """Keeping a stable position (target ≈ held) is no new spend → pass,
     even with a tiny liquid pool."""
