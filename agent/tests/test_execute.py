@@ -2416,6 +2416,107 @@ def test_diff_usdt_excess_credits_close_released_margin() -> None:
     assert sweeps[0].amount == Decimal("40.00")
 
 
+def test_diff_usdc_subscribe_funded_from_idle_usdt() -> None:
+    """`bybit-sandbox.68`: a USDC Earn subscribe on a USDT-funded wallet
+    gets a `USDCUSDT` Buy emitted BEFORE the subscribe so the stake has
+    USDC on hand. Pre-fix the only USDT→USDC conversion was the
+    post-subscribe excess sweep — a cycle too late, so the subscribe
+    180016'd (executed_partial). Mirrors the 2026-06-07 prod cycle:
+    $6 liquid USDC, $100 idle USDT, ~$70 USDC OnChain subscribe."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        liquid_usdc_usd="6",
+        liquid_usdt_usd="100",
+    )
+    snap.wallet.unified_coin_balances = {
+        "USDC": Decimal("6"),
+        "USDT": Decimal("100"),
+    }
+    d = _decision([
+        _venue("cash_usdc", 0.3),
+        _venue("bybit_flex", 0.7, [("1131", 1.0)]),  # USDC stable pick → $70
+    ])
+    actions = diff_to_actions(snap, d, snapshot_ts="20260607T120000Z")
+
+    subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_EARN]
+    assert len(subs) == 1 and subs[0].coin == "USDC"
+    sub_idx = actions.index(subs[0])
+
+    # Funding Buy: shortfall $70 - $6 = $64, × 1.01 = $64.64.
+    funding = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "USDCUSDT" and a.side == "Buy"
+    ]
+    assert funding, "expected a USDT→USDC funding Buy"
+    first_buy = funding[0]
+    assert first_buy.amount == Decimal("64.64")
+    # Ordered BEFORE the subscribe so the stake has USDC on hand.
+    assert actions.index(first_buy) < sub_idx
+    # USDC available at subscribe time covers the stake.
+    pre_sub_in = sum(
+        (a.amount for i, a in enumerate(actions)
+         if i < sub_idx and a.kind == ActionKind.SWAP_SPOT
+         and a.product_id == "USDCUSDT" and a.side == "Buy"),
+        Decimal(0),
+    )
+    assert Decimal("6") + pre_sub_in >= subs[0].amount
+
+
+def test_diff_usdc_subscribe_no_funding_when_usdc_on_hand() -> None:
+    """USDC subscribe fully covered by liquid USDC → no funding Buy
+    (regression guard: the `.68` path must not fire when USDC suffices)."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        liquid_usdc_usd="100",
+        liquid_usdt_usd="0",
+    )
+    snap.wallet.unified_coin_balances = {"USDC": Decimal("100")}
+    d = _decision([
+        _venue("cash_usdc", 0.3),
+        _venue("bybit_flex", 0.7, [("1131", 1.0)]),
+    ])
+    actions = diff_to_actions(snap, d, snapshot_ts="20260607T120000Z")
+    buys = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "USDCUSDT" and a.side == "Buy"
+    ]
+    assert buys == []
+
+
+def test_diff_usdc_funding_and_sweep_have_unique_order_link_ids() -> None:
+    """`bybit-sandbox.68`: a USDC-funding Buy (in `earn_swaps`) and the
+    USDT-excess sweep coexist with NO hedge swap. The block-offset scheme
+    reserves a hedge-swap slot before `earn_swaps`, but downstream offsets
+    count the actual `len(hedge_swaps)==0` — so pre-fix both Buys landed on
+    the same orderLinkId (retCode 170141 Duplicate clientOrderId). The
+    final renumber must keep every id unique."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        liquid_usdc_usd="0.2",
+        liquid_usdt_usd="44",
+    )
+    snap.wallet.unified_coin_balances = {
+        "USDC": Decimal("0.2"),
+        "USDT": Decimal("44"),
+    }
+    d = _decision([
+        _venue("cash_usdc", 0.77),
+        _venue("bybit_flex", 0.23, [("1131", 1.0)]),  # ~$23 USDC subscribe
+    ])
+    actions = diff_to_actions(snap, d, snapshot_ts="20260607T202447Z")
+
+    usdcusdt_buys = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "USDCUSDT" and a.side == "Buy"
+    ]
+    assert len(usdcusdt_buys) >= 2, "expected a funding Buy AND a sweep Buy"
+    olids = [a.order_link_id for a in actions]
+    assert len(olids) == len(set(olids)), f"duplicate orderLinkId: {olids}"
+
+
 @pytest.mark.asyncio
 async def test_execute_swap_spot_dry_run(tmp_path: Path) -> None:
     client = AsyncMock()
@@ -3248,6 +3349,40 @@ async def test_execute_onchain_subscribe_transfers_unified_to_fund_for_non_stabl
     assert earn_kwargs["amount"] == "7.45"
     assert earn_kwargs["account_type"] == "FUND"
     assert earn_kwargs["coin"] == "TON"
+
+
+@pytest.mark.asyncio
+async def test_ensure_fund_balance_quantizes_usdt_to_2dp() -> None:
+    """`bybit-sandbox.68`: USDT UNIFIED→FUND transfer must round to 2dp.
+    A 6dp move like `44.574262` 131210's ("transfer amount scale more than
+    accuracy length") for USDT, even though USDC settles fine at 6dp. The
+    high-precision UNIFIED balance would otherwise win the min() and carry
+    its 8dp scale into the transfer."""
+    from agent.bybit_oracle.bybit_client import WalletAccount, WalletCoin
+    from agent.sandbox.execute import _ensure_fund_balance
+
+    client = AsyncMock()
+    fund_probe = iter([Decimal("0"), Decimal("44.57")])  # empty → settled
+    client.get_account_coin_balance.side_effect = lambda **_: next(
+        fund_probe, Decimal("44.57")
+    )
+    client.get_wallet_balance.return_value = [
+        WalletAccount(
+            accountType="UNIFIED",
+            coin=[WalletCoin(
+                coin="USDT",
+                walletBalance="100.12345678",
+                availableToWithdraw="100.12345678",
+            )],
+        )
+    ]
+    await _ensure_fund_balance(client, "USDT", Decimal("44.3525"))
+
+    client.internal_transfer.assert_awaited_once()
+    amt = client.internal_transfer.await_args.kwargs["amount"]
+    # gap 44.3525 × 1.005 = 44.5742… → 2dp ROUND_DOWN = 44.57 (≥ required).
+    assert amt == "44.57"
+    assert Decimal(amt) >= Decimal("44.3525")
 
 
 @pytest.mark.asyncio

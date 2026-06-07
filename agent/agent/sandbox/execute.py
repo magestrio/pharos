@@ -781,8 +781,19 @@ def diff_to_actions(
     # earn-side swap that overflows the budget is dropped along with
     # its dependent SUBSCRIBE (else the subscribe 180016's at execute
     # time).
+    # A USDT→USDC funding Buy (`.68`) lands USDC the Sell-side stable
+    # swaps can then spend — credit it toward the USDC budget so they
+    # aren't dropped against the (pre-swap) start-of-cycle USDC balance.
+    usdc_buy_inflow = sum(
+        (
+            a.amount
+            for a in earn_swaps
+            if a.product_id == "USDCUSDT" and a.side == "Buy"
+        ),
+        Decimal(0),
+    )
     earn_swaps, dropped_coins = _enforce_usdc_budget(
-        snapshot.wallet.liquid_usdc_usd, hedge_swaps, earn_swaps
+        snapshot.wallet.liquid_usdc_usd + usdc_buy_inflow, hedge_swaps, earn_swaps
     )
 
     # USDC-budget drops cascade to subscribes AND their paired perps.
@@ -1021,7 +1032,7 @@ def diff_to_actions(
         extra_usdt_demand=buy_usdt_demand,
     )
 
-    return (
+    actions = (
         redeems
         + carry_closes
         + hedge_closes
@@ -1035,6 +1046,18 @@ def diff_to_actions(
         + usdt_excess_swaps
         + skips
     )
+    # Final pass: reassign `orderLinkId`s by final position so Bybit-side
+    # idempotency keys are unique regardless of how the per-block
+    # `idx_offset` arithmetic lined up. The block offsets above reserve a
+    # single hedge-swap slot before `earn_swaps`, but downstream offsets
+    # count the *actual* `len(hedge_swaps)` — so when no hedge swap is
+    # emitted, an `earn_swaps` entry and the `usdt_excess` sweep collided
+    # on the same id (`bybit-sandbox.68`: retCode 170141 Duplicate
+    # clientOrderId). Renumbering here is deterministic (same diff → same
+    # ids), so the read-only crash-replay scan still matches.
+    for i, a in enumerate(actions):
+        a.order_link_id = _order_link_id(snapshot_ts, i)
+    return actions
 
 
 def _coin_from_perp_symbol(symbol: str) -> str:
@@ -2442,6 +2465,21 @@ async def _transfer_satisfies_swap(
         return False
 
 
+def _transfer_quantum(coin: str | None) -> Decimal:
+    """Decimal quantum for a UNIFIED↔FUND internal transfer. Bybit rejects
+    amounts whose scale exceeds the coin's transfer accuracy (retCode
+    131210 "transfer amount scale more than accuracy length"). USDT's
+    accuracy is coarser than 6dp — a 6dp move like `44.574262` 131210's
+    even though USDC settles fine at 6dp (`bybit-sandbox.68`). Stablecoins
+    are ~$1, so a coarse 2dp move is well within every stable's accuracy
+    and the 0.5% sizing buffer dwarfs the ≤$0.01 rounding loss. Non-stable
+    coins keep 6dp (the prior default — fine for the coins we move and too
+    fine-grained to drop for sub-dollar tokens)."""
+    if coin and (coin == "USDC" or coin.upper() in _STABLES):
+        return Decimal("0.01")
+    return Decimal("0.000001")
+
+
 async def _ensure_unified_balance(
     client: Any, coin: str, required: Decimal
 ) -> None:
@@ -2484,7 +2522,12 @@ async def _ensure_unified_balance(
             return
     else:
         fund_have = fund_have_raw
-    move = min(fund_have, gap_with_buffer)
+    # ROUND_DOWN to the coin's transfer accuracy: `fund_have` carries the
+    # wallet's full precision (8+dp) and can win the min(), so the move
+    # would otherwise 131210 for USDT. See `_transfer_quantum`.
+    move = min(fund_have, gap_with_buffer).quantize(
+        _transfer_quantum(coin), rounding=ROUND_DOWN
+    )
     if move <= 0:
         log.info(
             "ensure_unified_balance: no FUND balance to move for %s "
@@ -2574,12 +2617,13 @@ async def _ensure_fund_balance(
     unified_have = _coin_equity_from_wallet(unified, coin)
     # Bybit's internal-transfer rejects amounts whose decimal scale exceeds
     # the coin's transfer accuracy (retCode 131210 "transfer amount scale
-    # more than accuracy length"). `gap_with_buffer` is already 6dp, but
-    # `unified_have` carries the wallet's full precision (8+dp) and can win
-    # the min(), so re-quantize the final move down to 6dp. ROUND_DOWN so
-    # we never move more than is actually available.
+    # more than accuracy length"). `gap_with_buffer` is 6dp and
+    # `unified_have` carries the wallet's full precision (8+dp), so
+    # re-quantize the final move down to the coin's accuracy. ROUND_DOWN so
+    # we never move more than is actually available. USDT needs a coarser
+    # scale than 6dp (`bybit-sandbox.68`) — see `_transfer_quantum`.
     move = min(unified_have, gap_with_buffer).quantize(
-        Decimal("0.000001"), rounding=ROUND_DOWN
+        _transfer_quantum(coin), rounding=ROUND_DOWN
     )
     if move <= 0:
         log.info(
@@ -3203,13 +3247,18 @@ def _swap_actions_for_earn_picks(
     # doesn't double-count non-stable spend.
     stable_demand: dict[str, Decimal] = {}
     nonstable_demand_usd: dict[str, Decimal] = {}
+    usdc_demand = Decimal(0)
     for a in subscribe_actions:
         if a.kind not in (ActionKind.SUBSCRIBE_EARN, ActionKind.SUBSCRIBE_LM):
             continue
         coin = a.coin
-        if coin in (None, "USDC"):
+        if coin is None:
             continue
-        if coin in _STABLES:
+        if coin == "USDC":
+            # Funded from idle USDT below — historically skipped because
+            # the wallet's base liquid coin was always USDC.
+            usdc_demand += a.amount
+        elif coin in _STABLES:
             stable_demand[coin] = stable_demand.get(coin, Decimal(0)) + a.amount
         elif a.amount_native is not None and a.amount_native > 0:
             # Non-stable: a.amount is USD, a.amount_native is native
@@ -3236,6 +3285,59 @@ def _swap_actions_for_earn_picks(
 
     swaps: list[Action] = []
     cursor = idx_offset
+
+    # USDC subscribes funded from idle USDT (`bybit-sandbox.68`). Deposits
+    # and USDT-coin Earn payouts land as USDT, so a USDC subscribe can
+    # outrun the USDC balance. Fund the shortfall via a `USDCUSDT` Buy
+    # (spend USDT, receive USDC) emitted FIRST — before the stable-Sell
+    # swaps that spend USDC and before the subscribe itself. Pre-fix the
+    # only USDT→USDC conversion was the post-subscribe excess sweep, which
+    # fired a cycle too late and left the subscribe to 180016
+    # (executed_partial). `side="Buy"` folds the USDT spend into
+    # `buy_usdt_demand`, so the excess sweep no longer double-converts.
+    # `usdc_have` nets out the USDC the same-cycle stable-Sell swaps will
+    # consume so the subscribe isn't left a few dollars short. Only the
+    # stables whose shortfall actually triggers a USDC→stable Sell count
+    # (mirrors the loop below) — subtracting raw demand would over-fund
+    # against stables the wallet already holds and could siphon USDT a
+    # USDT subscribe needs.
+    stable_usdc_spend = Decimal(0)
+    for coin, need in stable_demand.items():
+        bal = snapshot.wallet.unified_coin_balances.get(coin, Decimal(0))
+        sf = need - bal - redeem_credit_per_coin.get(coin, Decimal(0))
+        if sf >= MIN_SWAP_USDC:
+            stable_usdc_spend += (sf * Decimal("1.01")).quantize(Decimal("0.01"))
+    usdc_have = (
+        snapshot.wallet.liquid_usdc_usd
+        + redeem_credit_per_coin.get("USDC", Decimal(0))
+        - stable_usdc_spend
+    )
+    usdc_shortfall = usdc_demand - usdc_have
+    if (
+        usdc_demand > 0
+        and usdc_shortfall >= MIN_SWAP_USDC
+        and snapshot.wallet.liquid_usdt_usd > 0
+    ):
+        qty_usdt = (usdc_shortfall * Decimal("1.01")).quantize(Decimal("0.01"))
+        swaps.append(
+            Action(
+                kind=ActionKind.SWAP_SPOT,
+                category="Spot",
+                product_id="USDCUSDT",
+                coin="USDC",  # destination coin of the swap
+                amount=qty_usdt,  # USDT to spend — Bybit Buy uses quote qty
+                side="Buy",
+                order_link_id=_order_link_id(snapshot_ts, cursor),
+                reason=(
+                    f"buy {qty_usdt} USDC via USDCUSDT (Buy) for USDC Earn "
+                    f"subscribe coverage (need ${usdc_demand:.2f}, have "
+                    f"${usdc_have:.2f} after ${stable_usdc_spend:.2f} stable "
+                    f"swaps)"
+                ),
+            )
+        )
+        cursor += 1
+
     for coin, need in required_per_coin.items():
         wallet_balance = snapshot.wallet.unified_coin_balances.get(coin, Decimal(0))
         redeem_inflow = redeem_credit_per_coin.get(coin, Decimal(0))
