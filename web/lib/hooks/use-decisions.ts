@@ -2,6 +2,7 @@
 
 import { useMemo } from "react";
 import { type Decision } from "@/lib/data";
+import { formatDate, formatDateTime, formatTime } from "@/lib/datetime";
 import { useCycles } from "@/lib/agent-store-context";
 import type { CycleSummary } from "@/lib/agent-api";
 import {
@@ -25,10 +26,7 @@ function shortHash(hex: string, head = 6, tail = 4): string {
 }
 
 function formatTs(unixSec: number): string {
-  const d = new Date(unixSec * 1000);
-  const iso = d.toISOString(); // 2026-05-23T22:00:12.000Z
-  const [datePart, timePart] = iso.split("T");
-  return `${datePart} ${timePart.slice(0, 8)} UTC`;
+  return formatDateTime(unixSec * 1000);
 }
 
 function formatAgo(unixSec: number, nowMs: number = Date.now()): string {
@@ -102,6 +100,8 @@ function buildDecision(
     id: shortHash(event.decisionId),
     full: event.decisionId,
     ts: formatTs(event.timestamp),
+    dateLabel: formatDate(event.timestamp * 1000),
+    timeLabel: formatTime(event.timestamp * 1000),
     ago: formatAgo(event.timestamp, nowMs),
     summary: deriveSummary(cycle),
     risk: deriveRisk(cycle),
@@ -127,6 +127,8 @@ function decisionFromCycle(cycle: CycleSummary, nowMs: number): Decision {
     id: cycle.cycle_ts.slice(0, 19),
     full: cycle.cycle_ts,
     ts: formatTs(startedSec),
+    dateLabel: formatDate(startedSec * 1000),
+    timeLabel: formatTime(startedSec * 1000),
     ago: formatAgo(startedSec, nowMs),
     summary: deriveSummary(cycle),
     risk: deriveRisk(cycle),

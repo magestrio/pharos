@@ -9,6 +9,7 @@
 import Link from "next/link";
 
 import { ApiError, fetchCycles, type CycleSummary } from "@/lib/agent-api";
+import { formatDateTime } from "@/lib/datetime";
 
 export const dynamic = "force-dynamic";
 export const metadata = { title: "Vault8004 — Cycle History" };
@@ -138,6 +139,6 @@ function renderApiError(e: unknown): string {
 }
 
 function fmtTs(iso: string): string {
-  // 2026-05-29T16:02:11+00:00 → 2026-05-29 16:02:11 UTC
-  return iso.replace("T", " ").replace(/(\+|-)\d{2}:\d{2}$/, " UTC");
+  // 2026-05-29T16:02:11+00:00 → Jun 8, 2026, 14:30 UTC
+  return formatDateTime(iso);
 }

@@ -17,6 +17,7 @@ import {
 } from "@/lib/contracts";
 import { ErrorPanel, SkeletonBox, SkeletonRow } from "@/components/ui";
 import { ipfsGateway, mantleExplorerAddress, mantleExplorerTx } from "@/lib/explorer";
+import { formatDateTime } from "@/lib/datetime";
 import { useAttestorHealth } from "@/lib/hooks/use-attestor-health";
 import { useDecisionEvents } from "@/lib/hooks/use-decision-events";
 import { formatBpsAsPct, useReputation } from "@/lib/hooks/use-reputation";
@@ -216,7 +217,7 @@ function DecisionsSection() {
             >
               <div className="col-span-1 text-right text-dim-400 tabular">{i + 1}</div>
               <div className="col-span-3 text-dim-300 tabular">
-                {new Date(ev.timestamp * 1000).toISOString().slice(0, 19).replace("T", " ")}
+                {formatDateTime(ev.timestamp * 1000)}
               </div>
               <div className="col-span-4 text-white tabular">{short(ev.decisionId, 10, 6)}</div>
               <div className="col-span-2">

@@ -25,6 +25,10 @@ export type Decision = {
   id: string;
   full: string;
   ts: string;
+  // Split human-readable parts for the decision-log two-line column
+  // ("Jun 8, 2026" over "14:30 UTC"). `ts` keeps the combined string.
+  dateLabel: string;
+  timeLabel: string;
   ago: string;
   summary: string;
   risk: "LOW" | "MED" | "HIGH";

@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 
 import { RISK_FLAGS, type Decision } from "@/lib/data";
+import { formatTime } from "@/lib/datetime";
 import { useDecisions } from "@/lib/hooks/use-decisions";
 import { useCycleDetail } from "@/lib/agent-store-context";
 import type { CycleDetail, EventRow, ExecutionRow } from "@/lib/agent-api";
@@ -207,9 +208,9 @@ function DecisionItem({
     <div className="relative flex gap-3 sm:gap-5">
       <div className="w-[42px] sm:w-[156px] shrink-0 pt-3.5 relative">
         <div className="hidden sm:block font-mono text-[11px] text-dim-400 tabular leading-tight">
-          {d.ts.split(" ")[0]}
+          {d.dateLabel}
           <br />
-          <span className="text-dim-500">{d.ts.split(" ")[1]}</span>
+          <span className="text-dim-500">{d.timeLabel}</span>
         </div>
         <div className="sm:hidden font-mono text-[10px] text-dim-500 tabular text-right pr-1">{d.ago}</div>
         <div className="absolute top-[20px] left-[42px] sm:left-[156px] -translate-x-1/2 z-10">
@@ -611,7 +612,7 @@ function WatcherEventsBlock({
               <span className="text-[10.5px] uppercase tracking-[0.14em] opacity-80">{ev.kind}</span>
               {ev.coin && <span className="text-[10.5px] opacity-80">{ev.coin}</span>}
               <span className="text-[10.5px] tabular text-dim-500 ml-auto">
-                {new Date(ev.event_ts).toISOString().slice(11, 19)} UTC
+                {formatTime(ev.event_ts)}
               </span>
             </div>
           );

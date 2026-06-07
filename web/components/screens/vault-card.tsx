@@ -17,6 +17,7 @@ import {
   reputationOracleContract,
 } from "@/lib/contracts";
 import { mantleExplorerAddress, mantleExplorerTx } from "@/lib/explorer";
+import { formatDateTime } from "@/lib/datetime";
 import { useActiveHedges } from "@/lib/hooks/use-active-hedges";
 import {
   useAllocationStats,
@@ -1824,7 +1825,7 @@ function eventRowInner(ev: EventRow): React.ReactNode {
         </span>
       )}
       <span className="text-[10.5px] tabular text-dim-500 ml-auto">
-        {new Date(ev.event_ts).toISOString().slice(0, 19).replace("T", " ")} UTC
+        {formatDateTime(ev.event_ts)}
       </span>
       {ev.triggered_cycle_ts && <Icon.Chev className="text-dim-500" />}
     </>
