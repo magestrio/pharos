@@ -48,6 +48,7 @@ from dotenv import load_dotenv
 
 from agent.bybit_oracle.bybit_client import BybitClient
 from agent.reason.schema import Decision
+from agent.reason.venues import VENUE_REGISTRY
 from agent.sandbox.decide import (
     DECISION_DIR,
     _collect_recently_invalidated,
@@ -77,7 +78,13 @@ from agent.sandbox.safety import (
     is_halted,
     record_equity,
 )
-from agent.sandbox.snapshot import SNAPSHOT_DIR, collect_snapshot, write_snapshot
+from agent.sandbox.snapshot import (
+    SNAPSHOT_DIR,
+    STABLES,
+    Snapshot,
+    collect_snapshot,
+    write_snapshot,
+)
 from agent.sandbox.store import (
     apply_migrations,
     open_pool,
@@ -103,7 +110,7 @@ from agent.sandbox.watcher import (
 from agent.sandbox.watcher import (
     write_events as write_watcher_events,
 )
-from agent.validate.rules import validate
+from agent.validate.rules import _held_usd_by_product, validate
 
 # Default cycle cadence. Tightened to 30min in `.47` follow-up because
 # leveraged LM could liquidate in minutes; relaxed back to 4h in
@@ -338,6 +345,106 @@ def _drop_picks_into_cash(
             )
     new_decision = {**decision_dict, "venues": new_venues}
     return new_decision, dropped
+
+
+# Venues whose NEW picks draw the liquid stable pool (stable subscribes +
+# hedged non-stable spot/margin). LM / advance-Earn / carry are funded /
+# gated separately, so the liquid clamp leaves them to the validator.
+_LIQUID_CLAMP_VENUES = ("bybit_flex", "bybit_onchain")
+# Mirror of the executor's MIN_ACTION_USDC / validator _MIN_ACTION_USDC —
+# a delta below this is a no-op the diff never acts on.
+_MIN_NEW_ACTION_USD = 0.50
+
+
+def _clamp_to_liquid_budget(
+    decision_dict: dict[str, Any],
+    snapshot: Snapshot,
+) -> tuple[dict[str, Any], list[str], str | None]:
+    """Deterministic backstop (`bybit-sandbox.67`): the LLM repeatedly
+    over-commits NEW Earn deployment past the liquid budget even after the
+    snapshot pre-computes it (`wallet.max_new_nonstable_usd` /
+    `liquid_stables_usd`) AND the prompt spells it out — verified live: it
+    quoted "$7.40 max new non-stable" in its own thesis then took a $14
+    non-stable pick. So a prose/advisory gate isn't enough; this drops the
+    largest NEW picks (whole) into cash until the cycle's new spend fits
+    the budget.
+
+    Safe-direction: only REDUCES deployment toward cash (never opens or
+    enlarges), so it can't create naked exposure or a bad trade; the
+    validator still runs after. Held positions kept at size (net_new <
+    MIN) are never touched — only fresh/grown picks. Per-category, with
+    the shared-pool looseness documented on `check_stable_earn_funding`;
+    this is an upstream nudge, the validator is the hard gate.
+    """
+    wallet = snapshot.wallet
+    total_book = float(wallet.total_equity_usd)
+    liquid_stables = float(wallet.liquid_stables_usd)
+    # No liquidity signal (pre-pivot fixtures / legacy collector) → no-op,
+    # mirroring the validator's supply<=0 fall-through. Prod always
+    # populates the liquid fields.
+    if total_book <= 0 or liquid_stables <= 0:
+        return decision_dict, [], None
+    max_nonstable = float(wallet.max_new_nonstable_usd)
+
+    held = _held_usd_by_product(snapshot)
+    prod_coin: dict[tuple[str, str], str] = {}
+    for venue_id in _LIQUID_CLAMP_VENUES:
+        meta = VENUE_REGISTRY.get(venue_id)
+        cat = getattr(meta, "snapshot_category", None) if meta else None
+        if not cat:
+            continue
+        for p in snapshot.products.get(cat, []):
+            prod_coin[(cat, p.product_id)] = p.coin.upper()
+
+    new_stable: list[tuple[str, float]] = []
+    new_nonstable: list[tuple[str, float]] = []
+    for v in decision_dict.get("venues", []) or []:
+        vid = v.get("venue_id")
+        if vid not in _LIQUID_CLAMP_VENUES:
+            continue
+        meta = VENUE_REGISTRY.get(vid)
+        cat = getattr(meta, "snapshot_category", None) if meta else None
+        if not cat:
+            continue
+        vw = float(v.get("weight", 0))
+        for p in v.get("picks", []) or []:
+            pid = str(p.get("product_id", ""))
+            net_new = (
+                total_book * vw * float(p.get("weight", 0))
+                - held.get((cat, pid), 0.0)
+            )
+            if net_new < _MIN_NEW_ACTION_USD:
+                continue  # hold / reduce — funds nothing
+            if prod_coin.get((cat, pid), "") in STABLES:
+                new_stable.append((pid, net_new))
+            else:
+                new_nonstable.append((pid, net_new))
+
+    to_drop: set[str] = set()
+
+    def _select(picks: list[tuple[str, float]], budget: float) -> None:
+        total = sum(n for _, n in picks)
+        if total <= budget + 1e-9:
+            return
+        # Drop largest-first so the fewest picks are sacrificed.
+        for pid, n in sorted(picks, key=lambda x: x[1], reverse=True):
+            if total <= budget + 1e-9:
+                break
+            to_drop.add(pid)
+            total -= n
+
+    _select(new_nonstable, max_nonstable)
+    _select(new_stable, liquid_stables)
+
+    if not to_drop:
+        return decision_dict, [], None
+    new_dict, dropped = _drop_picks_into_cash(decision_dict, to_drop)
+    note = (
+        f"liquid_clamp dropped over-budget NEW picks "
+        f"{sorted(set(dropped))} → cash (liquid_stables ${liquid_stables:.2f}, "
+        f"max_new_nonstable ${max_nonstable:.2f})"
+    )
+    return new_dict, dropped, note
 
 
 def _build_auto_close_decision(
@@ -603,6 +710,26 @@ async def run_one_cycle(
                     )
                     decision = Decision.model_validate(filtered_dict)
                     outcome["cooldown_dropped"] = sorted(set(dropped))
+            # Liquid-budget clamp (`.67`) — deterministic backstop for the
+            # LLM over-committing NEW deployment past the pre-computed
+            # liquid budget. Drops the largest over-budget NEW picks into
+            # cash so the cycle produces a fundable decision instead of a
+            # validator reject. Runs after the cooldown drop (both are
+            # post-decide, pre-validate); validator still gates the result.
+            clamped_dict, clamp_dropped, clamp_note = _clamp_to_liquid_budget(
+                decision.model_dump(), snap
+            )
+            if clamp_dropped:
+                notes_list = clamped_dict.setdefault("notes", [])
+                if clamp_note:
+                    notes_list.append(clamp_note)
+                log.warning(
+                    "liquid clamp: LLM over-committed NEW picks past liquid "
+                    "budget — rolled %s into cash_usdc",
+                    sorted(set(clamp_dropped)),
+                )
+                decision = Decision.model_validate(clamped_dict)
+                outcome["liquid_clamp_dropped"] = sorted(set(clamp_dropped))
         decision_path = write_decision(
             decision,
             snap_path,

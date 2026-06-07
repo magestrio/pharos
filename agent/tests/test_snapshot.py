@@ -9,6 +9,7 @@ Focus:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
@@ -38,6 +39,7 @@ from agent.sandbox.snapshot import (
     ProductSummary,
     Snapshot,
     UsdcPegSnapshot,
+    WalletSnapshot,
     _advance_earn_summary,
     _alpha_summary,
     _annual_funding,
@@ -57,6 +59,36 @@ from agent.sandbox.snapshot import (
     _usdt_in_unified,
     collect_snapshot,
 )
+
+
+# ─── WalletSnapshot deployable-budget advisory (`bybit-sandbox.67`) ──────────
+
+
+def test_wallet_deployable_budget_computed_fields():
+    """`liquid_stables_usd` + `max_new_nonstable_usd` are pre-computed for
+    the LLM (so it stops sizing new picks off total_equity). Serialized
+    into the snapshot JSON; round-trip-safe (extra='ignore')."""
+    w = WalletSnapshot(
+        total_equity_usd=Decimal("78"),
+        liquid_usdc_usd=Decimal("5.94"),
+        liquid_usdt_usd=Decimal("0.01"),
+    )
+    assert w.liquid_stables_usd == Decimal("5.95")
+    # 5.95 / 2.05 = 2.90 (quantized)
+    assert w.max_new_nonstable_usd == Decimal("2.90")
+    dumped = json.loads(w.model_dump_json())
+    assert dumped["liquid_stables_usd"] == "5.95"
+    assert dumped["max_new_nonstable_usd"] == "2.90"
+    # Round-trip: serialized computed fields are ignored on re-parse.
+    assert WalletSnapshot(**dumped).liquid_stables_usd == Decimal("5.95")
+
+
+def test_wallet_deployable_budget_zero_liquid():
+    """No liquid stables → both ceilings are 0 (correct: deploy nothing
+    new without redeeming)."""
+    w = WalletSnapshot(total_equity_usd=Decimal("78"))
+    assert w.liquid_stables_usd == Decimal("0")
+    assert w.max_new_nonstable_usd == Decimal("0.00")
 
 
 # ─── _parse_percent ─────────────────────────────────────────────────────────

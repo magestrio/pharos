@@ -32,7 +32,7 @@ from collections.abc import Callable
 from typing import Any
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from agent.bybit_oracle.bybit_client import (
     BybitAPIError,
@@ -244,6 +244,36 @@ class WalletSnapshot(BaseModel):
     # USDC→USDT hedge swap drains the available USDT before the next
     # Buy swap fires.
     liquid_usdt_usd: Decimal = Decimal(0)
+
+    # Deployable-budget advisory (`bybit-sandbox.67`). The LLM repeatedly
+    # sized NEW Earn picks off `total_equity_usd` even though most of a
+    # small vault is locked in `earn_positions` — so it over-committed
+    # (e.g. 70% into fresh OnChain stables on a $6-liquid book) and the
+    # validator rejected every cycle. These computed fields hand the model
+    # the spend ceiling pre-computed so it stops deriving (and ignoring)
+    # it. Advisory only — the validator still gates; serialized into the
+    # snapshot the LLM reads.
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def liquid_stables_usd(self) -> Decimal:
+        """Spendable stable cash this cycle (liquid USDC + USDT, UNIFIED+
+        FUND): the ceiling on NEW STABLE Earn deployment without redeeming
+        anything (a stable subscribe costs ~1x its USD). `total_equity_usd`
+        is NOT this number — capital locked in `earn_positions` can't be
+        re-deployed until redeemed."""
+        return self.liquid_usdc_usd + self.liquid_usdt_usd
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def max_new_nonstable_usd(self) -> Decimal:
+        """Ceiling on the SUM of NEW hedged non-stable Earn picks this
+        cycle. Each costs `pick_usd` (spot Buy) + `pick_usd x 1.05` (perp
+        margin) ~= 2.05x, so this is `liquid_stables / (1 + margin buffer)`."""
+        denom = Decimal(1) + HEDGE_MARGIN_BUFFER
+        return (
+            (self.liquid_usdc_usd + self.liquid_usdt_usd) / denom
+        ).quantize(Decimal("0.01"))
 
 
 class MarketSnapshot(BaseModel):

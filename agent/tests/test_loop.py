@@ -36,6 +36,7 @@ def _stub_usage() -> DecisionUsage:
     )
 from agent.sandbox.snapshot import (
     MarketSnapshot,
+    PerpInfo,
     ProductSummary,
     Snapshot,
     UsdcPegSnapshot,
@@ -118,6 +119,112 @@ def _decision_clean() -> Decision:
         notes=[],
         expected_blended_apr_pct=4.0,
     )
+
+
+def _snapshot_with_ton(
+    *, liquid_usdc: str, liquid_usdt: str = "0", total_equity_usd: str = "100",
+    ton_held: str = "0",
+) -> Snapshot:
+    """Small-vault snapshot with a TON OnChain product + perp, for the
+    liquid-budget clamp tests. `ton_held` (native) seeds an OnChain TON
+    position so net-new vs held can be exercised."""
+    earn = (
+        [{"productId": "8", "coin": "TON", "amount": ton_held,
+          "category": "OnChain", "status": "Active"}]
+        if Decimal(ton_held) > 0 else []
+    )
+    return Snapshot(
+        captured_at=datetime.now(UTC),
+        wallet=WalletSnapshot(
+            total_equity_usd=Decimal(total_equity_usd),
+            liquid_usdc_usd=Decimal(liquid_usdc),
+            liquid_usdt_usd=Decimal(liquid_usdt),
+        ),
+        earn_positions=earn,
+        lm_positions=[],
+        products={
+            "FlexibleSaving": [],
+            "OnChain": [ProductSummary(
+                category="OnChain", product_id="8", coin="TON",
+                effective_apr=Decimal("0.18"), apr_source="estimate_apr",
+                base_apr_string=None, redeem_lockup_minutes=None, notes=[],
+            )],
+            "LiquidityMining": [],
+        },
+        market=MarketSnapshot(),
+        perp_market={"TON": PerpInfo(symbol="TONUSDT", mark_price=Decimal("2.0"),
+                                     min_notional_usd=Decimal("1.0"))},
+        usdc_peg=UsdcPegSnapshot(price_usd=Decimal("1.0"), deviation_bps=Decimal("0"),
+                                 fetched_at=datetime.now(UTC)),
+        errors=[],
+    )
+
+
+def test_clamp_drops_overbudget_new_nonstable_to_cash() -> None:
+    """`.67`: a NEW non-stable pick ($20) exceeding `max_new_nonstable`
+    ($6/2.05≈$2.93 on a $6-liquid book) is rolled into cash deterministically
+    (the LLM ignores the advisory)."""
+    from agent.sandbox.loop import _clamp_to_liquid_budget
+    snap = _snapshot_with_ton(liquid_usdc="6")
+    dec = Decision(
+        thesis="over-commit a fresh TON OnChain pick past the liquid budget.",
+        venues=[
+            VenueAllocation(venue_id="cash_usdc", weight=0.8),
+            VenueAllocation(venue_id="bybit_onchain", weight=0.2,
+                            picks=[Pick(product_id="8", weight=1.0)]),  # $20 new
+        ],
+        hedges=[], confidence=0.7, risk_flags=[], notes=[],
+        expected_blended_apr_pct=5.0,
+    )
+    new_dict, dropped, note = _clamp_to_liquid_budget(dec.model_dump(), snap)
+    assert dropped == ["8"]
+    assert "liquid_clamp" in (note or "")
+    # The decision must still be valid shape (weights sum to 1.0).
+    rebuilt = Decision.model_validate(new_dict)
+    assert abs(sum(v.weight for v in rebuilt.venues) - 1.0) < 1e-6
+    assert not any(
+        p.product_id == "8"
+        for v in rebuilt.venues for p in v.picks
+    )
+
+
+def test_clamp_keeps_held_position_at_size() -> None:
+    """A HELD TON position kept at its current size (net_new≈0) is NOT
+    dropped, even though its gross value exceeds the liquid budget."""
+    from agent.sandbox.loop import _clamp_to_liquid_budget
+    # 10 TON × $2 = $20 held; liquid only $6.
+    snap = _snapshot_with_ton(liquid_usdc="6", ton_held="10")
+    dec = Decision(
+        thesis="keep the existing TON OnChain position at its current size.",
+        venues=[
+            VenueAllocation(venue_id="cash_usdc", weight=0.8),
+            VenueAllocation(venue_id="bybit_onchain", weight=0.2,
+                            picks=[Pick(product_id="8", weight=1.0)]),  # $20 target == held
+        ],
+        hedges=[], confidence=0.7, risk_flags=[], notes=[],
+        expected_blended_apr_pct=5.0,
+    )
+    new_dict, dropped, note = _clamp_to_liquid_budget(dec.model_dump(), snap)
+    assert dropped == []
+    assert note is None
+
+
+def test_clamp_noop_when_within_budget() -> None:
+    """Ample liquid → nothing dropped."""
+    from agent.sandbox.loop import _clamp_to_liquid_budget
+    snap = _snapshot_with_ton(liquid_usdc="100")  # max_new_nonstable ≈ $48.8
+    dec = Decision(
+        thesis="a small fresh TON pick well within the liquid budget.",
+        venues=[
+            VenueAllocation(venue_id="cash_usdc", weight=0.9),
+            VenueAllocation(venue_id="bybit_onchain", weight=0.1,
+                            picks=[Pick(product_id="8", weight=1.0)]),  # $10 new
+        ],
+        hedges=[], confidence=0.7, risk_flags=[], notes=[],
+        expected_blended_apr_pct=5.0,
+    )
+    new_dict, dropped, note = _clamp_to_liquid_budget(dec.model_dump(), snap)
+    assert dropped == []
 
 
 def _decision_with_risk_flag() -> Decision:
