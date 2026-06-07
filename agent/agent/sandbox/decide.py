@@ -40,7 +40,13 @@ from agent.sandbox.snapshot import Snapshot
 from agent.validate.rules import validate
 
 MODEL = "claude-sonnet-4-6"
-MAX_TOKENS = 4096
+# Output cap for the forced `submit_decision` tool call. 4096 truncated
+# real decisions mid-JSON (the model emits `venues` first as a large nested
+# object; a cut there leaves the SDK unable to recover any field, yielding an
+# empty `{}` input and a cryptic downstream "field required" validation
+# error). Sonnet 4.6 supports far larger outputs and max_tokens is only a
+# cap — billed on actual tokens — so a generous ceiling is free insurance.
+MAX_TOKENS = 16384
 TOOL_NAME = "submit_decision"
 DECISION_DIR = Path(__file__).parent / "decisions"
 # Duplicated from `agent.sandbox.loop.CYCLE_LOG` to avoid an import
@@ -603,7 +609,22 @@ def _load_latest_prior_decision(
 def _extract_tool_input(response: anthropic.types.Message) -> dict[str, Any]:
     for block in response.content:
         if getattr(block, "type", None) == "tool_use" and block.name == TOOL_NAME:
-            return block.input  # type: ignore[return-value]
+            tool_input = block.input  # type: ignore[assignment]
+            if not tool_input:
+                # Forced tool_use returning empty input means the JSON was
+                # cut off before any field landed — almost always max_tokens
+                # truncation. Surface stop_reason + output token count so it
+                # is diagnosable instead of a downstream pydantic error.
+                out_tokens = getattr(
+                    getattr(response, "usage", None), "output_tokens", "?"
+                )
+                raise RuntimeError(
+                    f"{TOOL_NAME} returned empty input "
+                    f"(stop_reason={response.stop_reason}, "
+                    f"output_tokens={out_tokens}/{MAX_TOKENS}) — likely "
+                    f"max_tokens truncation; raise MAX_TOKENS"
+                )
+            return tool_input  # type: ignore[return-value]
     texts = [
         getattr(b, "text", "")
         for b in response.content

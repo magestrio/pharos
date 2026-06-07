@@ -55,6 +55,7 @@ from agent.sandbox.decide import (
     decide,
     write_decision,
 )
+from agent.sandbox.ipfs_pin import pin_decision_rationale
 from agent.sandbox.onchain_writer import OnchainWriter
 from agent.sandbox.carry_state import (
     DEFAULT_CARRY_STATE_PATH,
@@ -212,12 +213,58 @@ async def _anchor_onchain(
         decision_dict = decision.model_dump()
 
     anchor: dict[str, Any] = {}
+
+    # Anchor ACTUAL execution, not just intent. `outcome` already carries
+    # the per-action results (status) by the time we're called (post-
+    # execute). The IPFS payload embeds an `_execution` block (the public
+    # audit trail), and `actionHash` commits to the executed ledger for
+    # live cycles — so a partial failure can't masquerade on-chain as a
+    # fully-executed allocation. Dry-run / hold (no_actions) fall back to
+    # the intent hash (intent == execution there).
+    result = outcome.get("result")
+    execution_block: dict[str, Any] = {
+        "result": result,
+        "actions_executed": outcome.get("actions_executed"),
+        "actions_failed": outcome.get("actions_failed"),
+        "actions": outcome.get("actions") or [],
+    }
+    executed_actions = (
+        outcome.get("actions")
+        if result in ("executed", "executed_partial")
+        else None
+    )
+
+    # Pin rationale to IPFS first so the on-chain event carries a public
+    # CID. Failure → empty CID (still anchored, just no public link).
+    # The pinned payload = decision intent + `_execution` outcome.
+    pin_payload = dict(decision_dict)
+    pin_payload["_execution"] = execution_block
+    ipfs_cid = await asyncio.to_thread(
+        pin_decision_rationale, pin_payload, snap_name
+    )
+    if ipfs_cid:
+        anchor["ipfs_cid"] = ipfs_cid
+        # Persist the CID back into the decision file so future cycles'
+        # `_summarize_prior_decision` can reference it + the data-store
+        # picks it up if backfill re-reads decisions.
+        if decision_path and decision_path.exists():
+            try:
+                meta = decision_dict.setdefault("_meta", {})
+                meta["ipfs_cid"] = ipfs_cid
+                decision_path.write_text(json.dumps(decision_dict, indent=2))
+            except OSError as e:
+                log.warning("could not persist ipfs_cid into %s: %s", decision_path, e)
+
     tx_hash = await asyncio.to_thread(
-        writer.record_decision, decision_dict, snap_name
+        writer.record_decision,
+        decision_dict,
+        snap_name,
+        ipfs_cid=ipfs_cid or "",
+        executed_actions=executed_actions,
     )
     if tx_hash:
         anchor["decision_tx"] = tx_hash
-        log.info("decision anchored on-chain: tx=%s", tx_hash)
+        log.info("decision anchored on-chain: tx=%s cid=%s", tx_hash, ipfs_cid or "(none)")
 
     rep_tx = await asyncio.to_thread(writer.update_reputation)
     if rep_tx:

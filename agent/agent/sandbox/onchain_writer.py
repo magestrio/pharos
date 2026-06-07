@@ -107,6 +107,36 @@ def derive_ids(
     return decision_id, action_hash
 
 
+def derive_execution_hash(executed_actions: list[dict[str, Any]]) -> bytes:
+    """`keccak256` over the canonical executed-action ledger — what the
+    agent ACTUALLY did this cycle, including per-action `status`. This is
+    the on-chain commitment when execution happened, replacing
+    `derive_ids`' intent hash (decision venues+hedges). A partial
+    failure (some actions `error`/`orphan`) yields a different hash than
+    a clean batch, so an observer reading DecisionLog sees reality, not
+    the LLM's plan.
+
+    `error` strings are excluded (free-text, non-deterministic across
+    transient Bybit messages); the `status` enum already distinguishes
+    ok / error / orphan / skipped.
+    """
+    ledger = [
+        {
+            "kind": a.get("kind"),
+            "category": a.get("category"),
+            "product_id": a.get("product_id"),
+            "coin": a.get("coin"),
+            "amount": str(a.get("amount")) if a.get("amount") is not None else None,
+            "status": a.get("status"),
+        }
+        for a in executed_actions
+    ]
+    payload = json.dumps(
+        ledger, sort_keys=True, separators=(",", ":"), default=str
+    )
+    return Web3.keccak(text=payload)
+
+
 class OnchainWriter:
     """Bundles the agent EOA + DecisionLog/Oracle contracts.
 
@@ -230,9 +260,28 @@ class OnchainWriter:
         self,
         decision: dict[str, Any],
         snapshot_filename: str,
+        *,
+        ipfs_cid: str | None = None,
+        executed_actions: list[dict[str, Any]] | None = None,
     ) -> str | None:
-        """Submit a `DecisionRecorded` tx. Returns tx hash hex or `None`."""
-        decision_id, action_hash = derive_ids(decision, snapshot_filename)
+        """Submit a `DecisionRecorded` tx. Returns tx hash hex or `None`.
+
+        `ipfs_cid` (explicit) wins over `decision._meta.ipfs_cid` so the
+        caller can pass a freshly-pinned CID without round-tripping
+        through the decision dict.
+
+        `executed_actions` (when provided) makes `actionHash` commit to
+        what was ACTUALLY executed (`derive_execution_hash`) instead of
+        the intended allocation. Pass it only for live cycles that ran
+        execute; for dry-run / hold (no_actions) leave it None so the
+        intent hash is anchored (intent == execution in those cases).
+        """
+        decision_id, intent_hash = derive_ids(decision, snapshot_filename)
+        action_hash = (
+            derive_execution_hash(executed_actions)
+            if executed_actions is not None
+            else intent_hash
+        )
 
         # Skip if already recorded — `recordDecision` reverts on
         # duplicates ("duplicate decision"), which would just spam
@@ -248,11 +297,13 @@ class OnchainWriter:
         except Exception as e:
             log.warning("exists() pre-check failed: %s — attempting send anyway", e)
 
-        ipfs_cid = str((decision.get("_meta") or {}).get("ipfs_cid") or "")
+        cid = ipfs_cid if ipfs_cid is not None else str(
+            (decision.get("_meta") or {}).get("ipfs_cid") or ""
+        )
         fn = self.decision_log.functions.recordDecision(
             self.agent_id,
             decision_id,
-            ipfs_cid,
+            cid,
             action_hash,
         )
         return self._send(fn)

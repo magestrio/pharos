@@ -286,3 +286,59 @@ async def test_volatile_uses_credited_qty_not_requested_amount(db):
     # Sell order uses 0.0249 (credited), not 0.025 (requested).
     sell_call = client.place_spot_order.await_args
     assert sell_call.kwargs["qty_base"] == "0.0249"
+
+
+async def test_live_earn_native_qty_sums_product_rows() -> None:
+    """Executor-side redeem fallback (`_live_earn_native_qty`): sum every
+    live native row for a product_id (settled + Processing chunks) and
+    ignore other products. This is what keeps a non-stable REDEEM sized
+    in coin units when the planner left amount_native unset — the TON
+    180020 ("Position not found") was a USD figure sent as native qty."""
+    from agent.bybit_oracle.bybit_client import EarnPosition
+    from agent.sandbox.execute import _live_earn_native_qty
+
+    c = AsyncMock()
+    c.get_earn_positions.return_value = [
+        EarnPosition(productId="8", coin="TON", amount="4.154",
+                     category="OnChain", status="Active"),
+        EarnPosition(productId="8", coin="TON", amount="3.3823",
+                     category="OnChain", status="Active"),
+        EarnPosition(productId="999", coin="ETH", amount="1.0",
+                     category="OnChain"),
+    ]
+    assert await _live_earn_native_qty(c, "OnChain", "8") == Decimal("7.5363")
+    assert await _live_earn_native_qty(c, "OnChain", "missing") is None
+
+
+async def test_redeem_onchain_by_position_targets_each_id() -> None:
+    """OnChain redeem targets each per-stake position by its
+    redeemPositionId (a productId+amount redeem 180020s). Verify the
+    executor fetches positions and redeems ids until the requested native
+    amount is covered, ignoring other products."""
+    from agent.bybit_oracle.bybit_client import EarnOrderResult, EarnPosition
+    from agent.sandbox.execute import (
+        Action,
+        ActionKind,
+        _redeem_onchain_by_position,
+    )
+
+    c = AsyncMock()
+    c.get_earn_positions.return_value = [
+        EarnPosition(productId="8", coin="TON", amount="4.154", id="505282",
+                     category="OnChain", status="Active"),
+        EarnPosition(productId="8", coin="TON", amount="3.3823", id="505453",
+                     category="OnChain", status="Active"),
+        EarnPosition(productId="999", coin="ETH", amount="1.0", id="1",
+                     category="OnChain", status="Active"),
+    ]
+    c.place_earn_order.return_value = EarnOrderResult(orderId="o", orderLinkId="l")
+    action = Action(
+        kind=ActionKind.REDEEM_EARN, category="OnChain", product_id="8",
+        coin="TON", amount=Decimal("18"), order_link_id="lk", reason="redeem",
+    )
+    resp = await _redeem_onchain_by_position(c, action, Decimal("7.5363"))
+    assert c.place_earn_order.await_count == 2  # product 999 ignored
+    pids = {call.kwargs["redeem_position_id"]
+            for call in c.place_earn_order.await_args_list}
+    assert pids == {"505282", "505453"}
+    assert resp["count"] == 2

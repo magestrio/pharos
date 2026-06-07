@@ -105,10 +105,10 @@ def _decision_clean() -> Decision:
     return Decision(
         thesis="placeholder happy-path decision for cycle tests.",
         venues=[
-            VenueAllocation(venue_id="cash_usdc", weight=0.5),
+            VenueAllocation(venue_id="cash_usdc", weight=0.6),
             VenueAllocation(
                 venue_id="bybit_flex",
-                weight=0.5,
+                weight=0.4,
                 picks=[Pick(product_id="1131", weight=1.0)],
             ),
         ],

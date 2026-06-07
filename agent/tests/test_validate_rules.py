@@ -76,6 +76,7 @@ def _product(
     apr_source: str = "estimate_apr",
     notes: list[str] | None = None,
     redeem_lockup_minutes: int | None = None,
+    fixed_term_days: int | None = None,
     min_subscribe_usd: str | None = None,
 ) -> ProductSummary:
     return ProductSummary(
@@ -86,6 +87,7 @@ def _product(
         apr_source=apr_source,
         base_apr_string=None,
         redeem_lockup_minutes=redeem_lockup_minutes,
+        fixed_term_days=fixed_term_days,
         min_subscribe_usd=(
             Decimal(min_subscribe_usd) if min_subscribe_usd is not None else None
         ),
@@ -187,10 +189,11 @@ def _decision(
     expected_apr: float = 4.0,
     thesis: str = "Calm regime; anchor on cash + USD1 promo + tiny LM.",
 ) -> Decision:
-    """Default decision is validator-clean: cash 50%, flex 50% USD1@1.0."""
+    """Default decision is validator-clean: cash 60%, flex 40% USD1@1.0
+    (stable per-product cap is 0.40)."""
     venues = venues or [
-        _venue("cash_usdc", 0.5),
-        _venue("bybit_flex", 0.5, [("1131", 1.0)]),
+        _venue("cash_usdc", 0.6),
+        _venue("bybit_flex", 0.4, [("1131", 1.0)]),
     ]
     return Decision(
         thesis=thesis,
@@ -329,15 +332,13 @@ def test_check_effective_pick_cap_fails_when_non_stable_oversizes() -> None:
     assert "bybit_onchain/8" in (msg or "")
 
 
-def test_check_effective_pick_cap_passes_stable_at_70pct() -> None:
-    """2026-06-03 relaxation: stable Earn picks (USD1/USDC/USDT on
-    FlexibleSaving / OnChain) get a 0.70 cap so the LLM can deploy
-    capital into the highest-APR safe yield without artificially
-    splitting onto a lower-APR fallback."""
+def test_check_effective_pick_cap_passes_stable_at_40pct() -> None:
+    """2026-06-07: stable Earn per-product cap is 0.40. A single USD1
+    pick at exactly the cap passes."""
     d = _decision(
         venues=[
-            _venue("cash_usdc", 0.30),
-            _venue("bybit_flex", 0.70, [("1131", 1.0)]),  # USD1, eff 0.70
+            _venue("cash_usdc", 0.60),
+            _venue("bybit_flex", 0.40, [("1131", 1.0)]),  # USD1, eff 0.40
         ]
     )
     s = _snapshot(
@@ -353,12 +354,12 @@ def test_check_effective_pick_cap_passes_stable_at_70pct() -> None:
     assert ok, errs
 
 
-def test_check_effective_pick_cap_fails_stable_above_70pct() -> None:
-    """0.70 IS the stable cap — go above and it fails."""
+def test_check_effective_pick_cap_fails_stable_above_40pct() -> None:
+    """0.40 IS the stable cap — go above and it fails."""
     d = _decision(
         venues=[
-            _venue("cash_usdc", 0.20),
-            _venue("bybit_flex", 0.80, [("1131", 1.0)]),  # USD1, eff 0.80
+            _venue("cash_usdc", 0.50),
+            _venue("bybit_flex", 0.50, [("1131", 1.0)]),  # USD1, eff 0.50
         ]
     )
     s = _snapshot(
@@ -507,6 +508,51 @@ def test_check_lockup_cap_passes_for_4_day_lockup() -> None:
         venues=[
             _venue("cash_usdc", 0.5),
             _venue("bybit_onchain", 0.5, [("8", 1.0)]),
+        ]
+    )
+    ok, _ = check_lockup_cap(d, s)
+    assert ok is True
+
+
+def test_check_lockup_cap_rejects_fixed_term_above_7_days() -> None:
+    """OnChain Fixed-term product with term=30d locks principal past the
+    weekly horizon. `redeem_lockup_minutes` (post-redeem processing) is
+    None/short, so only the `fixed_term_days` gate catches it."""
+    s = _snapshot(
+        onchain_products=[
+            _product("42", "OnChain", coin="ETH",
+                     effective_apr="0.22",
+                     redeem_lockup_minutes=None,
+                     fixed_term_days=30),
+        ]
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_onchain", 0.5, [("42", 1.0)]),
+        ]
+    )
+    ok, msg = check_lockup_cap(d, s)
+    assert ok is False
+    assert "42" in (msg or "")
+    assert "fixed-term" in (msg or "")
+    assert "30" in (msg or "")
+
+
+def test_check_lockup_cap_passes_for_fixed_term_within_7_days() -> None:
+    """A 5-day Fixed-term OnChain product unwinds before the next weekly
+    rebalance — within cap, allowed."""
+    s = _snapshot(
+        onchain_products=[
+            _product("43", "OnChain", coin="SOL",
+                     effective_apr="0.19",
+                     fixed_term_days=5),
+        ]
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_onchain", 0.5, [("43", 1.0)]),
         ]
     )
     ok, _ = check_lockup_cap(d, s)

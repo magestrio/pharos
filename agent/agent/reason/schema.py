@@ -19,7 +19,13 @@ which is kept around for any caller that hasn't migrated yet.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from agent.reason.venues import VENUE_REGISTRY, VenueId
 
@@ -163,6 +169,19 @@ class Decision(BaseModel):
     risk_flags: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
     expected_blended_apr_pct: float = Field(ge=0)
+
+    @field_validator("risk_flags", "notes", "hedges", mode="before")
+    @classmethod
+    def _empty_str_to_list(cls, v: object) -> object:
+        # The LLM intermittently emits "" (empty string) instead of []
+        # for an empty array field — pydantic then rejects the whole
+        # Decision with a list_type error and the cycle hard-errors
+        # (observed live 2026-06-06/07 on `risk_flags`). Coerce the
+        # empty-string / null sentinel to an empty list; real lists pass
+        # through untouched.
+        if v is None or v == "":
+            return []
+        return v
 
     @model_validator(mode="after")
     def _venues_well_formed(self) -> "Decision":

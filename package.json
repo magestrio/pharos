@@ -10,6 +10,8 @@
     "safe:set-uri": "pnpm --filter @vault8004/safe-ops run set-agent-uri",
     "safe:register": "pnpm --filter @vault8004/safe-ops run register-agent",
     "start": "bash scripts/vault.sh start",
+    "sync": "bash scripts/vault.sh sync",
+    "deploy": "bash scripts/vault.sh deploy",
     "stop": "bash scripts/vault.sh stop",
     "restart": "bash scripts/vault.sh restart",
     "status": "bash scripts/vault.sh status",

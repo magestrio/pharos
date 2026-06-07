@@ -770,6 +770,31 @@ def test_diff_partial_redeem_when_target_below_current() -> None:
     assert actions[0].amount == Decimal("40")  # 60 current - 20 target
 
 
+def test_diff_partial_redeem_non_stable_sets_native_qty() -> None:
+    """Regression: reducing (not fully dropping) a non-stable OnChain
+    stake must size the REDEEM in native coin units. Pre-fix the regular
+    redeem branch left amount_native=None, so the executor sent the USD
+    figure as the native qty and Bybit redeemed the wrong amount /
+    rejected — the "exit TON didn't redeem from staking" desync."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        earn_positions=[_pos("OnChain", "8", "25", coin="TON")],
+        perp_market={"TON": _perp("TON", mark="2.0")},
+    )
+    # 25 TON @ $2 = $50 current; venue 0.2 → $20 target → redeem $30 (60%).
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.8),
+            _venue("bybit_onchain", 0.2, [("8", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    redeems = [a for a in actions if a.kind == ActionKind.REDEEM_EARN]
+    assert len(redeems) == 1
+    assert redeems[0].amount_native is not None
+    assert redeems[0].amount_native == Decimal("15")  # 60% of 25 TON
+
+
 # ─── Diff: non-stable current sizing (.34) ──────────────────────────────────
 
 
@@ -1420,8 +1445,18 @@ async def test_execute_live_calls_place_earn_order(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_execute_live_redeem_uses_redeem_side(tmp_path: Path) -> None:
+    from agent.bybit_oracle.bybit_client import EarnPosition
+
     client = AsyncMock()
     client.place_earn_order.return_value = EarnOrderResult(orderId="r-1")
+    # OnChain redeem is per-position: the executor reads live positions
+    # and redeems each by its redeemPositionId.
+    client.get_earn_positions.return_value = [
+        EarnPosition(
+            productId="26", coin="USDC", amount="10", id="900",
+            category="OnChain", status="Active",
+        ),
+    ]
     action = Action(
         kind=ActionKind.REDEEM_EARN,
         category="OnChain",
@@ -1440,6 +1475,82 @@ async def test_execute_live_redeem_uses_redeem_side(tmp_path: Path) -> None:
     assert kwargs["side"] == "Redeem"
     # OnChain Earn requires FUND account type per Bybit V5 spec.
     assert kwargs["account_type"] == "FUND"
+    # ...and must carry the per-stake position id, else 180020.
+    assert kwargs["redeem_position_id"] == "900"
+
+
+@pytest.mark.asyncio
+async def test_execute_redeem_polls_settlement_before_continue(
+    tmp_path: Path,
+) -> None:
+    """A successful live REDEEM_EARN must poll the wallet for the freed
+    coin before later actions consume it (redeem settlement barrier)."""
+    client = AsyncMock()
+    client.place_earn_order.return_value = EarnOrderResult(orderId="r-1")
+    action = Action(
+        kind=ActionKind.REDEEM_EARN,
+        category="FlexibleSaving",
+        product_id="1131",
+        coin="USD1",
+        amount=Decimal("50"),
+        order_link_id="sandbox-test-redeem-poll",
+        reason="redeem",
+    )
+    results = await execute_actions(
+        client, [action], snapshot_ts="20260607T120000Z",
+        dry_run=False, executions_dir=tmp_path,
+    )
+    assert results[0].status == "ok"
+    client.poll_redemption_credited.assert_awaited_once()
+    kwargs = client.poll_redemption_credited.await_args.kwargs
+    assert kwargs["coin"] == "USD1"
+    assert kwargs["min_credit"] == Decimal("50")
+
+
+@pytest.mark.asyncio
+async def test_execute_redeem_skips_poll_on_dry_run(tmp_path: Path) -> None:
+    """Dry-run places no orders, so there's nothing to wait for — the
+    settlement poll must not fire."""
+    client = AsyncMock()
+    client.place_earn_order.return_value = EarnOrderResult(orderId="r-1")
+    action = Action(
+        kind=ActionKind.REDEEM_EARN,
+        category="FlexibleSaving",
+        product_id="1131",
+        coin="USD1",
+        amount=Decimal("50"),
+        order_link_id="sandbox-test-redeem-dry",
+        reason="redeem",
+    )
+    await execute_actions(
+        client, [action], snapshot_ts="20260607T120000Z",
+        dry_run=True, executions_dir=tmp_path,
+    )
+    client.poll_redemption_credited.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_redeem_poll_timeout_continues(tmp_path: Path) -> None:
+    """If the freed coin doesn't credit in time, the cycle proceeds
+    (degrades to the old behavior) rather than raising."""
+    client = AsyncMock()
+    client.place_earn_order.return_value = EarnOrderResult(orderId="r-1")
+    client.poll_redemption_credited.side_effect = TimeoutError("not credited")
+    action = Action(
+        kind=ActionKind.REDEEM_EARN,
+        category="FlexibleSaving",
+        product_id="1131",
+        coin="USD1",
+        amount=Decimal("50"),
+        order_link_id="sandbox-test-redeem-timeout",
+        reason="redeem",
+    )
+    results = await execute_actions(
+        client, [action], snapshot_ts="20260607T120000Z",
+        dry_run=False, executions_dir=tmp_path,
+    )
+    assert results[0].status == "ok"
+    client.poll_redemption_credited.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -3741,11 +3852,21 @@ async def test_execute_redeem_success_lets_paired_close_perp_run(
 ) -> None:
     """Counter-test: when REDEEM succeeds, paired CLOSE_PERP runs
     normally — no false-positive skipping."""
-    from agent.bybit_oracle.bybit_client import EarnOrderResult, SpotOrderResult
+    from agent.bybit_oracle.bybit_client import (
+        EarnOrderResult,
+        EarnPosition,
+        SpotOrderResult,
+    )
     client = AsyncMock()
     client.place_earn_order.return_value = EarnOrderResult(
         orderId="earn-ok", orderLinkId="r-001"
     )
+    client.get_earn_positions.return_value = [
+        EarnPosition(
+            productId="8", coin="TON", amount="4.0", id="700",
+            category="OnChain", status="Active",
+        ),
+    ]
     client.place_perp_order.return_value = SpotOrderResult(
         orderId="perp-ok", orderLinkId="c-001"
     )
@@ -4078,3 +4199,41 @@ def test_reconcile_executions_errors_capped_at_ten(tmp_path: Path) -> None:
     assert summary["total"] == 25
     assert summary["counts"]["error"] == 25
     assert len(summary["errors"]) == 10
+
+
+def test_hedge_kept_while_onchain_redeem_unbonding() -> None:
+    """When the LLM drops a non-stable OnChain pick but the coin is STILL
+    held (redeem placed but unbonding/settling, Bybit keeps the row), the
+    perp hedge must NOT close — the in-flight redeem would otherwise be a
+    naked directional long for the whole settlement window."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        earn_positions=[_pos("OnChain", "8", "4.154", coin="TON")],
+        perp_positions=[_short_pos("TON", size="4.1", position_value="8.2")],
+        perp_market={"TON": _perp("TON", mark="2.0")},
+    )
+    d = _decision([_venue("cash_usdc", 1.0)])  # TON pick dropped
+    actions = diff_to_actions(snap, d, snapshot_ts="20260607T120000Z")
+    closes = [
+        a for a in actions
+        if a.kind == ActionKind.CLOSE_PERP and a.coin == "TON"
+    ]
+    assert closes == []  # hedge kept while TON still held / unbonding
+
+
+def test_hedge_closes_once_onchain_position_cleared() -> None:
+    """Counter-test: TON Earn position gone (redeem settled) + open short
+    + dropped pick → the hedge closes."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        earn_positions=[],  # TON cleared
+        perp_positions=[_short_pos("TON", size="4.1", position_value="8.2")],
+        perp_market={"TON": _perp("TON", mark="2.0")},
+    )
+    d = _decision([_venue("cash_usdc", 1.0)])
+    actions = diff_to_actions(snap, d, snapshot_ts="20260607T120000Z")
+    closes = [
+        a for a in actions
+        if a.kind == ActionKind.CLOSE_PERP and a.coin == "TON"
+    ]
+    assert len(closes) >= 1  # hedge closes now that underlying is gone

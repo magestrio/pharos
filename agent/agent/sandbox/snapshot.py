@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -40,6 +41,12 @@ from agent.bybit_oracle.bybit_client import (
     LinearTicker,
     OnChainEarnProduct,
     PerpPosition,
+)
+from agent.data.allora_client import (
+    SUPPORTED_TOKENS as ALLORA_TOKENS,
+    SUPPORTED_WINDOWS as ALLORA_WINDOWS,
+    AlloraClient,
+    AlloraInference,
 )
 from agent.reason.venues import CARRY_CATEGORY
 from agent.sandbox.on_chain import (
@@ -117,6 +124,14 @@ MAX_CARRY_NOTIONAL_FRACTION = Decimal("0.05")
 # month average ≈ 1.8% drag. Conservative placeholder; recalibrate in
 # `.6` smoke from realized P&L vs predicted carry.
 FUNDING_CARRY_FRICTION_ANNUAL = Decimal("0.018")
+
+# Reallocation horizon used to amortize zero-yield dead-time (subscribe
+# warmup + post-redeem processing) into `effective_apr_net_holding`. The
+# vault reallocates weekly; a product whose dead-time eats N of these 7
+# days realizes only `(H − N)/H` of its headline APR over one hold. Same
+# 7-day horizon the validator's lockup cap uses (validate.rules).
+HOLDING_HORIZON_MINUTES = 7 * 24 * 60  # 10080
+
 _EARN_PERMISSION_RET_CODE = 10005
 
 # Stables-set used to guarantee USDC-equivalent picks always survive the
@@ -154,8 +169,29 @@ class ProductSummary(BaseModel):
     coin: str  # for LM: f"{baseCoin}/{quoteCoin}"
     effective_apr: Decimal  # fractional [0, 1]
     apr_source: str  # measured_yield | estimate_apr | apy_e8 | aave_pool | quote_dual_offer | quote_discount | missing
+    # `effective_apr` discounted for the days capital earns NOTHING during
+    # a move — subscribe warmup (`yield_start_delay_min`) + post-redeem
+    # processing (`redeem_lockup_minutes`) — amortized over the weekly
+    # reallocation horizon (`HOLDING_HORIZON_MINUTES`). This is the rate
+    # to compare when deciding whether to CHURN into a product; the gross
+    # `effective_apr` overstates the realized return for short holds.
+    # None ⇒ no dead-time surfaced (net == gross).
+    effective_apr_net_holding: Decimal | None = None
     base_apr_string: str | None = None  # raw Bybit value (debug / audit)
     redeem_lockup_minutes: int | None = None
+    # OnChain Fixed-term lockup in days (`OnChainEarnProduct.term`, non-
+    # zero only for `duration == "Fixed"`). Distinct from
+    # `redeem_lockup_minutes` (post-redeem processing): this is the
+    # principal lock until maturity. The validator rejects picks whose
+    # fixed term exceeds the 7-day reallocation horizon. None ⇒ not a
+    # Fixed-term product (instant / Flexible).
+    fixed_term_days: int | None = None
+    # Minutes between a fresh subscribe and the moment the position starts
+    # ACCRUING yield (OnChain `interestCalculationTime − stakeTime`). Funds
+    # subscribed today don't earn until this elapses — zero-yield dead-time
+    # that erodes the realized APR over a short hold. None ⇒ not surfaced
+    # (Flexible products accrue ~immediately).
+    yield_start_delay_min: int | None = None
     # Minimum USD-equivalent the product accepts on a single subscribe.
     # Surfaced from Bybit's raw product fields (`minInvestmentQuote` for
     # LM, future: `minPurchaseAmount` for basic Earn) so the diff layer
@@ -218,6 +254,11 @@ class MarketSnapshot(BaseModel):
     eth_price: Decimal | None = None
     eth_24h_change_pct: Decimal | None = None
     eth_funding_rate: Decimal | None = None
+    # Allora directional forecasts (`mainnet-operations.7`). Empty list
+    # when ALLORA_API_KEY is unset OR every fetch in the cycle failed —
+    # the LLM treats absence as "no external signal" and falls back to
+    # its own market reasoning.
+    allora_inferences: list[AlloraInference] = Field(default_factory=list)
 
 
 class AaveV3UsdcSnapshot(BaseModel):
@@ -378,6 +419,18 @@ def _parse_percent(value: str | None) -> Decimal | None:
         return None
 
 
+def _parse_unix_ms(value: str | None) -> int | None:
+    """Parse Bybit's unix-millisecond timestamp strings into int. Returns
+    `None` on missing / malformed / non-positive."""
+    if not value:
+        return None
+    try:
+        ms = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return ms if ms > 0 else None
+
+
 def _flex_or_onchain_summary(
     p: FlexibleEarnProduct | OnChainEarnProduct,
     category: str,
@@ -410,13 +463,41 @@ def _flex_or_onchain_summary(
             lockup = None
 
     notes: list[str] = []
+    fixed_term_days: int | None = None
     if isinstance(p, OnChainEarnProduct):
         if p.duration == "Fixed" and p.term:
+            fixed_term_days = p.term
             notes.append(f"fixed_term_days={p.term}")
         if p.swapCoin:
             notes.append(f"swap_to={p.swapCoin}")
     if p.bonusEvents:
         notes.append(f"bonus_events={len(p.bonusEvents)}")
+
+    # Yield-start delay: OnChain products expose `stakeTime` and
+    # `interestCalculationTime` (unix ms). Funds subscribed at stakeTime
+    # don't accrue until interestCalculationTime — zero-yield warmup.
+    # Flexible products don't carry these → delay stays None.
+    yield_start_delay_min: int | None = None
+    if isinstance(p, OnChainEarnProduct):
+        stake_ms = _parse_unix_ms(p.stakeTime)
+        interest_ms = _parse_unix_ms(p.interestCalculationTime)
+        if stake_ms is not None and interest_ms is not None:
+            delay = (interest_ms - stake_ms) // 60000
+            if delay > 0:
+                yield_start_delay_min = int(delay)
+
+    # Effective APR net of zero-yield dead-time amortized over the weekly
+    # reallocation horizon. Dead-time = subscribe warmup + post-redeem
+    # processing (NOT fixed_term — principal earns during the term, it's
+    # just illiquid, which the lockup cap handles separately). Surfaced
+    # only when there IS dead-time, so the LLM sees net != gross.
+    effective_apr_net_holding: Decimal | None = None
+    dead_min = (yield_start_delay_min or 0) + (lockup or 0)
+    if dead_min > 0 and eff > 0:
+        earning = max(0, HOLDING_HORIZON_MINUTES - dead_min)
+        effective_apr_net_holding = (
+            eff * Decimal(earning) / Decimal(HOLDING_HORIZON_MINUTES)
+        )
 
     # minStakeAmount is denominated in the product's coin. For stables
     # (USDC/USDT/USDE/USD1/etc.) coin units ≈ USD, so it doubles as a
@@ -459,8 +540,11 @@ def _flex_or_onchain_summary(
         coin=p.coin,
         effective_apr=eff,
         apr_source=src,
+        effective_apr_net_holding=effective_apr_net_holding,
         base_apr_string=p.estimateApr,
         redeem_lockup_minutes=lockup,
+        fixed_term_days=fixed_term_days,
+        yield_start_delay_min=yield_start_delay_min,
         min_subscribe_usd=min_stake,
         stake_precision=stake_precision,
         notes=notes,
@@ -1062,6 +1146,35 @@ async def _measure_realized_apr(
     if not aprs:
         return None
     return sum(aprs, Decimal(0)) / Decimal(len(aprs))
+
+
+async def _collect_allora(errors: list[str]) -> list[AlloraInference]:
+    """Fan-out Allora fetches per (token, window). Returns the non-None
+    results, appends one error per failed call into `errors`. No-op when
+    `ALLORA_API_KEY` is unset.
+    """
+    key = os.environ.get("ALLORA_API_KEY", "").strip()
+    if not key:
+        return []
+    client = AlloraClient(key)
+    tasks = [
+        (token, window, client.fetch_inference(token, window))
+        for token in ALLORA_TOKENS
+        for window in ALLORA_WINDOWS
+    ]
+    results = await asyncio.gather(
+        *(t for _, _, t in tasks), return_exceptions=True
+    )
+    out: list[AlloraInference] = []
+    for (token, window, _), r in zip(tasks, results):
+        if isinstance(r, Exception):
+            errors.append(f"allora[{token}/{window}]: {type(r).__name__}: {r}")
+            continue
+        if r is None:
+            errors.append(f"allora[{token}/{window}]: empty")
+            continue
+        out.append(r)
+    return out
 
 
 async def _safe_earn(
@@ -2263,6 +2376,12 @@ async def collect_snapshot(
     # Market — take first ticker per symbol (single-symbol query returns one row)
     btc = btc_tickers[0] if btc_tickers else None
     eth = eth_tickers[0] if eth_tickers else None
+
+    # Allora directional forecasts. Best-effort: missing key → empty list,
+    # per-call failure → recorded in errors. The LLM treats absence as
+    # "no external signal" and falls back to spot+funding reasoning.
+    allora_inferences = await _collect_allora(errors)
+
     market = MarketSnapshot(
         btc_price=_ticker_price(btc),
         btc_24h_change_pct=_ticker_24h(btc),
@@ -2270,6 +2389,7 @@ async def collect_snapshot(
         eth_price=_ticker_price(eth),
         eth_24h_change_pct=_ticker_24h(eth),
         eth_funding_rate=_ticker_funding(eth),
+        allora_inferences=allora_inferences,
     )
 
     # Small-vault product filter (2026-06-03). Drop any product whose

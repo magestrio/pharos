@@ -612,6 +612,43 @@ def diff_to_actions(
                 )
             )
         else:
+            # Earn redeem expects NATIVE coin units, not USD. For
+            # non-stables, size the redeem from the held native qty
+            # (ground truth) scaled by the USD reduction — a full exit
+            # redeems the whole native balance. Without this the executor
+            # falls back to the USD `amount` and sends it as the native
+            # qty, so Bybit redeems the wrong amount / rejects — the exact
+            # "exit TON didn't actually redeem from staking" desync.
+            # Mirror of the subscribe + defensive-redeem paths above.
+            # Size off the HELD position's coin, not the target's — the
+            # target coin can default to USDC when the dropped product
+            # isn't in the snapshot product index, but we redeem the
+            # actual staked asset (e.g. TON).
+            redeem_native: Decimal | None = None
+            pos_coin = (current_pos.coin if current_pos else coin) or coin
+            if pos_coin and pos_coin != "USDC" and pos_coin not in _STABLES:
+                cur_native = (
+                    current_pos.amount_native if current_pos else Decimal(0)
+                )
+                if cur_native > 0 and current_amt > 0:
+                    frac = min(Decimal(1), (-delta) / current_amt)
+                    redeem_native = cur_native * frac
+                elif cur_native > 0:
+                    redeem_native = cur_native
+                if redeem_native is not None:
+                    product_sum = _earn_product_lookup(
+                        snapshot, category, product_id
+                    )
+                    precision = getattr(product_sum, "stake_precision", None)
+                    if precision is not None and precision >= 0:
+                        step = Decimal(1).scaleb(-precision)
+                        redeem_native = redeem_native.quantize(
+                            step, rounding=ROUND_DOWN
+                        )
+                    else:
+                        redeem_native = redeem_native.quantize(
+                            Decimal("0.0001"), rounding=ROUND_DOWN
+                        )
             redeems.append(
                 Action(
                     kind=ActionKind.REDEEM_EARN,
@@ -619,10 +656,16 @@ def diff_to_actions(
                     product_id=product_id,
                     coin=coin,
                     amount=-delta,
+                    amount_native=redeem_native,
                     order_link_id=order_link_id,
                     reason=(
                         f"redeem from {category}/{product_id} ({coin}): "
                         f"current ${current_amt:.2f} - target ${target_amt:.2f}"
+                        + (
+                            f" ({redeem_native} {coin} native)"
+                            if redeem_native is not None
+                            else ""
+                        )
                     ),
                 )
             )
@@ -1081,6 +1124,29 @@ def _hedge_diff_actions(
         decision, snapshot, total_book_usd
     )
 
+    # Coins still HELD as a non-stable OnChain Earn position right now
+    # (incl. a redeem that's placed but unbonding/settling — Bybit keeps
+    # the row until funds clear). The hedge must track the actual
+    # underlying, not the LLM's intent: closing the perp the moment the
+    # LLM drops the pick would leave the still-staked/unbonding coin a
+    # naked directional long for the whole settlement window. So we keep
+    # the hedge while the coin is still held and only close once the Earn
+    # position has actually cleared.
+    held_earn_coins: set[str] = set()
+    for p in snapshot.earn_positions:
+        data = p.model_dump(mode="python") if hasattr(p, "model_dump") else p
+        if (data.get("category") or "") not in _AUTO_HEDGE_CATEGORIES:
+            continue
+        c = (data.get("coin") or "").upper()
+        if not c or c in _STABLES:
+            continue
+        try:
+            amt = Decimal(str(data.get("amount", "0") or "0"))
+        except (InvalidOperation, TypeError):
+            amt = Decimal(0)
+        if amt > 0:
+            held_earn_coins.add(c)
+
     all_coins = sorted(set(current_by_coin) | set(targets_by_coin))
     cursor = idx_offset
 
@@ -1096,10 +1162,19 @@ def _hedge_diff_actions(
         target_notional = target if target is not None else Decimal(0)
 
         # CLOSE: current exists, and either target absent OR notional
-        # drift exceeds the rebalance threshold.
-        needs_close = pos is not None and (
-            target is None
-            or _notional_drifts(current_notional, target_notional)
+        # drift exceeds the rebalance threshold. EXCEPTION: when the LLM
+        # dropped the pick (target is None) but the coin is still held as
+        # an OnChain Earn position (redeem unbonding/settling), keep the
+        # hedge — closing now would unhedge the in-flight redeem. The
+        # close fires on a later cycle once the Earn position clears.
+        still_held = target is None and coin.upper() in held_earn_coins
+        needs_close = (
+            pos is not None
+            and not still_held
+            and (
+                target is None
+                or _notional_drifts(current_notional, target_notional)
+            )
         )
         # OPEN: target exists, and either current absent OR we're about
         # to close-and-reopen.
@@ -2452,7 +2527,15 @@ async def _ensure_fund_balance(
         log.warning("ensure_fund_balance: UNIFIED probe failed for %s: %s", coin, e)
         return
     unified_have = _coin_equity_from_wallet(unified, coin)
-    move = min(unified_have, gap_with_buffer)
+    # Bybit's internal-transfer rejects amounts whose decimal scale exceeds
+    # the coin's transfer accuracy (retCode 131210 "transfer amount scale
+    # more than accuracy length"). `gap_with_buffer` is already 6dp, but
+    # `unified_have` carries the wallet's full precision (8+dp) and can win
+    # the min(), so re-quantize the final move down to 6dp. ROUND_DOWN so
+    # we never move more than is actually available.
+    move = min(unified_have, gap_with_buffer).quantize(
+        Decimal("0.000001"), rounding=ROUND_DOWN
+    )
     if move <= 0:
         log.info(
             "ensure_fund_balance: no UNIFIED balance to move for %s "
@@ -2970,6 +3053,14 @@ def _close_naked_perp_actions(
     for a in redeems:
         if a.kind != ActionKind.REDEEM_EARN or not a.coin:
             continue
+        # OnChain redeems unbond/settle over time — the staked coin stays
+        # as backing this cycle (Bybit keeps the position until funds
+        # clear), so they must NOT reduce long exposure here, or the perp
+        # gets closed mid-unbond and the in-flight redeem goes naked. The
+        # hedge-diff layer applies the same hold. Pooled FlexibleSaving
+        # redeems are instant and DO reduce backing.
+        if (a.category or "") == "OnChain":
+            continue
         sub = a.amount_native if a.amount_native is not None else Decimal(0)
         if sub > 0:
             long_now[a.coin.upper()] = max(
@@ -3425,6 +3516,15 @@ def _notional_drifts(current: Decimal, target: Decimal) -> bool:
 # ─── Execution ──────────────────────────────────────────────────────────────
 
 
+# Redeem settlement barrier timeout. A successful REDEEM_EARN only PLACES
+# the order — the freed coin credits the wallet a bit later (FlexibleSaving
+# redemption is usually <1min). We poll inline before moving to capital-
+# consuming actions. Bounded well under the heartbeat so a slow/never-
+# settling redeem degrades to the old behavior (subscribe 180016 + atomic-
+# pair guard) rather than stalling the whole cycle.
+REDEEM_SETTLE_TIMEOUT_SECONDS: float = 180
+
+
 async def execute_actions(
     client: BybitClient,
     actions: list[Action],
@@ -3439,6 +3539,18 @@ async def execute_actions(
     Sequential by design — Bybit Earn subscriptions affect the same
     wallet balance; running in parallel would risk insufficient-funds
     errors mid-batch when the first subscribe hasn't settled yet.
+
+    Redeem settlement barrier (2026-06-07): after a successful
+    REDEEM_EARN we poll the wallet until the freed coin is actually
+    credited (`poll_redemption_credited`) before continuing to the spot-
+    sell / subscribe / perp-margin actions that consume it. The action
+    list is ordered redeems-first precisely so this freed capital funds
+    the subscribes; without the wait a rebalance that needs the freed
+    USD silently no-ops on retCode=180016. Polled inline (not as a
+    deferred end-of-redeems barrier) because the poll captures its
+    balance baseline at call entry — issuing all redeems first would let
+    the credit land before the baseline and the poll would never see the
+    delta.
 
     Atomic-pair guard (2026-06-03): if a REDEEM_EARN errors out (most
     commonly retCode=180020 "Position not found" / "Processing"), the
@@ -3543,6 +3655,33 @@ async def execute_actions(
                     "later OPEN_PERP_SHORT on this coin",
                     action.coin, res.error,
                 )
+
+            # Redeem settlement barrier (see function docstring): block
+            # until the redeemed coin is credited so the downstream
+            # spend (sell / subscribe / margin) sees real liquidity.
+            # Timeout → warn and proceed; the dependent SUBSCRIBE will
+            # 180016 and the atomic-pair guard handles its perp leg.
+            if (
+                action.kind == ActionKind.REDEEM_EARN
+                and res.status == "ok"
+                and not dry_run
+                and action.coin
+                and action.amount
+            ):
+                try:
+                    await client.poll_redemption_credited(
+                        coin=action.coin,
+                        min_credit=action.amount,
+                        timeout_seconds=REDEEM_SETTLE_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError as e:
+                    log.warning(
+                        "redeem of %s %s not credited before downstream "
+                        "spend (%s) — proceeding; a dependent SUBSCRIBE "
+                        "may hit 180016 and the atomic-pair guard will "
+                        "skip its perp leg",
+                        action.amount, action.coin, e,
+                    )
     return results
 
 
@@ -4133,6 +4272,38 @@ async def _execute_one(
                 if action.amount_native is not None
                 else action.amount
             )
+            # Robust redeem sizing (safety net over the diff layer): a
+            # non-stable Earn redeem with no planner-computed native qty
+            # would send the USD `amount` as the coin qty → Bybit can't
+            # find that many coins → retCode 180020 "Position not found"
+            # (live 2026-06-06/07, TON OnChain). Pull the real held native
+            # qty from Bybit so a redeem is ALWAYS in coin units; refuse
+            # rather than send USD-as-native.
+            if (
+                action.kind == ActionKind.REDEEM_EARN
+                and action.amount_native is None
+                and action.coin
+                and action.coin.upper() not in _STABLES
+            ):
+                held = await _live_earn_native_qty(
+                    client, action.category, action.product_id
+                )
+                if held is not None:
+                    send_amount = held
+                else:
+                    return ActionResult(
+                        action=action,
+                        status="error",
+                        response=None,
+                        error=(
+                            f"redeem {action.coin} {action.category}/"
+                            f"{action.product_id}: no native qty from planner "
+                            "and live position lookup empty — refusing to send "
+                            "USD as native (would 180020)"
+                        ),
+                        started_at=started,
+                        finished_at=datetime.now(UTC).isoformat(),
+                    )
             # For OnChain Stake (FUND wallet, per V5 spec) the coin must
             # already be in FUND. Non-stable Buy swaps deliver to UNIFIED,
             # so we transfer UNIFIED→FUND first. Mirror of the existing
@@ -4150,16 +4321,26 @@ async def _execute_one(
                     )
                 except (InvalidOperation, TypeError):
                     pass
-            earn_out = await client.place_earn_order(
-                category=action.category,  # type: ignore[arg-type]
-                product_id=action.product_id,
-                amount=str(send_amount),
-                side=side,  # type: ignore[arg-type]
-                coin=action.coin,
-                account_type=account_type,  # type: ignore[arg-type]
-                order_link_id=action.order_link_id,
-            )
-            response = {"orderId": earn_out.orderId}
+            if (
+                action.kind == ActionKind.REDEEM_EARN
+                and action.category == "OnChain"
+            ):
+                # OnChain non-LST redeem must target each per-stake
+                # position by its redeemPositionId, else 180020.
+                response = await _redeem_onchain_by_position(
+                    client, action, Decimal(str(send_amount))
+                )
+            else:
+                earn_out = await client.place_earn_order(
+                    category=action.category,  # type: ignore[arg-type]
+                    product_id=action.product_id,
+                    amount=str(send_amount),
+                    side=side,  # type: ignore[arg-type]
+                    coin=action.coin,
+                    account_type=account_type,  # type: ignore[arg-type]
+                    order_link_id=action.order_link_id,
+                )
+                response = {"orderId": earn_out.orderId}
     except BybitAPIError as e:
         return ActionResult(
             action=action,
@@ -4441,6 +4622,100 @@ def _alpha_current_positions(
 class _TargetPos:
     coin: str
     amount_usd: Decimal
+
+
+async def _redeem_onchain_by_position(
+    client: Any, action: "Action", target_native: Decimal
+) -> dict[str, Any]:
+    """Redeem an OnChain (non-LST) Earn product. Unlike pooled
+    FlexibleSaving, OnChain positions are per-stake: each carries its own
+    `id` and a Redeem WITHOUT `redeemPositionId` returns retCode 180020
+    "Position not found" (live TON, 2026-06-06/07). Fetch the live
+    positions for the product and redeem them one id at a time until the
+    requested native amount is covered. Returns a summary dict; raises the
+    last BybitAPIError only when every position-level redeem failed."""
+    positions = await client.get_earn_positions(category=action.category)
+    rows = [
+        p
+        for p in positions
+        if str(getattr(p, "productId", "")) == str(action.product_id)
+        and (getattr(p, "id", None) or "")
+    ]
+    if not rows:
+        raise BybitAPIError(
+            180020, "no OnChain position id to redeem", "/v5/earn/place-order"
+        )
+    remaining = target_native
+    redeemed: list[str] = []
+    last_err: BybitAPIError | None = None
+    for p in rows:
+        if remaining <= 0:
+            break
+        pid = str(p.id)
+        # Prefer the redeemable (available) amount; fall back to the full
+        # staked amount when Bybit doesn't surface availableAmount.
+        try:
+            avail = Decimal(str(getattr(p, "availableAmount", "") or "0"))
+        except (InvalidOperation, TypeError):
+            avail = Decimal(0)
+        try:
+            staked = Decimal(str(getattr(p, "amount", "0") or "0"))
+        except (InvalidOperation, TypeError):
+            staked = Decimal(0)
+        pos_qty = avail if avail > 0 else staked
+        if pos_qty <= 0:
+            continue
+        redeem_qty = min(pos_qty, remaining)
+        try:
+            out = await client.place_earn_order(
+                category=action.category,
+                product_id=action.product_id,
+                amount=str(redeem_qty),
+                side="Redeem",
+                coin=action.coin,
+                account_type=_ACCOUNT_TYPE[action.category],
+                order_link_id=f"{action.order_link_id}_{pid}"[:36],
+                redeem_position_id=pid,
+            )
+            redeemed.append(out.orderId)
+            remaining -= redeem_qty
+        except BybitAPIError as e:
+            last_err = e
+            continue
+    if not redeemed:
+        raise last_err or BybitAPIError(
+            180020, "all OnChain position redeems failed", "/v5/earn/place-order"
+        )
+    return {
+        "orderId": redeemed[0],
+        "redeemed_position_ids": redeemed,
+        "count": len(redeemed),
+    }
+
+
+async def _live_earn_native_qty(
+    client: Any, category: str, product_id: str
+) -> Decimal | None:
+    """Sum the live native-coin amount Bybit holds for one Earn product
+    (all rows for the product_id — e.g. settled + Processing OnChain
+    chunks). Used as the executor-side fallback so a non-stable REDEEM is
+    always sized in coin units even when the planner left amount_native
+    unset. Returns None on lookup failure or when nothing is held."""
+    try:
+        positions = await client.get_earn_positions(category=category)
+    except BybitAPIError:
+        return None
+    total = Decimal(0)
+    for p in positions:
+        if str(getattr(p, "productId", "")) != str(product_id):
+            continue
+        try:
+            amt = Decimal(str(getattr(p, "amount", "0")))
+        except (InvalidOperation, TypeError):
+            continue
+        if amt > 0:
+            total += amt
+    return total if total > 0 else None
 
 
 def _current_positions_by_pid(

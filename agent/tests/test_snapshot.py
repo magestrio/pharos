@@ -148,6 +148,51 @@ def test_onchain_summary_surfaces_fixed_term_and_swap_in_notes():
     s = _flex_or_onchain_summary(p, "OnChain")
     assert "fixed_term_days=30" in s.notes
     assert "swap_to=cmETH" in s.notes
+    # Fix 1: also surfaced as a structured field the validator can gate on.
+    assert s.fixed_term_days == 30
+
+
+def test_onchain_summary_yield_start_delay_from_timestamps():
+    """OnChain stakeTime→interestCalculationTime gap = subscribe warmup
+    where funds don't yet accrue."""
+    stake_ms = 1_700_000_000_000
+    interest_ms = stake_ms + 2 * 24 * 60 * 60 * 1000  # +2 days
+    p = _onchain(
+        "delayed", "20.0%", coin="SOL",
+        stakeTime=str(stake_ms),
+        interestCalculationTime=str(interest_ms),
+    )
+    s = _flex_or_onchain_summary(p, "OnChain")
+    assert s.yield_start_delay_min == 2880  # 2 days in minutes
+
+
+def test_onchain_summary_net_apr_discounts_dead_time():
+    """effective_apr_net_holding amortizes warmup + redeem processing over
+    the 7-day horizon, so it sits below the headline APR."""
+    stake_ms = 1_700_000_000_000
+    interest_ms = stake_ms + 2 * 24 * 60 * 60 * 1000  # +2 days warmup
+    p = _onchain(
+        "delayed", "20.0%", coin="SOL",
+        stakeTime=str(stake_ms),
+        interestCalculationTime=str(interest_ms),
+        redeemProcessingMinute=1440,  # +1 day post-redeem processing
+    )
+    s = _flex_or_onchain_summary(p, "OnChain")
+    dead = 2880 + 1440  # 3 days of zero yield
+    earning = 10080 - dead
+    expected = Decimal("0.20") * Decimal(earning) / Decimal(10080)
+    assert s.effective_apr == Decimal("0.20")
+    assert s.effective_apr_net_holding == expected
+    assert s.effective_apr_net_holding < s.effective_apr
+
+
+def test_flex_summary_no_net_apr_without_dead_time():
+    """Flexible product: instant accrual + redeem → net == gross, field
+    left None so the LLM knows there's no dead-time penalty."""
+    p = _flex("1131", "7.0%", coin="USD1")
+    s = _flex_or_onchain_summary(p, "FlexibleSaving")
+    assert s.yield_start_delay_min is None
+    assert s.effective_apr_net_holding is None
 
 
 # ─── _lm_summary ────────────────────────────────────────────────────────────

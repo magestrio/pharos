@@ -53,11 +53,13 @@ MAX_EFFECTIVE_PRODUCT = 0.50
 # which is independent of *which* stable is staked. Splitting USD1
 # across two products on the same venue doesn't actually reduce that
 # risk — it just dilutes APR onto the lower-yielding fallback. So we
-# let the LLM concentrate on the highest-APR stable Earn pick up to
-# the venue cap (typically 0.70). Raised from 0.50 on 2026-06-03 after
-# small-vault $30 idle audit — the prior cap forced LLM into 40% cash
-# when a 70% USD1 allocation was structurally safer.
-MAX_EFFECTIVE_STABLE_PRODUCT = 0.70
+# let the LLM concentrate on the highest-APR stable Earn pick — but
+# concentration is still bounded. Lowered to 0.40 on 2026-06-07 (operator
+# call) after a single USD1 pick took ~71% of a $70 book: counterparty
+# risk is one thing, but a single Earn product owning two-thirds of the
+# vault is too concentrated. To deploy more than 40% into stables, split
+# across distinct products/venues or accept a higher cash buffer.
+MAX_EFFECTIVE_STABLE_PRODUCT = 0.40
 
 # Conditional cap thresholds
 PEG_STRESS_BPS = 100
@@ -263,10 +265,19 @@ MAX_LOCKUP_MINUTES: int = 7 * 24 * 60  # 10080 = 7 days
 
 
 def check_lockup_cap(d: Decision, snapshot: Snapshot) -> Check:
-    """Reject any pick whose `redeem_lockup_minutes` (from snapshot)
-    exceeds `MAX_LOCKUP_MINUTES`. Picks without surfaced lockup are
-    treated as instant-redeem and allowed through (e.g. FlexibleSaving
-    products typically have `redeem_lockup_minutes=None`)."""
+    """Reject any pick whose effective lockup exceeds `MAX_LOCKUP_MINUTES`.
+
+    Two distinct lockup sources, both capped at the 7-day reallocation
+    horizon:
+    - `redeem_lockup_minutes` — post-redeem processing window
+      (`redeemProcessingMinute`). None ⇒ instant redeem (e.g.
+      FlexibleSaving), allowed through.
+    - `fixed_term_days` — OnChain Fixed-term principal lock until
+      maturity (`OnChainEarnProduct.term`). The docstring on
+      `OnChainEarnProduct` requires the validator to reject staking that
+      can't unwind before the next rebalance; this enforces it. None ⇒
+      Flexible / instant, allowed through.
+    """
     idx = _snapshot_index(snapshot)
     violations: list[str] = []
     for v in d.venues:
@@ -284,6 +295,12 @@ def check_lockup_cap(d: Decision, snapshot: Snapshot) -> Check:
                 violations.append(
                     f"{v.venue_id}/{pick.product_id} "
                     f"({lockup} min ≈ {days}d, cap 7d)"
+                )
+            term_days = summary.fixed_term_days
+            if term_days is not None and term_days * 1440 > MAX_LOCKUP_MINUTES:
+                violations.append(
+                    f"{v.venue_id}/{pick.product_id} "
+                    f"(fixed-term {term_days}d, cap 7d)"
                 )
     if violations:
         return False, (

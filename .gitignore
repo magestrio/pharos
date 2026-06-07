@@ -21,3 +21,4 @@ agent/agent/sandbox/cycle_log.jsonl
 agent/agent/sandbox/state/
 agent/agent/sandbox/events/
 .vault8004/
+.vercel

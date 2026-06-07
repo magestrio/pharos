@@ -1297,13 +1297,18 @@ class BybitClient:
         coin: str,
         account_type: AccountType,
         order_link_id: str,
+        redeem_position_id: str | None = None,
     ) -> EarnOrderResult:
         """Stake or Redeem a basic Earn product (FlexibleSaving | OnChain).
-        All seven fields are required by V5 `/v5/earn/place-order`:
+        All seven base fields are required by V5 `/v5/earn/place-order`:
         OnChain only accepts `accountType=FUND`; the same `order_link_id`
         cannot be reused within 30min (Bybit dedupes by it).
 
-        For advance categories use `place_advance_earn_order`.
+        `redeem_position_id` (Bybit `redeemPositionId`) is REQUIRED for
+        OnChain non-LST Redeem: those positions are per-stake (each carries
+        its own `id`/`orderId`), and a Redeem without it returns retCode
+        180020 "Position not found". FlexibleSaving is pooled and ignores
+        it. For advance categories use `place_advance_earn_order`.
         """
         body: dict[str, Any] = {
             "category": category,
@@ -1314,6 +1319,8 @@ class BybitClient:
             "accountType": account_type,
             "orderLinkId": order_link_id,
         }
+        if redeem_position_id is not None:
+            body["redeemPositionId"] = redeem_position_id
         data = await self._request("POST", "/v5/earn/place-order", body=body)
         return BybitResponse[EarnOrderResult].model_validate(data).result  # type: ignore[return-value]
 

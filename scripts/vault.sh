@@ -33,6 +33,11 @@ Commands:
   start             Bring up anvil-fork, postgres, deploy contracts,
                     start API + web + agent loop (local).
                     Remote: docker compose up -d --build on Hetzner.
+  sync              [remote] rsync the working tree to Hetzner
+                    ($HETZNER_REPO_DIR). Excludes .env*, *.pem, .git,
+                    node_modules, .venv, build/runtime dirs.
+  deploy            [remote] sync + docker compose up -d --build. This is
+                    the full code-deploy (no git remote configured).
   stop              Stop services.
   restart           stop + start.
   status            What's running, contract addresses, db state.
@@ -44,9 +49,10 @@ Commands:
 
 Examples:
   pnpm start                  # local: everything up
+  pnpm deploy --remote        # rsync tree → Hetzner, then up -d --build
   pnpm start --remote         # ssh into Hetzner, docker compose up -d
   pnpm status --remote
-  pnpm agent:run --remote
+  pnpm agent:run --remote     # one live cycle in the prod container
   pnpm logs agent-loop        # tail local agent log
 
 Direct (no pnpm):
@@ -198,6 +204,9 @@ stop_local() {
 
 # Remote commands ---------------------------------------------------------
 
+remote_sync_only() { load_env; remote_check; remote_sync; }
+# Full deploy: push code THEN rebuild+restart from the fresh tree.
+remote_deploy()  { load_env; remote_check; remote_sync; remote_compose up -d --build; }
 remote_start()   { load_env; remote_check; remote_compose up -d --build; }
 remote_stop()    { load_env; remote_check; remote_compose down; }
 remote_restart() { load_env; remote_check; remote_compose restart; }
@@ -225,6 +234,7 @@ run_local() {
     agent:loop)       load_env; load_env_local; start_agent_loop_local ;;
     db:reset)         load_env; start_pg; reset_db ;;
     contracts:deploy) load_env; start_anvil; deploy_local ;;
+    sync|deploy)      die "'$cmd' is remote-only — use: pnpm $cmd --remote" ;;
     logs)
       local svc=${1:-}
       [[ -n $svc ]] || die "usage: pnpm logs <service>  (anvil|api|web|agent-loop)"
@@ -238,6 +248,8 @@ run_local() {
 
 run_remote() {
   case "$cmd" in
+    sync)        remote_sync_only ;;
+    deploy)      remote_deploy ;;
     start)       remote_start ;;
     stop)        remote_stop ;;
     restart)     remote_restart ;;
