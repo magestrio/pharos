@@ -153,6 +153,39 @@ def test_flex_summary_uses_estimate_apr_for_non_special_product():
     assert s.apr_source == "estimate_apr"
 
 
+def test_flex_summary_prefers_apr_history_over_measured_and_estimate():
+    """`.70`: apr-history (pool-level, subsidy-inclusive, smoothed) wins over
+    both the noise-prone measured_yield and estimate_apr."""
+    p = _flex("1131", "0.83%", coin="USD1")
+    s = _flex_or_onchain_summary(
+        p, "FlexibleSaving",
+        measured_apr=Decimal("0.0700"),   # noisy 24h realized
+        apr_history=Decimal("0.0211"),    # smoothed pool effective
+    )
+    assert s.effective_apr == Decimal("0.0211")
+    assert s.apr_source == "apr_history"
+
+
+def test_flex_summary_falls_back_to_measured_when_no_apr_history():
+    """`.70`: measured_yield is the fallback when apr-history has no data."""
+    p = _flex("2", "0.78%")
+    s = _flex_or_onchain_summary(
+        p, "FlexibleSaving", measured_apr=Decimal("0.0103"), apr_history=None,
+    )
+    assert s.effective_apr == Decimal("0.0103")
+    assert s.apr_source == "measured_yield"
+
+
+def test_flex_summary_falls_back_to_estimate_when_no_effective_sources():
+    """`.70`: with neither apr-history nor measured_yield, estimate_apr."""
+    p = _flex("2", "0.78%")
+    s = _flex_or_onchain_summary(
+        p, "FlexibleSaving", measured_apr=None, apr_history=None,
+    )
+    assert s.effective_apr == Decimal("0.0078")
+    assert s.apr_source == "estimate_apr"
+
+
 def test_flex_summary_marks_missing_when_no_apr_anywhere():
     p = _flex("9999", None)
     s = _flex_or_onchain_summary(p, "FlexibleSaving")
@@ -646,6 +679,10 @@ def _mock_client_full() -> AsyncMock:
     # `.32`: perp positions default to empty so the snapshot collector
     # has something iterable to consume. Per-test overrides patch this.
     client.get_positions.return_value = []
+    # `.70`: apr-history defaults to no data → ranker falls back to
+    # measured_yield / estimateApr (the behavior these tests assert). A
+    # bare AsyncMock would return an un-awaited coroutine from `.get(...)`.
+    client.get_apr_history.return_value = {"list": []}
     return client
 
 

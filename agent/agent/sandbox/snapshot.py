@@ -168,7 +168,7 @@ class ProductSummary(BaseModel):
     product_id: str
     coin: str  # for LM: f"{baseCoin}/{quoteCoin}"
     effective_apr: Decimal  # fractional [0, 1]
-    apr_source: str  # measured_yield | estimate_apr | apy_e8 | aave_pool | quote_dual_offer | quote_discount | missing
+    apr_source: str  # apr_history | measured_yield | estimate_apr | apy_e8 | aave_pool | quote_dual_offer | quote_discount | missing
     # `effective_apr` discounted for the days capital earns NOTHING during
     # a move — subscribe warmup (`yield_start_delay_min`) + post-redeem
     # processing (`redeem_lockup_minutes`) — amortized over the weekly
@@ -465,19 +465,26 @@ def _flex_or_onchain_summary(
     p: FlexibleEarnProduct | OnChainEarnProduct,
     category: str,
     measured_apr: Decimal | None = None,
+    apr_history: Decimal | None = None,
 ) -> ProductSummary:
-    # APR resolution order:
-    #   1. `measured_apr` — realized APR computed from
-    #      `/v5/earn/hourly-yield` records on our open position. This is
-    #      the ground truth, captures any UI-only promo subsidies
-    #      Bybit's `estimateApr` field doesn't carry (e.g. USD1 shows
-    #      0.59% in API but realized ~7% under "Hold USD1, Earn WLFI").
-    #      Available ONLY for products with an active position +
-    #      ≥1 hourly settlement on Bybit's side.
-    #   2. `estimateApr` — Bybit's quoted base APR. Excludes promos.
-    #   3. `missing` — neither available → 0% / validator rejects pick.
+    # APR resolution order (`.70` re-prioritized apr_history over the
+    # noise-prone measured_yield):
+    #   1. `apr_history` — mean effective APR from `/v5/earn/apr-history`.
+    #      Pool-level, subsidy-inclusive AND hourly-smoothed: captures the
+    #      same promos as measured_yield (USD1 estimateApr 0.83% →
+    #      apr-history ~2.1%) but WITHOUT the small-position rounding noise
+    #      that inflated USDC product 2 to a spurious 4% (`.46`). Available
+    #      for any FlexibleSaving / OnChain product, position or not.
+    #   2. `measured_apr` — realized APR from `/v5/earn/hourly-yield` on our
+    #      open position. Fallback when apr-history has no data. Noise-prone
+    #      on tiny stakes (sub-precision hourly credits annualize huge), so
+    #      no longer the primary.
+    #   3. `estimateApr` — Bybit's quoted base APR. Excludes promos.
+    #   4. `missing` — none available → 0% / validator rejects pick.
     base = _parse_percent(p.estimateApr)
-    if measured_apr is not None and measured_apr > 0:
+    if apr_history is not None and apr_history > 0:
+        eff, src = apr_history, "apr_history"
+    elif measured_apr is not None and measured_apr > 0:
         eff, src = measured_apr, "measured_yield"
     elif base is not None:
         eff, src = base, "estimate_apr"
@@ -1190,6 +1197,40 @@ async def _measure_realized_apr(
     if not aprs:
         return None
     return sum(aprs, Decimal(0)) / Decimal(len(aprs))
+
+
+async def _measure_apr_history_mean(
+    client: BybitClient,
+    category: str,
+    product_id: str,
+    *,
+    days: int = 7,
+) -> Decimal | None:
+    """Mean effective APR from Bybit's `/v5/earn/apr-history` (`.70`).
+
+    Preferred over `_measure_realized_apr` (our 24h position `hourly-yield`):
+    apr-history is **pool-level, subsidy-inclusive, and hourly-smoothed**, so
+    it captures the same promos (USD1 estimateApr 0.83% → apr-history ~2.1%,
+    peaks 4.8%) WITHOUT the small-position rounding noise that inflated USD1C
+    product 2 to a spurious 4% (`bybit-sandbox.46`). Available for any
+    FlexibleSaving / OnChain product without an open position.
+
+    Returns the fractional [0,1] mean over the lookback, or None on no data /
+    error (caller falls back to `measured_yield` → `estimateApr`)."""
+    try:
+        data = await client.get_apr_history(
+            category=category, product_id=product_id, days=days
+        )
+    except BybitAPIError:
+        return None
+    vals: list[Decimal] = []
+    for row in data.get("list") or []:
+        v = _parse_percent(row.get("apr"))
+        if v is not None and v >= 0:
+            vals.append(v)
+    if not vals:
+        return None
+    return sum(vals, Decimal(0)) / Decimal(len(vals))
 
 
 async def _collect_allora(errors: list[str]) -> list[AlloraInference]:
@@ -2169,6 +2210,29 @@ async def collect_snapshot(
             if apr is not None:
                 measured_aprs[(cat, pid)] = apr
 
+    # apr-history APR (`.70`): pool-level, subsidy-inclusive effective APR
+    # for EVERY FlexibleSaving / OnChain candidate (no open position needed),
+    # the ranker's preferred signal over the noise-prone 24h `measured_yield`
+    # (see `_measure_apr_history_mean`). Fans out concurrently; per-product
+    # failures degrade to None so the summary falls back to measured_yield /
+    # estimateApr and the snapshot still builds under rate-limit.
+    aprhist_pairs = [
+        ("FlexibleSaving", p.productId) for p in flex_products if p.productId
+    ] + [("OnChain", p.productId) for p in onchain_products if p.productId]
+    aprhist_aprs: dict[tuple[str, str], Decimal] = {}
+    if aprhist_pairs:
+        results = await asyncio.gather(
+            *(_measure_apr_history_mean(client, cat, pid)
+              for cat, pid in aprhist_pairs),
+            return_exceptions=True,
+        )
+        for (cat, pid), apr in zip(aprhist_pairs, results):
+            if isinstance(apr, BaseException):
+                errors.append(f"apr_history[{cat}/{pid}]: {type(apr).__name__}: {apr}")
+                continue
+            if apr is not None:
+                aprhist_aprs[(cat, pid)] = apr
+
     # Wallet
     try:
         total_equity = Decimal(str(asset_overview.get("totalEquity", "0") or "0"))
@@ -2193,6 +2257,7 @@ async def collect_snapshot(
                     p,
                     "FlexibleSaving",
                     measured_apr=measured_aprs.get(("FlexibleSaving", p.productId)),
+                    apr_history=aprhist_aprs.get(("FlexibleSaving", p.productId)),
                 )
                 for p in flex_products
             ],
@@ -2204,6 +2269,7 @@ async def collect_snapshot(
                     p,
                     "OnChain",
                     measured_apr=measured_aprs.get(("OnChain", p.productId)),
+                    apr_history=aprhist_aprs.get(("OnChain", p.productId)),
                 )
                 for p in onchain_products
             ],
