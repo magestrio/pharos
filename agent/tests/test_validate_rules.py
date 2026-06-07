@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
@@ -50,6 +51,7 @@ from agent.validate.rules import (
     check_picks_required,
     check_product_ids_in_snapshot,
     check_risk_flags,
+    check_stable_earn_funding,
     check_stable_spend_cap,
     check_venue_caps,
     check_venue_floors,
@@ -105,6 +107,7 @@ def _snapshot(
     total_equity_usd: str = "100",
     liquid_usdc_usd: str = "0",
     liquid_usdt_usd: str = "0",
+    earn_positions: list[dict[str, Any]] | None = None,
 ) -> Snapshot:
     """Build a Snapshot with all the bells the validator reads. Defaults
     yield a calm regime — peg fine, one stable in flex, one stable in
@@ -125,7 +128,7 @@ def _snapshot(
             liquid_usdc_usd=Decimal(liquid_usdc_usd),
             liquid_usdt_usd=Decimal(liquid_usdt_usd),
         ),
-        earn_positions=[],
+        earn_positions=earn_positions or [],
         lm_positions=[],
         products=products,
         market=MarketSnapshot(),
@@ -830,6 +833,37 @@ def test_check_funding_rate_floor_fails_when_7d_avg_below_floor() -> None:
     assert "TON" in (msg or "")
 
 
+def test_check_funding_rate_floor_exempts_held_position_kept() -> None:
+    """Regression (`bybit-sandbox.65`, prod 2026-06-07): a held non-stable
+    position the LLM KEEPS at its current size must NOT be rejected for
+    sub-floor funding. The live blocker was a TON OnChain stake in
+    `Processing` status (un-redeemable) with funding -30%/yr — the prompt
+    forces holding Processing picks, but the floor demanded an impossible
+    exit, stranding every cycle as skipped:invalid. The floor gates only
+    NEW/grown exposure (net-new >= MIN_ACTION)."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={"TON": _perp("TON", mark="2.0", funding_rate_7d_avg="-0.0005")},
+        earn_positions=[_held_ton("13"), _held_ton("12")],  # 25 TON × $2 = $50 held
+    )
+    d = _hedged_decision(hedge_notional=-50.0)  # onchain 0.5 × $100 = $50 target == held
+    assert check_funding_rate_floor(d, s) == (True, None)
+
+
+def test_check_funding_rate_floor_fires_when_growing_held_below_floor() -> None:
+    """Growing a sub-floor position adds fresh funding bleed → still
+    rejected. Held $20, target $50 → net-new $30 (>= MIN_ACTION) → fire."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={"TON": _perp("TON", mark="2.0", funding_rate_7d_avg="-0.0005")},
+        earn_positions=[_held_ton("10")],  # 10 TON × $2 = $20 held
+    )
+    d = _hedged_decision(hedge_notional=-50.0)  # $50 target → +$30 new
+    ok, msg = check_funding_rate_floor(d, s)
+    assert ok is False
+    assert "TON" in (msg or "")
+
+
 def test_check_funding_rate_floor_passes_when_positive() -> None:
     s = _snapshot(
         onchain_products=_onchain_ton(),
@@ -971,6 +1005,166 @@ def test_check_stable_spend_cap_skips_pick_without_perp_market() -> None:
     assert check_stable_spend_cap(d, s) == (True, None)
 
 
+def _held_ton(amount: str, *, product_id: str = "8", status: str = "Active") -> dict:
+    """One OnChain TON earn-position row (Bybit shape: native `amount`)."""
+    return {
+        "productId": product_id,
+        "coin": "TON",
+        "amount": amount,
+        "category": "OnChain",
+        "status": status,
+    }
+
+
+def test_check_stable_spend_cap_holds_existing_position_no_new_spend() -> None:
+    """Regression (`bybit-sandbox.65`): a pick KEPT at its currently-held
+    size funds nothing from the liquid pool, so it must pass even when the
+    held position dwarfs liquid stables. Pre-fix this gross-counted the
+    held TON as fresh $40 spend + $42 margin and rejected every hold,
+    stranding the agent in a `skipped:invalid` loop on a fully-deployed
+    small vault."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
+        liquid_usdc_usd="15",  # far below the held position's $40
+        liquid_usdt_usd="0",
+        # 20 TON × $2.0 mark = $40 held — matches the 40% target below
+        earn_positions=[_held_ton("12"), _held_ton("8")],  # summed = 20 TON
+    )
+    d = _hedged_decision(onchain_venue_weight=0.40)  # $100 × 0.40 = $40 target
+    assert check_stable_spend_cap(d, s) == (True, None)
+
+
+def test_check_stable_spend_cap_counts_only_the_increase_over_held() -> None:
+    """Only `target − held` draws on the liquid pool. Held $20, target $40
+    → net-new $20 (spot) + $21 (margin) = $41 > $15 liquid → reject, and
+    the error names the net-new figure, not the gross target."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
+        liquid_usdc_usd="15",
+        liquid_usdt_usd="0",
+        earn_positions=[_held_ton("10")],  # 10 TON × $2.0 = $20 held
+    )
+    d = _hedged_decision(onchain_venue_weight=0.40)  # $40 target
+    ok, msg = check_stable_spend_cap(d, s)
+    assert not ok
+    assert msg is not None
+    assert "$20.00 new" in msg
+    assert "held $20.00" in msg
+    assert "exceeds liquid stables" in msg
+
+
+# ─── check_stable_earn_funding (2026-06-07, `bybit-sandbox.65`) ────────────
+
+
+def _held(category: str, pid: str, coin: str, amount: str, *, status: str = "") -> dict:
+    """One earn-position row (Bybit shape)."""
+    return {
+        "productId": pid,
+        "coin": coin,
+        "amount": amount,
+        "category": category,
+        "status": status,
+    }
+
+
+def _stable_onchain_products() -> list[ProductSummary]:
+    return [
+        _product("25", "OnChain", coin="USDT", effective_apr="0.0374"),
+        _product("26", "OnChain", coin="USDC", effective_apr="0.0338"),
+    ]
+
+
+def test_check_stable_earn_funding_rejects_over_commit_vs_liquid() -> None:
+    """Regression (prod 2026-06-07, `retCode=180016`): the LLM keeps USD1
+    Flex and still subscribes ~$50 of fresh OnChain USDC/USDT against $6
+    liquid. NEW stable spend must fit liquid + freed-by-redeem."""
+    s = _snapshot(
+        flex_products=[_product("1131", "FlexibleSaving", coin="USD1", effective_apr="0.0085")],
+        onchain_products=_stable_onchain_products(),
+        total_equity_usd="78",
+        liquid_usdc_usd="5.94",
+        liquid_usdt_usd="0.01",
+        earn_positions=[_held("FlexibleSaving", "1131", "USD1", "15.6")],  # kept, frees nothing
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.10),
+            _venue("bybit_flex", 0.20, [("1131", 1.0)]),       # keep USD1 (~$15.6, delta≈0)
+            _venue("bybit_onchain", 0.70, [("25", 0.5), ("26", 0.5)]),  # +$27 each new
+        ]
+    )
+    ok, msg = check_stable_earn_funding(d, s)
+    assert not ok
+    assert "new stable Earn spend" in (msg or "")
+    assert "180016" in (msg or "")
+
+
+def test_check_stable_earn_funding_allows_funded_rotation() -> None:
+    """Dropping USD1 frees its redeemable capital, which funds a new USDC
+    OnChain subscribe — the executor redeems before it subscribes, so the
+    rotation IS fundable and must pass."""
+    s = _snapshot(
+        flex_products=[_product("1131", "FlexibleSaving", coin="USD1", effective_apr="0.0085")],
+        onchain_products=_stable_onchain_products(),
+        total_equity_usd="78",
+        liquid_usdc_usd="6",
+        liquid_usdt_usd="0",
+        earn_positions=[_held("FlexibleSaving", "1131", "USD1", "40")],  # dropped → frees $40
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.49),
+            _venue("bybit_onchain", 0.51, [("26", 1.0)]),  # ~$40 new USDC, funded by USD1 redeem + $6 liquid
+        ]
+    )
+    assert check_stable_earn_funding(d, s) == (True, None)
+
+
+def test_check_stable_earn_funding_processing_source_not_freeable() -> None:
+    """A `Processing` stable stake can't be redeemed in time, so dropping
+    it does NOT free capital for a same-cycle subscribe → reject."""
+    s = _snapshot(
+        flex_products=[_product("1131", "FlexibleSaving", coin="USD1", effective_apr="0.0085")],
+        onchain_products=_stable_onchain_products(),
+        total_equity_usd="78",
+        liquid_usdc_usd="6",
+        liquid_usdt_usd="0",
+        # held USDC OnChain $40 but Processing → not freeable
+        earn_positions=[_held("OnChain", "26", "USDC", "40", status="Processing")],
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.49),
+            _venue("bybit_onchain", 0.51, [("25", 1.0)]),  # +$40 new USDT, only $6 freeable
+        ]
+    )
+    ok, msg = check_stable_earn_funding(d, s)
+    assert not ok
+    assert "freed-by-redeem $0.00" in (msg or "")
+
+
+def test_check_stable_earn_funding_holds_pass() -> None:
+    """Keeping a stable position (target ≈ held) is no new spend → pass,
+    even with a tiny liquid pool."""
+    s = _snapshot(
+        flex_products=[_product("1131", "FlexibleSaving", coin="USD1", effective_apr="0.0085")],
+        total_equity_usd="78",
+        liquid_usdc_usd="6",
+        liquid_usdt_usd="0",
+        earn_positions=[_held("FlexibleSaving", "1131", "USD1", "15.6")],
+    )
+    # bybit_flex 0.2 × $78 = $15.6 ≈ held → no new spend
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.80),
+            _venue("bybit_flex", 0.20, [("1131", 1.0)]),
+        ]
+    )
+    assert check_stable_earn_funding(d, s) == (True, None)
+
+
 # ─── check_min_stake (2026-06-04, `.51`) ──────────────────────────────────
 
 
@@ -1092,6 +1286,27 @@ def test_check_min_stake_fails_lm_below_floor() -> None:
     ok, msg = check_min_stake(d, s)
     assert not ok
     assert "bybit_lm/24" in (msg or "")
+
+
+def test_check_min_stake_holding_below_floor_does_not_fire() -> None:
+    """Regression (`bybit-sandbox.65`): a held Earn position kept at its
+    current size places NO subscribe (the diff's delta ≈ 0), so it can't
+    trip Bybit's `retCode=180012` even if the position now sits below the
+    product's current `min_subscribe_usd`. Pre-fix the gross compare
+    falsely rejected the hold."""
+    s = _snapshot(
+        onchain_products=[
+            _product(
+                "8", "OnChain", coin="TON", effective_apr="0.18",
+                min_subscribe_usd="100",  # held $40 sits under today's floor
+            )
+        ],
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
+        total_equity_usd="100",
+        earn_positions=[_held_ton("20")],  # 20 TON × $2.0 = $40 held
+    )
+    d = _hedged_decision(onchain_venue_weight=0.40)  # $40 target == held → no subscribe
+    assert check_min_stake(d, s) == (True, None)
 
 
 def test_check_min_stake_collects_multiple_violations() -> None:

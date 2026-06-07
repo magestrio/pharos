@@ -273,13 +273,21 @@ def _perp(
     )
 
 
-def _pos(category: str, product_id: str, amount: str, coin: str = "USDC") -> dict:
-    """A raw EarnPosition dict — mirrors `EarnPosition.model_dump()`."""
+def _pos(
+    category: str,
+    product_id: str,
+    amount: str,
+    coin: str = "USDC",
+    status: str = "",
+) -> dict:
+    """A raw EarnPosition dict — mirrors `EarnPosition.model_dump()`.
+    `status="Processing"` marks an un-redeemable (still-settling) chunk."""
     return {
         "category": category,
         "productId": product_id,
         "coin": coin,
         "amount": amount,
+        "status": status,
     }
 
 
@@ -364,6 +372,68 @@ def test_diff_redeems_when_currently_held_position_drops_out() -> None:
     redeem = [a for a in actions if a.kind == ActionKind.REDEEM_EARN][0]
     assert redeem.product_id == "9999"
     assert redeem.amount == Decimal("30")
+
+
+def test_diff_skips_redeem_when_position_fully_processing() -> None:
+    """Regression (`bybit-sandbox.65`, prod 2026-06-07): a held OnChain
+    position whose entire balance is still `Processing` cannot be redeemed
+    (place-order Redeem reverts retCode=180020). When the LLM drops it,
+    the diff must SKIP rather than emit a doomed REDEEM — the position is
+    held until Bybit settles it; the hedge stays via the atomic-pair
+    guard."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"TON": _perp("TON", mark="1.5", min_notional="1.0")},
+        earn_positions=[
+            _pos("OnChain", "8", "4.154", coin="TON", status="Processing"),
+            _pos("OnChain", "8", "3.382", coin="TON", status="Processing"),
+            _pos("OnChain", "8", "2.987", coin="TON", status="Processing"),
+        ],
+    )
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_flex", 0.5, [("1131", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260607T120000Z")
+    ton_redeems = [
+        a for a in actions
+        if a.kind == ActionKind.REDEEM_EARN and a.product_id == "8"
+    ]
+    assert ton_redeems == []  # no doomed redeem on a Processing position
+    ton_skips = [
+        a for a in actions
+        if a.kind == ActionKind.SKIP_OUT_OF_SCOPE and a.product_id == "8"
+    ]
+    assert len(ton_skips) == 1
+    assert "Processing" in ton_skips[0].reason
+
+
+def test_diff_redeems_partially_settled_position() -> None:
+    """A position with a settled (redeemable) chunk + a Processing chunk is
+    NOT fully processing → the redeem still fires (the Processing guard
+    only suppresses the entirely-unsettled case)."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"TON": _perp("TON", mark="1.5", min_notional="1.0")},
+        earn_positions=[
+            _pos("OnChain", "8", "4.0", coin="TON", status="Active"),
+            _pos("OnChain", "8", "3.0", coin="TON", status="Processing"),
+        ],
+    )
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_flex", 0.5, [("1131", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260607T120000Z")
+    ton_redeems = [
+        a for a in actions
+        if a.kind == ActionKind.REDEEM_EARN and a.product_id == "8"
+    ]
+    assert len(ton_redeems) == 1
 
 
 def test_diff_orphan_spot_sold_to_usdt_when_not_subscribed() -> None:

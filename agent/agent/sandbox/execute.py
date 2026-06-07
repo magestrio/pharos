@@ -505,6 +505,29 @@ def diff_to_actions(
             and current_pos.amount_native > 0
             and category in _BASIC_EARN_CATEGORIES
         ):
+            if _is_fully_processing(current_pos):
+                # Entire balance still settling — Redeem would revert
+                # retCode=180020. Hold; the hedge stays open via the
+                # atomic-pair guard. Re-evaluated once Bybit clears it.
+                skips.append(
+                    Action(
+                        kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                        category=category,
+                        product_id=product_id,
+                        coin=coin,
+                        amount=(
+                            current_amt if current_amt > 0
+                            else current_pos.amount_native
+                        ),
+                        order_link_id=order_link_id,
+                        reason=(
+                            f"{category}/{product_id} ({coin}): position "
+                            "Processing (un-redeemable) — holding until "
+                            "settled instead of a doomed REDEEM (180020)"
+                        ),
+                    )
+                )
+                continue
             # USD amount best-effort: if we have a mark, use it; else
             # fall back to native qty (executor's send_amount prefers
             # amount_native anyway). Reason string captures the gap.
@@ -612,6 +635,28 @@ def diff_to_actions(
                 )
             )
         else:
+            # Processing guard: a position whose entire balance is still
+            # settling can't be redeemed (place-order Redeem reverts
+            # retCode=180020). Skip rather than emit a doomed call — the
+            # LLM's intended reduction waits until Bybit clears it; the
+            # paired hedge stays open via the atomic-pair guard.
+            if _is_fully_processing(current_pos):
+                skips.append(
+                    Action(
+                        kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                        category=category,
+                        product_id=product_id,
+                        coin=coin,
+                        amount=-delta,
+                        order_link_id=order_link_id,
+                        reason=(
+                            f"{category}/{product_id} ({coin}): position "
+                            "Processing (un-redeemable) — cannot reduce yet, "
+                            "holding until settled (avoids 180020)"
+                        ),
+                    )
+                )
+                continue
             # Earn redeem expects NATIVE coin units, not USD. For
             # non-stables, size the redeem from the held native qty
             # (ground truth) scaled by the USD reduction — a full exit
@@ -4590,6 +4635,29 @@ class _CurrentPos:
     # silently collapse to amount_usd=0 — the diff layer needs the
     # native value to still emit a REDEEM and avoid naked spot exposure.
     amount_native: Decimal = Decimal(0)
+    # Redeemable (non-`Processing`) portion of the position. `None` means
+    # "not computed" (Alpha / carry / legacy callers) → treat as fully
+    # redeemable. OnChain stakes in `Processing` status (≈4 days after a
+    # fresh subscribe) CANNOT be redeemed — `place-order` Redeem reverts
+    # retCode=180020 — so the diff must not emit a REDEEM for a position
+    # whose entire balance is still Processing.
+    redeemable_native: Decimal | None = None
+    redeemable_usd: Decimal | None = None
+
+
+def _is_fully_processing(pos: "_CurrentPos | None") -> bool:
+    """True when `pos` exists but its ENTIRE balance is still `Processing`
+    (un-redeemable). Callers that don't compute status (Alpha / carry /
+    legacy) leave `redeemable_*` as None → treated as redeemable (False),
+    preserving prior behavior. Used to suppress doomed REDEEM_EARN calls
+    (retCode=180020) on positions Bybit hasn't settled yet."""
+    if pos is None:
+        return False
+    if pos.redeemable_native is None and pos.redeemable_usd is None:
+        return False
+    return (pos.redeemable_native or Decimal(0)) <= 0 and (
+        pos.redeemable_usd or Decimal(0)
+    ) <= 0
 
 
 def _alpha_current_positions(
@@ -4762,6 +4830,10 @@ def _current_positions_by_pid(
             continue
         coin = data.get("coin") or "USDC"
         amount_usd = _amount_to_usd(coin, amt, perp_market)
+        # Non-redeemable while the on-chain stake is still settling.
+        redeemable = str(data.get("status") or "").strip().lower() != "processing"
+        r_native = amt if redeemable else Decimal(0)
+        r_usd = amount_usd if redeemable else Decimal(0)
         existing = out.get((category, pid))
         if existing is not None:
             # Sum with prior entry (multiple Bybit rows for the same
@@ -4770,10 +4842,13 @@ def _current_positions_by_pid(
                 coin=existing.coin,
                 amount_usd=existing.amount_usd + amount_usd,
                 amount_native=existing.amount_native + amt,
+                redeemable_native=(existing.redeemable_native or Decimal(0)) + r_native,
+                redeemable_usd=(existing.redeemable_usd or Decimal(0)) + r_usd,
             )
         else:
             out[(category, pid)] = _CurrentPos(
-                coin=coin, amount_usd=amount_usd, amount_native=amt
+                coin=coin, amount_usd=amount_usd, amount_native=amt,
+                redeemable_native=r_native, redeemable_usd=r_usd,
             )
     return out
 

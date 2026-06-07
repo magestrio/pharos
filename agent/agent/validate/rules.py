@@ -21,6 +21,7 @@ time, so they're not re-checked here.
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Any
 
 from agent.reason.schema import Decision, VenueAllocation
 from agent.reason.venues import (
@@ -475,8 +476,20 @@ def check_funding_rate_floor(d: Decision, snapshot: Snapshot) -> Check:
     Annualization respects each coin's `funding_interval_hours` (4h /
     8h / etc.), restated 2026-06-03 — prior `× 3 × 365` math
     under-stated APR ~2× on 4h pairs and let some negative-funding
-    coins slip the floor."""
+    coins slip the floor.
+
+    Net-new only (2026-06-07, `bybit-sandbox.65`): the floor gates
+    OPENING or GROWING a sub-floor hedge, not KEEPING one. A held
+    non-stable position the LLM keeps or reduces (net-new spend below
+    `_MIN_ACTION_USDC`) is exempt — OnChain `Processing` positions cannot
+    be redeemed (place-order Redeem reverts retCode=180020) and the
+    prompt instructs holding them, so rejecting the hold would leave NO
+    legal decision and strand the cycle as skipped:invalid every time.
+    Exiting a redeemable sub-floor position is driven by the redeem path
+    + `funding_flip` watcher events, not by failing this check."""
     perp_market = getattr(snapshot, "perp_market", None) or {}
+    total_book = float(snapshot.wallet.total_equity_usd)
+    held_map = _held_usd_by_product(snapshot)
     bad: list[str] = []
     for venue_id, category in _AUTO_HEDGE_VENUES:
         venue = d.venue(venue_id)  # type: ignore[arg-type]
@@ -489,6 +502,14 @@ def check_funding_rate_floor(d: Decision, snapshot: Snapshot) -> Check:
                 continue
             coin = summary.coin.upper()
             if coin in _STABLE_COINS:
+                continue
+            net_new = (
+                total_book * float(venue.weight) * float(pick.weight)
+                - held_map.get((category, pick.product_id), 0.0)
+            )
+            if net_new < _MIN_ACTION_USDC:
+                # Hold or reduce — not fresh sub-floor exposure. Exempt
+                # (may be un-exitable Processing; exits go via redeem path).
                 continue
             info = perp_market.get(coin) or perp_market.get(coin.lower())
             if info is None or info.funding_rate_7d_avg is None:
@@ -701,11 +722,85 @@ _VALIDATOR_HEDGE_MARGIN_BUFFER = float(HEDGE_MARGIN_BUFFER)
 # to absorb withdrawal timing + slippage). Single source of truth: registry.
 CASH_FLOOR = float(VENUE_REGISTRY["cash_usdc"].min_weight)
 
+# Minimum USD delta the executor acts on — below this the diff layer
+# skips the (un)subscribe entirely (`MIN_ACTION_USDC` in
+# `agent.sandbox.execute`). The validator mirrors it so a near-no-op
+# "hold" (target ≈ currently-held) reserves no liquid stables and trips
+# no min-stake floor, matching what the live diff actually does.
+_MIN_ACTION_USDC = 0.50
+
+
+def _held_earn_detail(snapshot: Snapshot) -> dict[tuple[str, str], dict[str, Any]]:
+    """Held Earn detail per `(category, product_id)`: `coin`, total `usd`,
+    the REDEEMABLE (non-`Processing`) `redeemable_usd` portion, and an
+    `is_stable` flag. Mirrors the executor's `_current_positions_by_pid` /
+    `_amount_to_usd` (`agent.sandbox.execute`): stable balances at 1:1
+    USD, non-stables priced via `perp_market[coin].mark_price`, multiple
+    Bybit rows for one product SUMMED (a fresh OnChain subscribe shows up
+    as a settled chunk + a `Processing` chunk until it clears).
+
+    `Processing` chunks are excluded from `redeemable_usd` — they can't be
+    redeemed this cycle (place-order Redeem reverts retCode=180020), so the
+    capital they hold can't fund a same-cycle rotation. Validator and
+    executor MUST agree on held USD: the net-new screens use `target −
+    held` (the delta the live diff acts on); the stable-funding screen
+    uses the redeemable portion as freeable supply."""
+    perp_market = getattr(snapshot, "perp_market", None) or {}
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for p in getattr(snapshot, "earn_positions", None) or []:
+        data = p.model_dump(mode="python") if hasattr(p, "model_dump") else p
+        category = data.get("category") or ""
+        pid = str(data.get("productId") or data.get("product_id") or "")
+        if not category or not pid:
+            continue
+        try:
+            amt = float(data.get("amount", 0) or 0)
+        except (TypeError, ValueError):
+            amt = 0.0
+        if amt <= 0:
+            continue
+        coin = (data.get("coin") or "USDC").upper()
+        is_stable = coin in _STABLE_COINS
+        if is_stable:
+            usd = amt
+        else:
+            info = perp_market.get(coin) or perp_market.get(coin.lower())
+            mark = getattr(info, "mark_price", None) if info else None
+            usd = amt * float(mark) if mark and float(mark) > 0 else 0.0
+        redeemable = str(data.get("status") or "").strip().lower() != "processing"
+        entry = out.get((category, pid))
+        if entry is None:
+            entry = {
+                "coin": coin,
+                "usd": 0.0,
+                "redeemable_usd": 0.0,
+                "is_stable": is_stable,
+            }
+            out[(category, pid)] = entry
+        entry["usd"] += usd
+        if redeemable:
+            entry["redeemable_usd"] += usd
+    return out
+
+
+def _held_usd_by_product(snapshot: Snapshot) -> dict[tuple[str, str], float]:
+    """Total held Earn USD per `(category, product_id)` (incl. Processing
+    chunks). Thin wrapper over `_held_earn_detail`; the net-new screens
+    (stable-spend cap, min-stake, funding floor) compare `target − held`,
+    the delta the live diff acts on. LM / advance-Earn holdings don't live
+    in `earn_positions`, so they collapse to held=0 (gross), preserving
+    pre-net-new behavior for those venues."""
+    return {k: v["usd"] for k, v in _held_earn_detail(snapshot).items()}
+
 
 def check_stable_spend_cap(d: Decision, snapshot: Snapshot) -> Check:
-    """Reject decisions whose non-stable spend can't be funded by the
-    liquid stable balance. Each non-stable Earn pick triggers two USD
-    outflows the executor must satisfy from the stable pool:
+    """Reject decisions whose NEW non-stable spend can't be funded by the
+    liquid stable balance. Spend is scoped to `max(0, target − held)` per
+    pick (the same delta the executor's `diff_to_actions` acts on), so
+    keeping an existing position reserves nothing — only growing one or
+    opening a fresh pick draws on the pool. Each unit of new non-stable
+    Earn spend triggers two USD outflows the executor must satisfy from
+    the stable pool:
 
       • spot leg — `pick_usd` worth of USDT spent on Buy {coin}USDT
       • perp margin — `pick_usd × HEDGE_MARGIN_BUFFER` of USDT locked
@@ -730,6 +825,14 @@ def check_stable_spend_cap(d: Decision, snapshot: Snapshot) -> Check:
         return True, None
 
     perp_market = getattr(snapshot, "perp_market", None) or {}
+    # Only NEW spend draws on the liquid pool. A pick the LLM keeps at
+    # its current size (target ≈ currently-held) costs the diff nothing —
+    # counting its gross target as fresh spend falsely rejects every hold
+    # whenever a held non-stable position exceeds the liquid stable
+    # balance (the dominant cause of the small-vault `skipped:invalid`
+    # loop). Screen `max(0, target − held)` instead, mirroring the
+    # executor's `delta = target_amt − current_amt` in `diff_to_actions`.
+    held_map = _held_usd_by_product(snapshot)
     perp_demand = 0.0
     spot_demand = 0.0
     contributors: list[str] = []
@@ -753,12 +856,17 @@ def check_stable_spend_cap(d: Decision, snapshot: Snapshot) -> Check:
             if info is None:
                 continue
             pick_usd = total_book * float(venue.weight) * float(pick.weight)
-            if pick_usd <= 0:
+            net_new = pick_usd - held_map.get((category, pick.product_id), 0.0)
+            if net_new < _MIN_ACTION_USDC:
+                # Hold or reduce — the diff funds nothing from the liquid
+                # pool, so this pick reserves no stables.
                 continue
-            perp_demand += pick_usd * _VALIDATOR_HEDGE_MARGIN_BUFFER
-            spot_demand += pick_usd
+            held = held_map.get((category, pick.product_id), 0.0)
+            perp_demand += net_new * _VALIDATOR_HEDGE_MARGIN_BUFFER
+            spot_demand += net_new
             contributors.append(
-                f"{venue_id}/{pick.product_id}({coin})=${pick_usd:.2f}"
+                f"{venue_id}/{pick.product_id}({coin})=${net_new:.2f} new"
+                + (f" (held ${held:.2f})" if held > 0 else "")
             )
 
     # Funding-carry picks (`bybit-strategy-expansion.4`). Each carry
@@ -777,12 +885,15 @@ def check_stable_spend_cap(d: Decision, snapshot: Snapshot) -> Check:
             if coin in _STABLE_COINS:
                 continue
             pick_usd = total_book * float(carry.weight) * float(pick.weight)
-            if pick_usd <= 0:
+            held = held_map.get((_CARRY_CATEGORY, pick.product_id), 0.0)
+            net_new = pick_usd - held
+            if net_new < _MIN_ACTION_USDC:
                 continue
-            perp_demand += pick_usd * _VALIDATOR_HEDGE_MARGIN_BUFFER
-            spot_demand += pick_usd
+            perp_demand += net_new * _VALIDATOR_HEDGE_MARGIN_BUFFER
+            spot_demand += net_new
             contributors.append(
-                f"{_CARRY_VENUE_ID}/{pick.product_id}({coin})=${pick_usd:.2f}"
+                f"{_CARRY_VENUE_ID}/{pick.product_id}({coin})=${net_new:.2f} new"
+                + (f" (held ${held:.2f})" if held > 0 else "")
             )
 
     if not contributors:
@@ -810,12 +921,113 @@ def check_stable_spend_cap(d: Decision, snapshot: Snapshot) -> Check:
     return True, None
 
 
+# ─── Stable Earn funding gate (2026-06-07, `bybit-sandbox.65`) ─────────────
+
+
+def check_stable_earn_funding(d: Decision, snapshot: Snapshot) -> Check:
+    """NEW stable Earn subscribes must be fundable from liquid stables
+    plus capital freed by redeeming/reducing OTHER redeemable stable Earn
+    positions this cycle. `check_stable_spend_cap` screens the non-stable
+    (hedged) side; this screens the stable side, where the live failure is
+    `retCode=180016 Balance not enough` on SUBSCRIBE_EARN — e.g. the LLM
+    keeps USD1 and still allocates 70% of book to fresh OnChain USDC/USDT
+    against ~$6 liquid (prod 2026-06-07).
+
+    Net-new + freed-by-redeem, mirroring the executor's redeem-first
+    ordering (`diff_to_actions` emits redeems before subscribes and polls
+    the freed balance credited before spending it). Freed counts only the
+    REDEEMABLE portion of reduced/dropped stable positions — `Processing`
+    chunks can't settle in time to fund a same-cycle subscribe.
+
+    Scope / known limitations (all err toward PERMISSIVE — this check
+    never blocks a fundable decision, so it can't re-introduce the
+    every-cycle `skipped:invalid` loop it was added to fix; cases it
+    misses fall through to the executor's `retCode=180016` + atomic-pair
+    guard, which fail safe without naked exposure):
+      • Pooled, not per-coin: supply is `liquid_usdc + liquid_usdt` and
+        freed is credited coin-agnostically, but the executor funds a
+        USDC subscribe only from USDC (no swap) and swaps USDC→coin for
+        other stables. So a cross-coin rotation it passes may still 180016
+        at execute. Over-credits supply → permissive.
+      • Freed counts any non-`Processing` reduce/drop, but an OnChain
+        stable redeem may not settle within the cycle. Over-credits →
+        permissive.
+      • Shared pool with the non-stable side (`check_stable_spend_cap`):
+        each subtracts the pool independently, so a kept non-stable +
+        large new stable could overrun. Rare on small vaults.
+    A future unified per-coin liquidity model would tighten all three;
+    `check_capital_flow_simulation` is the gross-equity backstop."""
+    total_book = float(snapshot.wallet.total_equity_usd)
+    if total_book <= 0:
+        return True, None
+
+    detail = _held_earn_detail(snapshot)
+    idx = _snapshot_index(snapshot)
+
+    # Target USD per STABLE Earn (category, product_id) the decision asks
+    # for, paired with the pick's coin (for the error message).
+    targets: dict[tuple[str, str], tuple[float, str]] = {}
+    for venue_id, category in _AUTO_HEDGE_VENUES:
+        venue = d.venue(venue_id)  # type: ignore[arg-type]
+        if venue is None or venue.weight <= 0 or not venue.picks:
+            continue
+        cat_idx = idx.get(category, {})
+        for pick in venue.picks:
+            summary = cat_idx.get(pick.product_id)
+            if summary is None or summary.coin.upper() not in _STABLE_COINS:
+                continue
+            targets[(category, pick.product_id)] = (
+                total_book * float(venue.weight) * float(pick.weight),
+                summary.coin.upper(),
+            )
+
+    new_spend = 0.0
+    freed = 0.0
+    contributors: list[str] = []
+    keys = set(targets) | {k for k, v in detail.items() if v["is_stable"]}
+    for key in keys:
+        info = detail.get(key)
+        held = float(info["usd"]) if info else 0.0
+        redeemable = float(info["redeemable_usd"]) if info else 0.0
+        target, target_coin = targets.get(key, (0.0, ""))
+        delta = target - held
+        if delta >= _MIN_ACTION_USDC:
+            new_spend += delta
+            coin = info["coin"] if info else target_coin
+            contributors.append(f"{key[0]}/{key[1]}({coin or '?'})=+${delta:.2f}")
+        elif -delta >= _MIN_ACTION_USDC:
+            # Reduced or dropped — frees its REDEEMABLE portion only.
+            freed += min(held - target, redeemable)
+
+    if new_spend < _MIN_ACTION_USDC:
+        return True, None
+
+    liquid = float(snapshot.wallet.liquid_usdc_usd) + float(
+        snapshot.wallet.liquid_usdt_usd
+    )
+    supply = liquid + freed
+    # No liquidity signal at all (pre-pivot fixtures / legacy collector) →
+    # no-op, mirroring `check_stable_spend_cap`'s supply<=0 fall-through.
+    if supply <= 0:
+        return True, None
+
+    if new_spend > supply + 1e-9:
+        return False, (
+            f"new stable Earn spend ${new_spend:.2f} exceeds liquid stables "
+            f"${liquid:.2f} + freed-by-redeem ${freed:.2f} = ${supply:.2f} "
+            f"(retCode=180016 at execute) — redeem a held stable to fund the "
+            f"rotation or downsize: {', '.join(contributors)}"
+        )
+    return True, None
+
+
 # ─── Per-product min-stake gate (2026-06-04, `.51`) ────────────────────────
 
 
 def check_min_stake(d: Decision, snapshot: Snapshot) -> Check:
-    """Reject decisions where any pick's USD allocation falls below the
-    product's `min_subscribe_usd` floor.
+    """Reject decisions where any pick's NEW subscribe (`target − held`,
+    the amount the diff actually places) falls below the product's
+    `min_subscribe_usd` floor.
 
     Bybit rejects sub-floor subscribes with `retCode=180012` (Purchase
     share invalid). The executor's diff layer already SKIPs them so the
@@ -840,6 +1052,7 @@ def check_min_stake(d: Decision, snapshot: Snapshot) -> Check:
         return True, None
 
     snapshot_idx = _snapshot_index(snapshot)
+    held_map = _held_usd_by_product(snapshot)
     violations: list[str] = []
 
     for v in d.venues:
@@ -858,10 +1071,19 @@ def check_min_stake(d: Decision, snapshot: Snapshot) -> Check:
             if min_usd is None or min_usd <= 0:
                 continue
             pick_usd = total_book * float(v.weight) * float(p.weight)
-            if pick_usd + 1e-9 < float(min_usd):
+            # Only the NEW subscribe portion (target − held) hits Bybit's
+            # min-stake floor. A hold (delta < MIN_ACTION) places no
+            # subscribe so it can't trip retCode=180012; a delta below
+            # MIN_ACTION the executor skips silently. Flag the band the
+            # live diff would attempt-then-reject: a real subscribe
+            # (>= MIN_ACTION) that's still under the floor. (LM /
+            # advance-Earn holdings aren't in earn_positions → held=0 →
+            # gross, unchanged from before.)
+            delta = pick_usd - held_map.get((category, p.product_id), 0.0)
+            if delta >= _MIN_ACTION_USDC and delta + 1e-9 < float(min_usd):
                 violations.append(
                     f"{v.venue_id}/{p.product_id}({summary.coin})="
-                    f"${pick_usd:.2f}<min ${float(min_usd):.2f}"
+                    f"${delta:.2f}<min ${float(min_usd):.2f}"
                 )
     if violations:
         return False, (
@@ -1032,6 +1254,7 @@ def validate(decision: Decision, snapshot: Snapshot) -> tuple[bool, list[str]]:
         check_funding_carry_floor,
         check_no_double_carry_hedge,
         check_stable_spend_cap,
+        check_stable_earn_funding,
         check_capital_flow_simulation,
         check_min_stake,
     ]
