@@ -123,15 +123,24 @@ def _decision_clean() -> Decision:
 
 def _snapshot_with_ton(
     *, liquid_usdc: str, liquid_usdt: str = "0", total_equity_usd: str = "100",
-    ton_held: str = "0",
+    ton_held: str = "0", ton_funding_7d: str | None = None,
+    ton_interval: str = "8",
 ) -> Snapshot:
     """Small-vault snapshot with a TON OnChain product + perp, for the
     liquid-budget clamp tests. `ton_held` (native) seeds an OnChain TON
-    position so net-new vs held can be exercised."""
+    position so net-new vs held can be exercised. `ton_funding_7d` sets the
+    perp's signed per-period 7d-avg funding so the sub-floor clamp (.66) can
+    be exercised; None ⇒ no funding signal (not sub-floor)."""
     earn = (
         [{"productId": "8", "coin": "TON", "amount": ton_held,
           "category": "OnChain", "status": "Active"}]
         if Decimal(ton_held) > 0 else []
+    )
+    ton_perp = PerpInfo(
+        symbol="TONUSDT", mark_price=Decimal("2.0"),
+        min_notional_usd=Decimal("1.0"),
+        funding_rate_7d_avg=Decimal(ton_funding_7d) if ton_funding_7d else None,
+        funding_interval_hours=Decimal(ton_interval),
     )
     return Snapshot(
         captured_at=datetime.now(UTC),
@@ -152,8 +161,7 @@ def _snapshot_with_ton(
             "LiquidityMining": [],
         },
         market=MarketSnapshot(),
-        perp_market={"TON": PerpInfo(symbol="TONUSDT", mark_price=Decimal("2.0"),
-                                     min_notional_usd=Decimal("1.0"))},
+        perp_market={"TON": ton_perp},
         usdc_peg=UsdcPegSnapshot(price_usd=Decimal("1.0"), deviation_bps=Decimal("0"),
                                  fetched_at=datetime.now(UTC)),
         errors=[],
@@ -266,6 +274,131 @@ def test_clamp_runs_when_snapshot_fresh() -> None:
         decide_captured_at=snap.captured_at.isoformat(),
     )
     assert dropped == ["8"]
+
+
+# ─── sub-floor non-stable growth clamp (.66) ─────────────────────────────────
+
+
+def test_subfloor_clamp_clamps_grown_subfloor_to_held() -> None:
+    """(.66) The LLM grows a held sub-floor-funding non-stable ($10 held → $20
+    target). check_funding_rate_floor would reject the growth; the clamp trims
+    the pick to its current held size and parks the freed weight in cash so
+    the cycle validates."""
+    from agent.sandbox.loop import _clamp_subfloor_nonstable_growth
+    # 5 TON × $2 = $10 held; funding −0.0003/8h ≈ −32.85%/yr (sub-floor).
+    snap = _snapshot_with_ton(liquid_usdc="50", ton_held="5", ton_funding_7d="-0.0003")
+    dec = Decision(
+        thesis="grow the held sub-floor TON OnChain position past current size.",
+        venues=[
+            VenueAllocation(venue_id="cash_usdc", weight=0.8),
+            VenueAllocation(venue_id="bybit_onchain", weight=0.2,
+                            picks=[Pick(product_id="8", weight=1.0)]),  # $20 target
+        ],
+        hedges=[], confidence=0.7, risk_flags=[], notes=[],
+        expected_blended_apr_pct=5.0,
+    )
+    new_dict, clamped, note = _clamp_subfloor_nonstable_growth(dec.model_dump(), snap)
+    assert clamped == ["8"]
+    assert "subfloor_clamp" in (note or "")
+    rebuilt = Decision.model_validate(new_dict)
+    assert abs(sum(v.weight for v in rebuilt.venues) - 1.0) < 1e-6
+    onchain = next(v for v in rebuilt.venues if v.venue_id == "bybit_onchain")
+    # Clamped to held: $10 / $100 book = 0.10 effective.
+    assert abs(onchain.weight * onchain.picks[0].weight - 0.10) < 1e-6
+    cash = next(v for v in rebuilt.venues if v.venue_id == "cash_usdc")
+    assert abs(cash.weight - 0.90) < 1e-6  # 0.8 + 0.10 freed
+
+
+def test_subfloor_clamp_exempts_held_at_current() -> None:
+    """A held sub-floor position KEPT at current size (net_new≈0) is exempt —
+    matching check_funding_rate_floor's net-new-only gate."""
+    from agent.sandbox.loop import _clamp_subfloor_nonstable_growth
+    snap = _snapshot_with_ton(liquid_usdc="50", ton_held="10", ton_funding_7d="-0.0003")
+    dec = Decision(
+        thesis="keep the held sub-floor TON position at its current size.",
+        venues=[
+            VenueAllocation(venue_id="cash_usdc", weight=0.8),
+            VenueAllocation(venue_id="bybit_onchain", weight=0.2,
+                            picks=[Pick(product_id="8", weight=1.0)]),  # $20 == held
+        ],
+        hedges=[], confidence=0.7, risk_flags=[], notes=[],
+        expected_blended_apr_pct=5.0,
+    )
+    _, clamped, note = _clamp_subfloor_nonstable_growth(dec.model_dump(), snap)
+    assert clamped == []
+    assert note is None
+
+
+def test_subfloor_clamp_noop_when_funding_above_floor() -> None:
+    """Funding above the floor → growing is legal → no clamp."""
+    from agent.sandbox.loop import _clamp_subfloor_nonstable_growth
+    snap = _snapshot_with_ton(liquid_usdc="50", ton_held="0", ton_funding_7d="0.00005")
+    dec = Decision(
+        thesis="open a fresh TON pick whose funding is comfortably above floor.",
+        venues=[
+            VenueAllocation(venue_id="cash_usdc", weight=0.8),
+            VenueAllocation(venue_id="bybit_onchain", weight=0.2,
+                            picks=[Pick(product_id="8", weight=1.0)]),
+        ],
+        hedges=[], confidence=0.7, risk_flags=[], notes=[],
+        expected_blended_apr_pct=5.0,
+    )
+    _, clamped, _ = _clamp_subfloor_nonstable_growth(dec.model_dump(), snap)
+    assert clamped == []
+
+
+def test_subfloor_clamp_preserves_other_picks_in_venue() -> None:
+    """In a multi-pick venue, only the sub-floor non-stable pick is clamped;
+    the sibling stable pick keeps its ABSOLUTE effective weight (renormalized
+    within the shrunk venue)."""
+    from agent.sandbox.loop import _clamp_subfloor_nonstable_growth
+    snap = Snapshot(
+        captured_at=datetime.now(UTC),
+        wallet=WalletSnapshot(
+            total_equity_usd=Decimal("100"),
+            liquid_usdc_usd=Decimal("50"), liquid_usdt_usd=Decimal("0"),
+        ),
+        earn_positions=[], lm_positions=[],
+        products={
+            "FlexibleSaving": [],
+            "OnChain": [
+                ProductSummary(category="OnChain", product_id="26", coin="USDC",
+                               effective_apr=Decimal("0.034"), apr_source="apr_history"),
+                ProductSummary(category="OnChain", product_id="8", coin="TON",
+                               effective_apr=Decimal("0.18"), apr_source="estimate_apr"),
+            ],
+            "LiquidityMining": [],
+        },
+        market=MarketSnapshot(),
+        perp_market={"TON": PerpInfo(symbol="TONUSDT", mark_price=Decimal("2.0"),
+                                     min_notional_usd=Decimal("1.0"),
+                                     funding_rate_7d_avg=Decimal("-0.0003"),
+                                     funding_interval_hours=Decimal("8"))},
+        usdc_peg=UsdcPegSnapshot(price_usd=Decimal("1.0"), deviation_bps=Decimal("0"),
+                                 fetched_at=datetime.now(UTC)),
+        errors=[],
+    )
+    dec = Decision(
+        thesis="USDC OnChain plus a fresh sub-floor TON pick in the same venue.",
+        venues=[
+            VenueAllocation(venue_id="cash_usdc", weight=0.5),
+            VenueAllocation(venue_id="bybit_onchain", weight=0.5,
+                            picks=[Pick(product_id="26", weight=0.79),
+                                   Pick(product_id="8", weight=0.21)]),
+        ],
+        hedges=[], confidence=0.7, risk_flags=[], notes=[],
+        expected_blended_apr_pct=5.0,
+    )
+    new_dict, clamped, _ = _clamp_subfloor_nonstable_growth(dec.model_dump(), snap)
+    assert clamped == ["8"]
+    rebuilt = Decision.model_validate(new_dict)
+    assert abs(sum(v.weight for v in rebuilt.venues) - 1.0) < 1e-6
+    onchain = next(v for v in rebuilt.venues if v.venue_id == "bybit_onchain")
+    # TON (8) dropped (clamped to held=0); USDC (26) keeps absolute eff 0.395.
+    assert [p.product_id for p in onchain.picks] == ["26"]
+    assert abs(onchain.weight * onchain.picks[0].weight - 0.395) < 1e-6
+    cash = next(v for v in rebuilt.venues if v.venue_id == "cash_usdc")
+    assert abs(cash.weight - 0.605) < 1e-6  # 0.5 + 0.105 freed
 
 
 def _decision_with_risk_flag() -> Decision:

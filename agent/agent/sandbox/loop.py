@@ -79,9 +79,11 @@ from agent.sandbox.safety import (
     record_equity,
 )
 from agent.sandbox.snapshot import (
+    DEFAULT_FUNDING_INTERVAL_HOURS,
     SNAPSHOT_DIR,
     STABLES,
     Snapshot,
+    _annual_funding,
     collect_snapshot,
     write_snapshot,
 )
@@ -110,7 +112,11 @@ from agent.sandbox.watcher import (
 from agent.sandbox.watcher import (
     write_events as write_watcher_events,
 )
-from agent.validate.rules import _held_usd_by_product, validate
+from agent.validate.rules import (
+    FUNDING_FLOOR_HEDGE_ANNUAL,
+    _held_usd_by_product,
+    validate,
+)
 
 # Default cycle cadence. Tightened to 30min in `.47` follow-up because
 # leveraged LM could liquidate in minutes; relaxed back to 4h in
@@ -478,6 +484,122 @@ def _clamp_to_liquid_budget(
     return new_dict, dropped, note
 
 
+def _pick_is_subfloor_nonstable(
+    snapshot: Snapshot, coin: str
+) -> bool:
+    """True when `coin`'s perp 7d-avg funding (annualized) is below the hedge
+    floor — i.e. growing/opening a hedged Earn pick on it would be rejected by
+    `check_funding_rate_floor`. Mirrors that rule exactly: stables and
+    coins with no perp / no funding signal return False (the validator passes
+    those)."""
+    if coin in STABLES:
+        return False
+    perp_market = getattr(snapshot, "perp_market", None) or {}
+    info = perp_market.get(coin) or perp_market.get(coin.lower())
+    if info is None or info.funding_rate_7d_avg is None:
+        return False
+    interval = info.funding_interval_hours or DEFAULT_FUNDING_INTERVAL_HOURS
+    annual = _annual_funding(info.funding_rate_7d_avg, interval)
+    if annual is None:
+        return False  # broken interval → validator rejects; sizing clamp can't fix it
+    return float(annual) < FUNDING_FLOOR_HEDGE_ANNUAL
+
+
+def _clamp_subfloor_nonstable_growth(
+    decision_dict: dict[str, Any],
+    snapshot: Snapshot,
+) -> tuple[dict[str, Any], list[str], str | None]:
+    """Deterministic backstop (`bybit-sandbox.66` follow-up to `.67`): the LLM
+    keeps GROWING (or OPENING) a hedged non-stable Earn pick whose 7d funding
+    is below the hedge floor (−10.95%/yr). `check_funding_rate_floor` rejects
+    that net-new sub-floor exposure, stranding the cycle as skipped:invalid —
+    even though KEEPING the position at current size is validator-exempt. A
+    prose/funding-pre-filter nudge isn't enough (same lesson as `.65`/`.67`),
+    so clamp each offending pick's effective weight DOWN to its current held
+    size (0 if not held) and move the freed weight to cash.
+
+    Safe-direction: only REDUCES sub-floor deployment toward cash, never opens
+    or enlarges, so it can't create exposure — and keeping a held sub-floor
+    position at current size is exactly what the validator allows. Mirrors
+    `check_funding_rate_floor`'s net-new + funding logic so the clamp and the
+    gate never disagree. The validator still runs after as the hard gate."""
+    total_book = float(snapshot.wallet.total_equity_usd)
+    if total_book <= 0:
+        return decision_dict, [], None
+    held_map = _held_usd_by_product(snapshot)
+    prod_coin: dict[tuple[str, str], str] = {}
+    for venue_id in _LIQUID_CLAMP_VENUES:
+        meta = VENUE_REGISTRY.get(venue_id)
+        cat = getattr(meta, "snapshot_category", None) if meta else None
+        if not cat:
+            continue
+        for p in snapshot.products.get(cat, []):
+            prod_coin[(cat, p.product_id)] = p.coin.upper()
+
+    clamped: list[str] = []
+    freed = 0.0
+    new_venues: list[dict[str, Any]] = []
+    for v in decision_dict.get("venues", []) or []:
+        vid = v.get("venue_id")
+        vw = float(v.get("weight", 0))
+        meta = VENUE_REGISTRY.get(vid)
+        cat = getattr(meta, "snapshot_category", None) if meta else None
+        if vid not in _LIQUID_CLAMP_VENUES or not cat or vw <= 0:
+            new_venues.append(v)
+            continue
+        # Absolute effective weight per pick, clamping sub-floor growth.
+        abs_eff: list[tuple[dict[str, Any], float]] = []
+        changed = False
+        for p in v.get("picks", []) or []:
+            pid = str(p.get("product_id", ""))
+            coin = prod_coin.get((cat, pid), "")
+            eff = vw * float(p.get("weight", 0))
+            held = held_map.get((cat, pid), 0.0)
+            net_new = eff * total_book - held
+            if net_new > _MIN_NEW_ACTION_USD and _pick_is_subfloor_nonstable(
+                snapshot, coin
+            ):
+                new_eff = held / total_book  # clamp to current held (0 if new)
+                freed += eff - new_eff
+                clamped.append(pid)
+                changed = True
+                abs_eff.append((p, new_eff))
+            else:
+                abs_eff.append((p, eff))
+        if not changed:
+            new_venues.append(v)
+            continue
+        new_vw = sum(e for _, e in abs_eff)
+        if new_vw <= 1e-9:
+            continue  # whole venue clamped away → freed weight goes to cash
+        new_picks = [
+            {**p, "weight": e / new_vw} for p, e in abs_eff if e > 1e-9
+        ]
+        new_venues.append({**v, "weight": new_vw, "picks": new_picks})
+
+    if not clamped:
+        return decision_dict, [], None
+
+    # Park the freed weight in cash_usdc (merge into an existing cash venue or
+    # append one) — same shape as `_drop_picks_into_cash`'s cash handling.
+    cash_seen = False
+    for v in new_venues:
+        if v.get("venue_id") == "cash_usdc":
+            v["weight"] = float(v.get("weight", 0)) + freed
+            cash_seen = True
+            break
+    if not cash_seen:
+        new_venues.append({"venue_id": "cash_usdc", "weight": freed, "picks": []})
+
+    new_dict = {**decision_dict, "venues": new_venues}
+    note = (
+        f"subfloor_clamp held sub-floor non-stable growth → cash "
+        f"{sorted(set(clamped))} (funding below "
+        f"{FUNDING_FLOOR_HEDGE_ANNUAL * 100:+.2f}%/yr floor; kept at current size)"
+    )
+    return new_dict, clamped, note
+
+
 def _build_auto_close_decision(
     prior: dict[str, Any] | None,
     wake_events: list[dict[str, Any]] | None,
@@ -765,6 +887,26 @@ async def run_one_cycle(
                 )
                 decision = Decision.model_validate(clamped_dict)
                 outcome["liquid_clamp_dropped"] = sorted(set(clamp_dropped))
+            # Sub-floor non-stable clamp (`.66`) — deterministic backstop for
+            # the LLM growing/opening a hedged non-stable whose funding is
+            # below the hedge floor (check_funding_rate_floor reject). Clamps
+            # the grown pick to current held size (keeping is exempt) so the
+            # cycle validates instead of stranding skipped:invalid. Runs on
+            # the liquid-clamped dict; validator still gates the result.
+            sf_dict, sf_clamped, sf_note = _clamp_subfloor_nonstable_growth(
+                decision.model_dump(), snap
+            )
+            if sf_clamped:
+                notes_list = sf_dict.setdefault("notes", [])
+                if sf_note:
+                    notes_list.append(sf_note)
+                log.warning(
+                    "subfloor clamp: LLM grew sub-floor non-stable picks %s "
+                    "past the funding floor — clamped to current size + cash",
+                    sorted(set(sf_clamped)),
+                )
+                decision = Decision.model_validate(sf_dict)
+                outcome["subfloor_clamp_clamped"] = sorted(set(sf_clamped))
         decision_path = write_decision(
             decision,
             snap_path,
