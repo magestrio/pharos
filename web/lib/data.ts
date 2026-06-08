@@ -37,6 +37,11 @@ export type Decision = {
   profitable: boolean;
   conviction: "low" | "med" | "high";
   thesis: string;
+  // First-person "diary" note generated after the cycle's real outcome is
+  // known (agent/sandbox/reflect.py). Primary human-readable view; the
+  // structured `thesis` is the quant-detail behind a toggle. Undefined for
+  // older cycles or when reflection generation was skipped.
+  reflection?: string;
   risks: string;
   allora: string;
   flags: string[];

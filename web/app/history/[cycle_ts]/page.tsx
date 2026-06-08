@@ -24,6 +24,7 @@ type ValidatorResult = { ok?: boolean; errors?: string[] };
 
 type Decision = {
   thesis?: string;
+  reflection?: string;
   venues?: Array<{
     venue_id: string;
     weight: number;
@@ -151,6 +152,16 @@ function DecisionPanel({ decision }: { decision: Decision | null }) {
   const validatorOk = validator.ok;
   return (
     <Panel title="Decision">
+      {decision.reflection && (
+        <div className="mb-5">
+          <div className="text-[10px] font-mono uppercase tracking-[0.14em] text-accent mb-1.5">
+            Agent&apos;s notes
+          </div>
+          <p className="font-sans text-[15px] leading-[1.7] text-dim-100 whitespace-pre-wrap">
+            {decision.reflection}
+          </p>
+        </div>
+      )}
       {decision.thesis && (
         <div className="mb-4">
           <ThesisView body={decision.thesis} />

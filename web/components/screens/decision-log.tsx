@@ -299,6 +299,7 @@ function ConfidenceBadge({ value }: { value: number }) {
 
 type DecisionBlob = {
   thesis?: string;
+  reflection?: string;
   venues?: Array<{
     venue_id?: string;
     weight?: number;
@@ -335,6 +336,59 @@ function asDecisionBlob(value: Record<string, unknown> | null | undefined): Deci
   return value as DecisionBlob;
 }
 
+/**
+ * Rationale block. When the cycle has a first-person `reflection` note it
+ * leads as the primary, human-readable view and the structured quant
+ * `ThesisView` (signals / regime / allocation parse) moves behind a toggle.
+ * Older cycles with no reflection render the ThesisView directly, unchanged.
+ */
+function RationaleView({
+  reflection,
+  thesisBody,
+}: {
+  reflection?: string;
+  thesisBody: string;
+}) {
+  const [showQuant, setShowQuant] = useState(false);
+
+  if (!reflection || !reflection.trim()) {
+    return <ThesisView body={thesisBody} />;
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="space-y-2.5">
+        <Eyebrow tone="accent">Agent&apos;s notes</Eyebrow>
+        <p className="font-sans text-[15px] leading-[1.7] text-dim-100 whitespace-pre-wrap">
+          {reflection}
+        </p>
+      </div>
+      <div className="bg-ink-850/60 border border-ink-600/50 rounded-md overflow-hidden">
+        <button
+          type="button"
+          onClick={() => setShowQuant((v) => !v)}
+          className="w-full flex items-center justify-between gap-3 px-4 py-2.5 text-left hover:bg-ink-800/40 transition-colors"
+        >
+          <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-accent">
+            {showQuant ? "Hide quant rationale" : "Show quant rationale"}
+          </span>
+          <span
+            className={`font-mono text-[16px] text-accent transition-transform ${showQuant ? "rotate-90" : ""}`}
+            aria-hidden
+          >
+            ▸
+          </span>
+        </button>
+        {showQuant && (
+          <div className="px-4 pb-5 pt-3 border-t border-ink-600/40 fade-up">
+            <ThesisView body={thesisBody} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function DecisionThesis({
   d,
   detail,
@@ -357,6 +411,10 @@ function DecisionThesis({
   // Prefer the real on-chain rationale once it's loaded; otherwise fall
   // back to the row-derived placeholder / mock thesis.
   const thesisBody = blob?.thesis ?? d.thesis;
+  // First-person diary note (agent/sandbox/reflect.py). When present it's
+  // the primary human-readable view; the structured quant ThesisView moves
+  // behind a toggle. Absent on older cycles → ThesisView shows as before.
+  const reflection = blob?.reflection ?? d.reflection;
 
   // Risk flags: prefer the structured list from the decision blob.
   const flagKeys = blob?.risk_flags && blob.risk_flags.length > 0 ? blob.risk_flags : d.flags || [];
@@ -381,7 +439,7 @@ function DecisionThesis({
             </p>
           </div>
           <div className="max-w-[68ch]">
-            <ThesisView body={thesisBody} />
+            <RationaleView reflection={reflection} thesisBody={thesisBody} />
           </div>
           <div>
             <ThesisBlock
