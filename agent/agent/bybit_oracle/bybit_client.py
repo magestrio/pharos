@@ -1695,12 +1695,13 @@ class BybitClient:
         account_type: str,
         coin: str,
     ) -> Decimal:
-        """Per-coin walletBalance across account types other than UNIFIED.
-        `/v5/account/wallet-balance` is UNIFIED-only; for FUND / CONTRACT
-        / OPTION balances Bybit requires `/v5/asset/transfer/query-
-        account-coin-balance` which works for all wallets. Returns 0 on
-        miss / parse error (the executor pre-flight just won't transfer
-        any shortfall, and the downstream order surfaces the live error).
+        """Per-coin TRANSFERABLE balance for any wallet (the amount
+        `inter-transfer` will move). `/v5/account/wallet-balance` is
+        UNIFIED-only; for FUND / CONTRACT / OPTION balances Bybit requires
+        `/v5/asset/transfer/query-account-coin-balance` which works for all
+        wallets and exposes `transferBalance`. Returns 0 on miss / parse
+        error (the executor pre-flight just won't transfer any shortfall,
+        and the downstream order surfaces the live error).
         """
         data = await self._request(
             "GET",
@@ -1709,7 +1710,14 @@ class BybitClient:
         )
         result = (data or {}).get("result") or {}
         balance = result.get("balance") or {}
-        raw = balance.get("walletBalance") or balance.get("transferBalance")
+        # Prefer `transferBalance` — that is the amount `inter-transfer`
+        # actually honors. On the Unified Trading Account Bybit reserves a
+        # haircut, so `walletBalance` overstates the movable funds: sizing a
+        # UNIFIED→FUND move from walletBalance reverted 131212 "insufficient
+        # balance" at execute (prod 2026-06-08, UNIFIED USDT wallet 12.44 but
+        # transfer 9.46). For FUND/CONTRACT the two are equal, so this is a
+        # no-op there.
+        raw = balance.get("transferBalance") or balance.get("walletBalance")
         if raw is None:
             return Decimal(0)
         try:

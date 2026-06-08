@@ -2788,12 +2788,26 @@ async def _ensure_fund_balance(
     gap_with_buffer = (gap * Decimal("1.005")).quantize(
         Decimal("0.000001"), rounding=ROUND_DOWN
     )
+    # Size the move from the UNIFIED TRANSFERABLE balance, not equity.
+    # `get_wallet_balance` reports walletBalance/equity, but the UTA reserves
+    # a haircut so the inter-transfer endpoint only moves `transferBalance`.
+    # Sizing from equity moved more than allowed and reverted 131212 at
+    # execute (prod 2026-06-08: UNIFIED USDT equity 18.78 but only ~transfer
+    # movable → UNIFIED→FUND of $12.47 failed, OnChain USDT subscribe stranded).
     try:
-        unified = await client.get_wallet_balance(coin=coin, account_type="UNIFIED")
+        unified_have_raw = await client.get_account_coin_balance(
+            account_type="UNIFIED", coin=coin
+        )
     except Exception as e:  # noqa: BLE001
         log.warning("ensure_fund_balance: UNIFIED probe failed for %s: %s", coin, e)
         return
-    unified_have = _coin_equity_from_wallet(unified, coin)
+    if isinstance(unified_have_raw, Decimal):
+        unified_have = unified_have_raw
+    else:
+        try:
+            unified_have = Decimal(str(unified_have_raw))
+        except (InvalidOperation, TypeError, ValueError):
+            return
     # Bybit's internal-transfer rejects amounts whose decimal scale exceeds
     # the coin's transfer accuracy (retCode 131210 "transfer amount scale
     # more than accuracy length"). `gap_with_buffer` is 6dp and
@@ -3157,16 +3171,18 @@ def _orphan_spot_sell_actions(
     *,
     idx_offset: int,
 ) -> list[Action]:
-    """Defensive cleanup: sell to USDT the UNIFIED-wallet portion of a
-    non-stable coin that exceeds what's needed to balance an open perp
-    short on the same coin.
+    """Defensive cleanup: sell to USDT the wallet portion (UNIFIED + FUND)
+    of a non-stable coin that exceeds what's needed to balance an open perp
+    short on the same coin. FUND is included because LM/LP-redeem principal
+    settles there (`bybit-sandbox`, 2026-06-08: TIA); the SWAP_SPOT Sell
+    dispatch transfers the base coin FUND→UNIFIED before placing the order.
 
     Delta-neutral accounting (2026-06-03 fix after live naked-short bug):
-        total_long  = unified_balance + earn_staked_native
+        total_long  = wallet_balance(UNIFIED+FUND) + earn_staked_native
         perp_short  = abs(open Sell perp size on {coin}USDT)
                       after this cycle's planned closes / opens
         excess_long = max(0, total_long - perp_short)
-        sellable    = min(unified_balance, excess_long)
+        sellable    = min(wallet_balance, excess_long)
 
     Only the `sellable` portion goes to a `SWAP_SPOT Sell` — never the
     spot leg that's currently hedging an open short. Pre-fix the function
@@ -3211,11 +3227,26 @@ def _orphan_spot_sell_actions(
 
     swaps: list[Action] = []
     cursor = idx_offset
-    balances = snapshot.wallet.unified_coin_balances or {}
-    for coin, balance in balances.items():
-        if not coin:
-            continue
-        coin_u = coin.upper()
+    # Merge UNIFIED + FUND non-stable balances per coin. A coin freed by an
+    # LM/LP redeem lands in FUND (`bybit-sandbox`, 2026-06-08: TIA), which a
+    # UNIFIED-only scan never sees → naked spot forever. Both are sellable:
+    # the SWAP_SPOT Sell dispatch auto-transfers the base coin FUND→UNIFIED
+    # (`_ensure_unified_balance`) before placing the spot order.
+    balances: dict[str, Decimal] = {}
+    for src in (
+        snapshot.wallet.unified_coin_balances or {},
+        getattr(snapshot.wallet, "fund_coin_balances", None) or {},
+    ):
+        for coin, raw in src.items():
+            if not coin:
+                continue
+            try:
+                bal = raw if isinstance(raw, Decimal) else Decimal(str(raw))
+            except (InvalidOperation, TypeError):
+                continue
+            cu = coin.upper()
+            balances[cu] = balances.get(cu, Decimal(0)) + bal
+    for coin_u, balance in balances.items():
         if coin_u in _STABLES or coin_u == "USDC":
             continue
         if balance <= 0:
@@ -3224,7 +3255,7 @@ def _orphan_spot_sell_actions(
             continue
         perp_info = (snapshot.perp_market or {}).get(coin_u) or (
             snapshot.perp_market or {}
-        ).get(coin)
+        ).get(coin_u.lower())
         mark = getattr(perp_info, "mark_price", None) if perp_info else None
         if not mark or mark <= 0:
             continue
@@ -3262,7 +3293,7 @@ def _orphan_spot_sell_actions(
                 order_link_id=_order_link_id(snapshot_ts, cursor),
                 reason=(
                     f"sell orphan {qty} {coin_u} → {dest_coin} "
-                    f"(~${usd:.2f}): UNIFIED {balance} + Earn "
+                    f"(~${usd:.2f}): wallet {balance} (UNIFIED+FUND) + Earn "
                     f"{earn_long.get(coin_u, 0)} - perp short {short} = "
                     f"excess {excess_long}"
                 ),

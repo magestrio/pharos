@@ -473,6 +473,62 @@ def test_diff_orphan_spot_sold_to_usdt_when_not_subscribed() -> None:
     assert "orphan" in s.reason.lower()
 
 
+def test_diff_orphan_spot_sold_from_fund_account() -> None:
+    """`bybit-sandbox` 2026-06-08: principal freed by an LM/LP redeem
+    settles in the FUND account, not UNIFIED (live: ~17 TIA after an LM
+    exit). The orphan-seller must scan FUND too — the SWAP_SPOT Sell
+    dispatch transfers it FUND→UNIFIED first — else the non-stable sits as
+    naked directional spot forever, violating the controlled-risk thesis."""
+    snap = _snapshot(
+        total_equity_usd="180",
+        perp_market={"TIA": _perp("TIA", mark="0.32", min_notional="1.0")},
+    )
+    snap.wallet.unified_coin_balances = {}  # nothing sellable in UNIFIED
+    snap.wallet.fund_coin_balances = {"TIA": Decimal("17.08")}  # freed LM principal
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_flex", 0.5, [("1131", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260608T120000Z")
+    sells = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "TIAUSDT"
+        and a.side == "Sell"
+    ]
+    assert len(sells) == 1, [a.kind for a in actions]
+    assert sells[0].amount > Decimal("17")
+    assert "orphan" in sells[0].reason.lower()
+
+
+def test_diff_orphan_spot_merges_unified_and_fund() -> None:
+    """A non-stable split across UNIFIED and FUND is summed for the
+    sell-down (total long = wallet UNIFIED+FUND), not scanned per-account."""
+    snap = _snapshot(
+        total_equity_usd="180",
+        perp_market={"TIA": _perp("TIA", mark="0.32", min_notional="1.0")},
+    )
+    snap.wallet.unified_coin_balances = {"TIA": Decimal("5")}
+    snap.wallet.fund_coin_balances = {"TIA": Decimal("12")}
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_flex", 0.5, [("1131", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260608T120000Z")
+    sells = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "TIAUSDT"
+        and a.side == "Sell"
+    ]
+    assert len(sells) == 1
+    assert sells[0].amount > Decimal("16.9")  # ~17 combined, rounded down
+
+
 def test_diff_orphan_spot_btc_routes_to_usdc_directly() -> None:
     """`.49`: BTC settling out of a 1d DiscountBuy lands in UNIFIED with
     no Earn position and no perp short backing it. Orphan cleanup must
@@ -3394,20 +3450,19 @@ async def test_execute_onchain_subscribe_transfers_unified_to_fund_for_non_stabl
     Buy spot deposits the coin in UNIFIED but OnChain Earn expects
     FUND → retCode=180016 and the paired perp short is orphaned.
     """
-    from agent.bybit_oracle.bybit_client import WalletAccount, WalletCoin
     client = AsyncMock()
-    # FUND has 0 TON, UNIFIED has 7.6 TON (from the upstream Buy swap).
-    # Settle-poll: first FUND probe returns 0, post-transfer probes 8.
+    # FUND has 0 TON, UNIFIED has 7.6 TON transferable (from the upstream
+    # Buy swap). Settle-poll: first FUND probe returns 0, post-transfer 8.
+    # The UNIFIED source amount is read via get_account_coin_balance too
+    # (transferBalance — what inter-transfer honors), not get_wallet_balance.
     fund_probe_results = iter([Decimal("0"), Decimal("8")])
-    client.get_account_coin_balance.side_effect = lambda **_: next(
-        fund_probe_results, Decimal("8")
-    )
-    client.get_wallet_balance.return_value = [
-        WalletAccount(
-            accountType="UNIFIED",
-            coin=[WalletCoin(coin="TON", walletBalance="7.6", availableToWithdraw="7.6")],
-        )
-    ]
+
+    def _coin_balance(*, account_type: str, coin: str) -> Decimal:
+        if account_type == "UNIFIED":
+            return Decimal("7.6")
+        return next(fund_probe_results, Decimal("8"))
+
+    client.get_account_coin_balance.side_effect = _coin_balance
     from agent.bybit_oracle.bybit_client import EarnOrderResult
     client.place_earn_order.return_value = EarnOrderResult(
         orderId="earn-001", orderLinkId="sandbox-earn-001"
@@ -3447,24 +3502,19 @@ async def test_ensure_fund_balance_quantizes_usdt_to_2dp() -> None:
     accuracy length") for USDT, even though USDC settles fine at 6dp. The
     high-precision UNIFIED balance would otherwise win the min() and carry
     its 8dp scale into the transfer."""
-    from agent.bybit_oracle.bybit_client import WalletAccount, WalletCoin
     from agent.sandbox.execute import _ensure_fund_balance
 
     client = AsyncMock()
     fund_probe = iter([Decimal("0"), Decimal("44.57")])  # empty → settled
-    client.get_account_coin_balance.side_effect = lambda **_: next(
-        fund_probe, Decimal("44.57")
-    )
-    client.get_wallet_balance.return_value = [
-        WalletAccount(
-            accountType="UNIFIED",
-            coin=[WalletCoin(
-                coin="USDT",
-                walletBalance="100.12345678",
-                availableToWithdraw="100.12345678",
-            )],
-        )
-    ]
+    # UNIFIED source carries the wallet's full 8dp precision (transferBalance
+    # from get_account_coin_balance); it would win the min() and drag its
+    # scale into the transfer unless re-quantized to the coin's accuracy.
+    def _coin_balance(*, account_type: str, coin: str) -> Decimal:
+        if account_type == "UNIFIED":
+            return Decimal("100.12345678")
+        return next(fund_probe, Decimal("44.57"))
+
+    client.get_account_coin_balance.side_effect = _coin_balance
     await _ensure_fund_balance(client, "USDT", Decimal("44.3525"))
 
     client.internal_transfer.assert_awaited_once()
@@ -3472,6 +3522,53 @@ async def test_ensure_fund_balance_quantizes_usdt_to_2dp() -> None:
     # gap 44.3525 × 1.005 = 44.5742… → 2dp ROUND_DOWN = 44.57 (≥ required).
     assert amt == "44.57"
     assert Decimal(amt) >= Decimal("44.3525")
+
+
+@pytest.mark.asyncio
+async def test_ensure_fund_balance_clamps_move_to_unified_transferable() -> None:
+    """2026-06-08: the UNIFIED→FUND move must be sized from the UNIFIED
+    TRANSFERABLE balance (transferBalance via get_account_coin_balance), not
+    walletBalance/equity. The UTA reserves a haircut, so moving the
+    equity-sized gap reverts 131212 "insufficient balance" (prod: UNIFIED
+    USDT equity 18.78 but transfer movable lower → UNIFIED→FUND $12.47
+    failed, OnChain USDT subscribe stranded). The move must never exceed
+    transferable."""
+    from agent.sandbox.execute import _ensure_fund_balance
+
+    client = AsyncMock()
+    # FUND empty pre-transfer, credited to 12 after. UNIFIED transferable is
+    # exactly 12 — the move must clamp to it, NOT the buffered gap 12.06.
+    fund_probe = iter([Decimal("0"), Decimal("12")])
+
+    def _coin_balance(*, account_type: str, coin: str) -> Decimal:
+        if account_type == "UNIFIED":
+            return Decimal("12")
+        return next(fund_probe, Decimal("12"))
+
+    client.get_account_coin_balance.side_effect = _coin_balance
+    await _ensure_fund_balance(client, "USDT", Decimal("12"))
+
+    client.internal_transfer.assert_awaited_once()
+    amt = Decimal(client.internal_transfer.await_args.kwargs["amount"])
+    assert amt == Decimal("12.00")  # clamped to transferable, not 12.06
+
+
+@pytest.mark.asyncio
+async def test_get_account_coin_balance_prefers_transfer_balance() -> None:
+    """`get_account_coin_balance` returns `transferBalance` (what
+    inter-transfer honors), not `walletBalance` — the UTA reserves a haircut
+    so walletBalance overstates the movable amount."""
+    from agent.bybit_oracle.bybit_client import BybitClient
+
+    # Drive the real method against a stubbed _request.
+    inner = AsyncMock()
+    inner._request.return_value = {
+        "result": {"balance": {"walletBalance": "12.44", "transferBalance": "9.46"}}
+    }
+    got = await BybitClient.get_account_coin_balance(
+        inner, account_type="UNIFIED", coin="USDT"
+    )
+    assert got == Decimal("9.46")
 
 
 @pytest.mark.asyncio
