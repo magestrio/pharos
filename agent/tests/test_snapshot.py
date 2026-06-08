@@ -603,7 +603,11 @@ def test_apply_net_hedge_subtracts_negative_funding():
         - FUNDING_CARRY_FRICTION_ANNUAL
     )
     assert row.effective_apr_net_hedge == expected
-    assert row.effective_apr_net_hedge < row.effective_apr
+    # `effective_apr` is overwritten with the net (the headline the LLM reasons
+    # on); the original gross is preserved in `effective_apr_gross`.
+    assert row.effective_apr_gross == Decimal("0.56")
+    assert row.effective_apr == row.effective_apr_net_hedge
+    assert row.effective_apr_net_hedge < row.effective_apr_gross  # funding bled it
     assert row.net_hedge_source == "earn+funding-friction"
 
 
@@ -613,7 +617,8 @@ def test_apply_net_hedge_adds_positive_funding():
     row = _nonstable("AAA", "0.05")
     products = {"FlexibleSaving": [row], "OnChain": []}
     _apply_net_hedge_apr(products, {"AAA": _info("AAA", "0.0001")})
-    assert row.effective_apr_net_hedge > row.effective_apr  # subsidy net of friction
+    assert row.effective_apr == row.effective_apr_net_hedge  # net is the headline now
+    assert row.effective_apr_net_hedge > row.effective_apr_gross  # subsidy net of friction
 
 
 def test_apply_net_hedge_none_when_perp_missing():
@@ -1651,3 +1656,103 @@ def test_build_carry_products_defaults_to_8h_when_interval_missing() -> None:
     # Interval surfaced in notes either way (fallback prints the default).
     miss_note = next(n for n in rows_miss[0].notes if n.startswith("funding_interval_hours="))
     assert miss_note == f"funding_interval_hours={DEFAULT_FUNDING_INTERVAL_HOURS}"
+
+
+# ─── Carry spot-pair requirement (`bybit-sandbox`, 2026-06-08) ──────────────
+
+
+def _spotless_perp_client(coin: str, *, spot_status: str | None) -> AsyncMock:
+    """AsyncMock client for `_fetch_perp_info`: a Trading linear perp whose
+    SPOT pair status is `spot_status` (None → spot probe returns empty, i.e.
+    no spot market). `get_instruments_info` answers per `category` kwarg."""
+    from agent.bybit_oracle.bybit_client import (
+        InstrumentLeverageFilter,
+        InstrumentLotSizeFilter,
+        LinearInstrument,
+    )
+
+    sym = f"{coin}USDT"
+    linear = [
+        LinearInstrument(
+            symbol=sym,
+            status="Trading",
+            lotSizeFilter=InstrumentLotSizeFilter(minOrderQty="0.01", qtyStep="0.01"),
+            leverageFilter=InstrumentLeverageFilter(maxLeverage="10"),
+        )
+    ]
+    spot = (
+        [LinearInstrument(symbol=sym, status=spot_status)]
+        if spot_status is not None
+        else []
+    )
+
+    client = AsyncMock()
+    client.get_tickers.return_value = [_ticker(coin, "0.001")]
+    client.get_orderbook.side_effect = RuntimeError("no book")  # → depth None
+    client.get_funding_history.return_value = [Decimal("0.001")]
+    client.get_instruments_info.side_effect = lambda *, category, symbol: (
+        linear if category == "linear" else spot
+    )
+    return client
+
+
+@pytest.mark.asyncio
+async def test_fetch_perp_info_flags_missing_spot_market() -> None:
+    """A linear perp with NO spot pair (tokenized-equity perp like MRVLUSDT
+    — Trading on linear, empty on spot) is kept in perp_market for hedging
+    but flagged `has_spot_market=False`. A coin with a Trading spot pair is
+    flagged True."""
+    from agent.sandbox.snapshot import _fetch_perp_info
+
+    _, no_spot = await _fetch_perp_info(
+        _spotless_perp_client("MRVL", spot_status=None), "MRVL", []
+    )
+    assert no_spot is not None  # still usable as a perp (hedge) reference
+    assert no_spot.has_spot_market is False
+
+    _, with_spot = await _fetch_perp_info(
+        _spotless_perp_client("TON", spot_status="Trading"), "TON", []
+    )
+    assert with_spot is not None
+    assert with_spot.has_spot_market is True
+
+
+def test_build_carry_excludes_perp_without_spot_market() -> None:
+    """Carry opens a spot Buy leg, so a perp without a spot pair
+    (`has_spot_market=False`) must be filtered out — even when funding,
+    depth and min-notional all qualify. Isolates the spot gate from the
+    other carry constraints."""
+    qualifying = _info("MRVL", "0.0001")  # depth/min_notional all pass
+    assert _build_funding_carry_products(
+        {"MRVL": qualifying}, Decimal("10000")
+    ), "control: qualifies with default has_spot_market=True"
+
+    spotless = qualifying.model_copy(update={"has_spot_market": False})
+    assert _build_funding_carry_products({"MRVL": spotless}, Decimal("10000")) == []
+
+
+# ─── FUND-account balance surfacing (`bybit-sandbox`, 2026-06-08) ────────────
+
+
+def test_all_coins_in_fund_extracts_funding_account_only() -> None:
+    """`_all_coins_in_fund` reads the FUND (Funding) account's coinDetail —
+    where redeemed LM/LP principal (e.g. TIA) settles — and ignores UNIFIED.
+    This is what surfaces a stranded non-stable to the orphan-seller."""
+    from agent.sandbox.snapshot import _all_coins_in_fund
+
+    accounts = [
+        {
+            "accountType": "FundingAccount",
+            "coinDetail": [
+                {"coin": "TIA", "equity": "17.083644"},
+                {"coin": "USDT", "equity": "5.38"},
+            ],
+        },
+        {
+            "accountType": "UnifiedTradingAccount",
+            "coinDetail": [{"coin": "ETH", "equity": "0.5"}],
+        },
+    ]
+    fund = _all_coins_in_fund(accounts)
+    assert fund == {"TIA": Decimal("17.083644"), "USDT": Decimal("5.38")}
+    assert "ETH" not in fund  # UNIFIED coin not picked up

@@ -73,6 +73,13 @@ ADVANCE_QUOTE_TOP_K = 10
 # any non-stable Earn pick without a perp_market entry, so silent
 # under-fetch turns into a hard skipped-cycle.
 PERP_HEDGE_TOP_K = 16
+# Minimum USD value of a raw wallet non-stable balance (UNIFIED or FUND)
+# before we spend a perp-info fan-out on it so the orphan-seller can price
+# its disposal. Kept just under the executor's MIN_SWAP_USDC ($5) so a
+# borderline balance still gets a quote and the executor makes the final
+# cut; filters out the long tail of sub-cent dust that would otherwise
+# cost a 5-call fan-out each (`bybit-sandbox`, 2026-06-08).
+_WALLET_ORPHAN_FLOOR_USD = Decimal("3")
 # Funding-carry venue (`bybit-strategy-expansion.2`). Number of carry
 # candidates surfaced in `products["FundingCarry"]` after the friction-
 # adjusted ranking. Pre-fan-out we filter the all-linear-tickers feed
@@ -190,6 +197,11 @@ class ProductSummary(BaseModel):
     # Audit breadcrumb for the field above: "earn+funding-friction" when
     # computed, "perp_missing" / "funding_missing" when it couldn't be.
     net_hedge_source: str | None = None
+    # Original GROSS `effective_apr` before `_apply_net_hedge_apr` overwrites
+    # `effective_apr` with the realizable net-of-hedge yield (2026-06-08). Kept
+    # for audit / debugging the hedge impact. None for stables and for rows
+    # whose net couldn't be computed (effective_apr stays gross there).
+    effective_apr_gross: Decimal | None = None
     base_apr_string: str | None = None  # raw Bybit value (debug / audit)
     redeem_lockup_minutes: int | None = None
     # OnChain Fixed-term lockup in days (`OnChainEarnProduct.term`, non-
@@ -243,6 +255,14 @@ class WalletSnapshot(BaseModel):
     # wallet doesn't hold yet. Empty dict when the asset-overview has
     # no UNIFIED account.
     unified_coin_balances: dict[str, Decimal] = Field(default_factory=dict)
+    # Per-coin balances in the FUND (Funding) account, native units. Earn
+    # OnChain yield and redeemed LM/LP base-coin principal land here (not
+    # UNIFIED), so a non-stable freed by a redeem (e.g. TIA after an LM
+    # exit) sits in FUND, invisible to a UNIFIED-only scan. The executor's
+    # orphan-seller reads this so such balances get swept to stables
+    # instead of sitting as naked directional spot (`bybit-sandbox`,
+    # 2026-06-08). Empty when the asset-overview has no FUND account.
+    fund_coin_balances: dict[str, Decimal] = Field(default_factory=dict)
     # Total USDC the planner can spend on spot swaps this cycle — sum
     # across UNIFIED + FUND. The executor's `_transfer_satisfies_swap`
     # pre-flight can pull FUND USDC into UNIFIED, so for budgeting
@@ -386,6 +406,14 @@ class PerpInfo(BaseModel):
     # retCode=10001. Executor rounds down to the nearest step.
     qty_step: Decimal | None = None
     max_leverage: Decimal | None = None  # informational; we always hedge at 1x
+    # Whether a tradeable SPOT pair ({coin}USDT) exists. Funding-carry
+    # opens a spot Buy leg + perp Sell; some coins have a linear perp but
+    # NO spot market (tokenized-equity / pre-market perps like MRVLUSDT),
+    # so the carry spot leg reverts 170121 "Invalid symbol" (prod
+    # 2026-06-08). Carry surfacing requires this True. Defaults True so
+    # hedge-only fixtures (which never read it) are unaffected; the live
+    # fetcher sets it from a spot instruments-info probe.
+    has_spot_market: bool = True
 
 
 class Snapshot(BaseModel):
@@ -1374,6 +1402,11 @@ _UNIFIED_ACCOUNT_TYPES: frozenset[str] = frozenset(
     {"UnifiedTradingAccount", "UNIFIED"}
 )
 
+# FUND (Funding) account type, both the asset-overview echo form and the
+# request-param short form. Where Earn OnChain yield + redeemed LM/LP
+# principal settle.
+_FUND_ACCOUNT_TYPES: frozenset[str] = frozenset({"FundingAccount", "FUND"})
+
 
 def _usdt_in_unified(accounts: list[dict[str, Any]]) -> Decimal:
     """Pull the USDT balance from the UNIFIED account in an asset-overview
@@ -1427,6 +1460,28 @@ def _all_coins_in_unified(accounts: list[dict[str, Any]]) -> dict[str, Decimal]:
     out: dict[str, Decimal] = {}
     for acct in accounts:
         if acct.get("accountType") not in _UNIFIED_ACCOUNT_TYPES:
+            continue
+        for entry in acct.get("coinDetail") or []:
+            coin = entry.get("coin")
+            if not coin:
+                continue
+            raw = entry.get("equity") or entry.get("walletBalance") or "0"
+            try:
+                out[coin] = Decimal(str(raw))
+            except (InvalidOperation, TypeError):
+                continue
+    return out
+
+
+def _all_coins_in_fund(accounts: list[dict[str, Any]]) -> dict[str, Decimal]:
+    """`{coin: balance}` for every coin in the FUND (Funding) account,
+    native units. Mirror of `_all_coins_in_unified` for the wallet where
+    Earn OnChain yield + redeemed LM/LP principal settle — surfaced so the
+    executor's orphan-seller can sweep a non-stable stranded in FUND (e.g.
+    TIA freed by an LM exit) instead of leaving it as naked spot."""
+    out: dict[str, Decimal] = {}
+    for acct in accounts:
+        if acct.get("accountType") not in _FUND_ACCOUNT_TYPES:
             continue
         for entry in acct.get("coinDetail") or []:
             coin = entry.get("coin")
@@ -1516,6 +1571,13 @@ def _apply_net_hedge_apr(
                 base + funding_annual - FUNDING_CARRY_FRICTION_ANNUAL
             )
             row.net_hedge_source = "earn+funding-friction"
+            # Make NET the headline `effective_apr` the LLM reasons on
+            # (2026-06-08) — a gross 101% with -37%/yr funding is really a
+            # +64% hedged pick; surfacing gross let the model over-rate it.
+            # Stash gross for audit; guard idempotency (computed once/cycle).
+            if row.effective_apr_gross is None:
+                row.effective_apr_gross = row.effective_apr
+            row.effective_apr = row.effective_apr_net_hedge
 
 
 def _parse_funding_interval(raw: str | None) -> Decimal | None:
@@ -1541,12 +1603,15 @@ async def _fetch_perp_info(
     """
     symbol = f"{coin.upper()}USDT"
     try:
-        tickers, book, instruments, funding_history = await asyncio.gather(
-            client.get_tickers(category="linear", symbol=symbol),
-            client.get_orderbook(symbol=symbol, category="linear", limit=50),
-            client.get_instruments_info(category="linear", symbol=symbol),
-            client.get_funding_history(symbol=symbol, category="linear", limit=21),
-            return_exceptions=True,
+        tickers, book, instruments, funding_history, spot_instruments = (
+            await asyncio.gather(
+                client.get_tickers(category="linear", symbol=symbol),
+                client.get_orderbook(symbol=symbol, category="linear", limit=50),
+                client.get_instruments_info(category="linear", symbol=symbol),
+                client.get_funding_history(symbol=symbol, category="linear", limit=21),
+                client.get_instruments_info(category="spot", symbol=symbol),
+                return_exceptions=True,
+            )
         )
     except Exception as e:  # noqa: BLE001
         errors.append(f"perp_market[{coin}]: {type(e).__name__}: {e}")
@@ -1560,6 +1625,14 @@ async def _fetch_perp_info(
         book = None
     if isinstance(instruments, BaseException):
         instruments = None
+    # Spot-pair existence (carry needs a spot Buy leg). A failed probe
+    # degrades to False so a coin whose spot market we can't confirm is
+    # kept out of carry rather than 170121'ing the spot leg at execute.
+    has_spot_market = bool(
+        isinstance(spot_instruments, list)
+        and spot_instruments
+        and (spot_instruments[0].status or "Trading") == "Trading"
+    )
     funding_7d_avg: Decimal | None = None
     if isinstance(funding_history, list) and funding_history:
         funding_7d_avg = sum(funding_history, Decimal(0)) / Decimal(len(funding_history))
@@ -1633,6 +1706,7 @@ async def _fetch_perp_info(
         min_notional_usd=min_notional,
         qty_step=qty_step_d,
         max_leverage=max_lev,
+        has_spot_market=has_spot_market,
     )
 
 
@@ -1719,6 +1793,11 @@ def _build_funding_carry_products(
     rows: list[ProductSummary] = []
     for coin, info in perp_market.items():
         if coin in STABLES:
+            continue
+        # Carry opens a spot Buy leg — skip perps with no tradeable spot
+        # pair (tokenized-equity / pre-market perps like MRVLUSDT), whose
+        # spot leg reverts 170121 "Invalid symbol" at execute.
+        if not info.has_spot_market:
             continue
         if info.funding_rate_7d_avg is None:
             continue
@@ -2333,6 +2412,7 @@ async def collect_snapshot(
     accounts = asset_overview.get("list", []) or []
     usdt_available = _usdt_in_unified(accounts)
     unified_coins = _all_coins_in_unified(accounts)
+    fund_coins = _all_coins_in_fund(accounts)
     # USDC across UNIFIED + FUND + others. USDC is our universal swap
     # source coin — the planner needs the full liquid balance to
     # decide how many swaps it can afford without draining mid-cycle.
@@ -2543,6 +2623,35 @@ async def collect_snapshot(
         if coin in STABLES:
             continue
         held_perp_coins.append(coin)
+    # Also include non-stable coins sitting RAW in the wallet (UNIFIED or
+    # FUND) above a material USD floor — e.g. principal freed by an LM/LP
+    # redeem that landed in FUND (TIA, 2026-06-08). Without a perp quote
+    # the executor's orphan-seller can't price the disposal and the coin
+    # sits as naked directional spot. Price-filter via the already-fetched
+    # `all_linear_tickers` (no extra API calls) so the ~40 sub-cent dust
+    # balances don't each cost a 5-call fan-out; the floor is below the
+    # executor's MIN_SWAP_USDC so a borderline coin still gets a quote and
+    # the executor makes the final cut.
+    linear_mark: dict[str, Decimal] = {}
+    for t in all_linear_tickers:
+        if not t.symbol.endswith("USDT"):
+            continue
+        px = t.markPrice or t.lastPrice
+        if not px:
+            continue
+        try:
+            linear_mark[t.symbol.removesuffix("USDT").upper()] = Decimal(px)
+        except (InvalidOperation, TypeError):
+            continue
+    for src in (unified_coins, fund_coins):
+        for raw_coin, bal in src.items():
+            cu = (raw_coin or "").upper()
+            if not cu or cu in STABLES:
+                continue
+            mark = linear_mark.get(cu)
+            if mark is None or bal <= 0 or bal * mark < _WALLET_ORPHAN_FLOOR_USD:
+                continue
+            held_perp_coins.append(cu)
     # Merge: dedupe, preserve perp_coins order first (ranked picks take
     # priority within the per-coin fan-out budget), then append unseen
     # held coins beyond the cap so they ALWAYS get a quote.
@@ -2677,6 +2786,7 @@ async def collect_snapshot(
             accounts=accounts,
             usdt_available_usd=usdt_available,
             unified_coin_balances=unified_coins,
+            fund_coin_balances=fund_coins,
             liquid_usdc_usd=liquid_usdc,
             liquid_usdt_usd=liquid_usdt,
         ),
