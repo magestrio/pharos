@@ -38,6 +38,7 @@ from agent.sandbox.execute import (
     _execute_one,
     _hedged_pick_underfunded_coins,
     _lm_hedge_targets,
+    _orphan_perp_close_actions,
     _order_link_id,
     _stable_consolidate_actions,
     _swap_actions_for_hedges,
@@ -1462,6 +1463,63 @@ def test_diff_lm_held_base_keeps_hedge_when_pick_dropped() -> None:
     actions = diff_to_actions(snap, d, snapshot_ts="20260608T120000Z")
     closes = [a for a in actions if a.kind == ActionKind.CLOSE_PERP]
     assert closes == []  # hedge retained while the LP is still held
+
+
+# ─── Orphan perp-short close (de-risk sweep) ────────────────────────────────
+
+
+def test_orphan_perp_close_closes_unbacked_short() -> None:
+    """A perp short with no Earn/LM/carry backing (underlying redeemed) is an
+    orphan → close the full size. This is the BERA dust-short the conf-gated
+    hedge-diff couldn't clear."""
+    snap = _snapshot(
+        perp_market={"BERA": _perp("BERA", mark="0.26", min_order_qty="1")},
+        perp_positions=[_short_pos("BERA", size="1", position_value="0.26")],
+    )
+    closes = _orphan_perp_close_actions(snap, "20260608T120000Z", idx_offset=780)
+    assert len(closes) == 1
+    assert closes[0].kind == ActionKind.CLOSE_PERP
+    assert closes[0].coin == "BERA"
+    assert closes[0].amount == Decimal("1")
+
+
+def test_orphan_perp_close_keeps_earn_backed_short() -> None:
+    """A short still backed by a held Earn position is a real hedge → keep."""
+    snap = _snapshot(
+        perp_market={"TON": _perp("TON", mark="2.0")},
+        perp_positions=[_short_pos("TON", size="25", position_value="50")],
+        earn_positions=[_pos("OnChain", "8", "25", coin="TON")],
+    )
+    assert _orphan_perp_close_actions(snap, "20260608T120000Z", idx_offset=780) == []
+
+
+def test_orphan_perp_close_keeps_lm_base_hedge() -> None:
+    """The ETH short backing a held ETH/USDC LM base leg must NOT be swept —
+    it's a live hedge, not an orphan."""
+    snap = _snapshot(
+        perp_market={"ETH": _perp("ETH", mark="2000", min_order_qty="0.001")},
+        perp_positions=[_short_pos("ETH", size="0.01", position_value="20")],
+        lm_products=[_lm_product("24")],
+        lm_positions=[
+            _lm_position(product_id="24", position_id="9001", principal_usd="53")
+        ],
+    )
+    assert _orphan_perp_close_actions(snap, "20260608T120000Z", idx_offset=780) == []
+
+
+def test_orphan_perp_close_keeps_carry_coin() -> None:
+    """A funding-carry short is a standalone position, not an Earn hedge —
+    exclude it from the orphan sweep via carry_coins."""
+    snap = _snapshot(
+        perp_market={"SOL": _perp("SOL", mark="100")},
+        perp_positions=[_short_pos("SOL", size="1", position_value="100")],
+    )
+    assert (
+        _orphan_perp_close_actions(
+            snap, "20260608T120000Z", idx_offset=780, carry_coins={"SOL"}
+        )
+        == []
+    )
 
 
 def test_diff_advance_pick_emits_skip() -> None:

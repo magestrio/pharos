@@ -67,6 +67,7 @@ from agent.sandbox.carry_state import (
 from agent.sandbox.execute import (
     DEFAULT_AUTO_APPROVE_MIN_CONFIDENCE,
     EXECUTIONS_DIR,
+    _orphan_perp_close_actions,
     _orphan_spot_sell_actions,
     _stable_consolidate_actions,
     apply_carry_results_to_state,
@@ -1406,8 +1407,17 @@ async def run_one_cycle(
         # to avoid double execution.
         conf_ok = decision.confidence >= min_confidence
         if live and not (ok and conf_ok):
-            sweep = _orphan_spot_sell_actions(
-                snap, [], [], [], [], snap_path.stem, idx_offset=800
+            # Close orphan perp shorts (underlying Earn/LM redeemed → naked
+            # short bleeding funding) FIRST, then sell the spot they no
+            # longer back. Both are pure risk reduction and must run even
+            # when the full allocation won't (else the normal hedge-diff
+            # close stays gated to dry-run and dust never clears).
+            carry_coins = read_carry_state().active_coins()
+            perp_closes = _orphan_perp_close_actions(
+                snap, snap_path.stem, idx_offset=780, carry_coins=carry_coins
+            )
+            sweep = perp_closes + _orphan_spot_sell_actions(
+                snap, [], [], perp_closes, [], snap_path.stem, idx_offset=800
             )
             if sweep:
                 sweep_results = await execute_actions(

@@ -3731,6 +3731,93 @@ def _coin_to_perp_short_size(snapshot: Snapshot) -> dict[str, Decimal]:
     return out
 
 
+def _orphan_perp_close_actions(
+    snapshot: Snapshot,
+    snapshot_ts: str,
+    *,
+    idx_offset: int,
+    carry_coins: set[str] | None = None,
+) -> list[Action]:
+    """Close perp SHORTS whose coin has NO backing yield position — held
+    Earn (incl. settling `Processing`), held LM base leg, or funding-carry.
+    Such a short is an orphan: its underlying was redeemed/closed, so it's
+    a naked directional short that only bleeds funding. Closing it is pure
+    risk reduction.
+
+    Pure / state-only (mirrors `_orphan_spot_sell_actions`): reads wallet +
+    position state, NOT the decision, so the safety de-risk sweep can run
+    it on low-confidence / rejected cycles where the normal hedge-diff
+    close is gated to dry-run and never fires (the BERA dust-short bug:
+    Earn redeemed, hedge-diff plans the close every cycle but conf<0.60
+    dry-runs it, leaving a 1-BERA short matched against 1-BERA spot that
+    the orphan-spot-sell treats as delta-neutral backing → neither clears).
+
+    Closes the FULL short size (rounded to qty_step); a sub-min-order
+    remainder is genuine untradeable dust and stays. The matched spot then
+    becomes naked and is swept by `_orphan_spot_sell_actions` (modulo its
+    own sub-min floor)."""
+    carry_coins = {c.upper() for c in (carry_coins or set())}
+    backed: set[str] = set(carry_coins)
+    for p in snapshot.earn_positions or []:
+        data = p.model_dump(mode="python") if hasattr(p, "model_dump") else p
+        c = (data.get("coin") or "").upper()
+        if not c or c in _STABLES:
+            continue
+        try:
+            if Decimal(str(data.get("amount", "0") or "0")) > 0:
+                backed.add(c)
+        except (InvalidOperation, TypeError):
+            continue
+    for pos in snapshot.lm_positions or []:
+        product = _lm_product_from_snapshot(snapshot, str(pos.get("productId") or ""))
+        if product is None:
+            continue
+        parts = product.coin.split("/", 1)
+        if len(parts) != 2:
+            continue
+        base = parts[0].upper()
+        if base and base not in _STABLES and _lm_principal_usd(pos) > 0:
+            backed.add(base)
+
+    closes: list[Action] = []
+    cursor = idx_offset
+    for pos in snapshot.perp_positions:
+        if not pos.symbol.endswith("USDT") or pos.side != "Sell":
+            continue
+        coin_u = _coin_from_perp_symbol(pos.symbol).upper()
+        if coin_u in backed:
+            continue
+        size = _safe_decimal(pos.size)
+        if size <= 0:
+            continue
+        info = (snapshot.perp_market or {}).get(coin_u) or (
+            snapshot.perp_market or {}
+        ).get(coin_u.lower())
+        qty_step = getattr(info, "qty_step", None) if info else None
+        min_qty = getattr(info, "min_order_qty", None) if info else None
+        qty = _round_to_qty_step(size, qty_step, min_qty)
+        if qty is None or qty <= 0:
+            continue
+        mark = getattr(info, "mark_price", None) if info else None
+        note = f" ~${(qty * mark):.2f}" if mark and mark > 0 else ""
+        closes.append(
+            Action(
+                kind=ActionKind.CLOSE_PERP,
+                category="linear",
+                product_id=pos.symbol,
+                coin=coin_u,
+                amount=qty,
+                order_link_id=_order_link_id(snapshot_ts, cursor),
+                reason=(
+                    f"close orphan perp {coin_u} short {qty}{note}: no backing "
+                    f"Earn/LM/carry position (de-risk sweep)"
+                ),
+            )
+        )
+        cursor += 1
+    return closes
+
+
 def _orphan_spot_sell_actions(
     snapshot: Snapshot,
     subscribes: list[Action],
