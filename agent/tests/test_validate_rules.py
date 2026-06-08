@@ -44,6 +44,7 @@ from agent.validate.rules import (
     check_hedges_for_non_usd_picks,
     check_lm_leverage_forbidden,
     check_lm_leverage_size_cap,
+    check_lm_stable_preference,
     check_lockup_cap,
     check_min_stake,
     check_no_double_carry_hedge,
@@ -768,6 +769,174 @@ def test_check_hedges_for_non_usd_picks_passes_for_stable_pick() -> None:
     assert check_hedges_for_non_usd_picks(d, s) == (True, None)
 
 
+def test_check_hedges_rejects_lm_base_without_perp() -> None:
+    """LM base leg is auto-hedged now: an ETH/USDC pick with no ETH perp
+    is un-hedgeable and must be rejected, not opened as a naked LP base."""
+    s = _snapshot(perp_market={})  # default LM ETH/USDC, no perp
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.7),
+            _venue("bybit_lm", 0.3, [("24", 1.0)]),
+        ]
+    )
+    ok, msg = check_hedges_for_non_usd_picks(d, s)
+    assert ok is False
+    assert "bybit_lm" in (msg or "") and "ETH" in (msg or "")
+
+
+def test_check_hedges_accepts_lm_base_with_perp() -> None:
+    """ETH/USDC pick with an ETH perp whose min_notional the base leg
+    clears → hedgeable → pass. Base leg = 100 × 0.3 × 0.5 = $15 ≥ $1."""
+    s = _snapshot(perp_market={"ETH": _perp("ETH", min_notional="1.0")})
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.7),
+            _venue("bybit_lm", 0.3, [("24", 1.0)]),
+        ]
+    )
+    assert check_hedges_for_non_usd_picks(d, s) == (True, None)
+
+
+def test_check_hedges_rejects_lm_base_below_min_notional() -> None:
+    """The hedge is sized on HALF the pick (the base leg). Base leg
+    $15 < perp min_notional $20 → reject. Guards the half-notional math:
+    the full $30 pick would clear $20, so a reject here proves the half."""
+    s = _snapshot(perp_market={"ETH": _perp("ETH", min_notional="20")})
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.7),
+            _venue("bybit_lm", 0.3, [("24", 1.0)]),
+        ]
+    )
+    ok, msg = check_hedges_for_non_usd_picks(d, s)
+    assert ok is False
+    assert "base leg" in (msg or "")
+
+
+def test_capital_flow_counts_lm_base_leg_margin() -> None:
+    """A non-stable LM pick now commits stake + perp margin on the base
+    half. cash 0.10 + onchain-stable 0.60 + LM 0.30 commits
+    60 + (30 + 30×0.5×1.05) = 105.75 > allowable 90 → reject. Under the
+    old face-value treatment it committed exactly 90 and passed."""
+    s = _snapshot(perp_market={"ETH": _perp("ETH", min_notional="1.0")})
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.10),
+            _venue("bybit_onchain", 0.60, [("26", 1.0)]),
+            _venue("bybit_lm", 0.30, [("24", 1.0)]),
+        ]
+    )
+    ok, msg = check_capital_flow_simulation(d, s)
+    assert ok is False
+    assert "bybit_lm" in (msg or "")
+
+
+def test_check_funding_floor_rejects_lm_when_hedge_bleeds() -> None:
+    """LM net-of-hedge gate: a high-gross LP whose base-leg hedge nets
+    negative (ranker stored it in effective_apr_net_hedge) is rejected,
+    just like a bleeding Flex/OnChain pick."""
+    lm = _product("24", "LiquidityMining", coin="ETH/USDC", apr_source="apy_e8", notes=["max_leverage=1"])
+    lm.effective_apr_net_hedge = Decimal("-0.03")  # base funding bled the LP
+    s = _snapshot(lm_products=[lm], perp_market={"ETH": _perp("ETH", funding_rate_7d_avg="-0.0004")})
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.7),
+            _venue("bybit_lm", 0.3, [("24", 1.0)]),
+        ]
+    )
+    ok, msg = check_funding_rate_floor(d, s)
+    assert ok is False
+    assert "bybit_lm" in (msg or "")
+
+
+def test_check_funding_floor_accepts_lm_when_hedge_profitable() -> None:
+    """LM whose net-of-hedge yield stays positive passes the floor."""
+    lm = _product("24", "LiquidityMining", coin="ETH/USDC", apr_source="apy_e8", notes=["max_leverage=1"])
+    lm.effective_apr_net_hedge = Decimal("0.06")  # LP gross survives funding
+    s = _snapshot(lm_products=[lm], perp_market={"ETH": _perp("ETH", funding_rate_7d_avg="0.00005")})
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.7),
+            _venue("bybit_lm", 0.3, [("24", 1.0)]),
+        ]
+    )
+    assert check_funding_rate_floor(d, s) == (True, None)
+
+
+def _lm_pref_snapshot(lm_net: str, stable_apr: str = "0.0386", lm_positions=None):
+    """Snapshot for LM-stable-preference tests: one ETH/USDC LM with an
+    explicit net-of-hedge APR, one USDC stable alternative, ETH perp."""
+    lm = _product("24", "LiquidityMining", coin="ETH/USDC", apr_source="apy_e8", notes=["max_leverage=1"])
+    lm.effective_apr_net_hedge = Decimal(lm_net)
+    s = _snapshot(
+        lm_products=[lm],
+        flex_products=[_product("100", "FlexibleSaving", coin="USDC", effective_apr="0.02")],
+        onchain_products=[_product("26", "OnChain", coin="USDC", effective_apr=stable_apr)],
+        perp_market={"ETH": _perp("ETH")},
+    )
+    if lm_positions is not None:
+        s.lm_positions = lm_positions
+    return s
+
+
+def test_check_lm_stable_pref_passes_when_edge_clears_margin() -> None:
+    """LM hedged net 5.78% vs best stable 3.86% → edge 1.92% ≥ 1.5% → pass."""
+    s = _lm_pref_snapshot(lm_net="0.0578")
+    d = _decision(venues=[_venue("cash_usdc", 0.7), _venue("bybit_lm", 0.3, [("24", 1.0)])])
+    assert check_lm_stable_preference(d, s) == (True, None)
+
+
+def test_check_lm_stable_pref_rejects_thin_edge() -> None:
+    """LM net 4.5% vs stable 3.86% → edge 0.64% < 1.5% → reject NEW pick
+    (extra IL + hedge-maintenance risk for no real return over the stable)."""
+    s = _lm_pref_snapshot(lm_net="0.045")
+    d = _decision(venues=[_venue("cash_usdc", 0.7), _venue("bybit_lm", 0.3, [("24", 1.0)])])
+    ok, msg = check_lm_stable_preference(d, s)
+    assert ok is False
+    assert "bybit_lm" in (msg or "") and "margin" in (msg or "")
+
+
+def test_check_lm_stable_pref_exempts_held_position() -> None:
+    """A thin-edge LM that's already HELD (net-new < min) is exempt — the
+    gate steers NEW deployment only, never force-exits a standing LP."""
+    held = [{"productId": "24", "positionId": "9001", "principalLiquidityValue": "60", "status": "Active"}]
+    s = _lm_pref_snapshot(lm_net="0.045", lm_positions=held)  # target $30 < held $60
+    d = _decision(venues=[_venue("cash_usdc", 0.7), _venue("bybit_lm", 0.3, [("24", 1.0)])])
+    assert check_lm_stable_preference(d, s) == (True, None)
+
+
+def test_check_lm_stable_pref_stable_base_exempt() -> None:
+    """A stable-base LM (USDC/USDT) carries no IL/hedge premium to justify,
+    so the margin gate doesn't apply even if its yield trails the stable."""
+    lm = _product("70", "LiquidityMining", coin="USDC/USDT", apr_source="apy_e8")
+    lm.effective_apr_net_hedge = Decimal("0.01")
+    s = _snapshot(
+        lm_products=[lm],
+        onchain_products=[_product("26", "OnChain", coin="USDC", effective_apr="0.0386")],
+    )
+    d = _decision(venues=[_venue("cash_usdc", 0.7), _venue("bybit_lm", 0.3, [("70", 1.0)])])
+    assert check_lm_stable_preference(d, s) == (True, None)
+
+
+def test_capital_flow_stable_base_lm_commits_face_only() -> None:
+    """A stable-base LM pair (hypothetical USDC/USDT) carries no perp
+    hedge, so it commits at face: 60 + 30 = 90 == allowable → pass."""
+    s = _snapshot(
+        lm_products=[
+            _product("70", "LiquidityMining", coin="USDC/USDT", apr_source="apy_e8"),
+        ],
+        perp_market={"ETH": _perp("ETH", min_notional="1.0")},
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.10),
+            _venue("bybit_onchain", 0.60, [("26", 1.0)]),
+            _venue("bybit_lm", 0.30, [("70", 1.0)]),
+        ]
+    )
+    assert check_capital_flow_simulation(d, s) == (True, None)
+
+
 # ─── Aggregate happy + sad paths ────────────────────────────────────────────
 
 
@@ -1435,6 +1604,40 @@ def test_check_min_stake_holding_below_floor_does_not_fire() -> None:
     assert check_min_stake(d, s) == (True, None)
 
 
+def test_check_min_stake_held_sub_min_sliver_does_not_fire() -> None:
+    """Regression: a held position the LLM KEEPS drifts target-vs-held by
+    weight quantization — e.g. $0.56 on a $40 held stake — producing a
+    sub-min net-new the executor SKIPS (holds the position, no 180012).
+    Pre-fix this $0.50–$10 band falsely rejected the hold and stranded the
+    cycle skipped:invalid (the held-Processing-USDC loop hang)."""
+    s = _snapshot(
+        onchain_products=[
+            _product("26", "OnChain", coin="USDC", effective_apr="0.04", min_subscribe_usd="10")
+        ],
+        total_equity_usd="100",
+        earn_positions=[_held("OnChain", "26", "USDC", "40", status="Processing")],
+    )
+    # target $41 vs held $40 → $1 sub-min sliver on a held position.
+    d = _decision(venues=[_venue("cash_usdc", 0.59), _venue("bybit_onchain", 0.41, [("26", 1.0)])])
+    assert check_min_stake(d, s) == (True, None)
+
+
+def test_check_min_stake_fresh_sub_min_pick_still_fires() -> None:
+    """Intent preserved: a FRESH sub-min pick (no held position) is dropped
+    wholesale by the executor and must still surface — only held-position
+    slivers are exempted."""
+    s = _snapshot(
+        onchain_products=[
+            _product("26", "OnChain", coin="USDC", effective_apr="0.04", min_subscribe_usd="10")
+        ],
+        total_equity_usd="100",
+    )
+    d = _decision(venues=[_venue("cash_usdc", 0.95), _venue("bybit_onchain", 0.05, [("26", 1.0)])])
+    ok, msg = check_min_stake(d, s)  # $5 fresh < $10 min
+    assert not ok
+    assert "bybit_onchain/26" in (msg or "")
+
+
 def test_check_min_stake_collects_multiple_violations() -> None:
     """All violations surface in a single error message — operator sees
     every problem in one pass."""
@@ -2010,6 +2213,30 @@ def test_slow_settle_pref_blocks_thin_margin_onchain_relock() -> None:
     ok, msg = check_slow_settle_stable_preference(d, s)
     assert not ok
     assert msg is not None and "USDC" in msg and "Flex" in msg
+
+
+def test_slow_settle_pref_exempts_sub_min_sliver_on_held() -> None:
+    """Regression: a sub-min net-new sliver on a HELD OnChain stake (weight
+    quantization on a hold) can't be placed as a subscribe, so it's not a
+    'route to Flex' decision — exempt, don't reject. Pairs with the
+    check_min_stake fix that unstrands held-Processing holds."""
+    from agent.validate.rules import check_slow_settle_stable_preference
+    s = _snapshot(
+        flex_products=[
+            _product("100", "FlexibleSaving", coin="USDC", effective_apr="0.030",
+                     apr_source="apr_history"),
+        ],
+        onchain_products=[
+            _product("26", "OnChain", coin="USDC", effective_apr="0.034",
+                     apr_source="apr_history", effective_apr_net_holding="0.034",
+                     min_subscribe_usd="10"),
+        ],
+        total_equity_usd="100",
+        earn_positions=[_held("OnChain", "26", "USDC", "40", status="Processing")],
+    )
+    # target $41 vs held $40 → $1 sub-min sliver (< $10 min) → hold, not a relock.
+    d = _decision(venues=[_venue("cash_usdc", 0.59), _venue("bybit_onchain", 0.41, [("26", 1.0)])])
+    assert check_slow_settle_stable_preference(d, s) == (True, None)
 
 
 def test_slow_settle_pref_allows_fat_margin_onchain() -> None:

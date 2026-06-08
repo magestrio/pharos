@@ -48,7 +48,7 @@ from agent.data.allora_client import (
     AlloraClient,
     AlloraInference,
 )
-from agent.reason.venues import CARRY_CATEGORY
+from agent.reason.venues import CARRY_CATEGORY, LM_BASE_LEG_FRACTION
 from agent.sandbox.on_chain import (
     AAVE_V3_POOL_ADDRESS,
     AaveV3UsdcState,
@@ -1578,6 +1578,44 @@ def _apply_net_hedge_apr(
             if row.effective_apr_gross is None:
                 row.effective_apr_gross = row.effective_apr
             row.effective_apr = row.effective_apr_net_hedge
+
+    # LM base legs are auto-hedged on HALF the notional (a single-sided
+    # deposit rebalances 50/50). The LP gross yield (`apy_e8`) accrues on
+    # the WHOLE position; the perp short covers only the base half, so
+    # funding (subsidy/cost) and round-trip friction apply to half the
+    # notional. Net realizable, expressed on the full position:
+    #     net = gross_LP + 0.5×annualized_funding − 0.5×friction
+    # Surfaces a like-for-like NET so the LLM stops comparing LM GROSS
+    # against OnChain/Flex NET (the pre-fix ranking error: a 7% gross LP
+    # whose ETH leg bleeds −20%/yr funding is really ~7 − 10 = −3% hedged,
+    # worse than a 3.5% stable). Base coin parsed from the `BASE/QUOTE`
+    # pair; stable-base / no-perp / no-funding rows keep gross like before.
+    for row in products.get("LiquidityMining", []):
+        parts = row.coin.split("/", 1)
+        if len(parts) != 2:
+            continue
+        base = parts[0].upper()
+        if not base or base in STABLES:
+            continue
+        info = perp_market.get(base)
+        if info is None:
+            row.net_hedge_source = "perp_missing"
+            continue
+        funding_annual = _annual_funding(
+            info.funding_rate_7d_avg, info.funding_interval_hours
+        )
+        if funding_annual is None:
+            row.net_hedge_source = "funding_missing"
+            continue
+        row.effective_apr_net_hedge = (
+            row.effective_apr
+            + funding_annual * LM_BASE_LEG_FRACTION
+            - FUNDING_CARRY_FRICTION_ANNUAL * LM_BASE_LEG_FRACTION
+        )
+        row.net_hedge_source = "lp+half-funding-half-friction"
+        if row.effective_apr_gross is None:
+            row.effective_apr_gross = row.effective_apr
+        row.effective_apr = row.effective_apr_net_hedge
 
 
 def _parse_funding_interval(raw: str | None) -> Decimal | None:

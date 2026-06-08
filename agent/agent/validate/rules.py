@@ -29,6 +29,7 @@ from agent.reason.venues import (
     CARRY_CATEGORY,
     CARRY_VENUE_ID,
     HEDGE_VENUES,
+    LM_BASE_LEG_FRACTION,
     SLOW_SETTLE_CATEGORIES,
     VENUE_REGISTRY,
     VenueId,
@@ -484,6 +485,47 @@ def check_hedges_for_non_usd_picks(d: Decision, snapshot: Snapshot) -> Check:
                     f"${pick_usd:.2f} below perp min_notional "
                     f"${info.min_notional_usd:.2f} — hedge can't be placed"
                 )
+
+    # LM base legs are auto-hedged too (executor `_lm_hedge_targets`): a
+    # single-sided LM deposit rebalances 50/50, so half the pick is a
+    # directional long on the BASE coin (`BASE/QUOTE` pair) hedged by a
+    # perp short on that half. Feasibility-gate it like the Earn picks —
+    # reject when the base has no perp or the half-notional can't clear
+    # min_notional, otherwise the executor would open an un-hedgeable
+    # naked LM base leg.
+    lm_venue = d.venue("bybit_lm")
+    if lm_venue is not None and lm_venue.picks:
+        lm_idx = _snapshot_index(snapshot).get("LiquidityMining", {})
+        for pick in lm_venue.picks:
+            summary = lm_idx.get(pick.product_id)
+            if summary is None:
+                continue
+            parts = summary.coin.split("/", 1)
+            if len(parts) != 2:
+                continue
+            base = parts[0].upper()
+            if not base or base in _STABLE_COINS:
+                continue
+            info = perp_market.get(base) or perp_market.get(base.lower())
+            if info is None:
+                bad.append(f"bybit_lm/{pick.product_id}({base}): no perp_market entry")
+                continue
+            if info.min_notional_usd is None:
+                bad.append(f"bybit_lm/{pick.product_id}({base}): min_notional unknown")
+                continue
+            base_leg_usd = (
+                total_book
+                * Decimal(str(lm_venue.weight))
+                * Decimal(str(pick.weight))
+                * LM_BASE_LEG_FRACTION
+            )
+            if base_leg_usd < info.min_notional_usd:
+                bad.append(
+                    f"bybit_lm/{pick.product_id}({base}): base leg "
+                    f"${base_leg_usd:.2f} below perp min_notional "
+                    f"${info.min_notional_usd:.2f} — hedge can't be placed"
+                )
+
     if bad:
         return False, "non-USD Earn picks not hedgeable: " + " | ".join(bad)
     return True, None
@@ -623,6 +665,57 @@ def check_funding_rate_floor(d: Decision, snapshot: Snapshot) -> Check:
                     f"{NET_HEDGE_YIELD_FLOOR * 100:.0f}% (7d funding {fr_s}; "
                     "hedge not profitable — Earn APR doesn't cover funding cost)"
                 )
+
+    # LM picks carry the same net-of-hedge gate: now that the base leg is
+    # auto-hedged, a high-gross LP whose base funding bleeds the hedge can
+    # net negative. The snapshot ranker stores the LM net (gross_LP +
+    # ½·funding − ½·friction) in `effective_apr_net_hedge`, so the shared
+    # `net_hedge_yield` helper reads it directly. Net-new scoped against
+    # held LM principal so KEEPING a held LP whose funding turned negative
+    # isn't re-rejected (exit goes via the redeem path, not a cycle reject).
+    lm_venue = d.venue("bybit_lm")
+    if lm_venue is not None and lm_venue.picks:
+        lm_idx = _snapshot_index(snapshot).get("LiquidityMining", {})
+        held_lm = _held_lm_usd_by_product(snapshot)
+        for pick in lm_venue.picks:
+            summary = lm_idx.get(pick.product_id)
+            if summary is None:
+                continue
+            parts = summary.coin.split("/", 1)
+            if len(parts) != 2:
+                continue
+            base = parts[0].upper()
+            if not base or base in _STABLE_COINS:
+                continue
+            net_new = (
+                total_book * float(lm_venue.weight) * float(pick.weight)
+                - held_lm.get(pick.product_id, 0.0)
+            )
+            if net_new < _MIN_ACTION_USDC:
+                continue  # hold or reduce — not fresh exposure
+            info = perp_market.get(base) or perp_market.get(base.lower())
+            if info is None:
+                continue  # un-hedgeable — check_hedges_for_non_usd_picks owns this
+            net, interval_broken = net_hedge_yield(summary, info)
+            if interval_broken:
+                bad.append(
+                    f"bybit_lm/{pick.product_id}({base}): perp_market "
+                    f"funding_interval_hours={info.funding_interval_hours!r} "
+                    "invalid — cannot annualize hedge funding"
+                )
+                continue
+            if net is None:
+                continue  # no funding signal — can't assess, pass
+            if net <= NET_HEDGE_YIELD_FLOOR:
+                fr = info.funding_rate_7d_avg
+                fr_s = f"{float(fr):+.6f}" if fr is not None else "n/a"
+                bad.append(
+                    f"bybit_lm/{pick.product_id}({base}): net-of-hedge LP yield "
+                    f"{net * 100:+.2f}%/yr <= floor "
+                    f"{NET_HEDGE_YIELD_FLOOR * 100:.0f}% (7d funding {fr_s}; "
+                    "base-leg hedge bleeds the LP below profitable)"
+                )
+
     if bad:
         return False, (
             "non-USD Earn picks whose hedged net yield isn't profitable: "
@@ -878,6 +971,28 @@ def _held_usd_by_product(snapshot: Snapshot) -> dict[tuple[str, str], float]:
     in `earn_positions`, so they collapse to held=0 (gross), preserving
     pre-net-new behavior for those venues."""
     return {k: v["usd"] for k, v in _held_earn_detail(snapshot).items()}
+
+
+def _held_lm_usd_by_product(snapshot: Snapshot) -> dict[str, float]:
+    """Held LM principal (USD) per product_id, from `lm_positions`. LM
+    positions aren't in `earn_positions`, so the funding-floor net-new
+    screen needs this separately — without it, KEEPING a held LM whose
+    funding turned negative would re-trip the floor and strand the cycle
+    `skipped:invalid` (the `bybit-sandbox.65` failure mode). Reads Bybit's
+    consolidated `principalLiquidityValue`; absent/malformed → 0."""
+    out: dict[str, float] = {}
+    for pos in getattr(snapshot, "lm_positions", None) or []:
+        pid = str(pos.get("productId") or "")
+        if not pid:
+            continue
+        raw = pos.get("principalLiquidityValue")
+        try:
+            val = float(raw) if raw is not None else 0.0
+        except (TypeError, ValueError):
+            val = 0.0
+        if val > 0:
+            out[pid] = out.get(pid, 0.0) + val
+    return out
 
 
 def check_stable_spend_cap(d: Decision, snapshot: Snapshot) -> Check:
@@ -1172,8 +1287,21 @@ def check_min_stake(d: Decision, snapshot: Snapshot) -> Check:
             # (>= MIN_ACTION) that's still under the floor. (LM /
             # advance-Earn holdings aren't in earn_positions → held=0 →
             # gross, unchanged from before.)
-            delta = pick_usd - held_map.get((category, p.product_id), 0.0)
-            if delta >= _MIN_ACTION_USDC and delta + 1e-9 < float(min_usd):
+            held = held_map.get((category, p.product_id), 0.0)
+            delta = pick_usd - held
+            # Only a FRESH sub-min pick (no held position) trips 180012 and is
+            # dropped wholesale — surface THAT. A sub-min delta ON TOP of a
+            # held position is hold-rounding drift: the executor skips the tiny
+            # add (execute.py SUBSCRIBE_EARN min gate) and keeps the position,
+            # so it's no failure and must not block the cycle. Held Processing
+            # positions the LLM intends to HOLD drift target-vs-held by weight
+            # quantization every cycle (e.g. $0.56 on a $67 stake), which was
+            # stranding the loop `skipped:invalid` for a pure hold.
+            if (
+                held < _MIN_ACTION_USDC
+                and delta >= _MIN_ACTION_USDC
+                and delta + 1e-9 < float(min_usd)
+            ):
                 violations.append(
                     f"{v.venue_id}/{p.product_id}({summary.coin})="
                     f"${delta:.2f}<min ${float(min_usd):.2f}"
@@ -1194,7 +1322,6 @@ def check_min_stake(d: Decision, snapshot: Snapshot) -> Check:
 # / alpha / aave all consume a single coin balance without a paired
 # perp. cash_usdc is the float itself, excluded from commitment.
 _FACE_VALUE_VENUES: frozenset[VenueId] = frozenset({
-    "bybit_lm",
     "bybit_dual_asset",
     "bybit_discount_buy",
     "bybit_smart_leverage",
@@ -1221,8 +1348,10 @@ def check_capital_flow_simulation(d: Decision, snapshot: Snapshot) -> Check:
     individually but commits `0.65×1.05 + 0.25 + 0.10 = 1.03×book` —
     the live cycle will `retCode=170131` on the perp open.
 
-    Stable Earn picks, LM (leverage=1), advance-Earn, hold-to-earn,
-    alpha, and Aave commit at face value (no separate margin lock).
+    A non-stable LM pick commits its full deposit (stake) plus perp
+    margin on the BASE half (`pick_usd × 0.5 × HEDGE_MARGIN_BUFFER`) —
+    the base leg is now auto-hedged. Stable Earn picks, advance-Earn,
+    hold-to-earn, alpha, and Aave commit at face value (no margin lock).
     Picks without a `perp_market` entry on the symbol get face value
     too — `check_hedges_for_non_usd_picks` rejects them upstream, so
     counting margin here would produce a confusing duplicate error.
@@ -1317,6 +1446,37 @@ def check_capital_flow_simulation(d: Decision, snapshot: Snapshot) -> Check:
                 )
             continue
 
+        if v.venue_id == "bybit_lm":
+            # LM commits the full deposit as stake (face) PLUS perp margin
+            # on the BASE half (`_lm_hedge_targets` shorts half the pick).
+            # margin = (pick_usd × 0.5) × buffer, added only when the base
+            # is non-stable and has a perp. Held LM lives in lm_positions
+            # (not earn_positions), so held=0 here and the stake counts
+            # gross — same conservative treatment as carry; LM's 0.30 cap
+            # bounds any over-count.
+            cat_idx = snapshot_idx.get("LiquidityMining", {})
+            for p in v.picks:
+                pick_usd = venue_usd * float(p.weight)
+                if pick_usd < _MIN_ACTION_USDC:
+                    continue
+                summary = cat_idx.get(p.product_id)
+                base = ""
+                if summary is not None:
+                    parts = summary.coin.split("/", 1)
+                    if len(parts) == 2:
+                        base = parts[0].upper()
+                margin = 0.0
+                if base and base not in _STABLE_COINS:
+                    info = perp_market.get(base) or perp_market.get(base.lower())
+                    if info is not None:
+                        margin = pick_usd * 0.5 * _VALIDATOR_HEDGE_MARGIN_BUFFER
+                slice_usd = pick_usd + margin
+                committed += slice_usd
+                contributors.append(
+                    f"{v.venue_id}/{p.product_id}({base or '?'})=${slice_usd:.2f}"
+                )
+            continue
+
         if v.venue_id in _FACE_VALUE_VENUES:
             committed += venue_usd
             contributors.append(f"{v.venue_id}=${venue_usd:.2f}")
@@ -1358,6 +1518,20 @@ SLOW_SETTLE_MAX_WEIGHT = 0.50
 # dead-time-discounted rate (`effective_apr_net_holding`) to justify the lock;
 # otherwise route the NEW stable yield to Flex (instant redeem).
 SLOW_SETTLE_STABLE_PREF_MARGIN = 0.015  # 1.5%/yr absolute
+
+# Margin a NEW non-stable LM pick's net-of-hedge yield must clear over the
+# best available stable to justify being taken instead of the stable
+# (2026-06-09). The LM `effective_apr_net_hedge` already nets out funding +
+# friction on the hedged base half, but it does NOT price the residual
+# impermanent loss (the pool rebalances into the falling asset) nor the
+# operational cost of running a perp hedge (short-side liquidation tail,
+# rebalance slippage, funding variance). So a hedged LM that only ~ties a
+# stable is NOT worth the extra risk surface — "max yield AT CONTROLLED
+# risk" means the edge has to pay for the risk it adds. Same magnitude and
+# net-new posture as `SLOW_SETTLE_STABLE_PREF_MARGIN`: held LM is exempt
+# (never force-exited), so this only steers NEW deployment toward stables
+# when funding has eaten the LM edge thin.
+LM_STABLE_PREF_MARGIN = 0.015  # 1.5%/yr absolute
 
 # Source-quality ladder for high-yield non-stable picks. A non-stable Earn
 # pick whose APR is a bare `estimate_apr` (Bybit's quoted base, often a
@@ -1473,8 +1647,14 @@ def check_slow_settle_stable_preference(d: Decision, snapshot: Snapshot) -> Chec
             held = float(
                 detail.get((category, pick.product_id), {}).get("usd", 0.0)
             )
-            if target - held < _MIN_ACTION_USDC:
-                continue  # forced hold — never rejected
+            # New spend below the product's min_subscribe can't be placed (the
+            # executor skips it) — so it's not a real "route this to Flex"
+            # decision, just hold-rounding drift on a held position. Exempt it
+            # alongside the forced-hold case, else a $0.56 quantization sliver
+            # on a held Processing stake strands the cycle skipped:invalid.
+            min_sub = float(summary.min_subscribe_usd or 0.0)
+            if target - held < max(_MIN_ACTION_USDC, min_sub):
+                continue  # forced hold / sub-min sliver — never rejected
             coin = summary.coin.upper()
             # Compare against the BEST same-coin Flex twin that's actually
             # fundable at this pick size — not an arbitrary first match. A
@@ -1522,6 +1702,92 @@ def check_slow_settle_stable_preference(d: Decision, snapshot: Snapshot) -> Chec
     if bad:
         return False, (
             "NEW stable yield should default to liquid Flex: " + " | ".join(bad)
+        )
+    return True, None
+
+
+def _best_stable_net_apr(snapshot: Snapshot, max_subscribe_usd: float) -> tuple[float, str] | None:
+    """Best realizable stable Earn yield the agent could deploy `max_subscribe_usd`
+    into right now — the opportunity cost of any non-stable pick. Scans
+    FlexibleSaving + OnChain stable products fundable at this size and returns
+    `(net_apr, "venue/product")` for the highest `effective_apr_net_holding`
+    (else `effective_apr`), or None when none qualify."""
+    idx = _snapshot_index(snapshot)
+    best: tuple[float, str] | None = None
+    for category in ("FlexibleSaving", "OnChain"):
+        for pid, summary in idx.get(category, {}).items():
+            if summary.coin.upper() not in _STABLE_COINS:
+                continue
+            if (
+                summary.min_subscribe_usd is not None
+                and float(summary.min_subscribe_usd) > max_subscribe_usd
+            ):
+                continue
+            net = float(
+                summary.effective_apr_net_holding
+                if summary.effective_apr_net_holding is not None
+                else summary.effective_apr
+            )
+            if best is None or net > best[0]:
+                best = (net, f"{category}/{pid}")
+    return best
+
+
+def check_lm_stable_preference(d: Decision, snapshot: Snapshot) -> Check:
+    """A NEW non-stable LM pick must beat the best available stable yield by
+    `LM_STABLE_PREF_MARGIN` on a net-of-hedge basis, else route the capital to
+    the stable instead. The hedged-LM net (`effective_apr_net_hedge`) prices
+    funding + friction but NOT residual IL or perp-hedge maintenance, so a
+    thin edge over a zero-risk stable isn't "max yield at controlled risk" —
+    it's extra risk surface for no real return.
+
+    Net-new scoped (mirrors `check_slow_settle_stable_preference`): held LM
+    (`target − held < _MIN_ACTION_USDC`) is EXEMPT — this never force-exits a
+    standing position (exit is a redeem decision, not a cycle reject), it only
+    stops the agent OPENING/GROWING a thin-edge LP. Passes when no fundable
+    stable alternative exists or the base is stable (no hedge / no IL)."""
+    total_book = float(snapshot.wallet.total_equity_usd)
+    if total_book <= 0:
+        return True, None
+    lm_venue = d.venue("bybit_lm")
+    if lm_venue is None or lm_venue.weight <= 0 or not lm_venue.picks:
+        return True, None
+    lm_idx = _snapshot_index(snapshot).get("LiquidityMining", {})
+    held_lm = _held_lm_usd_by_product(snapshot)
+    bad: list[str] = []
+    for pick in lm_venue.picks:
+        summary = lm_idx.get(pick.product_id)
+        if summary is None:
+            continue
+        parts = summary.coin.split("/", 1)
+        if len(parts) != 2:
+            continue
+        base = parts[0].upper()
+        if not base or base in _STABLE_COINS:
+            continue  # stable-base LP carries no directional/IL premium to justify
+        target = total_book * float(lm_venue.weight) * float(pick.weight)
+        if target - held_lm.get(pick.product_id, 0.0) < _MIN_ACTION_USDC:
+            continue  # hold or reduce — never rejected
+        lm_net = float(
+            summary.effective_apr_net_hedge
+            if summary.effective_apr_net_hedge is not None
+            else summary.effective_apr
+        )
+        best_stable = _best_stable_net_apr(snapshot, target)
+        if best_stable is None:
+            continue  # no fundable stable alternative to route to
+        stable_net, stable_id = best_stable
+        if lm_net - stable_net < LM_STABLE_PREF_MARGIN:
+            bad.append(
+                f"bybit_lm/{pick.product_id}({summary.coin}): hedged net "
+                f"{lm_net:.2%} barely beats best stable {stable_id} "
+                f"{stable_net:.2%} (< {LM_STABLE_PREF_MARGIN:.1%} margin) — the "
+                f"edge doesn't pay for the LP's IL + perp-hedge maintenance; "
+                f"route NEW capital to the stable"
+            )
+    if bad:
+        return False, (
+            "NEW LM picks must beat stables by a risk margin: " + " | ".join(bad)
         )
     return True, None
 
@@ -1620,6 +1886,7 @@ def validate(decision: Decision, snapshot: Snapshot) -> tuple[bool, list[str]]:
         check_min_stake,
         check_slow_settle_cap,
         check_slow_settle_stable_preference,
+        check_lm_stable_preference,
         check_estimate_apr_probe_cap,
     ]
     errors: list[str] = []

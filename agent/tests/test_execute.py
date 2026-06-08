@@ -37,6 +37,7 @@ from agent.sandbox.execute import (
     _enforce_usdt_budget,
     _execute_one,
     _hedged_pick_underfunded_coins,
+    _lm_hedge_targets,
     _order_link_id,
     _stable_consolidate_actions,
     _swap_actions_for_hedges,
@@ -1114,7 +1115,13 @@ def test_diff_lm_subscribe_below_min_emits_skip() -> None:
     )
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
     subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_LM]
-    skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
+    # Narrow to the LM-category skip: the base leg now also drives a hedge,
+    # which SKIPs separately (category="Perp") when no perp_market entry exists.
+    skips = [
+        a
+        for a in actions
+        if a.kind == ActionKind.SKIP_OUT_OF_SCOPE and a.category == "LiquidityMining"
+    ]
     assert subs == []
     assert len(skips) == 1
     assert "below Bybit min" in skips[0].reason
@@ -1220,7 +1227,13 @@ def test_diff_lm_pick_non_stable_quote_emits_skip() -> None:
         ]
     )
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
-    skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
+    # LM-category skip only; the BTC base leg drives a separate hedge skip
+    # (no perp_market entry in this fixture).
+    skips = [
+        a
+        for a in actions
+        if a.kind == ActionKind.SKIP_OUT_OF_SCOPE and a.category == "LiquidityMining"
+    ]
     assert len(skips) == 1
     assert "not a recognized stable" in skips[0].reason
 
@@ -1342,9 +1355,113 @@ def test_diff_lm_partial_increase_emits_skip() -> None:
         ]
     )
     actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
-    skips = [a for a in actions if a.kind == ActionKind.SKIP_OUT_OF_SCOPE]
+    # LM-category skip only; the held ETH base leg drives a separate hedge
+    # skip (no perp_market entry in this fixture).
+    skips = [
+        a
+        for a in actions
+        if a.kind == ActionKind.SKIP_OUT_OF_SCOPE and a.category == "LiquidityMining"
+    ]
     assert len(skips) == 1
     assert "partial increase not wired" in skips[0].reason
+
+
+# ─── LM base-leg auto-hedge ─────────────────────────────────────────────────
+
+
+def test_lm_hedge_targets_half_notional() -> None:
+    """A single-sided LM deposit rebalances 50/50, so the hedge target on
+    the base coin is HALF the pick notional (the directional base leg)."""
+    snap = _snapshot(total_equity_usd="200", lm_products=[_lm_product("24")])
+    d = _decision([_venue("cash_usdc", 0.7), _venue("bybit_lm", 0.3, [("24", 1.0)])])
+    targets = _lm_hedge_targets(d, snap, Decimal("200"))
+    # pick_usd = 200 × 0.3 = $60; base leg = $30 of ETH.
+    assert targets == {"ETH": Decimal("30.0")}
+
+
+def test_lm_hedge_targets_skip_stable_base() -> None:
+    """A stable-base pair (hypothetical USDC/USDT) needs no hedge — both
+    legs are stable, no directional exposure."""
+    snap = _snapshot(
+        total_equity_usd="200",
+        lm_products=[_lm_product("70", base="USDC", quote="USDT")],
+    )
+    d = _decision([_venue("cash_usdc", 0.7), _venue("bybit_lm", 0.3, [("70", 1.0)])])
+    assert _lm_hedge_targets(d, snap, Decimal("200")) == {}
+
+
+def test_diff_lm_pick_emits_base_leg_hedge() -> None:
+    """An LM ETH/USDC pick produces an OPEN_PERP_SHORT on ETH sized at
+    HALF the pick notional (the base leg the pool holds long) — the fix
+    for the historical naked-LM-base exposure."""
+    snap = _snapshot(
+        total_equity_usd="200",
+        perp_market={"ETH": _perp("ETH", mark="2000", min_order_qty="0.001")},
+        lm_products=[_lm_product("24")],
+    )
+    d = _decision([_venue("cash_usdc", 0.7), _venue("bybit_lm", 0.3, [("24", 1.0)])])
+    actions = diff_to_actions(snap, d, snapshot_ts="20260608T120000Z")
+    subs = [a for a in actions if a.kind == ActionKind.SUBSCRIBE_LM]
+    opens = [a for a in actions if a.kind == ActionKind.OPEN_PERP_SHORT]
+    assert len(subs) == 1  # LP subscribe still fires
+    assert len(opens) == 1
+    h = opens[0]
+    assert h.product_id == "ETHUSDT"
+    assert h.coin == "ETH"
+    # base leg = 200 × 0.3 × 0.5 = $30; qty = 30 / 2000 = 0.015 ETH.
+    assert h.amount == Decimal("0.015")
+
+
+def test_diff_lm_and_onchain_same_coin_hedge_summed() -> None:
+    """An ETH OnChain pick (full notional) and an ETH/USDC LM base leg
+    (half notional) hedge into ONE summed ETH short, not two."""
+    eth_onchain = ProductSummary(
+        category="OnChain",
+        product_id="1",
+        coin="ETH",
+        effective_apr=Decimal("0.03"),
+        apr_source="estimate_apr",
+        notes=[],
+    )
+    snap = _snapshot(
+        total_equity_usd="200",
+        perp_market={"ETH": _perp("ETH", mark="2000", min_order_qty="0.001")},
+        onchain_products=[eth_onchain],
+        lm_products=[_lm_product("24")],
+    )
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_onchain", 0.2, [("1", 1.0)]),  # $40 full notional
+            _venue("bybit_lm", 0.3, [("24", 1.0)]),  # $60 → $30 base leg
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260608T120000Z")
+    opens = [a for a in actions if a.kind == ActionKind.OPEN_PERP_SHORT]
+    assert len(opens) == 1  # single ETH short, summed
+    # ($40 onchain + $30 lm base) / $2000 = 0.035 ETH.
+    assert opens[0].coin == "ETH"
+    assert opens[0].amount == Decimal("0.035")
+
+
+def test_diff_lm_held_base_keeps_hedge_when_pick_dropped() -> None:
+    """The LLM drops the LM pick but the LP is still held → the base leg
+    is still a live long, so the ETH short must NOT be closed yet."""
+    snap = _snapshot(
+        total_equity_usd="200",
+        perp_market={"ETH": _perp("ETH", mark="2000", min_order_qty="0.001")},
+        lm_products=[_lm_product("24")],
+        lm_positions=[
+            _lm_position(product_id="24", position_id="9001", principal_usd="60")
+        ],
+        perp_positions=[
+            _short_pos("ETH", size="0.015", position_value="30")
+        ],
+    )
+    d = _decision([_venue("cash_usdc", 1.0)])  # LM dropped entirely
+    actions = diff_to_actions(snap, d, snapshot_ts="20260608T120000Z")
+    closes = [a for a in actions if a.kind == ActionKind.CLOSE_PERP]
+    assert closes == []  # hedge retained while the LP is still held
 
 
 def test_diff_advance_pick_emits_skip() -> None:

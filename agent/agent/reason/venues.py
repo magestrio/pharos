@@ -14,6 +14,7 @@ like Aave V3 USDC during the pre-mainnet phase.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -127,8 +128,12 @@ VENUE_REGISTRY: dict[str, VenueMeta] = {
         snapshot_category="LiquidityMining",
         notes=(
             "Bybit Liquidity Mining — LP pairs (base/quote). At `max_leverage=1` "
-            "this is a plain unleveraged LP position: only risk is IL on the "
-            "pair plus quote-side price drift. Picks with `max_leverage > 1` "
+            "this is a plain unleveraged LP position. A single-sided deposit "
+            "rebalances 50/50, so half is a directional long on the BASE coin; "
+            "the executor AUTO-HEDGES that base half with a paired perp short "
+            "(half the pick notional), so the base needs a `perp_market` entry "
+            "and residual risk is IL on the pair plus funding on the hedged "
+            "half — not naked base-price exposure. Picks with `max_leverage > 1` "
             "are forbidden (validator rejects). 30% concentration cap is "
             "designed to bound IL exposure, not to discourage use — fill it "
             "up to the cap when calm markets and acceptable pairs exist."
@@ -338,3 +343,12 @@ BASIC_EARN_CATEGORIES: frozenset[str] = frozenset(
 # in <1min and are NOT here. Add LM / advance-Earn only if they prove to
 # delay-settle. Single source of truth for execute.py + validate/rules.py.
 SLOW_SETTLE_CATEGORIES: frozenset[str] = frozenset({"OnChain"})
+
+# Fraction of a single-sided `bybit_lm` deposit that becomes the
+# directional BASE leg. Bybit auto-rebalances the deposit to a 50/50 LP,
+# so half is long the non-stable base coin — the half the executor
+# auto-hedges with a paired perp short, the half the validator gates and
+# the snapshot ranker discounts for funding. Single source of truth for
+# snapshot.py + execute.py + validate/rules.py (each imports it here so
+# the 0.5 can't drift across the sizing / gating / ranking layers).
+LM_BASE_LEG_FRACTION: Decimal = Decimal("0.5")

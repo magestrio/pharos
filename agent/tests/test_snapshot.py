@@ -621,6 +621,47 @@ def test_apply_net_hedge_adds_positive_funding():
     assert row.effective_apr_net_hedge > row.effective_apr_gross  # subsidy net of friction
 
 
+def _lm_net_row(coin: str, gross: str, product_id: str = "24") -> ProductSummary:
+    return ProductSummary(
+        category="LiquidityMining",
+        product_id=product_id,
+        coin=coin,
+        effective_apr=Decimal(gross),
+        apr_source="apy_e8",
+        notes=["max_leverage=1"],
+    )
+
+
+def test_apply_net_hedge_lm_half_funding_and_friction():
+    """LM base leg is hedged on HALF the notional (50/50 LP), so funding
+    and friction apply at half weight on top of the full-position LP
+    gross. ETH funding -0.0003/8h (~-32.85%/yr) turns a 7% LP into
+    0.07 + 0.5×(-0.3285) - 0.5×0.018 ≈ -9.3% net — the hedge bleeds it.
+    Perp is looked up by the BASE coin (ETH), not the `ETH/USDC` pair."""
+    row = _lm_net_row("ETH/USDC", "0.07")
+    products = {"LiquidityMining": [row], "FlexibleSaving": [], "OnChain": []}
+    _apply_net_hedge_apr(products, {"ETH": _info("ETH", "-0.0003")})
+    expected = (
+        Decimal("0.07")
+        + _annual_funding(Decimal("-0.0003"), Decimal("8")) * Decimal("0.5")
+        - FUNDING_CARRY_FRICTION_ANNUAL * Decimal("0.5")
+    )
+    assert row.effective_apr_net_hedge == expected
+    assert row.effective_apr == row.effective_apr_net_hedge  # net is the headline
+    assert row.effective_apr_gross == Decimal("0.07")  # gross stashed for audit
+    assert row.net_hedge_source == "lp+half-funding-half-friction"
+
+
+def test_apply_net_hedge_lm_stable_base_untouched():
+    """A stable-base LM pair (hypothetical USDC/USDT) carries no perp
+    hedge — net stays None, gross effective_apr untouched."""
+    row = _lm_net_row("USDC/USDT", "0.02", product_id="70")
+    products = {"LiquidityMining": [row], "FlexibleSaving": [], "OnChain": []}
+    _apply_net_hedge_apr(products, {"USDC": _info("USDC", "0.0001")})
+    assert row.effective_apr_net_hedge is None
+    assert row.effective_apr == Decimal("0.02")
+
+
 def test_apply_net_hedge_none_when_perp_missing():
     """No perp data for the coin → can't compute the hedge leg; leave the net
     field None (falls back to gross ranking) and record why."""

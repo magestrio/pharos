@@ -52,6 +52,7 @@ from agent.reason.venues import (
     BASIC_EARN_CATEGORIES,
     CARRY_CATEGORY,
     CARRY_VENUE_ID,
+    LM_BASE_LEG_FRACTION,
     SLOW_SETTLE_CATEGORIES,
     VENUE_REGISTRY,
 )
@@ -1504,6 +1505,51 @@ def _auto_hedge_targets(
     return targets
 
 
+def _lm_hedge_targets(
+    decision: Decision,
+    snapshot: Snapshot,
+    total_book_usd: Decimal,
+) -> dict[str, Decimal]:
+    """Derive `{base_coin: half_notional_usd}` for `bybit_lm` picks with a
+    non-stable base. A single-sided USDC/USDT LM deposit auto-rebalances
+    to 50/50, so half the pick notional becomes a directional long on the
+    base coin (ETH in ETH/USDC). That leg is hedged by a paired perp short
+    sized at the base-leg notional — closing the naked delta the venue
+    used to carry (`bybit_lm` was historically exempt from the hedge gate;
+    the 'quote side hedges base' premise was false — a 50/50 LP holds half
+    the base long).
+
+    Merged into the same `targets_by_coin` as `_auto_hedge_targets` so a
+    coin held via both an OnChain/Flex pick AND an LM base leg gets one
+    summed short, and the existing open/close/resize diff applies
+    uniformly. Stable-base pairs (none in practice) contribute nothing.
+    """
+    targets: dict[str, Decimal] = {}
+    lm_venue = decision.venue("bybit_lm")
+    if lm_venue is None or not lm_venue.picks:
+        return targets
+    for pick in lm_venue.picks:
+        product = _lm_product_from_snapshot(snapshot, pick.product_id)
+        if product is None:
+            continue
+        parts = product.coin.split("/", 1)
+        if len(parts) != 2:
+            continue
+        base_coin = parts[0].upper()
+        if not base_coin or base_coin in _STABLES:
+            continue
+        pick_usd = (
+            total_book_usd
+            * Decimal(str(lm_venue.weight))
+            * Decimal(str(pick.weight))
+        )
+        base_leg = pick_usd * LM_BASE_LEG_FRACTION
+        if base_leg <= 0:
+            continue
+        targets[base_coin] = targets.get(base_coin, Decimal(0)) + base_leg
+    return targets
+
+
 def _invalidate_for_coin(
     decision: Decision, snapshot: Snapshot, coin: str
 ) -> dict[str, Any]:
@@ -1577,6 +1623,13 @@ def _hedge_diff_actions(
     targets_by_coin: dict[str, Decimal] = _auto_hedge_targets(
         decision, snapshot, total_book_usd
     )
+    # LM base legs hedge into the SAME per-coin short (summed), so the
+    # open/close/resize diff below treats an ETH OnChain pick and an
+    # ETH/USDC LM base leg as one combined ETH short.
+    for coin, notional in _lm_hedge_targets(
+        decision, snapshot, total_book_usd
+    ).items():
+        targets_by_coin[coin] = targets_by_coin.get(coin, Decimal(0)) + notional
 
     # Coins still HELD as a non-stable OnChain Earn position right now
     # (incl. a redeem that's placed but unbonding/settling — Bybit keeps
@@ -1600,6 +1653,25 @@ def _hedge_diff_actions(
             amt = Decimal(0)
         if amt > 0:
             held_earn_coins.add(c)
+
+    # Same persistence rule for held LM base legs: while an LP is still
+    # open (or redeeming), its base half is a live directional long, so
+    # keep the short even after the LLM drops the pick. The position's
+    # base coin comes from the catalog pair (`BASE/QUOTE`) keyed by
+    # productId; positions whose product left the snapshot are skipped
+    # (the LP redeem path addresses them by positionId anyway).
+    for pos in snapshot.lm_positions:
+        product = _lm_product_from_snapshot(snapshot, str(pos.get("productId") or ""))
+        if product is None:
+            continue
+        parts = product.coin.split("/", 1)
+        if len(parts) != 2:
+            continue
+        base = parts[0].upper()
+        if not base or base in _STABLES:
+            continue
+        if _lm_principal_usd(pos) > 0:
+            held_earn_coins.add(base)
 
     all_coins = sorted(set(current_by_coin) | set(targets_by_coin))
     cursor = idx_offset
@@ -3571,11 +3643,32 @@ def _unfunded_nonstable_subscribe_coins(
     return unfunded
 
 
+def _lm_base_leg_native(usd_base_leg: Decimal, base: str, snapshot: Snapshot) -> Decimal:
+    """Native base-coin amount for an LM base leg worth `usd_base_leg`,
+    priced at the perp mark. Sized identically to the hedge target
+    (`_lm_hedge_targets` → half-notional / mark) so the held/planned LM
+    long and its paired short net to zero in the naked-perp trimmer
+    instead of churning open/close on rounding. Returns 0 with no mark."""
+    info = (snapshot.perp_market or {}).get(base) or (snapshot.perp_market or {}).get(
+        base.lower()
+    )
+    mark = getattr(info, "mark_price", None) if info else None
+    if not mark or mark <= 0:
+        return Decimal(0)
+    return usd_base_leg / mark
+
+
 def _coin_to_long_exposure(snapshot: Snapshot) -> dict[str, Decimal]:
-    """Sum native LONG exposure per coin from currently-held Earn
-    positions. UNIFIED wallet balance is NOT included here — caller
-    adds it on top because it's the only thing actually sellable
-    via SWAP_SPOT. Stables are skipped (irrelevant for hedge balance)."""
+    """Sum native LONG exposure per coin from currently-held Earn AND
+    Liquidity-Mining positions. UNIFIED wallet balance is NOT included
+    here — caller adds it on top because it's the only thing actually
+    sellable via SWAP_SPOT. Stables are skipped (irrelevant for hedge
+    balance).
+
+    LM positions hold half their value in the non-stable BASE coin (a
+    50/50 LP), which is genuine long exposure backing the paired perp
+    short. Without it the naked-perp trimmer would treat the LM hedge as
+    unbacked and close it (`bybit_lm` was historically unhedged)."""
     out: dict[str, Decimal] = {}
     for p in snapshot.earn_positions or []:
         if hasattr(p, "model_dump"):
@@ -3591,6 +3684,21 @@ def _coin_to_long_exposure(snapshot: Snapshot) -> dict[str, Decimal]:
             continue
         if amt > 0:
             out[coin] = out.get(coin, Decimal(0)) + amt
+    for pos in snapshot.lm_positions or []:
+        product = _lm_product_from_snapshot(snapshot, str(pos.get("productId") or ""))
+        if product is None:
+            continue
+        parts = product.coin.split("/", 1)
+        if len(parts) != 2:
+            continue
+        base = parts[0].upper()
+        if not base or base in _STABLES:
+            continue
+        native = _lm_base_leg_native(
+            _lm_principal_usd(pos) * LM_BASE_LEG_FRACTION, base, snapshot
+        )
+        if native > 0:
+            out[base] = out.get(base, Decimal(0)) + native
     return out
 
 
@@ -3912,6 +4020,25 @@ def _close_naked_perp_actions(
         add = a.amount_native if a.amount_native is not None else Decimal(0)
         if add > 0:
             long_now[a.coin.upper()] = long_now.get(a.coin.upper(), Decimal(0)) + add
+    # A planned LM subscribe creates a base-coin long this cycle (the
+    # deposit rebalances 50/50). Count its base leg so the paired hedge
+    # OPEN isn't seen as naked and trimmed. `amount` is the USD deposit;
+    # half is the base leg, priced at the perp mark to match the hedge.
+    for a in subscribes:
+        if a.kind != ActionKind.SUBSCRIBE_LM:
+            continue
+        product = _lm_product_from_snapshot(snapshot, a.product_id)
+        if product is None:
+            continue
+        parts = product.coin.split("/", 1)
+        if len(parts) != 2:
+            continue
+        base = parts[0].upper()
+        if not base or base in _STABLES:
+            continue
+        native = _lm_base_leg_native(a.amount * LM_BASE_LEG_FRACTION, base, snapshot)
+        if native > 0:
+            long_now[base] = long_now.get(base, Decimal(0)) + native
     for a in redeems:
         if a.kind != ActionKind.REDEEM_EARN or not a.coin:
             continue
