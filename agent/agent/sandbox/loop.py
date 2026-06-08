@@ -66,6 +66,7 @@ from agent.sandbox.carry_state import (
 from agent.sandbox.execute import (
     DEFAULT_AUTO_APPROVE_MIN_CONFIDENCE,
     EXECUTIONS_DIR,
+    _orphan_spot_sell_actions,
     apply_carry_results_to_state,
     diff_to_actions,
     execute_actions,
@@ -354,9 +355,17 @@ def _drop_picks_into_cash(
 
 
 # Venues whose NEW picks draw the liquid stable pool (stable subscribes +
-# hedged non-stable spot/margin). LM / advance-Earn / carry are funded /
-# gated separately, so the liquid clamp leaves them to the validator.
+# hedged non-stable spot/margin). LM / advance-Earn are funded / gated
+# separately, so the sub-floor clamp leaves them to the validator.
 _LIQUID_CLAMP_VENUES = ("bybit_flex", "bybit_onchain")
+# Same set PLUS funding-carry for the liquid-budget clamp only. A carry pick
+# opens a spot Buy + perp short (the same ~2.05× USDT draw as a hedged
+# non-stable), so an unfundable carry must drop to cash too — else it survives
+# to `check_stable_spend_cap` and strands the cycle skipped:invalid (prod
+# 2026-06-08: HYPE carry $18.23 vs $10.41 liquid, every cycle). NOT shared
+# with the sub-floor clamp, which has carry-specific funding-floor semantics
+# (carry is gated by `check_funding_carry_floor`, not the hedge floor).
+_LIQUID_CLAMP_VENUES_CARRY = (*_LIQUID_CLAMP_VENUES, "bybit_funding_carry")
 # Mirror of the executor's MIN_ACTION_USDC / validator _MIN_ACTION_USDC —
 # a delta below this is a no-op the diff never acts on.
 _MIN_NEW_ACTION_USD = 0.50
@@ -425,7 +434,7 @@ def _clamp_to_liquid_budget(
 
     held = _held_usd_by_product(snapshot)
     prod_coin: dict[tuple[str, str], str] = {}
-    for venue_id in _LIQUID_CLAMP_VENUES:
+    for venue_id in _LIQUID_CLAMP_VENUES_CARRY:
         meta = VENUE_REGISTRY.get(venue_id)
         cat = getattr(meta, "snapshot_category", None) if meta else None
         if not cat:
@@ -437,7 +446,7 @@ def _clamp_to_liquid_budget(
     new_nonstable: list[tuple[str, float]] = []
     for v in decision_dict.get("venues", []) or []:
         vid = v.get("venue_id")
-        if vid not in _LIQUID_CLAMP_VENUES:
+        if vid not in _LIQUID_CLAMP_VENUES_CARRY:
             continue
         meta = VENUE_REGISTRY.get(vid)
         cat = getattr(meta, "snapshot_category", None) if meta else None
@@ -935,6 +944,49 @@ async def run_one_cycle(
             decision_path.write_text(json.dumps(raw_decision, indent=2))
         except (OSError, json.JSONDecodeError) as e:
             log.warning("failed to attach validator outcome to decision: %s", e)
+
+        # 3b. Safety de-risk sweep (2026-06-08). Winding down NAKED non-stable
+        # spot (e.g. LM/LP-redeem principal stranded in FUND — live: ~17 TIA)
+        # is pure risk reduction and must NOT be gated behind a valid,
+        # confidence>=floor allocation. The orphan-sell normally rides inside
+        # `diff_to_actions`, which only executes live on an approved cycle — so
+        # while the agent ran a string of sub-0.60 / skipped:invalid cycles the
+        # naked TIA was never sold, contradicting the controlled-risk mandate.
+        # When the full allocation cycle WON'T execute live (validator reject
+        # OR confidence < floor), run the orphan sweep on its own so naked
+        # exposure is still de-risked. It reads only wallet/perp state (not the
+        # rejected decision), keeps the delta-neutral guard (never sells a
+        # hedge leg), and appends to the same cycle execution log. On a
+        # full-live cycle `diff_to_actions` handles these sells, so skip here
+        # to avoid double execution.
+        conf_ok = decision.confidence >= min_confidence
+        if live and not (ok and conf_ok):
+            sweep = _orphan_spot_sell_actions(
+                snap, [], [], [], [], snap_path.stem, idx_offset=800
+            )
+            if sweep:
+                sweep_results = await execute_actions(
+                    bybit_client, sweep, snapshot_ts=snap_path.stem, dry_run=False
+                )
+                outcome["safety_sweep"] = [
+                    {
+                        "product_id": r.action.product_id,
+                        "coin": r.action.coin,
+                        "amount": str(r.action.amount),
+                        "status": r.status,
+                        "error": r.error,
+                    }
+                    for r in sweep_results
+                ]
+                swept_ok = sum(1 for r in sweep_results if r.status == "ok")
+                log.warning(
+                    "safety de-risk sweep: executed %d/%d orphan non-stable "
+                    "sell(s) on a non-executing cycle (validator_ok=%s "
+                    "confidence=%.2f < floor %.2f)",
+                    swept_ok, len(sweep), ok,
+                    float(decision.confidence), float(min_confidence),
+                )
+
         if not ok:
             outcome["result"] = "skipped:invalid"
             return outcome

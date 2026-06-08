@@ -196,6 +196,40 @@ def test_clamp_drops_overbudget_new_nonstable_to_cash() -> None:
     )
 
 
+def test_clamp_drops_overbudget_carry_to_cash() -> None:
+    """2026-06-08: a NEW funding-carry pick (spot Buy + perp short, ~2.05×
+    USDT draw) over the liquid budget is clamped to cash like a hedged
+    non-stable — else it survives to `check_stable_spend_cap` and strands
+    the cycle skipped:invalid (prod: HYPE carry $18.23 vs $10.41 liquid)."""
+    from agent.sandbox.loop import _clamp_to_liquid_budget
+    snap = _snapshot_with_ton(liquid_usdc="6")  # max_new_nonstable ≈ $2.93
+    snap.products["FundingCarry"] = [
+        ProductSummary(
+            category="FundingCarry", product_id="HYPEUSDT", coin="HYPE",
+            effective_apr=Decimal("0.08"), apr_source="funding_carry",
+            base_apr_string=None, redeem_lockup_minutes=0, notes=[],
+        ),
+    ]
+    dec = Decision(
+        thesis="open a HYPE funding-carry past the liquid budget.",
+        venues=[
+            VenueAllocation(venue_id="cash_usdc", weight=0.85),
+            VenueAllocation(venue_id="bybit_funding_carry", weight=0.15,
+                            picks=[Pick(product_id="HYPEUSDT", weight=1.0)]),  # $15 new
+        ],
+        hedges=[], confidence=0.7, risk_flags=[], notes=[],
+        expected_blended_apr_pct=6.0,
+    )
+    new_dict, dropped, note = _clamp_to_liquid_budget(dec.model_dump(), snap)
+    assert dropped == ["HYPEUSDT"]
+    assert "liquid_clamp" in (note or "")
+    rebuilt = Decision.model_validate(new_dict)
+    assert abs(sum(v.weight for v in rebuilt.venues) - 1.0) < 1e-6
+    assert not any(
+        p.product_id == "HYPEUSDT" for v in rebuilt.venues for p in v.picks
+    )
+
+
 def test_clamp_keeps_held_position_at_size() -> None:
     """A HELD TON position kept at its current size (net_new≈0) is NOT
     dropped, even though its gross value exceeds the liquid budget."""
@@ -483,6 +517,89 @@ async def test_run_one_cycle_validator_failure_short_circuits(tmp_path: Path) ->
     # Stage list stops at validate — no diff / approval / execute.
     assert "validate" in outcome["stages"]
     assert "diff" not in outcome["stages"]
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_derisk_sweep_runs_on_subconfidence(tmp_path: Path) -> None:
+    """`bybit-sandbox` 2026-06-08: naked non-stable stranded in FUND (TIA
+    freed by an LM redeem) must be de-risked even when the allocation cycle
+    is below the auto-approve floor — the agent ran 0.52-0.58 cycles for days
+    while ~17 TIA sat naked. The safety sweep executes a LIVE orphan Sell
+    independent of the allocation's approval."""
+    bybit = AsyncMock()
+    anthropic_client = AsyncMock()
+    snap = _snapshot()
+    snap.wallet.fund_coin_balances = {"TIA": Decimal("17.08")}  # naked in FUND
+    snap.perp_market = {
+        "TIA": PerpInfo(
+            symbol="TIAUSDT", mark_price=Decimal("0.32"),
+            min_notional_usd=Decimal("1.0"),
+            min_order_qty=Decimal("0.1"), qty_step=Decimal("0.1"),
+        )
+    }
+    # Valid allocation but sub-floor confidence → allocation won't execute.
+    decision = _decision_clean().model_copy(update={"confidence": 0.5})
+
+    with (
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: []),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
+        patch("agent.sandbox.loop.write_decision", lambda d, sp, **_kw: tmp_path / "decision.json"),
+        patch("agent.sandbox.loop.execute_actions", AsyncMock(return_value=[])) as exec_mock,
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        outcome = await run_one_cycle(
+            bybit, anthropic_client, live=True, yes=True, min_confidence=0.6
+        )
+
+    # The de-risk sweep ran LIVE (dry_run=False) with a TIAUSDT Sell, even
+    # though the allocation was sub-floor.
+    live_sells = [
+        c for c in exec_mock.call_args_list
+        if c.kwargs.get("dry_run") is False
+        and any(
+            a.product_id == "TIAUSDT" and a.side == "Sell"
+            for a in c.args[1]
+        )
+    ]
+    assert live_sells, exec_mock.call_args_list
+    assert outcome.get("safety_sweep") is not None
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_derisk_sweep_skipped_on_full_live(tmp_path: Path) -> None:
+    """On a valid, conf>=floor cycle the main diff already emits the orphan
+    sell, so the standalone sweep must NOT also fire — exactly one
+    execute_actions call, no separate `safety_sweep`."""
+    bybit = AsyncMock()
+    anthropic_client = AsyncMock()
+    snap = _snapshot()
+    snap.wallet.fund_coin_balances = {"TIA": Decimal("17.08")}
+    snap.perp_market = {
+        "TIA": PerpInfo(
+            symbol="TIAUSDT", mark_price=Decimal("0.32"),
+            min_notional_usd=Decimal("1.0"),
+            min_order_qty=Decimal("0.1"), qty_step=Decimal("0.1"),
+        )
+    }
+    decision = _decision_clean()  # confidence 0.7 >= floor
+
+    with (
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: []),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
+        patch("agent.sandbox.loop.write_decision", lambda d, sp, **_kw: tmp_path / "decision.json"),
+        patch("agent.sandbox.loop.execute_actions", AsyncMock(return_value=[])) as exec_mock,
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        outcome = await run_one_cycle(
+            bybit, anthropic_client, live=True, yes=True, min_confidence=0.6
+        )
+
+    assert exec_mock.call_count == 1  # only the main diff, no separate sweep
+    assert outcome.get("safety_sweep") is None
 
 
 @pytest.mark.asyncio
