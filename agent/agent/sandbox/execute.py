@@ -1539,6 +1539,30 @@ def _lm_action_for_target(
     """
     product = _lm_product_from_snapshot(snapshot, product_id)
     if product is None:
+        # A HELD position whose product is no longer in the snapshot must
+        # still be REDEEMABLE — redemption addresses the position by its
+        # `positionId` from `lm_positions` and needs no catalog row. This is
+        # the legacy-leveraged-LP exit path (`bybit-sandbox.66`): the `.66`
+        # filter drops `max_leverage>1` products from the choice set, so a
+        # position opened before the filter would otherwise be stuck
+        # un-redeemable here. Full-exit when the LLM dropped it to ~0.
+        held = _current_lm_position(snapshot.lm_positions, product_id)
+        if held is not None and target_amount_usd <= MIN_ACTION_USDC:
+            position_id, held_usd = held
+            return Action(
+                kind=ActionKind.REDEEM_LM,
+                category=_LM_CATEGORY,
+                product_id=product_id,
+                coin="?",
+                amount=held_usd,
+                order_link_id=order_link_id,
+                reason=(
+                    f"redeem LM/{product_id}: product no longer pickable "
+                    f"(dropped from choice set) but position held "
+                    f"${held_usd:.2f} → full exit (removeRate=100)"
+                ),
+                position_id=position_id,
+            )
         return Action(
             kind=ActionKind.SKIP_OUT_OF_SCOPE,
             category=_LM_CATEGORY,

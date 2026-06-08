@@ -1182,6 +1182,32 @@ def test_diff_lm_full_exit_when_target_zero_and_position_exists() -> None:
     assert redeems[0].amount == Decimal("20")
 
 
+def test_diff_lm_held_position_on_dropped_product_still_redeems() -> None:
+    """(.66) A legacy LM position whose product was dropped from the snapshot
+    choice set (the leveraged-product filter) must still REDEEM when the LLM
+    omits it — NOT SKIP. Otherwise the held capital is stuck un-redeemable
+    because the executor's product lookup returns None. Redemption only needs
+    the positionId from lm_positions, so the catalog row is unnecessary."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        lm_products=[_lm_product("24")],  # product 29 NOT in the catalog
+        lm_positions=[
+            _lm_position(product_id="29", position_id="211940", principal_usd="10.78")
+        ],
+    )
+    d = _decision([_venue("cash_usdc", 1.0)])  # LM omitted entirely
+    actions = diff_to_actions(snap, d, snapshot_ts="20260527T120000Z")
+    redeems = [a for a in actions if a.kind == ActionKind.REDEEM_LM]
+    assert len(redeems) == 1
+    assert redeems[0].position_id == "211940"
+    assert redeems[0].product_id == "29"
+    assert "dropped from choice set" in redeems[0].reason
+    assert not [
+        a for a in actions
+        if a.kind == ActionKind.SKIP_OUT_OF_SCOPE and a.product_id == "29"
+    ]
+
+
 def test_diff_lm_existing_position_at_target_emits_nothing() -> None:
     """Position size matches the LLM's target within MIN_ACTION_USDC →
     no-op. Avoids churn from re-subscribing the same position."""
