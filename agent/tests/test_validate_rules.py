@@ -42,6 +42,7 @@ from agent.validate.rules import (
     check_funding_carry_floor,
     check_funding_rate_floor,
     check_hedges_for_non_usd_picks,
+    check_lm_leverage_forbidden,
     check_lm_leverage_size_cap,
     check_lockup_cap,
     check_min_stake,
@@ -317,12 +318,12 @@ def test_check_picks_required_fails_when_cash_has_picks() -> None:
 
 
 def test_check_effective_pick_cap_fails_when_non_stable_oversizes() -> None:
-    """Non-stable picks (e.g. TON OnChain) still capped at 0.50.
-    Effective bybit_onchain=0.60 × pick.weight=1.0 = 0.60 > 0.50 cap."""
+    """Non-stable picks (e.g. TON OnChain) capped at 0.60 (.66).
+    Effective bybit_onchain=0.65 × pick.weight=1.0 = 0.65 > 0.60 cap."""
     d = _decision(
         venues=[
-            _venue("cash_usdc", 0.40),
-            _venue("bybit_onchain", 0.60, [("8", 1.0)]),
+            _venue("cash_usdc", 0.35),
+            _venue("bybit_onchain", 0.65, [("8", 1.0)]),
         ]
     )
     s = _snapshot(
@@ -335,13 +336,14 @@ def test_check_effective_pick_cap_fails_when_non_stable_oversizes() -> None:
     assert "bybit_onchain/8" in (msg or "")
 
 
-def test_check_effective_pick_cap_passes_stable_at_40pct() -> None:
-    """2026-06-07: stable Earn per-product cap is 0.40. A single USD1
-    pick at exactly the cap passes."""
+def test_check_effective_pick_cap_passes_stable_at_60pct() -> None:
+    """2026-06-08 (.66): stable Earn per-product cap is 0.60. A single USD1
+    pick at exactly the cap passes — concentration into the best stable is
+    the intended behavior."""
     d = _decision(
         venues=[
-            _venue("cash_usdc", 0.60),
-            _venue("bybit_flex", 0.40, [("1131", 1.0)]),  # USD1, eff 0.40
+            _venue("cash_usdc", 0.40),
+            _venue("bybit_flex", 0.60, [("1131", 1.0)]),  # USD1, eff 0.60
         ]
     )
     s = _snapshot(
@@ -357,12 +359,12 @@ def test_check_effective_pick_cap_passes_stable_at_40pct() -> None:
     assert ok, errs
 
 
-def test_check_effective_pick_cap_fails_stable_above_40pct() -> None:
-    """0.40 IS the stable cap — go above and it fails."""
+def test_check_effective_pick_cap_fails_stable_above_60pct() -> None:
+    """0.60 IS the stable cap — go above and it fails."""
     d = _decision(
         venues=[
-            _venue("cash_usdc", 0.50),
-            _venue("bybit_flex", 0.50, [("1131", 1.0)]),  # USD1, eff 0.50
+            _venue("cash_usdc", 0.35),
+            _venue("bybit_flex", 0.65, [("1131", 1.0)]),  # USD1, eff 0.65
         ]
     )
     s = _snapshot(
@@ -656,6 +658,61 @@ def test_check_lm_leverage_size_cap_passes_when_no_lm_picks() -> None:
     s = _snapshot()
     d = _decision()  # no LM venue used
     assert check_lm_leverage_size_cap(d, s) == (True, None)
+
+
+def test_check_lm_leverage_forbidden_rejects_above_1x() -> None:
+    """(.66) Any LM pick with max_leverage>1 is rejected outright — a
+    leveraged LP on a volatile token is speculative directional risk."""
+    s = _snapshot(
+        lm_products=[
+            _product("99", "LiquidityMining", coin="TIA/USDT", apr_source="apy_e8", notes=["max_leverage=5"]),
+        ]
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.95),
+            _venue("bybit_lm", 0.05, [("99", 1.0)]),  # tiny size, still rejected
+        ]
+    )
+    ok, msg = check_lm_leverage_forbidden(d, s)
+    assert ok is False
+    assert "max_leverage=5" in (msg or "")
+
+
+def test_check_lm_leverage_forbidden_allows_1x_and_missing() -> None:
+    """1x pairs and pairs with no max_leverage note (treated as 1x) pass."""
+    s = _snapshot(
+        lm_products=[
+            _product("24", "LiquidityMining", coin="ETH/USDC", apr_source="apy_e8", notes=["max_leverage=1"]),
+            _product("25", "LiquidityMining", coin="BTC/USDC", apr_source="apy_e8", notes=[]),
+        ]
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.7),
+            _venue("bybit_lm", 0.30, [("24", 0.5), ("25", 0.5)]),
+        ]
+    )
+    assert check_lm_leverage_forbidden(d, s) == (True, None)
+
+
+def test_validate_rejects_leveraged_lm_end_to_end() -> None:
+    """Full validate() rejects a leveraged LM pick (integration of the new
+    forbidden gate)."""
+    s = _snapshot(
+        lm_products=[
+            _product("99", "LiquidityMining", coin="TIA/USDT", apr_source="apy_e8", notes=["max_leverage=5"]),
+        ]
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.94),
+            _venue("bybit_lm", 0.06, [("99", 1.0)]),  # within size cap 0.30/5, but leveraged
+        ]
+    )
+    ok, errs = validate(d, s)
+    assert ok is False
+    assert any("unleveraged" in e for e in errs)
 
 
 def test_check_hedges_for_non_usd_picks_fails_without_hedge() -> None:

@@ -43,7 +43,9 @@ from agent.sandbox.snapshot import (
     _advance_earn_summary,
     _alpha_summary,
     _annual_funding,
+    _apply_net_hedge_apr,
     _build_funding_carry_products,
+    _lm_is_unleveraged,
     _flex_or_onchain_summary,
     _hold_to_earn_summary,
     _is_open_perp,
@@ -574,6 +576,136 @@ def test_rank_uses_net_apr_when_present():
     assert [p.product_id for p in ranked] == ["flat-liquid", "high-gross"]
 
 
+# ─── _apply_net_hedge_apr (.66) ──────────────────────────────────────────────
+
+
+def _nonstable(coin: str, gross: str, net_holding: str | None = None) -> ProductSummary:
+    return ProductSummary(
+        category="FlexibleSaving",
+        product_id=f"{coin}-prod",
+        coin=coin,
+        effective_apr=Decimal(gross),
+        apr_source="estimate_apr",
+        effective_apr_net_holding=Decimal(net_holding) if net_holding else None,
+    )
+
+
+def test_apply_net_hedge_subtracts_negative_funding():
+    """A non-stable Earn pick whose hedge perp has negative funding earns LESS
+    than its gross headline — the short pays funding every period."""
+    row = _nonstable("SIGN", "0.56")
+    products = {"FlexibleSaving": [row], "OnChain": []}
+    # -0.0003 per 8h → annualized ≈ -0.3285; net = 0.56 - 0.3285 - 0.018.
+    _apply_net_hedge_apr(products, {"SIGN": _info("SIGN", "-0.0003")})
+    expected = (
+        Decimal("0.56")
+        + _annual_funding(Decimal("-0.0003"), Decimal("8"))
+        - FUNDING_CARRY_FRICTION_ANNUAL
+    )
+    assert row.effective_apr_net_hedge == expected
+    assert row.effective_apr_net_hedge < row.effective_apr
+    assert row.net_hedge_source == "earn+funding-friction"
+
+
+def test_apply_net_hedge_adds_positive_funding():
+    """Positive funding subsidizes the hedge — the short RECEIVES funding, so
+    the realizable net can exceed the gross Earn APR."""
+    row = _nonstable("AAA", "0.05")
+    products = {"FlexibleSaving": [row], "OnChain": []}
+    _apply_net_hedge_apr(products, {"AAA": _info("AAA", "0.0001")})
+    assert row.effective_apr_net_hedge > row.effective_apr  # subsidy net of friction
+
+
+def test_apply_net_hedge_none_when_perp_missing():
+    """No perp data for the coin → can't compute the hedge leg; leave the net
+    field None (falls back to gross ranking) and record why."""
+    row = _nonstable("NOPERP", "0.20")
+    products = {"FlexibleSaving": [row], "OnChain": []}
+    _apply_net_hedge_apr(products, {})  # empty perp_market
+    assert row.effective_apr_net_hedge is None
+    assert row.net_hedge_source == "perp_missing"
+
+
+def test_apply_net_hedge_skips_stables():
+    """Stables have no hedge leg — their gross effective_apr is already
+    realizable, so the net field stays None and is untouched."""
+    stable = ProductSummary(
+        category="FlexibleSaving", product_id="usdc", coin="USDC",
+        effective_apr=Decimal("0.03"), apr_source="apr_history",
+    )
+    products = {"FlexibleSaving": [stable], "OnChain": []}
+    _apply_net_hedge_apr(products, {"USDC": _info("USDC", "0.0001")})
+    assert stable.effective_apr_net_hedge is None
+    assert stable.net_hedge_source is None
+
+
+def test_apply_net_hedge_respects_funding_interval():
+    """4h funding annualizes to 2x an 8h pair at the same per-period rate, so a
+    4h coin's funding contribution to the net is double the 8h coin's."""
+    gross = "0.10"
+    r4 = _nonstable("FOURH", gross)
+    r8 = _nonstable("EIGHTH", gross)
+    products = {"FlexibleSaving": [r4, r8], "OnChain": []}
+    _apply_net_hedge_apr(products, {
+        "FOURH": _info("FOURH", "0.0001", interval_hours="4"),
+        "EIGHTH": _info("EIGHTH", "0.0001", interval_hours="8"),
+    })
+    contrib_4h = r4.effective_apr_net_hedge - Decimal(gross) + FUNDING_CARRY_FRICTION_ANNUAL
+    contrib_8h = r8.effective_apr_net_hedge - Decimal(gross) + FUNDING_CARRY_FRICTION_ANNUAL
+    assert contrib_4h == contrib_8h * 2
+
+
+def test_rank_uses_net_hedge_over_gross():
+    """The live SIGN/HYPE failure: a 56%-headline non-stable whose hedge
+    funding is deeply negative must rank BELOW a flatter stable once net-of-
+    hedge is applied — gross APR is a mirage."""
+    sign = _nonstable("SIGN", "0.56")
+    usdc = ProductSummary(
+        category="FlexibleSaving", product_id="usdc", coin="USDC",
+        effective_apr=Decimal("0.40"), apr_source="apr_history",
+    )
+    products = {"FlexibleSaving": [sign, usdc], "OnChain": []}
+    _apply_net_hedge_apr(products, {"SIGN": _info("SIGN", "-0.0003")})
+    ranked = _rank(products["FlexibleSaving"], top_k=10)
+    # SIGN net ≈ 0.56 - 0.3285 - 0.018 ≈ 0.21 < USDC 0.40.
+    assert [p.product_id for p in ranked] == ["usdc", "SIGN-prod"]
+
+
+# ─── _lm_is_unleveraged (.66) ────────────────────────────────────────────────
+
+
+def _lm_row(pid: str, lev_note: str | None) -> ProductSummary:
+    return ProductSummary(
+        category="LiquidityMining", product_id=pid, coin="X/USDT",
+        effective_apr=Decimal("0.08"), apr_source="apy_e8",
+        notes=[lev_note] if lev_note else [],
+    )
+
+
+def test_lm_is_unleveraged_predicate():
+    assert _lm_is_unleveraged(_lm_row("a", "max_leverage=5")) is False
+    assert _lm_is_unleveraged(_lm_row("b", "max_leverage=7")) is False
+    assert _lm_is_unleveraged(_lm_row("c", "max_leverage=1")) is True
+    assert _lm_is_unleveraged(_lm_row("d", None)) is True  # missing note → 1x
+    # Unparseable (e.g. decimal-string) note → 1x, mirroring the validator's
+    # int-parse-with-None→1 fallback so the two predicates never disagree.
+    assert _lm_is_unleveraged(_lm_row("e", "max_leverage=1.0")) is True
+
+
+def test_lm_ranking_drops_leveraged_pairs():
+    """Mirror of the collect_snapshot LM filter: leveraged rows are dropped
+    from the choice set before ranking, so only the 1x pair survives even
+    though the 5x pair has the higher APR."""
+    rows = [
+        _lm_summary({"productId": "16", "baseCoin": "NEAR", "quoteCoin": "USDT",
+                     "apyE8": "32000000", "maxLeverage": 5}),
+        _lm_summary({"productId": "24", "baseCoin": "ETH", "quoteCoin": "USDC",
+                     "apyE8": "8000000", "maxLeverage": 1}),
+    ]
+    ranked = _rank([s for s in rows if _lm_is_unleveraged(s)])
+    assert [s.product_id for s in ranked] == ["24"]
+
+
 # ─── _safe_earn ─────────────────────────────────────────────────────────────
 
 
@@ -645,7 +777,9 @@ def _mock_client_full() -> AsyncMock:
             "baseCoin": "BTC",
             "quoteCoin": "USDT",
             "apyE8": "1433162",
-            "maxLeverage": 10,
+            # 1x — leveraged LM rows are now dropped from the choice set (.66),
+            # so the shape test uses an unleveraged pair to keep an LM product.
+            "maxLeverage": 1,
         }
     ]
     # Advance-Earn families default to empty for the legacy shape test —

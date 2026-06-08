@@ -177,6 +177,19 @@ class ProductSummary(BaseModel):
     # `effective_apr` overstates the realized return for short holds.
     # None ⇒ no dead-time surfaced (net == gross).
     effective_apr_net_holding: Decimal | None = None
+    # Realizable yield of a non-stable Earn pick AFTER its auto-hedge funding
+    # leg + round-trip friction (`bybit-sandbox.66`). A non-stable Earn long is
+    # hedged by a short perp; the short receives positive funding (subsidy) and
+    # pays negative funding (cost), so the rate the vault actually earns is
+    # `gross_earn_apr + annualized_funding − friction`. This is the ranking key
+    # for non-stables — gross `effective_apr` overstates the hedged return when
+    # funding is negative. None ⇒ stable (no hedge) OR perp data missing this
+    # cycle (then ranking falls back to gross). Computed post-perp-fan-out by
+    # `_apply_net_hedge_apr`, not in the per-product summary builder.
+    effective_apr_net_hedge: Decimal | None = None
+    # Audit breadcrumb for the field above: "earn+funding-friction" when
+    # computed, "perp_missing" / "funding_missing" when it couldn't be.
+    net_hedge_source: str | None = None
     base_apr_string: str | None = None  # raw Bybit value (debug / audit)
     redeem_lockup_minutes: int | None = None
     # OnChain Fixed-term lockup in days (`OnChainEarnProduct.term`, non-
@@ -1114,17 +1127,39 @@ def _lm_liquidation_distance_pct(pos: dict[str, Any]) -> Decimal | None:
 
 
 def _rank_key(s: ProductSummary) -> Decimal:
-    """Ranking key: dead-time-adjusted APR when surfaced
-    (`effective_apr_net_holding`), else gross `effective_apr`. Ranking by
-    net means a high-headline product whose subscribe warmup + redeem
-    processing eats most of a weekly hold doesn't out-rank a flatter but
-    instantly-liquid one. Products without dead-time fall back to gross,
-    so existing FlexibleSaving ordering is unchanged."""
-    return (
-        s.effective_apr_net_holding
-        if s.effective_apr_net_holding is not None
-        else s.effective_apr
-    )
+    """Ranking key, in precedence (`bybit-sandbox.66`):
+      1. `effective_apr_net_hedge` — realizable yield AFTER the auto-hedge
+         funding leg + round-trip friction (non-stable Earn with perp data).
+         This is the TRUE rate a hedged non-stable earns, so a high-headline
+         alt whose funding bleeds it (e.g. 56% Earn at −20%/yr funding ⇒ net
+         ≈ 0) sinks below a flatter stable or a delta-neutral carry.
+      2. `effective_apr_net_holding` — dead-time-adjusted gross (subscribe
+         warmup + redeem processing) when no hedge applies (stables, or
+         non-stables whose perp data is missing this cycle).
+      3. `effective_apr` — plain gross fallback.
+    Products without either net field fall back to gross, so stable / LM
+    ordering is unchanged."""
+    if s.effective_apr_net_hedge is not None:
+        return s.effective_apr_net_hedge
+    if s.effective_apr_net_holding is not None:
+        return s.effective_apr_net_holding
+    return s.effective_apr
+
+
+def _lm_is_unleveraged(s: ProductSummary) -> bool:
+    """True when an LM row is UNLEVERAGED (`bybit-sandbox.66`). Parses the
+    `max_leverage=N` note with the SAME int-parse as the validator's
+    `_extract_max_leverage` (rules.py) so the two never disagree: leveraged
+    iff the note parses to an int > 1; an absent OR unparseable note is
+    treated as 1x (kept), matching the validator's missing→1 convention.
+    Leveraged rows are dropped from the LLM's choice set entirely."""
+    for n in s.notes:
+        if n.startswith("max_leverage="):
+            try:
+                return int(n.split("=", 1)[1]) <= 1
+            except (ValueError, IndexError):
+                return True  # unparseable → 1x, mirrors validator None→1
+    return True  # no note → 1x
 
 
 def _rank(
@@ -1424,6 +1459,63 @@ def _annual_funding(
     if interval <= 0:
         return None
     return per_period * HOURS_PER_YEAR / interval
+
+
+def _apply_net_hedge_apr(
+    products: dict[str, list[ProductSummary]],
+    perp_market: dict[str, "PerpInfo"],
+) -> None:
+    """Compute the realizable net-of-hedge APR for every non-stable basic-Earn
+    pick and store it on the row (`bybit-sandbox.66`).
+
+    A non-stable Earn long is auto-hedged by a short perp of equal size. The
+    short RECEIVES funding when `funding_rate_7d_avg` is positive (subsidy) and
+    PAYS it when negative (cost), so the realizable yield is
+
+        net = gross_earn_apr + annualized_funding − round_trip_friction
+
+    — the same shape (and sign convention) as `_build_funding_carry_products`
+    (a short perp + long spot), reusing `_annual_funding` and
+    `FUNDING_CARRY_FRICTION_ANNUAL`. Without this the ranker sorts non-stables
+    on GROSS Earn APR, so a coin with an eye-popping headline (e.g. 56%) but
+    deeply negative funding (the hedge bleeds it to ~0 or below) out-ranks a
+    genuinely-better stable or carry pick.
+
+    Must run AFTER the perp fan-out (the funding leg only exists once
+    `perp_market` is resolved), hence a post-pass that mutates rows in place:
+    sets `effective_apr_net_hedge` (the new rank key) and `net_hedge_source`
+    (audit). Stables are skipped (no hedge leg — their `effective_apr` is
+    already realizable). A non-stable whose coin has no perp data this cycle
+    keeps `effective_apr_net_hedge=None` and falls back to gross ranking — no
+    worse than before. Only FlexibleSaving + OnChain carry the auto-hedge
+    contract; LM / advance-Earn / carry rows are untouched.
+    """
+    for category in ("FlexibleSaving", "OnChain"):
+        for row in products.get(category, []):
+            if row.coin in STABLES:
+                continue
+            info = perp_market.get(row.coin.upper())
+            if info is None:
+                row.net_hedge_source = "perp_missing"
+                continue
+            funding_annual = _annual_funding(
+                info.funding_rate_7d_avg, info.funding_interval_hours
+            )
+            if funding_annual is None:
+                row.net_hedge_source = "funding_missing"
+                continue
+            # Apply the hedge funding + friction on top of the same base the
+            # old ranker used (dead-time-adjusted gross when present, else
+            # plain gross) so the two adjustments compose rather than override.
+            base = (
+                row.effective_apr_net_holding
+                if row.effective_apr_net_holding is not None
+                else row.effective_apr
+            )
+            row.effective_apr_net_hedge = (
+                base + funding_annual - FUNDING_CARRY_FRICTION_ANNUAL
+            )
+            row.net_hedge_source = "earn+funding-friction"
 
 
 def _parse_funding_interval(raw: str | None) -> Decimal | None:
@@ -2249,7 +2341,11 @@ async def collect_snapshot(
 
     # Products: normalize + rank with diversification floor.
     stable_floor = lambda s: s.coin in STABLES  # noqa: E731
-    lm_unleveraged = lambda s: "max_leverage=1" in s.notes  # noqa: E731
+    # `.66`: LM is restricted to UNLEVERAGED pairs — leveraged LP on a
+    # volatile token is speculative directional risk the owner's "controlled
+    # risk" mandate rules out, so leveraged rows are DROPPED from the choice
+    # set entirely (the LLM never sees them); `check_lm_leverage_forbidden`
+    # is the deterministic backstop. See `_lm_is_unleveraged`.
     products = {
         "FlexibleSaving": _rank(
             [
@@ -2276,8 +2372,11 @@ async def collect_snapshot(
             must_include=stable_floor,
         ),
         "LiquidityMining": _rank(
-            [_lm_summary(p) for p in lm_products],
-            must_include=lm_unleveraged,
+            [
+                s
+                for s in (_lm_summary(p) for p in lm_products)
+                if _lm_is_unleveraged(s)
+            ],
         ),
     }
     # Advance-Earn families. APR for DualAssets + DiscountBuy comes
@@ -2473,6 +2572,19 @@ async def collect_snapshot(
         }
     else:
         perp_market = {}
+
+    # `bybit-sandbox.66`: now that perp_market is resolved, compute each
+    # non-stable Earn pick's realizable net-of-hedge APR and RE-RANK
+    # FlexibleSaving + OnChain on it. The funding leg only exists after the
+    # perp fan-out above, so this can't live in `_flex_or_onchain_summary`.
+    # Ranking on net stops mirage-yield alts (high headline APR, deeply
+    # negative funding) from topping the LLM's choice set; the must_include
+    # stable floor is re-applied so a hedge-free stable still always appears.
+    _apply_net_hedge_apr(products, perp_market)
+    products["FlexibleSaving"] = _rank(
+        products["FlexibleSaving"], must_include=stable_floor
+    )
+    products["OnChain"] = _rank(products["OnChain"], must_include=stable_floor)
 
     # Funding-carry category. Filters + ranks coins from perp_market by
     # friction-adjusted carry APR. Venue `bybit_funding_carry` (`.3`)

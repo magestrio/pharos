@@ -45,10 +45,15 @@ from agent.sandbox.snapshot import (
 
 MIN_CONFIDENCE = 0.4
 # Cap on a single non-stable product as fraction of TOTAL book.
-# Tight because non-stables carry directional + funding-rate risk on
-# top of counterparty risk — concentration in one volatile coin is
-# strictly worse than spreading across two.
-MAX_EFFECTIVE_PRODUCT = 0.50
+# Non-stables carry directional + funding-rate risk on top of
+# counterparty risk, but the directional leg is auto-hedged and the
+# funding leg is now priced into the ranking (`effective_apr_net_hedge`,
+# .66), so concentrating into the single best risk-adjusted net-yield
+# pick is the intended behavior — the owner's mandate is to grow the
+# book by picking the best, not to spread across mediocre substitutes.
+# Raised 0.50 → 0.60 on 2026-06-08 to permit that concentration while
+# still keeping any single coin below two-thirds of the book.
+MAX_EFFECTIVE_PRODUCT = 0.60
 # Stable Earn picks (USD1/USDC/USDT/USDE/...) on FlexibleSaving / OnChain
 # get a wider cap. The dominant risk on a stable Earn pick is Bybit's
 # Earn-product counterparty risk (custody, smart contract, settlement),
@@ -56,12 +61,13 @@ MAX_EFFECTIVE_PRODUCT = 0.50
 # across two products on the same venue doesn't actually reduce that
 # risk — it just dilutes APR onto the lower-yielding fallback. So we
 # let the LLM concentrate on the highest-APR stable Earn pick — but
-# concentration is still bounded. Lowered to 0.40 on 2026-06-07 (operator
-# call) after a single USD1 pick took ~71% of a $70 book: counterparty
-# risk is one thing, but a single Earn product owning two-thirds of the
-# vault is too concentrated. To deploy more than 40% into stables, split
-# across distinct products/venues or accept a higher cash buffer.
-MAX_EFFECTIVE_STABLE_PRODUCT = 0.40
+# concentration is still bounded. Set to 0.60 on 2026-06-08 (operator
+# call): the owner's mandate is to concentrate into the single best
+# risk-adjusted pick, not to dilute APR by splitting one stable across
+# two products that share the same counterparty risk. This REVERSES the
+# 2026-06-07 lowering to 0.40 (which forced scatter + idle cash); 0.60
+# still keeps a single Earn product below two-thirds of the book.
+MAX_EFFECTIVE_STABLE_PRODUCT = 0.60
 
 # Conditional cap thresholds
 PEG_STRESS_BPS = 100
@@ -383,6 +389,36 @@ def check_lm_leverage_size_cap(d: Decision, snapshot: Snapshot) -> Check:
         return False, (
             f"LM picks exceed leverage-scaled size cap "
             f"({LM_LEVERAGE_CAP_FACTOR:.0%}/leverage): {', '.join(violations)}"
+        )
+    return True, None
+
+
+def check_lm_leverage_forbidden(d: Decision, snapshot: Snapshot) -> Check:
+    """LM picks must be UNLEVERAGED (`max_leverage == 1`). A leveraged LP on a
+    volatile token is speculative directional risk with a liquidation tail —
+    the opposite of the owner's "controlled risk" mandate (`bybit-sandbox.66`;
+    a 5x TIA/USDT LP shipped live and triggered this). Picks with no
+    `max_leverage` note are treated as 1 (allowed). This supersedes the older
+    size-scaling tolerance of `check_lm_leverage_size_cap` (which still runs as
+    a backstop bounding the unleveraged pick to the 30% venue cap). The
+    snapshot also drops leveraged LM rows from the choice set, so a compliant
+    LLM never sees them; this gate is the deterministic enforcement."""
+    lm = d.venue("bybit_lm")
+    if lm is None or not lm.picks:
+        return True, None
+    lm_idx = _snapshot_index(snapshot).get("LiquidityMining", {})
+    violations: list[str] = []
+    for pick in lm.picks:
+        summary = lm_idx.get(pick.product_id)
+        if summary is None:
+            continue  # already caught by check_product_ids_in_snapshot
+        lev = _extract_max_leverage(summary) or 1
+        if lev > 1:
+            violations.append(f"{pick.product_id}(max_leverage={lev})")
+    if violations:
+        return False, (
+            f"LM picks must be unleveraged (max_leverage=1); leveraged LP is "
+            f"speculative directional risk: {', '.join(violations)}"
         )
     return True, None
 
@@ -1255,6 +1291,7 @@ def validate(decision: Decision, snapshot: Snapshot) -> tuple[bool, list[str]]:
         check_product_ids_in_snapshot,
         check_no_missing_apr_source,
         check_lockup_cap,
+        check_lm_leverage_forbidden,
         check_lm_leverage_size_cap,
         check_hedges_for_non_usd_picks,
         check_funding_rate_floor,

@@ -48,3 +48,26 @@ def test_event_reactions_heartbeat_fallthrough_noted() -> None:
     prompt = build_system_prompt()
     assert "heartbeat" in prompt.lower()
     assert "no `## Wake reason`" in prompt or "no ## Wake reason" in prompt
+
+
+def test_objective_mandates_concentration_on_best_net_yield() -> None:
+    """(.66) The objective must tell the model to concentrate into the best
+    risk-adjusted NET yield, not passively spread."""
+    prompt = build_system_prompt().lower()
+    assert "concentrat" in prompt
+    assert "net yield" in prompt or "net-of-hedge" in prompt or "effective_apr_net_hedge" in prompt
+
+
+def test_prompt_references_net_hedge_field() -> None:
+    """The pre-computed net-of-hedge field must be surfaced so the model
+    ranks on it instead of doing the funding math by hand."""
+    prompt = build_system_prompt()
+    assert "effective_apr_net_hedge" in prompt
+
+
+def test_prompt_forbids_leveraged_lm() -> None:
+    """(.66) LM leverage is forbidden — the prompt must say so, not the old
+    'Leveraged LM is ALLOWED' framing."""
+    prompt = build_system_prompt()
+    assert "Leveraged LM is ALLOWED" not in prompt
+    assert "unleveraged" in prompt.lower()
