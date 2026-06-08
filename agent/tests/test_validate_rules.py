@@ -957,6 +957,38 @@ def test_check_funding_rate_floor_passes_at_threshold() -> None:
     )
     d = _hedged_decision(hedge_notional=-50.0)
     assert check_funding_rate_floor(d, s) == (True, None)
+
+
+def test_check_funding_rate_floor_passes_high_apr_despite_negative_funding() -> None:
+    """2026-06-08 (the yield fix): a high Earn APR that more than covers a
+    deeply-negative funding cost is a PRIME controllable-risk pick, NOT a
+    reject. The OLD raw-funding floor killed it (funding -54.75%/yr <
+    -10.95%), forcing the agent into ~3% stables. Now gated on the NET:
+    gross 100% Earn + (-54.75%) funding - 1.8% friction = +43.5% net > 0
+    → PASS. (Live: ME 101% Earn / -37% funding ⇒ +64% net delta-neutral.)"""
+    s = _snapshot(
+        onchain_products=[
+            _product("8", "OnChain", coin="TON", effective_apr="1.0")
+        ],
+        perp_market={"TON": _perp("TON", mark="2.0", funding_rate_7d_avg="-0.0005")},
+    )
+    d = _hedged_decision(hedge_notional=-50.0)  # net-new TON pick, net +43.5%
+    assert check_funding_rate_floor(d, s) == (True, None)
+
+
+def test_check_funding_rate_floor_rejects_net_negative_hedge() -> None:
+    """Net-NEGATIVE hedges still rejected: a low Earn APR the funding cost
+    overwhelms (gross 5% - 54.75% funding - 1.8% = -51.5% net ≤ 0)."""
+    s = _snapshot(
+        onchain_products=[
+            _product("8", "OnChain", coin="TON", effective_apr="0.05")
+        ],
+        perp_market={"TON": _perp("TON", mark="2.0", funding_rate_7d_avg="-0.0005")},
+    )
+    d = _hedged_decision(hedge_notional=-50.0)
+    ok, msg = check_funding_rate_floor(d, s)
+    assert ok is False
+    assert "net-of-hedge" in (msg or "") and "TON" in (msg or "")
     # Sanity: the rate above exactly equals the annualized floor when
     # annualized at the 8h default. Guards against future floor changes.
     assert float(Decimal("-0.0001") * Decimal("1095")) == pytest.approx(
@@ -968,9 +1000,14 @@ def test_aggregate_validate_passes_hedged_non_usd_pick() -> None:
     """End-to-end: validator accepts a TON OnChain pick when the hedge
     is sized correctly and the perp market entry clears min-notional.
     `bybit_onchain.max_weight=0.40` (registry), so the pick goes at 40%
-    of book → $40 hedge target ±20% tolerance."""
+    of book → $40 hedge target ±20% tolerance. CONFIRMED apr_source
+    (`apr_history`) so the unconfirmed-estimate probe cap doesn't apply —
+    a measured/historical rate may be sized to the venue cap."""
     s = _snapshot(
-        onchain_products=_onchain_ton(),
+        onchain_products=[
+            _product("8", "OnChain", coin="TON", effective_apr="0.18",
+                     apr_source="apr_history")
+        ],
         perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
         # liquid covers $40 spot + $42 perp margin
         liquid_usdc_usd="60",
@@ -1480,6 +1517,41 @@ def test_check_capital_flow_passes_hedged_within_cap() -> None:
     assert check_capital_flow_simulation(d, s) == (True, None)
 
 
+def test_check_capital_flow_holding_nonstable_does_not_reject() -> None:
+    """`bybit-sandbox` 2026-06-08: net-new scoping. A held non-stable Earn
+    position the LLM re-states as a HOLD (target ≈ held) commits no NEW
+    capital, so it must NOT trip the rule — even though its gross 2.05×
+    would exceed the ceiling. Pre-fix this rejected the very hold the prompt
+    mandates for an un-redeemable Processing position (live: TON)."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
+        total_equity_usd="100",
+        # Held TON OnChain ≈ $45 (22.5 × mark 2.0) — same size as the pick.
+        earn_positions=[_held("OnChain", "8", "TON", "22.5")],
+    )
+    # Re-state the held TON at 45% of book ($45) — a pure hold, net_new ≈ 0.
+    d = _hedged_decision(onchain_venue_weight=0.45)
+    assert check_capital_flow_simulation(d, s) == (True, None)
+
+
+def test_check_capital_flow_growing_nonstable_still_caught() -> None:
+    """Net-new scoping still catches GROWTH: held TON ≈ $10 grown to a $55
+    target → net_new $45 × 2.05 = $92.25 > $90 ceiling → reject. The
+    perp-OPEN risk the rule guards is a net-new event, so opening fresh
+    exposure past the buffer must still fail."""
+    s = _snapshot(
+        onchain_products=_onchain_ton(),
+        perp_market={"TON": _perp("TON", mark="2.0", min_notional="1.0")},
+        total_equity_usd="100",
+        earn_positions=[_held("OnChain", "8", "TON", "5")],  # ≈ $10 held
+    )
+    d = _hedged_decision(onchain_venue_weight=0.55)  # $55 target → $45 new
+    ok, msg = check_capital_flow_simulation(d, s)
+    assert not ok
+    assert msg is not None and "target capital commitment" in msg
+
+
 def test_check_capital_flow_fails_mixed_venues_overflow() -> None:
     """OnChain TON 30% (hedged) + LM 30% + cash 40% on $100 → commit
     = 30×2.05 + 30 + 0 = $61.50 + $30 = $91.50, allowable $90 → reject.
@@ -1697,6 +1769,104 @@ def _carry_product(coin: str = "TON", apr: str = "0.20") -> ProductSummary:
         effective_apr=apr,
         apr_source="funding_carry",
     )
+
+
+def test_check_slow_settle_cap_blocks_new_onchain_when_over_cap() -> None:
+    """2026-06-08: with 54% of book already frozen in OnChain Processing,
+    a NEW OnChain subscribe is rejected (cap 50%) — stop freezing more,
+    keep liquidity for high-net picks. Held Processing is exempt."""
+    from agent.validate.rules import check_slow_settle_cap
+    s = _snapshot(
+        onchain_products=[
+            _product("26", "OnChain", coin="USDC", effective_apr="0.034",
+                     apr_source="apr_history"),
+            _product("25", "OnChain", coin="USDT", effective_apr="0.038",
+                     apr_source="apr_history"),
+        ],
+        total_equity_usd="180",
+        # $97 held OnChain (Processing) = 54% of book
+        earn_positions=[
+            _held("OnChain", "26", "USDC", "67", status="Processing"),
+            _held("OnChain", "25", "USDT", "30", status="Processing"),
+        ],
+        liquid_usdc_usd="10", liquid_usdt_usd="10",
+    )
+    # LLM tries to add MORE USDT OnChain (new spend) on top of the 54% held.
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.30),
+            _venue("bybit_onchain", 0.70, [("26", 0.55), ("25", 0.45)]),
+        ]
+    )
+    ok, msg = check_slow_settle_cap(d, s)
+    assert not ok
+    assert msg is not None and "slow-settle" in msg
+
+
+def test_check_slow_settle_cap_exempts_held_only_hold() -> None:
+    """A pure HOLD of the frozen OnChain book (no new spend) passes — the
+    cap is net-new, never rejects an un-redeemable Processing hold."""
+    from agent.validate.rules import check_slow_settle_cap
+    s = _snapshot(
+        onchain_products=[
+            _product("26", "OnChain", coin="USDC", effective_apr="0.034",
+                     apr_source="apr_history"),
+        ],
+        total_equity_usd="180",
+        earn_positions=[_held("OnChain", "26", "USDC", "97", status="Processing")],
+    )
+    # target ≈ held ($97 ≈ 0.5375 × 180 × 1.0) → net-new ≈ 0 → exempt
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.4625),
+            _venue("bybit_onchain", 0.5375, [("26", 1.0)]),
+        ]
+    )
+    assert check_slow_settle_cap(d, s) == (True, None)
+
+
+def test_check_estimate_apr_probe_cap_blocks_oversized_unconfirmed() -> None:
+    """An UNCONFIRMED estimate_apr non-stable pick above the 7% probe cap is
+    rejected — probe it, don't bet the cap on a quoted rate (ME mirage risk)."""
+    from agent.validate.rules import check_estimate_apr_probe_cap
+    s = _snapshot(
+        flex_products=[
+            _product("498", "FlexibleSaving", coin="ME", effective_apr="0.60",
+                     apr_source="estimate_apr"),
+        ],
+        perp_market={"ME": _perp("ME", mark="0.06", min_notional="0.06")},
+        total_equity_usd="180",
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.60),
+            _venue("bybit_flex", 0.40, [("498", 1.0)]),  # 40% >> 7% probe cap
+        ]
+    )
+    ok, msg = check_estimate_apr_probe_cap(d, s)
+    assert not ok
+    assert msg is not None and "probe cap" in msg
+
+
+def test_check_estimate_apr_probe_cap_allows_probe_size() -> None:
+    """Same pick at probe size (≤7%) passes; a CONFIRMED source at any size
+    is exempt (probe→scale)."""
+    from agent.validate.rules import check_estimate_apr_probe_cap
+    s = _snapshot(
+        flex_products=[
+            _product("498", "FlexibleSaving", coin="ME", effective_apr="0.60",
+                     apr_source="estimate_apr"),
+        ],
+        perp_market={"ME": _perp("ME", mark="0.06", min_notional="0.06")},
+        total_equity_usd="180",
+    )
+    probe = _decision(
+        venues=[
+            _venue("cash_usdc", 0.95),
+            _venue("bybit_flex", 0.05, [("498", 1.0)]),  # 5% ≤ 7% probe
+        ]
+    )
+    assert check_estimate_apr_probe_cap(probe, s) == (True, None)
 
 
 def test_check_funding_carry_floor_passes_when_above_floor() -> None:
@@ -1957,9 +2127,11 @@ def test_check_funding_rate_floor_passes_4h_coin_at_annualized_floor() -> None:
 
 
 def test_check_funding_rate_floor_rejects_4h_coin_below_annualized_floor() -> None:
-    """A 4h coin at -0.00009/period (annualized -19.7%) breaches floor.
-    Pre-fix bug: per-period -0.00009 vs per-period floor -0.0001 →
-    above floor → passed. Now correctly rejected."""
+    """4h-interval funding is annualized correctly in the NET calc. TON gross
+    18% + (-0.00009/4h → annualized -19.7%) - 1.8% friction = -3.5% net ≤ 0
+    → reject. The SAME -0.00009 at 8h annualizes to only -9.86% → net +6.3%
+    → would pass; so the 4h interval is decisive (regression guard for the
+    per-period vs annualized bug)."""
     s = _snapshot(
         onchain_products=_onchain_ton(),
         perp_market={
@@ -1973,7 +2145,7 @@ def test_check_funding_rate_floor_rejects_4h_coin_below_annualized_floor() -> No
     d = _hedged_decision(hedge_notional=-50.0)
     ok, msg = check_funding_rate_floor(d, s)
     assert ok is False
-    assert msg is not None and "annualized" in msg
+    assert msg is not None and "net-of-hedge" in msg
 
 
 def test_check_funding_carry_floor_accepts_4h_coin_above_annualized_floor() -> None:
