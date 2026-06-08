@@ -71,3 +71,18 @@ def test_prompt_forbids_leveraged_lm() -> None:
     prompt = build_system_prompt()
     assert "Leveraged LM is ALLOWED" not in prompt
     assert "unleveraged" in prompt.lower()
+
+
+def test_prompt_source_quality_ladder_and_flex_default() -> None:
+    """(.1/.6) The probe ladder must be graded by source quality (7% probe →
+    30% on measured_yield → 60% on apr_history) and NEW stable yield must
+    default to liquid Flex over slow-settle OnChain."""
+    prompt = build_system_prompt()
+    lower = prompt.lower()
+    assert "source-quality" in lower or "source quality" in lower
+    # measured_yield is the intermediate (~30%) tier, apr_history unlocks 60%.
+    assert "30%" in prompt and "60%" in prompt
+    assert "measured_yield" in prompt and "apr_history" in prompt
+    # Flex is the default for NEW stable yield.
+    assert "effective_apr_net_holding" in prompt
+    assert "default" in lower and "flex" in lower

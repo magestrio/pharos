@@ -12,6 +12,7 @@ import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -26,6 +27,7 @@ from agent.bybit_oracle.bybit_client import (
 from agent.reason.schema import Decision, Hedge, Pick, VenueAllocation
 from agent.sandbox.execute import (
     MIN_ACTION_USDC,
+    MIN_SWAP_USDC,
     Action,
     ActionKind,
     diff_to_actions,
@@ -33,7 +35,12 @@ from agent.sandbox.execute import (
     reconcile_executions,
     verify_executions_against_bybit,
     _enforce_usdt_budget,
+    _execute_one,
+    _hedged_pick_underfunded_coins,
     _order_link_id,
+    _stable_consolidate_actions,
+    _swap_actions_for_hedges,
+    _unfunded_nonstable_subscribe_coins,
 )
 from agent.sandbox.snapshot import (
     MarketSnapshot,
@@ -2068,7 +2075,12 @@ def test_diff_hedge_close_only_when_perp_market_missing() -> None:
     ]
     assert len(closes) == 1
     assert not opens
-    assert len(skips) == 1
+    # Two TON skips: the reopen (no perp_market entry to price qty) and the
+    # `.3` guard on the OnChain subscribe — without a mark we can't size the
+    # native stake units, so there's no funded spot path (would 180016).
+    assert len(skips) == 2
+    assert any("cannot price qty" in s.reason for s in skips)
+    assert any("no funded spot path" in s.reason for s in skips)
 
 
 def test_diff_hedge_sequence_close_before_open_before_subscribe() -> None:
@@ -2199,6 +2211,10 @@ def test_diff_swap_emitted_when_usdt_short_for_open_hedge() -> None:
     snap = _snapshot(
         total_equity_usd="100",
         usdt_available_usd="0",
+        # USDC headroom so the `.2` pre-flight (which bounds the funding-swap
+        # inflow by available USDC) keeps the pick — this test isolates the
+        # swap SIZING, not the USDC-starvation skip path.
+        liquid_usdc_usd="150",
         perp_market={"TON": _perp("TON", mark="2.0")},
         perp_positions=[],
         onchain_products=[_TON_PRODUCT],
@@ -2214,8 +2230,41 @@ def test_diff_swap_emitted_when_usdt_short_for_open_hedge() -> None:
     assert sw.side == "Sell"
     assert sw.coin == "USDT"
     # perp margin 50 × 1.05 = 52.50; Buy demand for $50 TON pick =
-    # 50.00 × 1.01 = 50.50 → consolidated swap = 103.00.
-    assert sw.amount == Decimal("103.00")
+    # 50.00 × 1.01 = 50.50 → shortfall 103.00. Sized to cover shortfall + the
+    # `.2` spend reserve (max(1%·103, $0.20) = 1.03), grossed up for the 0.1%
+    # fee: (103.00 + 1.03) / 0.999 = 104.134 → ROUND_UP 104.14.
+    assert sw.amount == Decimal("104.14")
+
+
+def test_hedge_swap_headroom_covers_dual_leg_after_fee() -> None:
+    """Regression for the live 2026-06-08 BERA drop: a hedged non-stable pick
+    needs USDT for BOTH legs (perp margin + the {coin}USDT Buy). The USDC→USDT
+    funding swap must over-convert so the USDT NETTED after the ~0.1% spot fee
+    + quantize still covers both — bare-shortfall sizing under-delivered and
+    the tail Buy dropped on a sub-cent gap, stranding the pick in cash."""
+    snap = _snapshot(
+        total_equity_usd="178", usdt_available_usd="0",
+        perp_market={"BERA": _perp("BERA", mark="2.0")},
+    )
+    opens = [Action(
+        kind=ActionKind.OPEN_PERP_SHORT, category="Perp", product_id="BERAUSDT",
+        coin="BERA", amount=Decimal("6.0"), order_link_id="lid", reason="",
+        side="Sell",
+    )]
+    # perp notional 6×2=12, margin ×1.05=12.60; Buy demand 12.58 →
+    # shortfall 25.18. Sized to cover shortfall + the `.2` spend reserve
+    # (max(1%·25.18, $0.20) = 0.2518), grossed up for the 0.1% fee:
+    # (25.18 + 0.2518) / 0.999 = 25.4573 → ROUND_UP 25.46.
+    swaps = _swap_actions_for_hedges(
+        snap, opens, [], "20260608T160000Z",
+        idx_offset=0, extra_usdt_demand=Decimal("12.58"),
+    )
+    assert len(swaps) == 1
+    qty = swaps[0].amount
+    assert qty == Decimal("25.46")
+    # USDT netted after the 0.1% taker fee covers the $25.18 dual-leg need
+    # PLUS the spend reserve, so the `.2` pre-flight keeps the pick.
+    assert qty * Decimal("0.999") >= Decimal("25.18") + Decimal("0.2518")
 
 
 def test_diff_no_swap_when_usdt_already_sufficient() -> None:
@@ -2396,16 +2445,24 @@ def test_diff_usdt_excess_swept_to_usdc_when_no_demand() -> None:
     assert len(sweeps) == 1
     s = sweeps[0]
     assert s.coin == "USDC"
-    assert s.amount == Decimal("50.00")
+    # excess $50 − reserve max(1%, $0.20)=$0.50 = $49.50 (under-size so the
+    # cleanup Buy can't over-reach dispatch-time UNIFIED USDT).
+    assert s.amount == Decimal("49.50")
     # Sweep must sit after subscribes so USDT consumers fire first.
     kinds = [a.kind for a in actions]
     assert kinds[-1] == ActionKind.SWAP_SPOT
 
 
 def test_diff_usdt_excess_no_sweep_when_hedge_consumes_supply() -> None:
-    """Liquid USDT consumed by perp margin + non-stable Buy demand →
-    excess negative → no sweep (and `_swap_actions_for_hedges` fires
-    instead to cover the shortfall)."""
+    """Hedged non-stable pick funded almost entirely by the USDC→USDT swap.
+
+    Post-`.2`: with $50 liquid USDT and no USDC the TON pick ($52.50 margin
+    + $50.50 Buy = $103 demand) relies on the funding swap, whose 0.5%
+    headroom can't clear the 1% spend reserve — so the pre-flight
+    BINARY-skips the whole hedged pick (the exact partial-exec it exists to
+    prevent): no perp open, no Buy, no subscribe survives, and the funding
+    Sell is re-sized to 0. The now-idle $50 USDT has no consumer left, so
+    the `.60` excess sweep correctly reclaims it back to USDC (one Buy)."""
     snap = _snapshot(
         total_equity_usd="100",
         liquid_usdt_usd="50",
@@ -2414,26 +2471,38 @@ def test_diff_usdt_excess_no_sweep_when_hedge_consumes_supply() -> None:
     )
     d = _decision_with_hedge(hedge_notional=-50.0)
     actions = diff_to_actions(snap, d, snapshot_ts="20260604T120000Z")
-    buys = [
-        a for a in actions
-        if a.kind == ActionKind.SWAP_SPOT
-        and a.product_id == "USDCUSDT"
-        and a.side == "Buy"
-    ]
-    assert buys == []
-    # And the shortfall path DID fire (Sell USDCUSDT).
+    # `.2` skipped the whole hedged TON pick: no perp open, no Buy demand,
+    # no subscribe survives; the funding Sell was re-sized to 0.
+    assert not [a for a in actions if a.kind == ActionKind.OPEN_PERP_SHORT]
+    assert not [a for a in actions if a.kind == ActionKind.SUBSCRIBE_EARN]
     sells = [
         a for a in actions
         if a.kind == ActionKind.SWAP_SPOT
         and a.product_id == "USDCUSDT"
         and a.side == "Sell"
     ]
-    assert len(sells) == 1
+    assert sells == []
+    assert any(
+        a.kind == ActionKind.SKIP_OUT_OF_SCOPE
+        and a.coin == "TON"
+        and "170131 pre-flight" in a.reason
+        for a in actions
+    )
+    # No Buy demand remains, so `.60` reclaims the idle USDT to USDC.
+    buys = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "USDCUSDT"
+        and a.side == "Buy"
+    ]
+    assert len(buys) == 1
+    assert buys[0].coin == "USDC"
 
 
 def test_diff_usdt_excess_reduced_by_usdt_subscribe_demand() -> None:
     """Liquid USDT $70 - USDT-stable Flex subscribe $50 = $20 excess →
-    sweep $20. Verifies the `usdt_subscribe_demand` subtraction."""
+    sweep $20 − reserve $0.20 floor = $19.80. Verifies the
+    `usdt_subscribe_demand` subtraction (and the small under-size reserve)."""
     snap = _snapshot(
         total_equity_usd="100",
         liquid_usdt_usd="70",
@@ -2454,7 +2523,7 @@ def test_diff_usdt_excess_reduced_by_usdt_subscribe_demand() -> None:
         and a.side == "Buy"
     ]
     assert len(sweeps) == 1
-    assert sweeps[0].amount == Decimal("20.00")
+    assert sweeps[0].amount == Decimal("19.80")
 
 
 def test_diff_usdt_excess_below_threshold_suppressed() -> None:
@@ -2496,8 +2565,29 @@ def test_diff_usdt_excess_credits_close_released_margin() -> None:
         and a.side == "Buy"
     ]
     assert len(sweeps) == 1
-    # close_notional = 20 × $2 = $40; no demand → excess $40 → sweep $40.
-    assert sweeps[0].amount == Decimal("40.00")
+    # close_notional = 20 × $2 = $40; no demand → excess $40 − reserve
+    # max(1%, $0.20)=$0.40 = $39.60.
+    assert sweeps[0].amount == Decimal("39.60")
+
+
+def test_diff_usdt_excess_under_sizes_below_liquid() -> None:
+    """Regression for the live 2026-06-08 executed_partial: the cleanup sweep
+    sized to the snapshot's liquid_usdt ($13.11) over-reached dispatch-time
+    UNIFIED ($13.01) and the Buy rejected. The swept qty must be strictly
+    below liquid_usdt so settlement drift / FUND dust can't strand it."""
+    snap = _snapshot(total_equity_usd="178", liquid_usdt_usd="13.11")
+    d = _decision([_venue("cash_usdc", 1.0)])
+    actions = diff_to_actions(snap, d, snapshot_ts="20260608T163359Z")
+    sweeps = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "USDCUSDT"
+        and a.side == "Buy"
+    ]
+    assert len(sweeps) == 1
+    # excess $13.11 − reserve max(1%=$0.13, $0.20)=$0.20 = $12.91 < $13.01.
+    assert sweeps[0].amount == Decimal("12.91")
+    assert sweeps[0].amount < Decimal("13.11")
 
 
 def test_diff_usdc_subscribe_funded_from_idle_usdt() -> None:
@@ -3933,6 +4023,465 @@ def test_enforce_usdt_budget_leaves_sell_swaps_untouched() -> None:
     assert kept == [sell, buy]
 
 
+# ─── `.2` hedged-pick fully-fund-or-skip pre-flight ─────────────────────────
+
+
+def _buy_action(coin: str, amount: str, idx: int = 0) -> Action:
+    """A `{coin}USDT` Buy swap (non-stable Earn funding leg)."""
+    return _spot_action(
+        product_id=f"{coin}USDT", coin=coin, amount=amount, side="Buy", idx=idx
+    )
+
+
+def _subscribe_action(
+    coin: str, amount: str, *, category: str = "OnChain", native: str | None = None
+) -> Action:
+    return Action(
+        kind=ActionKind.SUBSCRIBE_EARN,
+        category=category,
+        product_id="8",
+        coin=coin,
+        amount=Decimal(amount),
+        amount_native=Decimal(native) if native is not None else None,
+        order_link_id="s-001",
+        reason="test subscribe",
+    )
+
+
+def test_hedged_pick_underfunded_drops_when_supply_short() -> None:
+    """UNIFIED USDT can't fund margin+Buy for the hedged pick after the
+    spend reserve → the whole coin is returned (binary skip)."""
+    # ID short 80 × $0.5 × 1.05 = $42 margin; Buy $40 → demand $82.
+    # liquid_usdt $42 → reserved $41.58 < $42 margin → ID unfundable.
+    snap = _snapshot(
+        total_equity_usd="1000",
+        liquid_usdt_usd="42",
+        perp_market={"ID": _perp("ID", mark="0.5")},
+    )
+    out = _hedged_pick_underfunded_coins(
+        snap,
+        hedge_opens=[_open_short_action("ID", "80")],
+        hedge_closes=[],
+        hedge_swaps=[],
+        earn_swaps=[_buy_action("ID", "40")],
+    )
+    assert out == {"ID"}
+
+
+def test_hedged_pick_underfunded_cent_exact_drop() -> None:
+    """Cent-exact boundary. Demand = $42 margin (80×0.5×1.05) + $40 Buy = $82;
+    reserve is max(1%·82, $0.20) = $0.82 of that demand. $82.81 liquid reserves
+    to $81.99 < $82 → drop; $82.82 reserves to exactly $82.00 ≥ $82 → keep."""
+    snap_drop = _snapshot(
+        total_equity_usd="1000",
+        liquid_usdt_usd="82.81",
+        perp_market={"ID": _perp("ID", mark="0.5")},
+    )
+    assert _hedged_pick_underfunded_coins(
+        snap_drop,
+        hedge_opens=[_open_short_action("ID", "80")],
+        hedge_closes=[],
+        hedge_swaps=[],
+        earn_swaps=[_buy_action("ID", "40")],
+    ) == {"ID"}
+    snap_keep = _snapshot(
+        total_equity_usd="1000",
+        liquid_usdt_usd="82.82",
+        perp_market={"ID": _perp("ID", mark="0.5")},
+    )
+    assert _hedged_pick_underfunded_coins(
+        snap_keep,
+        hedge_opens=[_open_short_action("ID", "80")],
+        hedge_closes=[],
+        hedge_swaps=[],
+        earn_swaps=[_buy_action("ID", "40")],
+    ) == set()
+
+
+def test_hedged_pick_underfunded_keeps_when_comfortable() -> None:
+    """Ample liquid USDT covers margin+Buy+reserve → keep (empty set)."""
+    snap = _snapshot(
+        total_equity_usd="1000",
+        liquid_usdt_usd="500",
+        perp_market={"ID": _perp("ID", mark="0.5")},
+    )
+    assert _hedged_pick_underfunded_coins(
+        snap,
+        hedge_opens=[_open_short_action("ID", "80")],
+        hedge_closes=[],
+        hedge_swaps=[],
+        earn_swaps=[_buy_action("ID", "40")],
+    ) == set()
+
+
+def test_hedged_pick_underfunded_reserve_floor_on_tiny_book() -> None:
+    """On a tiny book the $0.20 reserve FLOOR (not the 1%) is what binds.
+    ID short 2 × $0.5 × 1.05 = $1.05 margin; Buy $1 → demand $2.05.
+    liquid $2.20 → 1% reserve $0.022 < $0.20 floor → reserved $2.00 < $2.05
+    → drop. liquid $2.26 → reserved $2.06 ≥ $2.05 → keep."""
+    snap_drop = _snapshot(
+        total_equity_usd="10",
+        liquid_usdt_usd="2.20",
+        perp_market={"ID": _perp("ID", mark="0.5")},
+    )
+    assert _hedged_pick_underfunded_coins(
+        snap_drop,
+        hedge_opens=[_open_short_action("ID", "2")],
+        hedge_closes=[],
+        hedge_swaps=[],
+        earn_swaps=[_buy_action("ID", "1")],
+    ) == {"ID"}
+    snap_keep = _snapshot(
+        total_equity_usd="10",
+        liquid_usdt_usd="2.26",
+        perp_market={"ID": _perp("ID", mark="0.5")},
+    )
+    assert _hedged_pick_underfunded_coins(
+        snap_keep,
+        hedge_opens=[_open_short_action("ID", "2")],
+        hedge_closes=[],
+        hedge_swaps=[],
+        earn_swaps=[_buy_action("ID", "1")],
+    ) == set()
+
+
+def test_hedged_pick_underfunded_fee_haircut_forces_drop() -> None:
+    """The ~0.1% fee haircut on the funding-swap inflow forces a cent-exact
+    drop that the un-haircut supply would have kept. Supply is almost entirely
+    the USDC→USDT hedge swap ($82.85 Sell), USDC-backed. Demand $82, reserve
+    max(1%·82, $0.20) = $0.82. Post-haircut: 0.01 + 82.85×0.999 = $82.777 →
+    reserved $81.957 < $82 → drop. Without the haircut: 0.01 + 82.85 = $82.86 →
+    reserved $82.04 ≥ $82 → keep. The haircut is the deciding factor."""
+    snap = _snapshot(
+        total_equity_usd="1000",
+        liquid_usdt_usd="0.01",  # non-zero so the pre-flight doesn't early-out
+        liquid_usdc_usd="100",  # backs the $82.85 funding swap (else inflow→0)
+        perp_market={"ID": _perp("ID", mark="0.5")},
+    )
+    hedge_swap = _spot_action(
+        product_id="USDCUSDT", coin="USDT", amount="82.85", side="Sell"
+    )
+    assert _hedged_pick_underfunded_coins(
+        snap,
+        hedge_opens=[_open_short_action("ID", "80")],
+        hedge_closes=[],
+        hedge_swaps=[hedge_swap],
+        earn_swaps=[_buy_action("ID", "40")],
+    ) == {"ID"}
+
+
+def test_hedged_pick_underfunded_missing_mark() -> None:
+    """Missing / non-positive mark → unfundable (can't size the margin)."""
+    snap = _snapshot(
+        total_equity_usd="1000",
+        liquid_usdt_usd="500",
+        perp_market={},  # no ID entry
+    )
+    assert _hedged_pick_underfunded_coins(
+        snap,
+        hedge_opens=[_open_short_action("ID", "80")],
+        hedge_closes=[],
+        hedge_swaps=[],
+        earn_swaps=[_buy_action("ID", "40")],
+    ) == {"ID"}
+
+
+def test_hedged_pick_underfunded_no_false_positive_stable_cash() -> None:
+    """No OPEN_PERP_SHORT (stable-only / cash-only cycle) → empty set, even
+    with idle USDT and a stable Sell swap present."""
+    snap = _snapshot(total_equity_usd="1000", liquid_usdt_usd="5")
+    assert _hedged_pick_underfunded_coins(
+        snap,
+        hedge_opens=[],
+        hedge_closes=[],
+        hedge_swaps=[],
+        earn_swaps=[_spot_action(
+            product_id="USDCUSDT", coin="USDT", amount="20", side="Sell"
+        )],
+    ) == set()
+
+
+def test_hedged_pick_underfunded_multi_coin_priority() -> None:
+    """Two hedged coins, priority-ordered: all margins reserved first, then
+    Buys. A fits, B's Buy overflows → B dropped atomically, A kept.
+    A: short 40 × $0.5 × 1.05 = $21 margin, Buy $20 → $41.
+    B: short 40 × $0.5 × 1.05 = $21 margin, Buy $20 → $41. Total $82.
+    liquid $63: reserved $62.37. Margins $21+$21=$42 fit (avail $20.37);
+    A-Buy $20 fits (avail $0.37); B-Buy $20 overflows → B dropped."""
+    snap = _snapshot(
+        total_equity_usd="1000",
+        liquid_usdt_usd="63",
+        perp_market={"AAA": _perp("AAA", mark="0.5"), "BBB": _perp("BBB", mark="0.5")},
+    )
+    out = _hedged_pick_underfunded_coins(
+        snap,
+        hedge_opens=[
+            _open_short_action("AAA", "40", idx=0),
+            _open_short_action("BBB", "40", idx=1),
+        ],
+        hedge_closes=[],
+        hedge_swaps=[],
+        earn_swaps=[_buy_action("AAA", "20", idx=0), _buy_action("BBB", "20", idx=1)],
+    )
+    assert out == {"BBB"}
+
+
+def test_diff_hedged_pick_underfunded_skipped_atomically() -> None:
+    """Integration: a hedged pick that can't be fully funded is BINARY-skipped
+    — no subscribe, no Buy, no perp survives, and the funding Sell is re-sized
+    to 0. Here $50 liquid USDT + $0 USDC can't cover the $103 two-leg demand
+    (the funding swap has no USDC to sell), so the whole TON pick goes to cash
+    atomically instead of stranding a leg on retCode=170131."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        liquid_usdt_usd="50",
+        perp_market={"TON": _perp("TON", mark="2.0")},
+        onchain_products=[_TON_PRODUCT],
+    )
+    d = _decision_with_hedge(hedge_notional=-50.0)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260608T120000Z")
+    assert not [a for a in actions if a.kind == ActionKind.SUBSCRIBE_EARN]
+    assert not [a for a in actions if a.kind == ActionKind.OPEN_PERP_SHORT]
+    # No funding Sell survives (re-sized to 0 after the cascade).
+    assert not [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "USDCUSDT"
+        and a.side == "Sell"
+    ]
+    # No TON Buy swap survives either.
+    assert not [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT and a.side == "Buy" and a.coin == "TON"
+    ]
+    skips = [
+        a for a in actions
+        if a.kind == ActionKind.SKIP_OUT_OF_SCOPE and a.coin == "TON"
+    ]
+    assert any("170131 pre-flight" in s.reason for s in skips)
+
+
+def test_diff_hedged_pick_survives_when_usdc_backs_swap() -> None:
+    """Epic-critical counter-case to the atomic skip: a hedged non-stable pick
+    funded by the USDC→USDT swap MUST survive when USDC is ample — this is
+    exactly the high-net BERA/ME pick the book exists to harvest. With $0
+    liquid USDT but $150 USDC, the funding swap is sized to cover both legs +
+    the `.2` spend reserve, so the pre-flight keeps the whole pick (subscribe +
+    Buy + perp + funding Sell all present, no 170131 skip). Guards against the
+    over-skip where a too-thin funding swap nuked every swap-funded hedged
+    pick and locked the book into single-digit stables."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        liquid_usdt_usd="0",
+        liquid_usdc_usd="150",
+        perp_market={"TON": _perp("TON", mark="2.0")},
+        onchain_products=[_TON_PRODUCT],
+    )
+    d = _decision_with_hedge(hedge_notional=-50.0)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260608T120000Z")
+    # The whole hedged pick survives — all three legs present, nothing skipped.
+    assert [a for a in actions if a.kind == ActionKind.SUBSCRIBE_EARN]
+    assert [a for a in actions if a.kind == ActionKind.OPEN_PERP_SHORT]
+    assert [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT
+        and a.product_id == "USDCUSDT"
+        and a.side == "Sell"
+    ]
+    assert [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT and a.side == "Buy" and a.coin == "TON"
+    ]
+    assert not [
+        a for a in actions
+        if a.kind == ActionKind.SKIP_OUT_OF_SCOPE
+        and a.coin == "TON"
+        and "170131 pre-flight" in a.reason
+    ]
+
+
+# ─── `.3` non-stable subscribe no-spot-path planner guard ───────────────────
+
+
+def test_unfunded_nonstable_subscribe_no_spot_path() -> None:
+    """Non-stable subscribe with no native balance and no emitted Buy →
+    unfunded (would 180016)."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"TON": _perp("TON", mark="2.0")},
+    )
+    out = _unfunded_nonstable_subscribe_coins(
+        snap,
+        subscribes=[_subscribe_action("TON", "50", native="25")],
+        earn_swaps=[],
+        redeems=[],
+    )
+    assert out == {"TON"}
+
+
+def test_unfunded_nonstable_subscribe_funded_by_buy() -> None:
+    """Emitted `{coin}USDT` Buy covers the subscribe → funded (not flagged)."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"TON": _perp("TON", mark="2.0")},
+    )
+    out = _unfunded_nonstable_subscribe_coins(
+        snap,
+        subscribes=[_subscribe_action("TON", "50", native="25")],
+        earn_swaps=[_buy_action("TON", "50")],
+        redeems=[],
+    )
+    assert out == set()
+
+
+def test_unfunded_nonstable_subscribe_funded_by_native_no_overskip() -> None:
+    """Wallet already holds the coin; shortfall < MIN_SWAP so no Buy was
+    emitted — must NOT be flagged (the native balance covers it)."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"TON": _perp("TON", mark="2.0")},
+    )
+    # Subscribe $50; native 24 TON × $2 = $48; shortfall $2 < MIN_SWAP $5.
+    snap.wallet.unified_coin_balances = {"TON": Decimal("24")}
+    out = _unfunded_nonstable_subscribe_coins(
+        snap,
+        subscribes=[_subscribe_action("TON", "50", native="25")],
+        earn_swaps=[],
+        redeems=[],
+    )
+    assert out == set()
+
+
+def test_unfunded_nonstable_subscribe_missing_mark() -> None:
+    """No mark → can't size native units → unfunded."""
+    snap = _snapshot(total_equity_usd="100", perp_market={})
+    out = _unfunded_nonstable_subscribe_coins(
+        snap,
+        subscribes=[_subscribe_action("TON", "50")],
+        earn_swaps=[],
+        redeems=[],
+    )
+    assert out == {"TON"}
+
+
+def test_unfunded_nonstable_subscribe_credits_fast_redeem() -> None:
+    """A fast-settling same-coin redeem credits toward coverage; a slow
+    OnChain redeem does NOT (mirrors `_redeem_settles_in_cycle`)."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"TON": _perp("TON", mark="2.0")},
+    )
+    fast = Action(
+        kind=ActionKind.REDEEM_EARN, category="FlexibleSaving", product_id="9",
+        coin="TON", amount=Decimal("50"), order_link_id="r", reason="fast",
+    )
+    assert _unfunded_nonstable_subscribe_coins(
+        snap, subscribes=[_subscribe_action("TON", "50", native="25")],
+        earn_swaps=[], redeems=[fast],
+    ) == set()
+    slow = Action(
+        kind=ActionKind.REDEEM_EARN, category="OnChain", product_id="8",
+        coin="TON", amount=Decimal("50"), order_link_id="r", reason="slow",
+    )
+    assert _unfunded_nonstable_subscribe_coins(
+        snap, subscribes=[_subscribe_action("TON", "50", native="25")],
+        earn_swaps=[], redeems=[slow],
+    ) == {"TON"}
+
+
+def test_unfunded_nonstable_subscribe_ignores_stables() -> None:
+    """USDC / stable subscribes are never flagged (no spot-coin path)."""
+    snap = _snapshot(total_equity_usd="100", perp_market={})
+    out = _unfunded_nonstable_subscribe_coins(
+        snap,
+        subscribes=[
+            _subscribe_action("USDC", "50", category="FlexibleSaving"),
+            _subscribe_action("USDT", "50", category="FlexibleSaving"),
+        ],
+        earn_swaps=[],
+        redeems=[],
+    )
+    assert out == set()
+
+
+def test_diff_nonstable_no_spot_path_cascades_perp_to_skip() -> None:
+    """Integration: a non-stable subscribe with no mark (no spot path)
+    cascades its paired perp to SKIP so the short isn't left naked. Uses a
+    redeem-funded scenario so the subscribe itself is otherwise plannable
+    but the mark is missing for the open coin."""
+    # TON pick but perp_market lacks TON → no mark → `.3` flags it; the
+    # paired perp can't open anyway, but the guard's reason must name it.
+    snap = _snapshot(
+        total_equity_usd="100",
+        liquid_usdt_usd="200",
+        perp_market={},
+        onchain_products=[_TON_PRODUCT],
+    )
+    d = _decision_with_hedge(hedge_notional=-50.0)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260608T130000Z")
+    assert not [a for a in actions if a.kind == ActionKind.SUBSCRIBE_EARN]
+    assert not [a for a in actions if a.kind == ActionKind.OPEN_PERP_SHORT]
+    assert any(
+        a.kind == ActionKind.SKIP_OUT_OF_SCOPE
+        and a.coin == "TON"
+        and "no funded spot path" in a.reason
+        for a in actions
+    )
+
+
+def test_diff_nonstable_funded_by_buy_keeps_both() -> None:
+    """A non-stable pick whose USDT→coin Buy fully funds it keeps both the
+    subscribe and the paired perp (no `.3` over-skip)."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        liquid_usdc_usd="200",
+        liquid_usdt_usd="200",
+        perp_market={"TON": _perp("TON", mark="2.0")},
+        onchain_products=[_TON_PRODUCT],
+    )
+    d = _decision_with_hedge(hedge_notional=-50.0)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260608T140000Z")
+    assert len([a for a in actions if a.kind == ActionKind.SUBSCRIBE_EARN]) == 1
+    assert len([a for a in actions if a.kind == ActionKind.OPEN_PERP_SHORT]) == 1
+    # The funding Buy for TON is present.
+    assert [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT and a.side == "Buy" and a.coin == "TON"
+    ]
+
+
+def test_diff_nonstable_funded_by_native_keeps_both() -> None:
+    """Wallet already holds the coin (shortfall < MIN_SWAP, no Buy emitted)
+    → both subscribe and perp kept. Guards against `.3` over-skipping a
+    self-funded pick."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        liquid_usdc_usd="200",
+        liquid_usdt_usd="200",
+        perp_market={"TON": _perp("TON", mark="2.0")},
+        onchain_products=[_TON_PRODUCT],
+    )
+    # $50 TON pick; native 24 TON × $2 = $48 → shortfall $2 < MIN_SWAP $5,
+    # so `_swap_actions_for_earn_picks` emits no Buy.
+    snap.wallet.unified_coin_balances = {"TON": Decimal("24")}
+    d = _decision_with_hedge(hedge_notional=-50.0)
+    actions = diff_to_actions(snap, d, snapshot_ts="20260608T150000Z")
+    assert len([a for a in actions if a.kind == ActionKind.SUBSCRIBE_EARN]) == 1
+    assert len([a for a in actions if a.kind == ActionKind.OPEN_PERP_SHORT]) == 1
+    # No TON Buy was emitted (shortfall too small) and the pick was NOT
+    # skipped for lack of a spot path.
+    assert not [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT and a.side == "Buy" and a.coin == "TON"
+    ]
+    assert not [
+        a for a in actions
+        if a.kind == ActionKind.SKIP_OUT_OF_SCOPE
+        and a.coin == "TON"
+        and "no funded spot path" in a.reason
+    ]
+
+
 # ─── Bybit-side stop-loss on perp open (2026-06-03) ────────────────────────
 
 
@@ -4735,3 +5284,147 @@ def test_hedge_closes_once_onchain_position_cleared() -> None:
         if a.kind == ActionKind.CLOSE_PERP and a.coin == "TON"
     ]
     assert len(closes) >= 1  # hedge closes now that underlying is gone
+
+
+# ─── Stable consolidation (idle non-core stable → USDC) ─────────────────────
+
+
+def test_stable_consolidate_emits_usd1_sell() -> None:
+    """Live symptom (2026-06-08): ~$42 USD1 idle in the wallet, invisible to
+    the USDC+USDT liquid budget. The consolidation must emit exactly one
+    SWAP_SPOT Sell on USD1USDT (the real Bybit pair; USD1USDC does not
+    exist) → USDT, and never touch the core stables."""
+    snap = _snapshot(total_equity_usd="178")
+    snap.wallet.unified_coin_balances = {
+        "USD1": Decimal("41.90"),
+        "USDC": Decimal("17.75"),  # core stable — must NOT be swept
+        "USDT": Decimal("1.57"),   # core stable — must NOT be swept
+    }
+    actions = _stable_consolidate_actions(
+        snap, "20260608T150000Z", idx_offset=700
+    )
+    assert len(actions) == 1, [a.product_id for a in actions]
+    a = actions[0]
+    assert a.kind == ActionKind.SWAP_SPOT
+    assert a.side == "Sell"
+    assert a.product_id == "USD1USDT"
+    assert a.coin == "USDT"
+    assert a.amount == Decimal("41.90")
+    assert a.extra.get("skip_fund_transfer") is True
+    assert "consolidate" in a.reason.lower()
+
+
+def test_stable_consolidate_floors_each_account_to_avoid_oversell() -> None:
+    """Regression for the live 2026-06-08 reject: UNIFIED 41.8966 + a sub-lot
+    FUND dust (0.008, can't transfer) must NOT size the Sell to 41.90 (more
+    than UNIFIED holds). Each account is floored to the 0.01 lot first →
+    41.89 + 0.00 = 41.89, safely ≤ the tradable balance."""
+    snap = _snapshot(total_equity_usd="178")
+    snap.wallet.unified_coin_balances = {"USD1": Decimal("41.896606")}
+    snap.wallet.fund_coin_balances = {"USD1": Decimal("0.008042")}
+    actions = _stable_consolidate_actions(snap, "20260608T150000Z", idx_offset=700)
+    assert len(actions) == 1
+    assert actions[0].amount == Decimal("41.89")
+
+
+def test_stable_consolidate_skips_dust_below_min() -> None:
+    """A USD1 balance under MIN_SWAP_USDC ($5) is fee-dominated dust — skip."""
+    snap = _snapshot(total_equity_usd="100")
+    snap.wallet.unified_coin_balances = {"USD1": Decimal("3.00")}
+    assert _stable_consolidate_actions(snap, "20260608T150000Z", idx_offset=700) == []
+
+
+def test_stable_consolidate_merges_fund_balance() -> None:
+    """USD1 split across UNIFIED + FUND is summed (FUND→UNIFIED transfer
+    happens at dispatch via _ensure_unified_balance)."""
+    snap = _snapshot(total_equity_usd="100")
+    snap.wallet.unified_coin_balances = {"USD1": Decimal("20.00")}
+    snap.wallet.fund_coin_balances = {"USD1": Decimal("22.50")}
+    actions = _stable_consolidate_actions(snap, "20260608T150000Z", idx_offset=700)
+    assert len(actions) == 1
+    assert actions[0].amount == Decimal("42.50")
+
+
+def test_stable_consolidate_skips_unsupported_noncore_stable() -> None:
+    """A non-core stable with no confirmed {coin}USDC pair (not in the
+    allowlist) is left idle, NOT emitted as an unlisted symbol that would
+    reject at dispatch."""
+    snap = _snapshot(total_equity_usd="100")
+    snap.wallet.unified_coin_balances = {"FDUSD": Decimal("30.00")}
+    assert _stable_consolidate_actions(snap, "20260608T150000Z", idx_offset=700) == []
+
+
+def _consolidate_action() -> Action:
+    return Action(
+        kind=ActionKind.SWAP_SPOT,
+        category="Spot",
+        product_id="USD1USDT",
+        coin="USDT",
+        amount=Decimal("41.89"),
+        order_link_id="lid_consolidate",
+        reason="consolidate idle 41.89 USD1 → USDT",
+        side="Sell",
+        extra={"skip_fund_transfer": True},
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skip_fund_transfer_forces_the_sell(monkeypatch) -> None:
+    """With skip_fund_transfer set, the disposal Sell must NOT consult the
+    transfer-satisfies optimization (which is for ACQUIRING a target) — even
+    when FUND holds plenty of the destination coin. Otherwise the sell would
+    no-op and the USD1 stays stranded — the exact bug we are fixing."""
+    import agent.sandbox.execute as ex
+
+    called = {"transfer_satisfies": False}
+
+    async def _spy_transfer(client, target_coin, required):  # noqa: ANN001
+        called["transfer_satisfies"] = True
+        return True  # would short-circuit the sell if consulted
+
+    async def _noop_ensure(client, coin, required):  # noqa: ANN001
+        return None
+
+    monkeypatch.setattr(ex, "_transfer_satisfies_swap", _spy_transfer)
+    monkeypatch.setattr(ex, "_ensure_unified_balance", _noop_ensure)
+
+    client = AsyncMock()
+    client.place_spot_order = AsyncMock(
+        return_value=SimpleNamespace(orderId="SELL1")
+    )
+    res = await _execute_one(client, _consolidate_action(), dry_run=False)
+
+    assert called["transfer_satisfies"] is False  # bypassed
+    client.place_spot_order.assert_awaited_once()
+    kwargs = client.place_spot_order.await_args.kwargs
+    assert kwargs["symbol"] == "USD1USDT"
+    assert kwargs["side"] == "Sell"
+    assert res.status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_default_sell_still_consults_transfer(monkeypatch) -> None:
+    """Contrast: a normal SWAP_SPOT Sell (no skip flag) keeps the
+    transfer-satisfies optimization — proving the guard is opt-in and the
+    legacy funding-swap path is untouched."""
+    import agent.sandbox.execute as ex
+
+    called = {"transfer_satisfies": False}
+
+    async def _spy_transfer(client, target_coin, required):  # noqa: ANN001
+        called["transfer_satisfies"] = True
+        return True  # satisfied → sell short-circuited
+
+    monkeypatch.setattr(ex, "_transfer_satisfies_swap", _spy_transfer)
+
+    client = AsyncMock()
+    client.place_spot_order = AsyncMock(
+        return_value=SimpleNamespace(orderId="SELL2")
+    )
+    action = _consolidate_action()
+    action.extra = {}  # no skip flag → legacy behavior
+    res = await _execute_one(client, action, dry_run=False)
+
+    assert called["transfer_satisfies"] is True
+    client.place_spot_order.assert_not_awaited()  # transfer satisfied the swap
+    assert res.status == "ok"

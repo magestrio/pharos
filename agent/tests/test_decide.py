@@ -645,12 +645,14 @@ def test_load_recent_prior_decisions_joins_cycle_outcome(tmp_path: Path) -> None
         "result": "executed",
         "actions_planned": 3,
         "actions_executed": 3,
+        "actions_failed": None,
         "wake_reason": "heartbeat",
     }
     assert out[1]["_cycle_outcome"] == {
         "result": "executed_partial",
         "actions_planned": 5,
         "actions_executed": 3,
+        "actions_failed": None,
         "wake_reason": "event:funding_flip",
     }
 

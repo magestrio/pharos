@@ -124,7 +124,7 @@ def _decision_clean() -> Decision:
 def _snapshot_with_ton(
     *, liquid_usdc: str, liquid_usdt: str = "0", total_equity_usd: str = "100",
     ton_held: str = "0", ton_funding_7d: str | None = None,
-    ton_interval: str = "8",
+    ton_interval: str = "8", ton_apr: str = "0.18",
 ) -> Snapshot:
     """Small-vault snapshot with a TON OnChain product + perp, for the
     liquid-budget clamp tests. `ton_held` (native) seeds an OnChain TON
@@ -155,7 +155,7 @@ def _snapshot_with_ton(
             "FlexibleSaving": [],
             "OnChain": [ProductSummary(
                 category="OnChain", product_id="8", coin="TON",
-                effective_apr=Decimal("0.18"), apr_source="estimate_apr",
+                effective_apr=Decimal(ton_apr), apr_source="estimate_apr",
                 base_apr_string=None, redeem_lockup_minutes=None, notes=[],
             )],
             "LiquidityMining": [],
@@ -343,6 +343,33 @@ def test_subfloor_clamp_clamps_grown_subfloor_to_held() -> None:
     assert abs(cash.weight - 0.90) < 1e-6  # 0.8 + 0.10 freed
 
 
+def test_subfloor_clamp_keeps_net_positive_highapr_pick() -> None:
+    """Regression for the live 2026-06-08 ME bug: a NEW non-stable pick with
+    deeply negative funding (−32.85%/yr, raw sub-floor) but a high Earn APR
+    that more than covers it (net-of-hedge POSITIVE) must NOT be clamped — the
+    old clamp gated raw funding and dumped a +35%-net pick to cash, leaving the
+    vault in ~3% stables. The net-aware clamp must keep it (the validator
+    passes it)."""
+    from agent.sandbox.loop import _clamp_subfloor_nonstable_growth
+    # gross 0.70 + annual(−0.0003/8h ≈ −0.3285) − friction 0.018 = +0.3535 net.
+    snap = _snapshot_with_ton(
+        liquid_usdc="50", ton_held="0", ton_funding_7d="-0.0003", ton_apr="0.70"
+    )
+    dec = Decision(
+        thesis="open a high-APR hedged TON OnChain pick; net yield is positive.",
+        venues=[
+            VenueAllocation(venue_id="cash_usdc", weight=0.8),
+            VenueAllocation(venue_id="bybit_onchain", weight=0.2,
+                            picks=[Pick(product_id="8", weight=1.0)]),  # $20 new
+        ],
+        hedges=[], confidence=0.7, risk_flags=[], notes=[],
+        expected_blended_apr_pct=10.0,
+    )
+    new_dict, clamped, note = _clamp_subfloor_nonstable_growth(dec.model_dump(), snap)
+    assert clamped == [], note
+    assert new_dict == dec.model_dump()  # untouched
+
+
 def test_subfloor_clamp_exempts_held_at_current() -> None:
     """A held sub-floor position KEPT at current size (net_new≈0) is exempt —
     matching check_funding_rate_floor's net-new-only gate."""
@@ -461,7 +488,7 @@ async def test_run_one_cycle_happy_path_dry_run(tmp_path: Path) -> None:
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
         patch(
             "agent.sandbox.loop._load_recent_prior_decisions",
-            lambda: [],
+            lambda *_a, **_kw: [],
         ),
         patch(
             "agent.sandbox.loop.decide",
@@ -499,7 +526,7 @@ async def test_run_one_cycle_validator_failure_short_circuits(tmp_path: Path) ->
     with (
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(bad_decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -543,7 +570,7 @@ async def test_run_one_cycle_derisk_sweep_runs_on_subconfidence(tmp_path: Path) 
     with (
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: []),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: []),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch("agent.sandbox.loop.write_decision", lambda d, sp, **_kw: tmp_path / "decision.json"),
         patch("agent.sandbox.loop.execute_actions", AsyncMock(return_value=[])) as exec_mock,
@@ -588,7 +615,7 @@ async def test_run_one_cycle_derisk_sweep_skipped_on_full_live(tmp_path: Path) -
     with (
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: []),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: []),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch("agent.sandbox.loop.write_decision", lambda d, sp, **_kw: tmp_path / "decision.json"),
         patch("agent.sandbox.loop.execute_actions", AsyncMock(return_value=[])) as exec_mock,
@@ -612,7 +639,7 @@ async def test_run_one_cycle_no_actions_when_book_zero(tmp_path: Path) -> None:
     with (
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -759,7 +786,7 @@ async def test_run_one_cycle_trips_halt_when_carry_state_write_fails(
             "agent.sandbox.loop.write_snapshot",
             lambda s: tmp_path / "snap.json",
         ),
-        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -830,7 +857,7 @@ async def test_run_one_cycle_live_without_approval_downgrades(tmp_path: Path) ->
     with (
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -892,7 +919,7 @@ async def test_run_loop_once_executes_single_cycle(tmp_path: Path) -> None:
         ),
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -1014,7 +1041,7 @@ async def test_run_loop_continues_on_informational_probe_failure(tmp_path: Path)
         ),
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -1126,7 +1153,7 @@ async def test_run_one_cycle_stamps_wake_reason_heartbeat(tmp_path: Path) -> Non
     with (
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -1159,7 +1186,7 @@ async def test_run_one_cycle_passes_wake_events_through(tmp_path: Path) -> None:
     with (
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: None),
         patch("agent.sandbox.loop.decide", decide_mock),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -1198,7 +1225,7 @@ async def test_run_one_cycle_updates_watcher_baseline(tmp_path: Path) -> None:
     with (
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(bad_decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -1277,7 +1304,7 @@ async def test_run_loop_watcher_wakes_early_on_p0_event(tmp_path: Path) -> None:
         ),
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: None),
         patch("agent.sandbox.loop.decide", _decide),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -1352,7 +1379,7 @@ async def test_run_loop_watcher_disabled_by_default(tmp_path: Path) -> None:
         ),
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -1477,7 +1504,7 @@ async def test_e2e_price_drop_drives_event_driven_cycle(
         ),
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: None),
         patch("agent.sandbox.loop.decide", _decide),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -1575,7 +1602,7 @@ async def test_run_loop_continues_when_db_record_cycle_raises(
         ),
         patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
         patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
-        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda: None),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: None),
         patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
         patch(
             "agent.sandbox.loop.write_decision",
@@ -1848,3 +1875,337 @@ def test_detect_unfinished_cycles_skips_empty_execution_files(tmp_path: Path) ->
     cycle_log = tmp_path / "cycle_log.jsonl"
     cycle_log.write_text("")
     assert detect_unfinished_cycles(cycle_log, executions) == []
+
+
+# --- agent-yield-quality.4 / .5 : deterministic confidence + expected-APR ---
+
+
+def _snap_recompute(
+    *, total_equity_usd: str = "100",
+    flex_apr_source: str = "estimate_apr",
+    flex_held: str = "0",
+    net_hedge: str | None = None,
+    errors: list[str] | None = None,
+) -> Snapshot:
+    """Snapshot with one NON-STABLE (TON) FlexibleSaving product + paired
+    perp, for the confidence / expected-APR recompute tests. `flex_held`
+    seeds a held TON Earn position (native) so net-new vs held can be
+    exercised; `net_hedge` sets `effective_apr_net_hedge` (fractional) so the
+    APR blend can be net-of-hedge."""
+    held = (
+        [{"productId": "TON1", "coin": "TON", "amount": flex_held,
+          "category": "FlexibleSaving", "status": "Active"}]
+        if Decimal(flex_held) > 0 else []
+    )
+    return Snapshot(
+        captured_at=datetime.now(UTC),
+        wallet=WalletSnapshot(
+            total_equity_usd=Decimal(total_equity_usd),
+            liquid_usdc_usd=Decimal("80"), liquid_usdt_usd=Decimal("0"),
+        ),
+        earn_positions=held, lm_positions=[],
+        products={
+            "FlexibleSaving": [ProductSummary(
+                category="FlexibleSaving", product_id="TON1", coin="TON",
+                effective_apr=Decimal("0.20"), apr_source=flex_apr_source,
+                effective_apr_net_hedge=(
+                    Decimal(net_hedge) if net_hedge is not None else None
+                ),
+                base_apr_string=None, redeem_lockup_minutes=None, notes=[],
+            )],
+            "OnChain": [], "LiquidityMining": [],
+        },
+        market=MarketSnapshot(),
+        perp_market={"TON": PerpInfo(
+            symbol="TONUSDT", mark_price=Decimal("2.0"),
+            min_notional_usd=Decimal("1.0"),
+            funding_rate_7d_avg=Decimal("0.00005"),  # positive → above floor
+            funding_interval_hours=Decimal("8"),
+        )},
+        usdc_peg=UsdcPegSnapshot(price_usd=Decimal("1.0"), deviation_bps=Decimal("0"),
+                                 fetched_at=datetime.now(UTC)),
+        errors=errors or [],
+    )
+
+
+def _dec_recompute(
+    *, confidence: float = 0.65, flex_weight: float = 0.05,
+    expected_apr: float = 9.9,
+) -> dict:
+    """A decision picking the TON Flex product (small NEW non-stable)."""
+    return Decision(
+        thesis="probe a fresh non-stable TON Flex pick for the recompute tests.",
+        venues=[
+            VenueAllocation(venue_id="cash_usdc", weight=1.0 - flex_weight),
+            VenueAllocation(venue_id="bybit_flex", weight=flex_weight,
+                            picks=[Pick(product_id="TON1", weight=1.0)]),
+        ],
+        hedges=[], confidence=confidence, risk_flags=[], notes=[],
+        expected_blended_apr_pct=expected_apr,
+    ).model_dump()
+
+
+def test_recompute_confidence_penalizes_unconfirmed_estimate_apr() -> None:
+    from agent.sandbox.loop import _recompute_confidence
+    snap = _snap_recompute()  # TON estimate_apr, NEW ($5 net-new)
+    new, reasons = _recompute_confidence(_dec_recompute(confidence=0.65), snap, [])
+    assert abs(new - 0.55) < 1e-9  # 0.65 − 0.10
+    assert any("unconfirmed_apr" in r for r in reasons)
+
+
+def test_recompute_confidence_penalizes_snapshot_errors() -> None:
+    from agent.sandbox.loop import _recompute_confidence
+    # Confirmed APR (no unconfirmed penalty), but a snapshot data gap that
+    # touches the PICKED coin (TON perp ticker failed → its hedge is blind).
+    snap = _snap_recompute(
+        flex_apr_source="apr_history",
+        errors=["perp_market[TON]: tickers: BybitAPIError"],
+    )
+    new, reasons = _recompute_confidence(_dec_recompute(confidence=0.65), snap, [])
+    # data_gap −0.10 then all_confirmed bonus +0.05 (the only pick is
+    # apr_history); capped at base+bonus, so 0.65 − 0.10 + 0.05 = 0.60.
+    assert abs(new - 0.60) < 1e-9
+    assert any("data_gap" in r for r in reasons)
+
+
+def test_recompute_confidence_ignores_unpicked_coin_errors() -> None:
+    from agent.sandbox.loop import _recompute_confidence
+    # snapshot.errors is a catch-all: a perp ticker for an UNPICKED coin (METH)
+    # fails every cycle. It must NOT dock the data-gap penalty, else the 0.65
+    # anchor falls below the 0.60 execute gate on essentially every cycle and
+    # the agent silently stops trading. The pick (TON) is fully confirmed.
+    snap = _snap_recompute(
+        flex_apr_source="apr_history",
+        errors=[
+            "perp_market[METH]: tickers: BybitAPIError",
+            "advance_position[DualAssets/136052]: retCode=10006 rate limit",
+        ],
+    )
+    new, reasons = _recompute_confidence(_dec_recompute(confidence=0.65), snap, [])
+    # No data_gap; only the all_confirmed +0.05 → 0.70 (capped at base+bonus).
+    assert abs(new - 0.70) < 1e-9
+    assert not any("data_gap" in r for r in reasons)
+
+
+def test_recompute_confidence_penalizes_failed_legs_last_cycle() -> None:
+    from agent.sandbox.loop import _recompute_confidence
+    snap = _snap_recompute(flex_apr_source="apr_history")
+    priors = [{"confidence": 0.65,
+               "_cycle_outcome": {"result": "executed_partial", "actions_failed": 1}}]
+    new, reasons = _recompute_confidence(_dec_recompute(confidence=0.65), snap, priors)
+    # failed_legs −0.10 + all_confirmed +0.05, capped at base+0.05 → 0.60.
+    assert abs(new - 0.60) < 1e-9
+    assert any("failed_legs" in r for r in reasons)
+
+
+def test_recompute_confidence_bonus_when_all_confirmed_capped() -> None:
+    from agent.sandbox.loop import _recompute_confidence
+    snap = _snap_recompute(flex_apr_source="measured_yield")
+    new, reasons = _recompute_confidence(_dec_recompute(confidence=0.65), snap, [])
+    # Only the explicit bonus may RAISE, and only by CONF_BONUS_ALL_CONFIRMED.
+    assert abs(new - 0.70) < 1e-9  # 0.65 + 0.05
+    assert any("all_confirmed" in r for r in reasons)
+
+
+def test_recompute_confidence_bonus_cannot_inflate_low_llm_confidence() -> None:
+    from agent.sandbox.loop import _recompute_confidence
+    # A low LLM confidence with a fully-confirmed book: the bonus is capped at
+    # base + bonus, so it can never lift a 0.45 into a live (>=0.60) trade.
+    snap = _snap_recompute(flex_apr_source="apr_history")
+    new, _ = _recompute_confidence(_dec_recompute(confidence=0.45), snap, [])
+    assert abs(new - 0.50) < 1e-9  # 0.45 + 0.05, not pinned up to the floor
+
+
+def test_recompute_confidence_floors_at_min_when_penalties_stack() -> None:
+    from agent.sandbox.loop import _recompute_confidence
+    from agent.validate.rules import MIN_CONFIDENCE
+    # estimate_apr NEW (−0.10) + snapshot errors (−0.10) + failed legs (−0.10)
+    # + budget starved (−0.05) = −0.35 off 0.65 → 0.30, floored to MIN.
+    snap = _snap_recompute(errors=["bybit 5xx"])
+    dec = _dec_recompute(confidence=0.65)
+    dec["_outcome_liquid_clamp_dropped"] = ["TON1"]
+    priors = [{"confidence": 0.65,
+               "_cycle_outcome": {"result": "error", "actions_failed": 0}}]
+    new, reasons = _recompute_confidence(dec, snap, priors)
+    assert abs(new - MIN_CONFIDENCE) < 1e-9
+    assert any("budget_starved" in r for r in reasons)
+
+
+def test_recompute_confidence_noop_when_clean() -> None:
+    from agent.sandbox.loop import _recompute_confidence
+    # Held TON (no NEW spend) on a confirmed source, no errors, clean prior —
+    # the only penalty/bonus is gated off, so confidence is unchanged.
+    snap = _snap_recompute(flex_apr_source="apr_history", flex_held="50")
+    # flex 0.05 → target $5 < held $100, net_new < 0 → not NEW. But the bonus
+    # WOULD raise (all confirmed). Use a single held confirmed pick → bonus
+    # fires; to test a true no-op, drop confidence so base+bonus == base is
+    # impossible — instead assert it only moves by the bonus.
+    new, reasons = _recompute_confidence(
+        _dec_recompute(confidence=0.65, flex_weight=0.40), snap, []
+    )
+    # $40 target < $100 held → net_new negative → no unconfirmed penalty even
+    # if source were estimate; here source is apr_history so all_confirmed
+    # bonus applies (+0.05).
+    assert abs(new - 0.70) < 1e-9
+    assert reasons == ["all_confirmed (every pick apr_history/measured_yield): +0.05"]
+
+
+def test_recompute_confidence_truly_noop_returns_base() -> None:
+    from agent.sandbox.loop import _recompute_confidence
+    # A picks-less (cash-only) decision: no picks at all → no bonus, no
+    # penalties → confidence returned unchanged.
+    snap = _snap_recompute()
+    dec = Decision(
+        thesis="cash-only hold with nothing to recompute for the test.",
+        venues=[VenueAllocation(venue_id="cash_usdc", weight=1.0)],
+        hedges=[], confidence=0.65, risk_flags=[], notes=[],
+        expected_blended_apr_pct=0.0,
+    ).model_dump()
+    new, reasons = _recompute_confidence(dec, snap, [])
+    assert new == 0.65
+    assert reasons == []
+
+
+def test_confidence_anchor_warning_fires_on_streak() -> None:
+    from agent.sandbox.loop import CONF_ANCHOR_STREAK_N, _confidence_anchor_warning
+    # current + (N-1) priors all 0.65 → fires.
+    priors = [{"confidence": 0.65} for _ in range(CONF_ANCHOR_STREAK_N - 1)]
+    msg = _confidence_anchor_warning(0.65, priors)
+    assert msg is not None and "anchored" in msg
+
+
+def test_confidence_anchor_warning_none_on_differing() -> None:
+    from agent.sandbox.loop import CONF_ANCHOR_STREAK_N, _confidence_anchor_warning
+    priors = [{"confidence": 0.65} for _ in range(CONF_ANCHOR_STREAK_N - 2)]
+    priors.append({"confidence": 0.70})  # breaks the streak
+    assert _confidence_anchor_warning(0.65, priors) is None
+    # Too few priors → None.
+    assert _confidence_anchor_warning(0.65, [{"confidence": 0.65}]) is None
+
+
+def test_recompute_expected_apr_blends_net_of_hedge() -> None:
+    from agent.sandbox.loop import _recompute_expected_apr
+    # Non-stable TON gross 20% but net-of-hedge 6% (funding bleed). The blend
+    # must use the NET, and cash contributes 0.
+    snap = _snap_recompute(net_hedge="0.06")
+    dec = _dec_recompute(flex_weight=0.40, expected_apr=8.0)  # LLM said 8%
+    apr, breakdown = _recompute_expected_apr(dec, snap)
+    # weight_in_book = 0.40 * 1.0; net-of-hedge 6% → 0.40 * 6 = 2.4%.
+    assert abs(apr - 2.4) < 1e-9
+    assert len(breakdown) == 1
+    assert abs(breakdown[0]["pick_apr_pct"] - 6.0) < 1e-9
+
+
+def test_recompute_expected_apr_stable_uses_effective_apr() -> None:
+    from agent.sandbox.loop import _recompute_expected_apr
+    # A stable pick uses plain effective_apr (no hedge); cash = 0.
+    snap = _snapshot()  # USD1 Flex at 7.52%, stable
+    dec = Decision(
+        thesis="stable USD1 Flex blend for the expected-apr units check.",
+        venues=[
+            VenueAllocation(venue_id="cash_usdc", weight=0.6),
+            VenueAllocation(venue_id="bybit_flex", weight=0.4,
+                            picks=[Pick(product_id="1131", weight=1.0)]),
+        ],
+        hedges=[], confidence=0.7, risk_flags=[], notes=[],
+        expected_blended_apr_pct=4.0,
+    ).model_dump()
+    apr, _ = _recompute_expected_apr(dec, snap)
+    # 0.4 * 7.52% = 3.008% (percent units, matching the schema).
+    assert abs(apr - 3.008) < 1e-6
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_recomputes_confidence_end_to_end(tmp_path: Path) -> None:
+    """LLM stub returns the 0.65 anchor + a NEW non-stable estimate_apr pick;
+    `run_one_cycle` lowers it to the deterministic recompute (0.55) and records
+    `confidence_recomputed`. The lowered value is what gets persisted."""
+    bybit = AsyncMock()
+    anthropic_client = AsyncMock()
+    snap = _snap_recompute()  # TON estimate_apr, NEW
+    decision = Decision.model_validate(_dec_recompute(confidence=0.65))
+
+    with (
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: []),
+        patch("agent.sandbox.loop.decide",
+              AsyncMock(return_value=(decision, _stub_usage()))),
+        patch("agent.sandbox.loop.write_decision",
+              lambda d, sp, **_kw: tmp_path / "decision.json"),
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        outcome = await run_one_cycle(
+            bybit, anthropic_client, live=False, yes=False, min_confidence=0.6
+        )
+
+    assert abs(outcome["confidence"] - 0.55) < 1e-9
+    assert outcome["confidence_recomputed"]["from"] == 0.65
+    assert abs(outcome["confidence_recomputed"]["to"] - 0.55) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_auto_close_confidence_not_recomputed(tmp_path: Path) -> None:
+    """The auto-close fast-path sets confidence=1.0 by design and must stay
+    exempt from the recompute (it skips the LLM block entirely)."""
+    bybit = AsyncMock()
+    anthropic_client = AsyncMock()
+    snap = _snap_recompute()
+    # A prior decision holding the TON pick, plus a pick_invalidated wake event
+    # → auto-close path builds a deterministic confidence=1.0 close.
+    prior = _dec_recompute(confidence=0.65)
+    wake = [{"kind": "pick_invalidated", "position_id": "earn:TON1", "coin": "TON"}]
+
+    with (
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+        patch("agent.sandbox.loop._load_recent_prior_decisions",
+              lambda *_a, **_kw: [prior]),
+        patch("agent.sandbox.loop.write_decision",
+              lambda d, sp, **_kw: tmp_path / "decision.json"),
+        patch("agent.sandbox.loop.decide",
+              AsyncMock(side_effect=AssertionError("LLM must be skipped"))),
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        outcome = await run_one_cycle(
+            bybit, anthropic_client, live=False, yes=False, min_confidence=0.6,
+            wake_events=wake,
+        )
+
+    assert outcome.get("auto_close") is True
+    assert outcome["confidence"] == 1.0  # untouched by the recompute
+    assert "confidence_recomputed" not in outcome
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_recomputes_expected_apr_end_to_end(tmp_path: Path) -> None:
+    """`outcome[expected_apr_pct]` is the deterministic net-of-hedge blend of
+    snapshot APRs, not the LLM's hand-computed headline."""
+    bybit = AsyncMock()
+    anthropic_client = AsyncMock()
+    # TON net-of-hedge 6%; held so the pick isn't NEW (keeps the cycle clean of
+    # the unconfirmed/probe machinery) and the blend is purely about units.
+    snap = _snap_recompute(flex_apr_source="apr_history", net_hedge="0.06",
+                           flex_held="50")
+    decision = Decision.model_validate(
+        _dec_recompute(confidence=0.65, flex_weight=0.40, expected_apr=8.0)
+    )
+
+    with (
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: []),
+        patch("agent.sandbox.loop.decide",
+              AsyncMock(return_value=(decision, _stub_usage()))),
+        patch("agent.sandbox.loop.write_decision",
+              lambda d, sp, **_kw: tmp_path / "decision.json"),
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        outcome = await run_one_cycle(
+            bybit, anthropic_client, live=False, yes=False, min_confidence=0.6
+        )
+
+    # 0.40 * 6% net-of-hedge = 2.4% (not the LLM's 8.0).
+    assert abs(outcome["expected_apr_pct"] - 2.4) < 1e-6
+    assert abs(outcome["expected_apr_recomputed"]["to"] - 2.4) < 1e-6
+    assert outcome["expected_apr_recomputed"]["from"] == 8.0

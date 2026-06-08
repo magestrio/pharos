@@ -33,7 +33,7 @@ import os
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from decimal import ROUND_DOWN, Decimal, InvalidOperation
+from decimal import ROUND_DOWN, ROUND_UP, Decimal, InvalidOperation
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -343,6 +343,34 @@ HEDGE_NOTIONAL_REBALANCE_THRESHOLD = Decimal("0.10")
 # residual sub-$5 shortfall that has to be filled out of band — vs.
 # the current behavior of a guaranteed live rejection.
 MIN_SWAP_USDC = Decimal("5.00")
+
+# Headroom on a USDC→USDT funding swap. Selling `qty` USDC on USDCUSDT
+# nets only `qty × (1 − spot_fee)` USDT (~0.1% taker), and quantizing the
+# qty rounds DOWN — so a swap sized at the bare shortfall under-delivers by
+# fee+rounding and the tail Buy leg drops on a sub-cent gap (live 2026-06-08:
+# a BERA hedged pick's spot Buy dropped $0.004 short, stranding the whole
+# non-stable pick in cash). Over-convert by 0.5% (mirrors
+# `_ensure_unified_balance`) so the netted USDT covers both hedge legs. The
+# tiny excess is < MIN_SWAP_USDC so it isn't swept back (no fee churn).
+_STABLE_SWAP_HEADROOM = Decimal("1.005")
+
+# Unified-spend reserve for the per-coin fully-fund-or-skip pre-flight
+# (`.2`). The snapshot `liquid_usdt` reads a hair ABOVE dispatch-time
+# UNIFIED — spot taker fee on the funding leg, FUND dust that can't
+# transfer, unsettled margin from a same-cycle close, and 2dp rounding all
+# shave the actually-spendable balance. Reserving max(1%, $0.20) before
+# allocating per-coin demand makes the spend side symmetric with the
+# `.60` sweep reserve (`_swap_actions_for_usdt_excess`), so we never size a
+# hedged pick against USDT that isn't really there (live: 43% of cycles
+# went executed_partial with retCode=170131 on the funding leg).
+_UNIFIED_SPEND_RESERVE_FACTOR = Decimal("0.01")
+_UNIFIED_SPEND_RESERVE_FLOOR = Decimal("0.20")
+
+# Fee haircut on the USDC→USDT funding swap: a $X Sell on USDCUSDT nets
+# only ~X × (1 − 0.1% taker) USDT. The USDT-budget supply must discount the
+# inflow by this factor or it over-counts spendable USDT by the fee and the
+# tail Buy leg drops a few cents short at dispatch.
+_FUNDING_SWAP_FEE_FACTOR = Decimal("0.999")
 
 
 @dataclass
@@ -921,12 +949,13 @@ def diff_to_actions(
     # subscribe will 180016 at execute time and the perp would open
     # naked — convert both to SKIPs.
     #
-    # NOTE: we DON'T extend this to "non-stable subscribe with no
-    # swap path" — that's an architectural TODO (non-stable USD→native
-    # conversion isn't wired). The auto-hedge tests rely on the perp
-    # firing even when the spot fill is unresolved; until non-stable
-    # swap wiring lands, the subscribe will hit 180016 live and the
-    # operator manually closes the orphan perp. Tracked separately.
+    # The non-stable USD→native Buy path IS wired (`_swap_actions_for_earn_picks`
+    # nonstable_demand_usd → {coin}USDT Buy). The non-stable analogue of this
+    # USDC cascade is the `.3` planner guard below (`_unfunded_nonstable_subscribe_coins`),
+    # which drops a non-stable subscribe + paired perp when no funded spot
+    # path exists (mark missing, or a non-budget Buy shortfall). The runtime
+    # `subscribe_failed_coins` guard in `execute_actions` stays as
+    # defense-in-depth for whatever the plan-time guards can't foresee.
     if dropped_coins:
         new_subscribes: list[Action] = []
         for a in subscribes:
@@ -1071,6 +1100,107 @@ def diff_to_actions(
             extra_usdt_demand=buy_usdt_demand,
         )
 
+    # `.2` pre-flight: per-coin fully-fund-or-skip for hedged non-stable
+    # picks. The two per-currency budget passes above can drop just the Buy
+    # leg of a hedged pick (sizing supply off the optimistic snapshot
+    # `liquid_usdt` with no fee/precision haircut), leaving the perp + the
+    # funding swap → 170131 on the funding leg, executed_partial. This runs
+    # against the reserved UNIFIED USDT (`_usdt_supply` less a fee/dust/round
+    # reserve, symmetric with the `.60` sweep reserve) and BINARY-skips any
+    # coin whose perp margin + Buy leg don't both fit — the whole pick goes
+    # to cash atomically (no perp, no Buy, no subscribe survives).
+    underfunded = _hedged_pick_underfunded_coins(
+        snapshot, hedge_opens, hedge_closes, hedge_swaps, earn_swaps
+    )
+    if underfunded:
+        new_subscribes = []
+        for a in subscribes:
+            if (
+                a.kind in (ActionKind.SUBSCRIBE_EARN, ActionKind.SUBSCRIBE_LM)
+                and a.coin in underfunded
+            ):
+                new_subscribes.append(
+                    Action(
+                        kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                        category=a.category,
+                        product_id=a.product_id,
+                        coin=a.coin,
+                        amount=a.amount,
+                        order_link_id=a.order_link_id,
+                        reason=(
+                            f"{a.category}/{a.product_id} ({a.coin}): "
+                            f"retCode=170131 pre-flight — reliably-spendable "
+                            f"UNIFIED USDT can't fund both perp margin and "
+                            f"the USDT→{a.coin} Buy after the spend reserve; "
+                            f"skipping the whole hedged pick (no partial exec)"
+                        ),
+                    )
+                )
+            else:
+                new_subscribes.append(a)
+        subscribes = new_subscribes
+
+        new_earn_swaps = []
+        for a in earn_swaps:
+            if a.side == "Buy" and a.coin in underfunded:
+                new_earn_swaps.append(
+                    Action(
+                        kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                        category=a.category,
+                        product_id=a.product_id,
+                        coin=a.coin,
+                        amount=a.amount,
+                        order_link_id=a.order_link_id,
+                        reason=(
+                            f"Buy USDT→{a.coin} dropped: paired hedged pick "
+                            f"under-funded (170131 pre-flight) — skip"
+                        ),
+                    )
+                )
+            else:
+                new_earn_swaps.append(a)
+        earn_swaps = new_earn_swaps
+
+        new_hedge_opens = []
+        for a in hedge_opens:
+            if (
+                a.kind == ActionKind.OPEN_PERP_SHORT
+                and a.coin in underfunded
+            ):
+                new_hedge_opens.append(
+                    Action(
+                        kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                        category=a.category,
+                        product_id=a.product_id,
+                        coin=a.coin,
+                        amount=a.amount,
+                        order_link_id=a.order_link_id,
+                        reason=(
+                            f"hedge {a.coin}: paired Earn subscribe under-"
+                            f"funded (170131 pre-flight); skipping perp open "
+                            f"to avoid naked short"
+                        ),
+                    )
+                )
+            else:
+                new_hedge_opens.append(a)
+        hedge_opens = new_hedge_opens
+        # Re-size the consolidated USDT swap after the cascade — Buy swaps
+        # and perp opens were dropped, so the funding demand shrank (to 0
+        # when this was the only hedged pick).
+        buy_usdt_demand = sum(
+            (a.amount for a in earn_swaps if a.side == "Buy"),
+            Decimal(0),
+        )
+        hedge_swaps = _swap_actions_for_hedges(
+            snapshot,
+            hedge_opens,
+            hedge_closes,
+            snapshot_ts,
+            idx_offset=len(all_pids) + len(hedge_closes) + len(hedge_opens),
+            extra_usdt_demand=buy_usdt_demand,
+        )
+
     # `.63` defer pass: same-coin subscribes that can only be funded by a
     # slow OnChain redeem (won't credit this cycle) are converted to SKIP
     # so we don't burn a doomed 180016 and leave capital suspended — the
@@ -1105,6 +1235,107 @@ def diff_to_actions(
             else:
                 new_hedge_opens.append(a)
         hedge_opens = new_hedge_opens
+
+    # `.3` planner guard: a non-stable subscribe with NO funded spot path
+    # (mark missing → no Buy swap emitted; or the emitted Buy + native
+    # balance + in-cycle redeem still fall short by ≥ MIN_SWAP_USDC for a
+    # non-budget reason) would 180016 live and strand its paired perp as a
+    # naked short. Cascade both to SKIP. Shares the per-coin funded-coverage
+    # notion with the `.2` pre-flight (`_buy_usd_for_coin` / `_coin_mark`).
+    # The runtime `subscribe_failed_coins` guard (`execute_actions`) stays as
+    # defense-in-depth for the residual cases this plan-time guard can't see.
+    unfunded_subs = _unfunded_nonstable_subscribe_coins(
+        snapshot, subscribes, earn_swaps, redeems
+    )
+    if unfunded_subs:
+        new_subscribes = []
+        for a in subscribes:
+            if (
+                a.kind in (ActionKind.SUBSCRIBE_EARN, ActionKind.SUBSCRIBE_LM)
+                and a.coin in unfunded_subs
+            ):
+                new_subscribes.append(
+                    Action(
+                        kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                        category=a.category,
+                        product_id=a.product_id,
+                        coin=a.coin,
+                        amount=a.amount,
+                        order_link_id=a.order_link_id,
+                        reason=(
+                            f"{a.category}/{a.product_id} ({a.coin}): no "
+                            f"funded spot path; would 180016 — skip"
+                        ),
+                    )
+                )
+            else:
+                new_subscribes.append(a)
+        subscribes = new_subscribes
+
+        # Drop any {coin}USDT Buy for an unfunded coin too. `.3` provably only
+        # fires when no covering Buy exists (a real planner Buy would have
+        # closed the coverage gap), so this is normally a no-op — but mirroring
+        # the `.2` cascade removes the implicit invariant: an orphan Buy can
+        # never leak regardless of how the Buy was sized. A SKIP carries no
+        # `side`, so it drops out of the re-size's Buy-demand sum below.
+        new_earn_swaps = []
+        for a in earn_swaps:
+            if a.side == "Buy" and a.coin in unfunded_subs:
+                new_earn_swaps.append(
+                    Action(
+                        kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                        category=a.category,
+                        product_id=a.product_id,
+                        coin=a.coin,
+                        amount=a.amount,
+                        order_link_id=a.order_link_id,
+                        reason=(
+                            f"Buy USDT→{a.coin} dropped: paired subscribe has "
+                            f"no funded spot path (180016 pre-empt) — skip"
+                        ),
+                    )
+                )
+            else:
+                new_earn_swaps.append(a)
+        earn_swaps = new_earn_swaps
+
+        new_hedge_opens = []
+        for a in hedge_opens:
+            if (
+                a.kind == ActionKind.OPEN_PERP_SHORT
+                and a.coin in unfunded_subs
+            ):
+                new_hedge_opens.append(
+                    Action(
+                        kind=ActionKind.SKIP_OUT_OF_SCOPE,
+                        category=a.category,
+                        product_id=a.product_id,
+                        coin=a.coin,
+                        amount=a.amount,
+                        order_link_id=a.order_link_id,
+                        reason=(
+                            f"hedge {a.coin}: paired Earn subscribe unfunded "
+                            f"— skipping perp to avoid naked short"
+                        ),
+                    )
+                )
+            else:
+                new_hedge_opens.append(a)
+        hedge_opens = new_hedge_opens
+        # Re-size the consolidated USDT swap after the cascade — perp opens
+        # may have dropped, shrinking the funding demand.
+        buy_usdt_demand = sum(
+            (a.amount for a in earn_swaps if a.side == "Buy"),
+            Decimal(0),
+        )
+        hedge_swaps = _swap_actions_for_hedges(
+            snapshot,
+            hedge_opens,
+            hedge_closes,
+            snapshot_ts,
+            idx_offset=len(all_pids) + len(hedge_closes) + len(hedge_opens),
+            extra_usdt_demand=buy_usdt_demand,
+        )
 
     # Defensive orphan-cleanup: sells UNIFIED-wallet non-stable balance
     # that EXCEEDS the post-cycle perp short coverage. Critically does
@@ -3011,6 +3242,68 @@ def _enforce_usdc_budget(
     return kept_sell + buy_swaps, dropped
 
 
+def _preflight_spend_reserve(demand: Decimal) -> Decimal:
+    """USDT buffer the `.2` pre-flight withholds (and the funding swap
+    pre-funds) to absorb snapshot-vs-dispatch UNIFIED drift — spot fee, FUND
+    dust, unsettled margin, 2dp rounding: `max(1%, $0.20)` of the two-leg
+    `demand`. Computed on the SAME demand `_swap_actions_for_hedges` sizes the
+    funding swap against, so a genuinely-fundable swap-funded pick clears the
+    pre-flight instead of being skipped for leaving < reserve in UNIFIED."""
+    return max(
+        demand * _UNIFIED_SPEND_RESERVE_FACTOR, _UNIFIED_SPEND_RESERVE_FLOOR
+    )
+
+
+def _usdt_supply(
+    liquid_usdt: Decimal,
+    hedge_swaps: list[Action],
+    hedge_closes: list[Action],
+    snapshot: Snapshot,
+    *,
+    liquid_usdc: Decimal | None = None,
+) -> Decimal:
+    """Spendable UNIFIED USDT this cycle = existing liquid USDT + fee-haircut
+    USDC→USDT hedge swap inflow + CLOSE_PERP margin releases. Single source
+    of the USDT-supply notion shared by `_enforce_usdt_budget` (the budget
+    cap) and `_hedged_pick_underfunded_coins` (`.2` pre-flight) so the two
+    can never drift on what counts as available USDT.
+
+    `liquid_usdc` (pre-flight only) bounds the hedge-swap inflow by the USDC
+    actually available to sell: the funding swap is never capped by the USDC
+    budget (`_enforce_usdc_budget` treats it as priority-1 and short-circuits
+    when `liquid_usdc<=0`), so without this bound the pre-flight would count
+    USDT from a swap that can't execute for lack of USDC — passing a pick that
+    then 170131s on the swap leg. The hedge swap has first claim on USDC (perp
+    margin is risk-critical), so it gets the full `min(swap, liquid_usdc)`.
+    `_enforce_usdt_budget` passes `None` (looser, USDC-unaware); the pre-flight
+    is the strict final gate."""
+    hedge_swap_inflow = sum(
+        (
+            s.amount
+            for s in hedge_swaps
+            if s.kind == ActionKind.SWAP_SPOT
+            and s.product_id == "USDCUSDT"
+            and s.side != "Buy"
+        ),
+        Decimal(0),
+    )
+    if liquid_usdc is not None:
+        hedge_swap_inflow = min(hedge_swap_inflow, liquid_usdc)
+    close_release = Decimal(0)
+    for a in hedge_closes:
+        info = snapshot.perp_market.get(a.coin) or snapshot.perp_market.get(
+            a.coin.upper()
+        )
+        if info is None or info.mark_price is None or info.mark_price <= 0:
+            continue
+        close_release += a.amount * info.mark_price
+    return (
+        liquid_usdt
+        + hedge_swap_inflow * _FUNDING_SWAP_FEE_FACTOR
+        + close_release
+    )
+
+
 def _enforce_usdt_budget(
     liquid_usdt: Decimal,
     hedge_swaps: list[Action],
@@ -3038,27 +3331,9 @@ def _enforce_usdt_budget(
     if liquid_usdt <= 0:
         return earn_swaps, set()
 
-    # Supply: existing USDT + hedge USDC→USDT swap inflow + close releases.
-    hedge_swap_inflow = sum(
-        (
-            s.amount
-            for s in hedge_swaps
-            if s.kind == ActionKind.SWAP_SPOT
-            and s.product_id == "USDCUSDT"
-            and s.side != "Buy"
-        ),
-        Decimal(0),
-    )
-    close_release = Decimal(0)
-    for a in hedge_closes:
-        info = snapshot.perp_market.get(a.coin) or snapshot.perp_market.get(
-            a.coin.upper()
-        )
-        if info is None or info.mark_price is None or info.mark_price <= 0:
-            continue
-        close_release += a.amount * info.mark_price
-
-    supply = liquid_usdt + hedge_swap_inflow + close_release
+    # Supply: existing USDT + fee-haircut hedge USDC→USDT swap inflow +
+    # close releases. Shared with the `.2` pre-flight via `_usdt_supply`.
+    supply = _usdt_supply(liquid_usdt, hedge_swaps, hedge_closes, snapshot)
 
     # Demand: perp margin (with buffer).
     perp_demand = Decimal(0)
@@ -3083,10 +3358,10 @@ def _enforce_usdt_budget(
         dropped = {a.coin for a in buy_swaps}
         log.warning(
             "usdt_budget: perp margin demand $%s ≥ USDT supply $%s "
-            "(liquid $%s + hedge swap $%s + close release $%s) — "
+            "(liquid $%s + fee-haircut hedge swap + close release) — "
             "dropping all %d non-stable Buy swap(s) for: %s",
-            perp_demand, supply, liquid_usdt, hedge_swap_inflow,
-            close_release, len(buy_swaps), ", ".join(sorted(dropped)),
+            perp_demand, supply, liquid_usdt,
+            len(buy_swaps), ", ".join(sorted(dropped)),
         )
         return other_swaps, dropped
 
@@ -3107,6 +3382,193 @@ def _enforce_usdt_budget(
                 perp_demand, supply,
             )
     return other_swaps + kept_buy, dropped
+
+
+def _coin_mark(snapshot: Snapshot, coin: str) -> Decimal | None:
+    """Mark price for `coin` from the perp market, or None when missing /
+    non-positive. Shared resolver so the `.2` / `.3` coverage helpers price
+    the same way the planner and budget passes do."""
+    info = (snapshot.perp_market or {}).get(coin) or (
+        snapshot.perp_market or {}
+    ).get((coin or "").upper())
+    mark = getattr(info, "mark_price", None) if info else None
+    if mark is None or mark <= 0:
+        return None
+    return mark
+
+
+def _buy_usd_for_coin(earn_swaps: list[Action], coin: str) -> Decimal:
+    """USD (≈USDT) value the cycle's emitted `{coin}USDT` Buy swap(s) deliver
+    for `coin`. The Buy `amount` is the USDT quote spend, which is the
+    coin's funded coverage from the spot leg. Shared between the `.2`
+    pre-flight (Buy demand against the USDT pool) and the `.3` planner guard
+    (Buy contribution to per-coin coverage) so both read the same number."""
+    return sum(
+        (
+            a.amount
+            for a in earn_swaps
+            if a.kind == ActionKind.SWAP_SPOT
+            and a.side == "Buy"
+            and a.coin == coin
+            and a.product_id == f"{coin}USDT"
+        ),
+        Decimal(0),
+    )
+
+
+def _hedged_pick_underfunded_coins(
+    snapshot: Snapshot,
+    hedge_opens: list[Action],
+    hedge_closes: list[Action],
+    hedge_swaps: list[Action],
+    earn_swaps: list[Action],
+) -> set[str]:
+    """`.2` pre-flight: per-coin fully-fund-or-skip guarantee for hedged
+    non-stable picks. After the USDC+USDT budget cascades have run, the
+    spendable UNIFIED USDT (`_usdt_supply`, less a reserve) must cover BOTH
+    legs of every hedged pick — the perp margin AND the paired `{coin}USDT`
+    Buy. The two per-currency budget passes can drop just the Buy leg while
+    leaving the perp + funding swap, stranding the funding swap on a
+    retCode=170131 (43% of prod cycles went executed_partial this way).
+
+    Allocation is priority-ordered against `reserved_supply`: ALL perp
+    margins first (risk-critical), then the Buy legs. A coin whose margin
+    fits but whose Buy can not be fully covered afterward is BINARY-skipped
+    (the whole coin), since a half-funded hedged pick is the partial-exec
+    failure mode we're eliminating. A missing / non-positive mark makes the
+    coin unfundable (conservative — can't size the margin).
+
+    Returns the set of coins to drop (subscribe + Buy + perp). Pure: caller
+    converts the actions and re-sizes the funding swap.
+    """
+    open_coins = [
+        a.coin for a in hedge_opens if a.kind == ActionKind.OPEN_PERP_SHORT
+    ]
+    if not open_coins:
+        return set()
+    # Mirror the `_enforce_usdt_budget` early-out: an unpopulated
+    # `liquid_usdt` (legacy callers / tests / pre-pivot fixtures) means the
+    # budget pass was a no-op, so the pre-flight can't reason about UNIFIED
+    # either — fall back to the optimistic let-it-ride behavior. Production
+    # always populates the field.
+    if snapshot.wallet.liquid_usdt_usd <= 0:
+        return set()
+
+    supply = _usdt_supply(
+        snapshot.wallet.liquid_usdt_usd,
+        hedge_swaps,
+        hedge_closes,
+        snapshot,
+        liquid_usdc=snapshot.wallet.liquid_usdc_usd,
+    )
+
+    # Per-coin two-leg demand. Mark missing → unfundable up front.
+    margins: dict[str, Decimal] = {}
+    buys: dict[str, Decimal] = {}
+    unfunded: set[str] = set()
+    for coin in open_coins:
+        mark = _coin_mark(snapshot, coin)
+        if mark is None:
+            unfunded.add(coin)
+            continue
+        # Native qty for the coin's open(s) × mark × buffer.
+        qty = sum(
+            (
+                a.amount
+                for a in hedge_opens
+                if a.kind == ActionKind.OPEN_PERP_SHORT and a.coin == coin
+            ),
+            Decimal(0),
+        )
+        margins[coin] = qty * mark * HEDGE_MARGIN_BUFFER
+        buys[coin] = _buy_usd_for_coin(earn_swaps, coin)
+
+    # Reserve relative to the two-leg demand being funded (NOT raw supply): the
+    # funding swap pre-funds exactly this buffer on the same basis
+    # (`_swap_actions_for_hedges`), so a fundable swap-funded pick clears the
+    # gate. Reserving against supply instead would skip every pick funded
+    # mostly by the swap (supply ≈ demand there), nuking the high-net hedged
+    # picks the book exists to harvest.
+    total_demand = sum(margins.values(), Decimal(0)) + sum(
+        buys.values(), Decimal(0)
+    )
+    reserved_supply = supply - _preflight_spend_reserve(total_demand)
+
+    # Priority pass 1: reserve every perp margin (risk-critical) before any
+    # Buy leg. A coin whose margin alone overflows is unfundable.
+    avail = reserved_supply
+    for coin, margin in margins.items():
+        if margin <= avail:
+            avail -= margin
+        else:
+            unfunded.add(coin)
+    # Priority pass 2: fund the Buy legs of coins whose margin cleared, from
+    # the residual. A Buy that can't be fully covered drops its whole coin.
+    for coin, buy in buys.items():
+        if coin in unfunded:
+            continue
+        if buy <= avail:
+            avail -= buy
+        else:
+            unfunded.add(coin)
+    return unfunded
+
+
+def _unfunded_nonstable_subscribe_coins(
+    snapshot: Snapshot,
+    subscribes: list[Action],
+    earn_swaps: list[Action],
+    redeems: list[Action],
+) -> set[str]:
+    """`.3` planner guard: per-coin coverage for non-stable Earn/LM
+    subscribes that have NO funded spot path. A non-stable subscribe whose
+    funded coverage falls short of the required amount (or whose mark is
+    missing) would 180016 live, leaving the paired perp a naked short.
+
+    Funded coverage (USD) per coin
+        = current native wallet balance × mark
+          + emitted `{coin}USDT` Buy in `earn_swaps`
+          + in-cycle (fast-settling) REDEEM_EARN credit
+
+    Mirrors `_redeem_settles_in_cycle`: slow OnChain redeems don't credit
+    this cycle. A coin is unfunded when `required − coverage ≥ MIN_SWAP_USDC`
+    (the same gap the swap planner needs before it would emit a Buy, so a
+    shortfall too small to swap is NOT flagged — avoids over-skipping a pick
+    that the existing native balance already covers) OR the mark is missing.
+
+    Returns the set of non-stable coins to drop. Pure: caller cascades the
+    subscribe + paired perp.
+    """
+    redeem_credit: dict[str, Decimal] = {}
+    for a in redeems:
+        if a.kind != ActionKind.REDEEM_EARN or not _redeem_settles_in_cycle(a):
+            continue
+        redeem_credit[a.coin] = redeem_credit.get(a.coin, Decimal(0)) + a.amount
+
+    required: dict[str, Decimal] = {}
+    for a in subscribes:
+        if a.kind not in (ActionKind.SUBSCRIBE_EARN, ActionKind.SUBSCRIBE_LM):
+            continue
+        coin = a.coin
+        if not coin or coin == "USDC" or coin in _STABLES:
+            continue
+        required[coin] = required.get(coin, Decimal(0)) + a.amount
+
+    unfunded: set[str] = set()
+    for coin, need in required.items():
+        mark = _coin_mark(snapshot, coin)
+        if mark is None:
+            unfunded.add(coin)
+            continue
+        native = snapshot.wallet.unified_coin_balances.get(coin, Decimal(0))
+        coverage = (
+            native * mark
+            + _buy_usd_for_coin(earn_swaps, coin)
+            + redeem_credit.get(coin, Decimal(0))
+        )
+        if need - coverage >= MIN_SWAP_USDC:
+            unfunded.add(coin)
+    return unfunded
 
 
 def _coin_to_long_exposure(snapshot: Snapshot) -> dict[str, Decimal]:
@@ -3301,6 +3763,107 @@ def _orphan_spot_sell_actions(
         )
         cursor += 1
     _ = redeems  # parameter kept for call-site symmetry / future use
+    return swaps
+
+
+# Non-core stables that, when they settle idle into the wallet (the
+# canonical case is USD1 principal left behind by a FlexibleSaving redeem),
+# are invisible to the liquid budget — `liquid_stables_usd` counts only
+# USDC+USDT — and are never swept by the orphan-seller (which skips every
+# coin in `_STABLES`). So they rot at 0%. Each maps to the confirmed Bybit
+# spot pair (base = the stranded coin, Sell route) used to rebase it into a
+# core stable (USDC/USDT) the budget DOES count. NB: only `{coin}USDT`-style
+# pairs with base = the coin work via the Sell dispatch; `USD1USDC` does NOT
+# exist on Bybit (the listed pair is `USDCUSD1`, base USDC, which would need
+# a Buy). Expand ONLY with a base=coin pair verified Trading above
+# MIN_SWAP_USDC — an unlisted symbol just rejects at dispatch.
+_STABLE_CONSOLIDATE_PAIRS: dict[str, tuple[str, str]] = {
+    "USD1": ("USD1USDT", "USDT"),
+}
+
+# Lot precision to floor each per-account stable balance to before summing.
+# Stable spot pairs use 0.01 basePrecision; `validate_qty` re-floors at
+# dispatch, this is the conservative pre-floor that keeps the sized qty at
+# or below the tradable balance.
+_STABLE_LOT = Decimal("0.01")
+
+
+def _stable_consolidate_actions(
+    snapshot: Snapshot,
+    snapshot_ts: str,
+    *,
+    idx_offset: int,
+) -> list[Action]:
+    """Rebase idle NON-CORE stable wallet balances (USD1, …) into a core
+    stable (USDT) so they re-enter the liquid budget and get deployed
+    instead of sitting at 0%. Mirrors `_orphan_spot_sell_actions` but for
+    perp-less stables.
+
+    Pure stable→stable disposal: no perp, no directional exposure, no delta
+    guard (these coins have no perp market). Reads ONLY wallet balances
+    (UNIFIED+FUND) — earn-staked native is excluded (it must be REDEEMed,
+    not sold, and never lands in these maps). Skips sub-MIN_SWAP_USDC dust.
+
+    Each per-account balance is floored to the stable lot BEFORE summing:
+    the UNIFIED+FUND total can exceed the tradable amount when a sub-lot
+    FUND dust can't transfer to UNIFIED, and the snapshot's per-account
+    value is itself 2dp-rounded (can round UP) — so summing raw then
+    flooring would size the Sell past the real balance and Bybit rejects
+    it (observed live 2026-06-08: sized 41.90 vs 41.8966 in UNIFIED).
+
+    Emits one SWAP_SPOT Sell per coin via its confirmed base=coin pair.
+    `extra.skip_fund_transfer` forces the actual sell: the dispatch's
+    `_transfer_satisfies_swap` optimization is for *acquiring* a target
+    coin already sitting in FUND — wrong for disposal, where it would
+    no-op the sell and leave the stable stranded.
+    """
+    balances: dict[str, Decimal] = {}
+    for src in (
+        snapshot.wallet.unified_coin_balances or {},
+        getattr(snapshot.wallet, "fund_coin_balances", None) or {},
+    ):
+        for coin, raw in src.items():
+            if not coin:
+                continue
+            try:
+                bal = raw if isinstance(raw, Decimal) else Decimal(str(raw))
+            except (InvalidOperation, TypeError):
+                continue
+            # Floor EACH account to the lot before summing (see docstring).
+            bal = bal.quantize(_STABLE_LOT, rounding=ROUND_DOWN)
+            if bal <= 0:
+                continue
+            cu = coin.upper()
+            balances[cu] = balances.get(cu, Decimal(0)) + bal
+
+    swaps: list[Action] = []
+    cursor = idx_offset
+    for coin_u, qty in sorted(balances.items()):
+        pair = _STABLE_CONSOLIDATE_PAIRS.get(coin_u)
+        if pair is None:
+            continue  # core stable (USDC/USDT), non-stable, or no Sell pair
+        # Stable ~ $1, so qty ≈ USD. Skip fee-dominated dust.
+        if qty < MIN_SWAP_USDC:
+            continue
+        symbol, dest_coin = pair
+        swaps.append(
+            Action(
+                kind=ActionKind.SWAP_SPOT,
+                category="Spot",
+                product_id=symbol,
+                coin=dest_coin,
+                amount=qty,
+                side="Sell",
+                order_link_id=_order_link_id(snapshot_ts, cursor),
+                reason=(
+                    f"consolidate idle {qty} {coin_u} → {dest_coin} "
+                    f"(~${qty:.2f}): non-core stable invisible to the "
+                    f"USDC+USDT liquid budget, rebasing to deployable stable"
+                ),
+                extra={"skip_fund_transfer": True},
+            )
+        )
+        cursor += 1
     return swaps
 
 
@@ -3712,7 +4275,22 @@ def _swap_actions_for_hedges(
     if shortfall < MIN_SWAP_USDC:
         return []
 
-    qty = shortfall.quantize(Decimal("0.01"))
+    # Size so the NET USDT (after the ~0.1% spot fee) covers the shortfall PLUS
+    # the `.2` pre-flight spend reserve, then round UP. A flat 0.5% headroom
+    # (`_STABLE_SWAP_HEADROOM`) is SMALLER than that reserve, so a pick funded
+    # mostly by this swap cleared the budget cap but was then atomically skipped
+    # by the pre-flight for leaving < reserve in UNIFIED — nuking exactly the
+    # high-net hedged picks the book needs. Gross `shortfall + reserve` up by
+    # the fee factor so a genuinely-fundable swap-funded pick survives; the
+    # pre-flight then fires only when USDC itself can't cover this swap (true
+    # insufficiency). Keep the old headroom as a floor so the prior sub-cent
+    # over-convert is never undercut. The excess (~reserve) is < MIN_SWAP_USDC
+    # so the USDT-excess sweep won't churn it back.
+    reserve = _preflight_spend_reserve(required)
+    qty = max(
+        (shortfall + reserve) / _FUNDING_SWAP_FEE_FACTOR,
+        shortfall * _STABLE_SWAP_HEADROOM,
+    ).quantize(Decimal("0.01"), rounding=ROUND_UP)
     perp_part = open_notional * HEDGE_MARGIN_BUFFER
     return [
         Action(
@@ -3821,7 +4399,19 @@ def _swap_actions_for_usdt_excess(
     if excess < MIN_SWAP_USDC:
         return []
 
-    qty = excess.quantize(Decimal("0.01"))
+    # Under-size the sweep so it never over-reaches the USDT actually
+    # spendable in UNIFIED at dispatch. The snapshot's `liquid_usdt` (and a
+    # same-cycle close release) can read a hair above dispatch-time UNIFIED —
+    # FUND dust that can't transfer, freshly-released margin not yet settled,
+    # balance precision. Over-sweeping 170131s the Buy and strands the cycle
+    # as executed_partial (live 2026-06-08: sized $13.11 vs $13.01 in UNIFIED).
+    # Under-sweeping is SAFE — the residual is swept next cycle. Reserve
+    # max(1%, $0.20) and ROUND_DOWN; skip if the reserved amount drops below
+    # the pair's min order.
+    reserve = max(excess * Decimal("0.01"), Decimal("0.20"))
+    qty = (excess - reserve).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    if qty < MIN_SWAP_USDC:
+        return []
     return [
         Action(
             kind=ActionKind.SWAP_SPOT,
@@ -4595,9 +5185,17 @@ async def _execute_one(
             if side == "Sell":
                 # Pre-flight: if target coin already sits in FUND in
                 # sufficient quantity, transfer it instead of paying
-                # spot fees to recreate balance we already have.
+                # spot fees to recreate balance we already have. Skipped
+                # for disposal sells (`skip_fund_transfer`, stable
+                # consolidation) where the goal is to SELL the base coin,
+                # not acquire the destination — there the optimization
+                # would no-op the sell and strand the balance.
                 target_coin = action.coin
-                if await _transfer_satisfies_swap(client, target_coin, action.amount):
+                if not action.extra.get(
+                    "skip_fund_transfer"
+                ) and await _transfer_satisfies_swap(
+                    client, target_coin, action.amount
+                ):
                     response = {
                         "transferred_in_lieu_of_swap": True,
                         "coin": target_coin,

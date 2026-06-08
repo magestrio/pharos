@@ -515,6 +515,39 @@ FUNDING_FLOOR_HEDGE_ANNUAL = -0.1095
 NET_HEDGE_YIELD_FLOOR = 0.0
 
 
+def net_hedge_yield(summary: Any, perp_info: Any) -> tuple[float | None, bool]:
+    """Realizable net-of-hedge ANNUAL yield for a hedged non-stable Earn pick:
+    `gross_earn_apr + annualized_7d_funding − friction` — the
+    `effective_apr_net_hedge` the snapshot ranker precomputes.
+
+    Returns `(net, interval_broken)`:
+      - `net` is None when there's no funding signal at all (caller: "no
+        signal → pass");
+      - `interval_broken` is True when `funding_interval_hours` can't be
+        annualized (caller: reject — a sizing clamp can't fix bad data).
+
+    SINGLE SOURCE OF TRUTH for the net-yield gate so the validator
+    (`check_funding_rate_floor`) and the loop's deterministic sub-floor clamp
+    (`_pick_is_subfloor_nonstable`) can't drift. They DID drift (2026-06-08):
+    the clamp still gated RAW funding (≥ -10.95%/yr) and dumped a +28%-net ME
+    pick to cash while the net-aware validator would have passed it — leaving
+    the vault parked in ~3% stables."""
+    net = summary.effective_apr_net_hedge
+    if net is not None:
+        return float(net), False
+    if perp_info is None or perp_info.funding_rate_7d_avg is None:
+        return None, False
+    interval = perp_info.funding_interval_hours or DEFAULT_FUNDING_INTERVAL_HOURS
+    annual = _annual_funding(perp_info.funding_rate_7d_avg, interval)
+    if annual is None:
+        return None, True
+    gross = summary.effective_apr_gross or summary.effective_apr
+    return (
+        float(gross) + float(annual) - float(FUNDING_CARRY_FRICTION_ANNUAL),
+        False,
+    )
+
+
 def check_funding_rate_floor(d: Decision, snapshot: Snapshot) -> Check:
     """For each non-stable Earn pick (OnChain + FlexibleSaving), reject if
     the REALIZABLE NET-OF-HEDGE yield is not profitable. A non-stable Earn
@@ -569,33 +602,24 @@ def check_funding_rate_floor(d: Decision, snapshot: Snapshot) -> Check:
             if info is None:
                 # Un-hedgeable — check_hedges_for_non_usd_picks owns this.
                 continue
-            # Realizable net-of-hedge yield. Prefer the ranker's precomputed
-            # field; fall back to computing it inline (test fixtures / a
-            # snapshot built without `_apply_net_hedge_apr`).
-            net = summary.effective_apr_net_hedge
-            if net is None:
-                if info.funding_rate_7d_avg is None:
-                    continue  # no funding signal — can't assess, pass
-                interval = (
-                    info.funding_interval_hours or DEFAULT_FUNDING_INTERVAL_HOURS
+            # Realizable net-of-hedge yield via the shared helper (same one
+            # the loop's sub-floor clamp uses, so they can't drift).
+            net, interval_broken = net_hedge_yield(summary, info)
+            if interval_broken:
+                bad.append(
+                    f"{venue_id}/{pick.product_id}({coin}): perp_market "
+                    f"funding_interval_hours={info.funding_interval_hours!r} "
+                    "invalid — cannot annualize hedge funding"
                 )
-                annual = _annual_funding(info.funding_rate_7d_avg, interval)
-                if annual is None:
-                    bad.append(
-                        f"{venue_id}/{pick.product_id}({coin}): perp_market "
-                        f"funding_interval_hours={info.funding_interval_hours!r} "
-                        "invalid — cannot annualize hedge funding"
-                    )
-                    continue
-                gross = summary.effective_apr_gross or summary.effective_apr
-                net = gross + annual - FUNDING_CARRY_FRICTION_ANNUAL
-            net_f = float(net)
-            if net_f <= NET_HEDGE_YIELD_FLOOR:
+                continue
+            if net is None:
+                continue  # no funding signal — can't assess, pass
+            if net <= NET_HEDGE_YIELD_FLOOR:
                 fr = info.funding_rate_7d_avg
                 fr_s = f"{float(fr):+.6f}" if fr is not None else "n/a"
                 bad.append(
                     f"{venue_id}/{pick.product_id}({coin}): net-of-hedge yield "
-                    f"{net_f * 100:+.2f}%/yr <= floor "
+                    f"{net * 100:+.2f}%/yr <= floor "
                     f"{NET_HEDGE_YIELD_FLOOR * 100:.0f}% (7d funding {fr_s}; "
                     "hedge not profitable — Earn APR doesn't cover funding cost)"
                 )
@@ -1325,14 +1349,39 @@ def check_capital_flow_simulation(d: Decision, snapshot: Snapshot) -> Check:
 # Keeps >= (1 - cap) of book in liquid/fast venues as deployable powder.
 SLOW_SETTLE_MAX_WEIGHT = 0.50
 
-# Probe cap for UNCONFIRMED high-yield. A non-stable Earn pick whose APR is a
-# bare `estimate_apr` (Bybit's quoted base, often a transient/mis-quoted
-# promo — e.g. ME 98% gross) may collapse, leaving the hedge to bleed funding.
-# Enter it as a PROBE; scale only once the rate confirms (apr_source becomes
-# apr_history / measured_yield). Caps NEW effective weight of such a pick;
-# confirmed picks use the normal per-product cap. Enforces the "probe→scale"
-# posture deterministically rather than trusting the prompt.
+# Default-to-liquid-Flex margin for NEW stable yield (2026-06-08). Below the
+# 50% slow-settle wall the agent still defaults to OnChain on stables because
+# its gross APR reads higher — but the dead-time discount (subscribe warmup +
+# ~7d redeem `Processing`) eats much of that edge, and the frozen capital
+# can't chase high-net hedged picks. So when a same-coin liquid Flex twin
+# exists, NEW OnChain stable yield must beat it by at least this margin on the
+# dead-time-discounted rate (`effective_apr_net_holding`) to justify the lock;
+# otherwise route the NEW stable yield to Flex (instant redeem).
+SLOW_SETTLE_STABLE_PREF_MARGIN = 0.015  # 1.5%/yr absolute
+
+# Source-quality ladder for high-yield non-stable picks. A non-stable Earn
+# pick whose APR is a bare `estimate_apr` (Bybit's quoted base, often a
+# transient/mis-quoted promo — e.g. ME 98% gross) may collapse, leaving the
+# hedge to bleed funding. Enter it as a PROBE; scale only as the rate confirms
+# from a higher-quality source. This is a 3-tier NET-NEW cap keyed on
+# `apr_source`, NOT an N-cycle counter — the validator is stateless and reads
+# only the current snapshot:
+#   estimate_apr   → ESTIMATE_PROBE_CAP        (probe, unconfirmed)
+#   measured_yield → MEASURED_YIELD_SCALE_CAP  (confirmed but noisy)
+#   apr_history    → exempt here (pool-level, noise-immune) → MAX_EFFECTIVE_PRODUCT
+# Caps NEW effective weight; held probes are exempt (growing one past the cap
+# is gated, holding it isn't). Enforces the "probe→scale" posture
+# deterministically rather than trusting the prompt.
 ESTIMATE_PROBE_CAP = 0.07
+
+# Intermediate tier between the 7% probe and the 0.60 product cap.
+# `measured_yield` is a CONFIRMED realized rate (our own position) but is
+# single-position-noisy on a tiny stake (snapshot.py ~L519-522: sub-precision
+# hourly credits annualize spuriously), so it earns an intermediate net-new
+# cap — above the bare-estimate probe, below the full product cap. Only
+# pool-level `apr_history` (noise-immune) unlocks 0.60 via
+# `check_effective_pick_cap`.
+MEASURED_YIELD_SCALE_CAP = 0.30
 
 
 def check_slow_settle_cap(d: Decision, snapshot: Snapshot) -> Check:
@@ -1388,16 +1437,116 @@ def check_slow_settle_cap(d: Decision, snapshot: Snapshot) -> Check:
     return True, None
 
 
-def check_estimate_apr_probe_cap(d: Decision, snapshot: Snapshot) -> Check:
-    """Cap NEW effective weight of an UNCONFIRMED (`estimate_apr`) non-stable
-    Earn pick at `ESTIMATE_PROBE_CAP` — probe it, don't bet the cap on a
-    quoted rate that may be a transient promo (if it collapses the hedge
-    bleeds funding). Confirmed picks (`apr_history` / `measured_yield`) are
-    exempt and use the normal per-product cap → probe-then-scale. Net-new
-    scoped (growing a held probe past the cap is gated; holding isn't)."""
+def check_slow_settle_stable_preference(d: Decision, snapshot: Snapshot) -> Check:
+    """Default NEW stable yield to liquid Flex over slow-settle OnChain unless
+    the OnChain rate clears `SLOW_SETTLE_STABLE_PREF_MARGIN`. Independent of the
+    50% slow-settle wall: even with room under the cap, locking stables into a
+    ~7d-redeem OnChain pick when a same-coin Flex twin yields ~the same freezes
+    capital for no real edge.
+
+    Net-new scoped (mirrors `check_slow_settle_cap`): for each OnChain stable
+    pick with NEW spend (`target − held`) >= `_MIN_ACTION_USDC`, look up a
+    same-coin stable Flex product; if one exists, REJECT only when the OnChain
+    net rate (`effective_apr_net_holding`, else `effective_apr` — the dead-time
+    discount is the whole point) beats the Flex twin's by less than the margin.
+    Never rejects a forced hold (net-new below the floor) or a coin with no
+    Flex twin to route to."""
     total_book = float(snapshot.wallet.total_equity_usd)
     if total_book <= 0:
         return True, None
+    detail = _held_earn_detail(snapshot)
+    idx = _snapshot_index(snapshot)
+    flex_idx = idx.get("FlexibleSaving", {})
+    bad: list[str] = []
+    for venue_id, category in _AUTO_HEDGE_VENUES:
+        if category not in SLOW_SETTLE_CATEGORIES:
+            continue
+        venue = d.venue(venue_id)  # type: ignore[arg-type]
+        if venue is None or venue.weight <= 0 or not venue.picks:
+            continue
+        cat_idx = idx.get(category, {})
+        for pick in venue.picks:
+            summary = cat_idx.get(pick.product_id)
+            if summary is None or summary.coin.upper() not in _STABLE_COINS:
+                continue
+            target = total_book * float(venue.weight) * float(pick.weight)
+            held = float(
+                detail.get((category, pick.product_id), {}).get("usd", 0.0)
+            )
+            if target - held < _MIN_ACTION_USDC:
+                continue  # forced hold — never rejected
+            coin = summary.coin.upper()
+            # Compare against the BEST same-coin Flex twin that's actually
+            # fundable at this pick size — not an arbitrary first match. A
+            # twin whose min_subscribe exceeds the target can't absorb this
+            # yield, so it's no real alternative; and routing should target the
+            # highest-yielding liquid twin, else a low-APR twin listed first
+            # would spuriously clear (or a high one spuriously block) the gate.
+            feasible_twins = [
+                p
+                for p in flex_idx.values()
+                if p.coin.upper() == coin
+                and (
+                    p.min_subscribe_usd is None
+                    or float(p.min_subscribe_usd) <= target
+                )
+            ]
+            if not feasible_twins:
+                continue  # no fundable liquid twin to route to
+            onchain_net = float(
+                summary.effective_apr_net_holding
+                if summary.effective_apr_net_holding is not None
+                else summary.effective_apr
+            )
+            flex_twin = max(
+                feasible_twins,
+                key=lambda p: float(
+                    p.effective_apr_net_holding
+                    if p.effective_apr_net_holding is not None
+                    else p.effective_apr
+                ),
+            )
+            flex_net = float(
+                flex_twin.effective_apr_net_holding
+                if flex_twin.effective_apr_net_holding is not None
+                else flex_twin.effective_apr
+            )
+            if onchain_net - flex_net < SLOW_SETTLE_STABLE_PREF_MARGIN:
+                bad.append(
+                    f"{venue_id}/{pick.product_id}({coin}): OnChain net "
+                    f"{onchain_net:.2%} barely beats same-coin Flex "
+                    f"{flex_twin.product_id} {flex_net:.2%} (< "
+                    f"{SLOW_SETTLE_STABLE_PREF_MARGIN:.1%} margin) — route NEW "
+                    f"{coin} yield to liquid Flex, don't freeze it ~7d OnChain"
+                )
+    if bad:
+        return False, (
+            "NEW stable yield should default to liquid Flex: " + " | ".join(bad)
+        )
+    return True, None
+
+
+def check_estimate_apr_probe_cap(d: Decision, snapshot: Snapshot) -> Check:
+    """3-tier SOURCE-QUALITY ladder on the NEW effective weight of a
+    high-yield non-stable Earn pick, keyed on `apr_source`:
+      • `estimate_apr`   → `ESTIMATE_PROBE_CAP` (7%) — a bare quoted rate may
+        be a transient promo; if it collapses the hedge bleeds funding, so
+        probe it.
+      • `measured_yield` → `MEASURED_YIELD_SCALE_CAP` (30%) — confirmed
+        (our own realized rate) but single-position-noisy, so an intermediate
+        scale rather than the full product cap.
+      • `apr_history` / anything else → exempt here; the pool-level,
+        noise-immune `apr_history` unlocks the 0.60 `check_effective_pick_cap`.
+    Source-quality, NOT an N-cycle counter — the validator is STATELESS and
+    reads only the current snapshot. Net-new scoped (growing a held position
+    past the cap is gated; holding isn't)."""
+    total_book = float(snapshot.wallet.total_equity_usd)
+    if total_book <= 0:
+        return True, None
+    source_caps = {
+        "estimate_apr": ("probe", ESTIMATE_PROBE_CAP),
+        "measured_yield": ("measured_yield scale", MEASURED_YIELD_SCALE_CAP),
+    }
     detail = _held_earn_detail(snapshot)
     idx = _snapshot_index(snapshot)
     bad: list[str] = []
@@ -1410,22 +1559,26 @@ def check_estimate_apr_probe_cap(d: Decision, snapshot: Snapshot) -> Check:
             summary = cat_idx.get(pick.product_id)
             if summary is None or summary.coin.upper() in _STABLE_COINS:
                 continue
-            if summary.apr_source != "estimate_apr":
-                continue  # confirmed → normal per-product cap governs
+            tier = source_caps.get(summary.apr_source)
+            if tier is None:
+                continue  # apr_history / missing / other → product cap governs
+            tier_name, cap = tier
             target = total_book * float(venue.weight) * float(pick.weight)
             held = float(
                 detail.get((category, pick.product_id), {}).get("usd", 0.0)
             )
             net_new_frac = max(0.0, (target - held) / total_book)
-            if net_new_frac > ESTIMATE_PROBE_CAP + 1e-9:
+            if net_new_frac > cap + 1e-9:
                 bad.append(
                     f"{venue_id}/{pick.product_id}({summary.coin}): NEW "
-                    f"{net_new_frac:.0%} of book > probe cap "
-                    f"{ESTIMATE_PROBE_CAP:.0%} on an UNCONFIRMED estimate_apr "
-                    f"pick — probe it, scale only once apr_history/measured_yield confirms"
+                    f"{net_new_frac:.0%} of book > {tier_name} cap "
+                    f"{cap:.0%} on a {summary.apr_source} pick — scale only "
+                    f"as the source confirms (apr_history unlocks 0.60)"
                 )
     if bad:
-        return False, "unconfirmed high-yield picks exceed probe cap: " + " | ".join(bad)
+        return False, (
+            "high-yield picks exceed source-quality cap: " + " | ".join(bad)
+        )
     return True, None
 
 
@@ -1466,6 +1619,7 @@ def validate(decision: Decision, snapshot: Snapshot) -> tuple[bool, list[str]]:
         check_capital_flow_simulation,
         check_min_stake,
         check_slow_settle_cap,
+        check_slow_settle_stable_preference,
         check_estimate_apr_probe_cap,
     ]
     errors: list[str] = []

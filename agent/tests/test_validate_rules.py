@@ -81,6 +81,7 @@ def _product(
     redeem_lockup_minutes: int | None = None,
     fixed_term_days: int | None = None,
     min_subscribe_usd: str | None = None,
+    effective_apr_net_holding: str | None = None,
 ) -> ProductSummary:
     return ProductSummary(
         category=category,
@@ -93,6 +94,11 @@ def _product(
         fixed_term_days=fixed_term_days,
         min_subscribe_usd=(
             Decimal(min_subscribe_usd) if min_subscribe_usd is not None else None
+        ),
+        effective_apr_net_holding=(
+            Decimal(effective_apr_net_holding)
+            if effective_apr_net_holding is not None
+            else None
         ),
         notes=notes or [],
     )
@@ -1867,6 +1873,275 @@ def test_check_estimate_apr_probe_cap_allows_probe_size() -> None:
         ]
     )
     assert check_estimate_apr_probe_cap(probe, s) == (True, None)
+
+
+# ─── Probe ladder (.1) — measured_yield intermediate tier ──────────────────
+
+
+def _ladder_snapshot(apr_source: str) -> Snapshot:
+    """ME non-stable Flex pick at 60% APR from the given source, $180 book."""
+    return _snapshot(
+        flex_products=[
+            _product("498", "FlexibleSaving", coin="ME", effective_apr="0.60",
+                     apr_source=apr_source),
+        ],
+        perp_market={"ME": _perp("ME", mark="0.06", min_notional="0.06")},
+        total_equity_usd="180",
+    )
+
+
+def _ladder_decision(weight: float) -> Decision:
+    return _decision(
+        venues=[
+            _venue("cash_usdc", round(1.0 - weight, 4)),
+            _venue("bybit_flex", weight, [("498", 1.0)]),
+        ]
+    )
+
+
+def test_probe_ladder_estimate_apr_still_capped_at_7pct() -> None:
+    """estimate_apr tier unchanged: 40% >> 7% probe cap is rejected."""
+    from agent.validate.rules import check_estimate_apr_probe_cap
+    ok, msg = check_estimate_apr_probe_cap(
+        _ladder_decision(0.40), _ladder_snapshot("estimate_apr")
+    )
+    assert not ok
+    assert msg is not None and "probe cap" in msg and "7%" in msg
+
+
+def test_probe_ladder_estimate_apr_passes_at_5pct() -> None:
+    """estimate_apr at 5% (≤ 7%) passes."""
+    from agent.validate.rules import check_estimate_apr_probe_cap
+    assert check_estimate_apr_probe_cap(
+        _ladder_decision(0.05), _ladder_snapshot("estimate_apr")
+    ) == (True, None)
+
+
+def test_probe_ladder_measured_yield_passes_at_25pct() -> None:
+    """measured_yield unlocks the intermediate 30% tier: 25% passes."""
+    from agent.validate.rules import check_estimate_apr_probe_cap
+    assert check_estimate_apr_probe_cap(
+        _ladder_decision(0.25), _ladder_snapshot("measured_yield")
+    ) == (True, None)
+
+
+def test_probe_ladder_measured_yield_blocked_at_45pct() -> None:
+    """measured_yield above the 30% tier is rejected (msg names the tier)."""
+    from agent.validate.rules import check_estimate_apr_probe_cap
+    ok, msg = check_estimate_apr_probe_cap(
+        _ladder_decision(0.45), _ladder_snapshot("measured_yield")
+    )
+    assert not ok
+    assert msg is not None
+    assert "measured_yield" in msg and "30%" in msg
+
+
+def test_probe_ladder_measured_yield_held_is_exempt() -> None:
+    """Net-new scoped: a 45% measured_yield pick that is already HELD (no new
+    spend) passes — growing past the tier is gated, holding isn't."""
+    from agent.validate.rules import check_estimate_apr_probe_cap
+    s = _snapshot(
+        flex_products=[
+            _product("498", "FlexibleSaving", coin="ME", effective_apr="0.60",
+                     apr_source="measured_yield"),
+        ],
+        perp_market={"ME": _perp("ME", mark="0.06", min_notional="0.06")},
+        total_equity_usd="180",
+        # held USD = amount × mark = 1350 × 0.06 = $81 = 45% of book ≈ target
+        earn_positions=[_held("FlexibleSaving", "498", "ME", "1350")],
+    )
+    assert check_estimate_apr_probe_cap(_ladder_decision(0.45), s) == (True, None)
+
+
+def test_probe_ladder_apr_history_exempt_at_55pct() -> None:
+    """apr_history is noise-immune: exempt from the ladder (the 0.60 product
+    cap governs it instead), so 55% passes here."""
+    from agent.validate.rules import check_estimate_apr_probe_cap
+    assert check_estimate_apr_probe_cap(
+        _ladder_decision(0.55), _ladder_snapshot("apr_history")
+    ) == (True, None)
+
+
+def test_probe_ladder_stable_unaffected() -> None:
+    """The ladder only governs NON-stable picks; a large stable estimate_apr
+    pick is not touched here (its own caps apply elsewhere)."""
+    from agent.validate.rules import check_estimate_apr_probe_cap
+    s = _snapshot(
+        flex_products=[
+            _product("1131", "FlexibleSaving", coin="USD1", effective_apr="0.40",
+                     apr_source="estimate_apr"),
+        ],
+        total_equity_usd="180",
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.60),
+            _venue("bybit_flex", 0.40, [("1131", 1.0)]),
+        ]
+    )
+    assert check_estimate_apr_probe_cap(d, s) == (True, None)
+
+
+# ─── Slow-settle stable preference (.6) ────────────────────────────────────
+
+
+def test_slow_settle_pref_blocks_thin_margin_onchain_relock() -> None:
+    """NEW OnChain stable yield is rejected when a same-coin Flex twin yields
+    nearly the same (< 1.5%/yr margin) — route to liquid Flex, don't freeze."""
+    from agent.validate.rules import check_slow_settle_stable_preference
+    s = _snapshot(
+        flex_products=[
+            _product("100", "FlexibleSaving", coin="USDC", effective_apr="0.030",
+                     apr_source="apr_history"),
+        ],
+        onchain_products=[
+            _product("26", "OnChain", coin="USDC", effective_apr="0.034",
+                     apr_source="apr_history",
+                     effective_apr_net_holding="0.034"),
+        ],
+        total_equity_usd="180",
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.40),
+            _venue("bybit_onchain", 0.60, [("26", 1.0)]),
+        ]
+    )
+    ok, msg = check_slow_settle_stable_preference(d, s)
+    assert not ok
+    assert msg is not None and "USDC" in msg and "Flex" in msg
+
+
+def test_slow_settle_pref_allows_fat_margin_onchain() -> None:
+    """When OnChain's dead-time-discounted net clears the 1.5%/yr margin over
+    the Flex twin, the relock is justified — passes."""
+    from agent.validate.rules import check_slow_settle_stable_preference
+    s = _snapshot(
+        flex_products=[
+            _product("100", "FlexibleSaving", coin="USDC", effective_apr="0.010",
+                     apr_source="apr_history"),
+        ],
+        onchain_products=[
+            _product("26", "OnChain", coin="USDC", effective_apr="0.045",
+                     apr_source="apr_history",
+                     effective_apr_net_holding="0.040"),
+        ],
+        total_equity_usd="180",
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.40),
+            _venue("bybit_onchain", 0.60, [("26", 1.0)]),
+        ]
+    )
+    assert check_slow_settle_stable_preference(d, s) == (True, None)
+
+
+def test_slow_settle_pref_inert_without_flex_twin() -> None:
+    """No same-coin Flex product → nowhere to route → inert (passes) even on a
+    thin OnChain rate."""
+    from agent.validate.rules import check_slow_settle_stable_preference
+    s = _snapshot(
+        flex_products=[
+            _product("100", "FlexibleSaving", coin="USDT", effective_apr="0.030",
+                     apr_source="apr_history"),
+        ],
+        onchain_products=[
+            _product("26", "OnChain", coin="USDC", effective_apr="0.034",
+                     apr_source="apr_history"),
+        ],
+        total_equity_usd="180",
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.40),
+            _venue("bybit_onchain", 0.60, [("26", 1.0)]),
+        ]
+    )
+    assert check_slow_settle_stable_preference(d, s) == (True, None)
+
+
+def test_slow_settle_pref_compares_best_feasible_flex_twin() -> None:
+    """The gate compares OnChain against the BEST same-coin Flex twin that's
+    actually fundable at the pick size — not an arbitrary first match. Here a
+    thin high-APR twin (3.3%) is INFEASIBLE (min_subscribe $500 > $108 target);
+    only the feasible 0.8% twin remains, so OnChain 3.4% clears the 1.5% margin
+    over it and is NOT rejected (routing to the infeasible twin would strand
+    the yield)."""
+    from agent.validate.rules import check_slow_settle_stable_preference
+    s = _snapshot(
+        flex_products=[
+            _product("100", "FlexibleSaving", coin="USDC", effective_apr="0.033",
+                     apr_source="apr_history", min_subscribe_usd="500"),
+            _product("101", "FlexibleSaving", coin="USDC", effective_apr="0.008",
+                     apr_source="apr_history"),
+        ],
+        onchain_products=[
+            _product("26", "OnChain", coin="USDC", effective_apr="0.034",
+                     apr_source="apr_history", effective_apr_net_holding="0.034"),
+        ],
+        total_equity_usd="180",
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.40),
+            _venue("bybit_onchain", 0.60, [("26", 1.0)]),
+        ]
+    )
+    # Best FEASIBLE twin is the 0.8% one (the 3.3% twin needs $500 > $108);
+    # 3.4% − 0.8% = 2.6% ≥ 1.5% margin → allowed.
+    assert check_slow_settle_stable_preference(d, s) == (True, None)
+
+
+def test_slow_settle_pref_exempts_held_hold() -> None:
+    """A pure HOLD of the OnChain stable (net-new < floor) is never rejected,
+    even with a same-coin Flex twin at a near-equal rate."""
+    from agent.validate.rules import check_slow_settle_stable_preference
+    s = _snapshot(
+        flex_products=[
+            _product("100", "FlexibleSaving", coin="USDC", effective_apr="0.030",
+                     apr_source="apr_history"),
+        ],
+        onchain_products=[
+            _product("26", "OnChain", coin="USDC", effective_apr="0.034",
+                     apr_source="apr_history"),
+        ],
+        total_equity_usd="180",
+        # ~$108 held = 60% of book ≈ target → net-new ≈ 0
+        earn_positions=[_held("OnChain", "26", "USDC", "108")],
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.40),
+            _venue("bybit_onchain", 0.60, [("26", 1.0)]),
+        ]
+    )
+    assert check_slow_settle_stable_preference(d, s) == (True, None)
+
+
+def test_slow_settle_pref_ignores_nonstable_onchain() -> None:
+    """The preference governs STABLE OnChain only; a non-stable OnChain pick is
+    not touched (the probe/net-hedge rules cover it)."""
+    from agent.validate.rules import check_slow_settle_stable_preference
+    s = _snapshot(
+        flex_products=[
+            _product("100", "FlexibleSaving", coin="TON", effective_apr="0.030",
+                     apr_source="apr_history"),
+        ],
+        onchain_products=[
+            _product("26", "OnChain", coin="TON", effective_apr="0.034",
+                     apr_source="apr_history"),
+        ],
+        perp_market={"TON": _perp("TON")},
+        total_equity_usd="180",
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.60),
+            _venue("bybit_onchain", 0.40, [("26", 1.0)]),
+        ]
+    )
+    assert check_slow_settle_stable_preference(d, s) == (True, None)
 
 
 def test_check_funding_carry_floor_passes_when_above_floor() -> None:

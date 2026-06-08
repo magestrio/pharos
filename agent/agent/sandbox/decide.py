@@ -583,6 +583,7 @@ def _load_recent_prior_decisions(
                     "result": entry.get("result"),
                     "actions_planned": entry.get("actions_planned"),
                     "actions_executed": entry.get("actions_executed"),
+                    "actions_failed": entry.get("actions_failed"),
                     "wake_reason": entry.get("wake_reason"),
                 }
     except OSError:

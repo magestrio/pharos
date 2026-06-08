@@ -58,6 +58,7 @@ from agent.sandbox.decide import (
 )
 from agent.sandbox.ipfs_pin import pin_decision_rationale
 from agent.sandbox.onchain_writer import OnchainWriter
+from agent.sandbox.reflect import reflect_on_cycle
 from agent.sandbox.carry_state import (
     DEFAULT_CARRY_STATE_PATH,
     read_carry_state,
@@ -67,6 +68,7 @@ from agent.sandbox.execute import (
     DEFAULT_AUTO_APPROVE_MIN_CONFIDENCE,
     EXECUTIONS_DIR,
     _orphan_spot_sell_actions,
+    _stable_consolidate_actions,
     apply_carry_results_to_state,
     diff_to_actions,
     execute_actions,
@@ -80,11 +82,9 @@ from agent.sandbox.safety import (
     record_equity,
 )
 from agent.sandbox.snapshot import (
-    DEFAULT_FUNDING_INTERVAL_HOURS,
     SNAPSHOT_DIR,
     STABLES,
     Snapshot,
-    _annual_funding,
     collect_snapshot,
     write_snapshot,
 )
@@ -114,8 +114,12 @@ from agent.sandbox.watcher import (
     write_events as write_watcher_events,
 )
 from agent.validate.rules import (
-    FUNDING_FLOOR_HEDGE_ANNUAL,
+    MIN_CONFIDENCE,
+    NET_HEDGE_YIELD_FLOOR,
+    _held_earn_detail,
     _held_usd_by_product,
+    _snapshot_index,
+    net_hedge_yield,
     validate,
 )
 
@@ -196,6 +200,84 @@ _CRITICAL_PROBE_ENDPOINTS: frozenset[str] = frozenset(
 log = logging.getLogger(__name__)
 
 
+def _execution_block(outcome: dict[str, Any]) -> dict[str, Any]:
+    """The cycle's actual-outcome block — shared by the IPFS pin
+    (intent + execution audit trail) and the human reflection."""
+    return {
+        "result": outcome.get("result"),
+        "actions_executed": outcome.get("actions_executed"),
+        "actions_failed": outcome.get("actions_failed"),
+        "actions": outcome.get("actions") or [],
+    }
+
+
+async def _attach_reflection(
+    outcome: dict[str, Any],
+    client: anthropic.AsyncAnthropic,
+) -> None:
+    """Best-effort: generate a first-person 'diary' note for the finished
+    cycle and persist it as the decision's top-level `reflection`.
+
+    Called twice per cycle: once inside `run_one_cycle` just before the
+    on-chain anchor (so the executed-path IPFS pin embeds the note), and
+    once as a backstop in `run_loop` for cycles that returned before the
+    pin (held / skipped:invalid / errored). Idempotent across both calls —
+    it skips when the note is already present on the outcome OR the file —
+    so exactly one Haiku call happens per cycle. The note is written into
+    the decision file, so `_record_cycle_from_outcome` (which re-reads the
+    file) carries it into Postgres → API → web. Failure never affects the
+    cycle.
+    """
+    # Idempotency, source of truth = the outcome. Checking the outcome (not
+    # just the file) closes a double-call gap: if the file write below fails,
+    # the note still lives on the outcome, so the backstop call won't re-run
+    # the (paid) Haiku generation.
+    if outcome.get("reflection"):
+        return
+    decision_name = outcome.get("decision_filename")
+    if not decision_name:
+        return
+    decision_path = DECISION_DIR / decision_name
+    if not decision_path.exists():
+        return
+    try:
+        decision_dict = json.loads(decision_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    if decision_dict.get("reflection"):
+        return  # a prior run already persisted one (resume / re-run)
+
+    raw_snapshot: dict[str, Any] | None = None
+    snap_name = outcome.get("snapshot_filename")
+    if snap_name:
+        snap_path = SNAPSHOT_DIR / snap_name
+        if snap_path.exists():
+            try:
+                raw_snapshot = json.loads(snap_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                raw_snapshot = None
+
+    text = await reflect_on_cycle(
+        decision_dict,
+        _execution_block(outcome),
+        raw_snapshot,
+        client=client,
+    )
+    if not text:
+        return
+
+    # Record on the outcome FIRST so a file-write failure can't make the
+    # backstop re-generate. Then persist to the file (best-effort) so the
+    # pin + store pick it up.
+    outcome["reflection"] = text
+    outcome.setdefault("stages", []).append("reflect")
+    decision_dict["reflection"] = text
+    try:
+        decision_path.write_text(json.dumps(decision_dict, indent=2))
+    except OSError as e:
+        log.warning("could not persist reflection into %s: %s", decision_path, e)
+
+
 async def _anchor_onchain(
     decision: Decision,
     outcome: dict[str, Any],
@@ -236,12 +318,7 @@ async def _anchor_onchain(
     # fully-executed allocation. Dry-run / hold (no_actions) fall back to
     # the intent hash (intent == execution there).
     result = outcome.get("result")
-    execution_block: dict[str, Any] = {
-        "result": result,
-        "actions_executed": outcome.get("actions_executed"),
-        "actions_failed": outcome.get("actions_failed"),
-        "actions": outcome.get("actions") or [],
-    }
+    execution_block = _execution_block(outcome)
     executed_actions = (
         outcome.get("actions")
         if result in ("executed", "executed_partial")
@@ -370,6 +447,24 @@ _LIQUID_CLAMP_VENUES_CARRY = (*_LIQUID_CLAMP_VENUES, "bybit_funding_carry")
 # a delta below this is a no-op the diff never acts on.
 _MIN_NEW_ACTION_USD = 0.50
 
+# Confidence recompute (`agent-yield-quality.4`). 12/14 prod cycles emitted
+# EXACTLY 0.65 — one notch above the 0.60 execute gate — i.e. the LLM anchors
+# on a fixed "just above the floor" number rather than scoring conviction. We
+# recompute confidence DETERMINISTICALLY from the data quality of THIS cycle
+# (unconfirmed APRs, snapshot data gaps, last-cycle execution failures, budget
+# starvation) so a thin/risky cycle can't auto-execute on a hand-picked 0.65.
+# Penalties only LOWER; the single bonus can RAISE confidence, but only when
+# every pick is confirmed AND only by `CONF_BONUS_ALL_CONFIRMED` (so the
+# recompute can never inflate a low LLM confidence into a live trade).
+CONF_PENALTY_UNCONFIRMED_APR = 0.10  # any NEW non-stable pick on estimate_apr
+CONF_PENALTY_DATA_GAP = 0.10  # snapshot.errors OR a picked apr_source=missing
+CONF_PENALTY_FAILED_LEGS = 0.10  # last cycle executed_partial / error / failed legs
+CONF_PENALTY_BUDGET_STARVED = 0.05  # liquid clamp dropped NEW picks THIS cycle
+CONF_BONUS_ALL_CONFIRMED = 0.05  # every non-cash pick apr_history / measured_yield
+# Pure telemetry: warn when the current + the prior N-1 confidences are all
+# equal (the 0.65-anchor signature) so an operator/dashboard can flag it.
+CONF_ANCHOR_STREAK_N = 5
+
 
 def _clamp_to_liquid_budget(
     decision_dict: dict[str, Any],
@@ -493,25 +588,22 @@ def _clamp_to_liquid_budget(
     return new_dict, dropped, note
 
 
-def _pick_is_subfloor_nonstable(
-    snapshot: Snapshot, coin: str
-) -> bool:
-    """True when `coin`'s perp 7d-avg funding (annualized) is below the hedge
-    floor — i.e. growing/opening a hedged Earn pick on it would be rejected by
-    `check_funding_rate_floor`. Mirrors that rule exactly: stables and
-    coins with no perp / no funding signal return False (the validator passes
-    those)."""
-    if coin in STABLES:
+def _pick_is_subfloor_nonstable(summary: Any, perp_info: Any) -> bool:
+    """True when growing/opening a hedged Earn pick on this product would be
+    rejected by `check_funding_rate_floor` — i.e. its realizable NET-of-hedge
+    yield is not profitable. Uses the SAME `net_hedge_yield` helper as the
+    validator so the clamp can't over-reject net-positive high-APR picks (the
+    2026-06-08 ME bug: a +28%-net pick dumped to cash on raw funding). Stables,
+    no summary, no funding signal, or a broken interval → False (the clamp
+    leaves those to the validator)."""
+    if summary is None:
         return False
-    perp_market = getattr(snapshot, "perp_market", None) or {}
-    info = perp_market.get(coin) or perp_market.get(coin.lower())
-    if info is None or info.funding_rate_7d_avg is None:
+    if (summary.coin or "").upper() in STABLES:
         return False
-    interval = info.funding_interval_hours or DEFAULT_FUNDING_INTERVAL_HOURS
-    annual = _annual_funding(info.funding_rate_7d_avg, interval)
-    if annual is None:
-        return False  # broken interval → validator rejects; sizing clamp can't fix it
-    return float(annual) < FUNDING_FLOOR_HEDGE_ANNUAL
+    net, interval_broken = net_hedge_yield(summary, perp_info)
+    if net is None or interval_broken:
+        return False
+    return net <= NET_HEDGE_YIELD_FLOOR
 
 
 def _clamp_subfloor_nonstable_growth(
@@ -519,8 +611,8 @@ def _clamp_subfloor_nonstable_growth(
     snapshot: Snapshot,
 ) -> tuple[dict[str, Any], list[str], str | None]:
     """Deterministic backstop (`bybit-sandbox.66` follow-up to `.67`): the LLM
-    keeps GROWING (or OPENING) a hedged non-stable Earn pick whose 7d funding
-    is below the hedge floor (−10.95%/yr). `check_funding_rate_floor` rejects
+    keeps GROWING (or OPENING) a hedged non-stable Earn pick whose realizable
+    NET-of-hedge yield isn't profitable. `check_funding_rate_floor` rejects
     that net-new sub-floor exposure, stranding the cycle as skipped:invalid —
     even though KEEPING the position at current size is validator-exempt. A
     prose/funding-pre-filter nudge isn't enough (same lesson as `.65`/`.67`),
@@ -529,14 +621,19 @@ def _clamp_subfloor_nonstable_growth(
 
     Safe-direction: only REDUCES sub-floor deployment toward cash, never opens
     or enlarges, so it can't create exposure — and keeping a held sub-floor
-    position at current size is exactly what the validator allows. Mirrors
-    `check_funding_rate_floor`'s net-new + funding logic so the clamp and the
-    gate never disagree. The validator still runs after as the hard gate."""
+    position at current size is exactly what the validator allows. Uses the
+    SAME `net_hedge_yield` helper as `check_funding_rate_floor` (2026-06-08:
+    this clamp previously gated RAW funding ≥ -10.95%/yr and dumped a +28%-net
+    ME pick to cash while the net-aware validator would have passed it — the
+    drift this shared helper prevents). The validator still runs after as the
+    hard gate."""
     total_book = float(snapshot.wallet.total_equity_usd)
     if total_book <= 0:
         return decision_dict, [], None
     held_map = _held_usd_by_product(snapshot)
+    perp_market = getattr(snapshot, "perp_market", None) or {}
     prod_coin: dict[tuple[str, str], str] = {}
+    prod_summary: dict[tuple[str, str], Any] = {}
     for venue_id in _LIQUID_CLAMP_VENUES:
         meta = VENUE_REGISTRY.get(venue_id)
         cat = getattr(meta, "snapshot_category", None) if meta else None
@@ -544,6 +641,7 @@ def _clamp_subfloor_nonstable_growth(
             continue
         for p in snapshot.products.get(cat, []):
             prod_coin[(cat, p.product_id)] = p.coin.upper()
+            prod_summary[(cat, p.product_id)] = p
 
     clamped: list[str] = []
     freed = 0.0
@@ -562,11 +660,13 @@ def _clamp_subfloor_nonstable_growth(
         for p in v.get("picks", []) or []:
             pid = str(p.get("product_id", ""))
             coin = prod_coin.get((cat, pid), "")
+            summary = prod_summary.get((cat, pid))
+            perp_info = perp_market.get(coin) or perp_market.get(coin.lower())
             eff = vw * float(p.get("weight", 0))
             held = held_map.get((cat, pid), 0.0)
             net_new = eff * total_book - held
             if net_new > _MIN_NEW_ACTION_USD and _pick_is_subfloor_nonstable(
-                snapshot, coin
+                summary, perp_info
             ):
                 new_eff = held / total_book  # clamp to current held (0 if new)
                 freed += eff - new_eff
@@ -603,10 +703,237 @@ def _clamp_subfloor_nonstable_growth(
     new_dict = {**decision_dict, "venues": new_venues}
     note = (
         f"subfloor_clamp held sub-floor non-stable growth → cash "
-        f"{sorted(set(clamped))} (funding below "
-        f"{FUNDING_FLOOR_HEDGE_ANNUAL * 100:+.2f}%/yr floor; kept at current size)"
+        f"{sorted(set(clamped))} (net-of-hedge yield <= "
+        f"{NET_HEDGE_YIELD_FLOOR * 100:.0f}% — hedge not profitable; kept at "
+        f"current size)"
     )
     return new_dict, clamped, note
+
+
+def _iter_picked_summaries(
+    decision_dict: dict[str, Any],
+    snapshot: Snapshot,
+) -> list[tuple[str, Any, float]]:
+    """Resolve every ranker-backed pick to `(category, summary, net_new_usd)`.
+
+    `net_new_usd` is `target − held` (the delta the live diff acts on), held
+    USD taken from `_held_earn_detail` so the classification matches
+    `check_estimate_apr_probe_cap` exactly. Picks whose product_id isn't in the
+    snapshot (hallucination — owned by `check_product_ids_in_snapshot`) are
+    skipped. `cash_usdc` / picks-less venues contribute nothing."""
+    total_book = float(snapshot.wallet.total_equity_usd)
+    detail = _held_earn_detail(snapshot)
+    idx = _snapshot_index(snapshot)
+    out: list[tuple[str, Any, float]] = []
+    for v in decision_dict.get("venues", []) or []:
+        vid = v.get("venue_id")
+        meta = VENUE_REGISTRY.get(vid)
+        cat = getattr(meta, "snapshot_category", None) if meta else None
+        if not getattr(meta, "requires_picks", False) or not cat:
+            continue
+        vw = float(v.get("weight", 0))
+        cat_idx = idx.get(cat, {})
+        for p in v.get("picks", []) or []:
+            pid = str(p.get("product_id", ""))
+            summary = cat_idx.get(pid)
+            if summary is None:
+                continue
+            target = total_book * vw * float(p.get("weight", 0))
+            held = float(detail.get((cat, pid), {}).get("usd", 0.0))
+            out.append((cat, summary, target - held))
+    return out
+
+
+def _recompute_confidence(
+    decision_dict: dict[str, Any],
+    snapshot: Snapshot,
+    priors: list[dict[str, Any]] | None,
+) -> tuple[float, list[str]]:
+    """Deterministic confidence from THIS cycle's data quality
+    (`agent-yield-quality.4`). The LLM anchors confidence on a fixed 0.65 (one
+    notch above the 0.60 execute gate) instead of scoring conviction, so a thin
+    or risky cycle auto-executes on a hand-picked number. Recompute it from
+    signals the LLM can't fudge:
+
+      − unconfirmed APR: any NEW (net_new > `_MIN_NEW_ACTION_USD`) non-stable
+        pick still on `estimate_apr` (a quoted rate that may be a transient
+        promo, classified exactly as `check_estimate_apr_probe_cap`);
+      − data gap: `snapshot.errors` non-empty OR any picked product priced off
+        `apr_source == "missing"` (yield can't be trusted);
+      − failed legs: the latest prior cycle came back `executed_partial` /
+        `error` (or carried failed legs) — execution risk that should temper
+        the next bet;
+      − budget starved: this cycle's liquid clamp dropped NEW picks (the plan
+        didn't fit the funds), keyed off `outcome[liquid_clamp_dropped]`.
+
+    One bonus RAISES: every non-cash pick confirmed (`apr_history` /
+    `measured_yield`). Penalties stack down to the `MIN_CONFIDENCE` floor; the
+    result is additionally clamped to `base + CONF_BONUS_ALL_CONFIRMED` so the
+    recompute can lift confidence ONLY via the explicit confirmed bonus — never
+    inflate a low LLM confidence into a live trade. Pure: no IO, no mutation."""
+    base = float(decision_dict.get("confidence", 0.0))
+    picks = _iter_picked_summaries(decision_dict, snapshot)
+    reasons: list[str] = []
+    new = base
+
+    has_unconfirmed_new = any(
+        net_new > _MIN_NEW_ACTION_USD
+        and (s.coin or "").upper() not in STABLES
+        and s.apr_source == "estimate_apr"
+        for _cat, s, net_new in picks
+    )
+    if has_unconfirmed_new:
+        new -= CONF_PENALTY_UNCONFIRMED_APR
+        reasons.append(
+            f"unconfirmed_apr (NEW non-stable estimate_apr pick): "
+            f"-{CONF_PENALTY_UNCONFIRMED_APR}"
+        )
+
+    picked_missing = any(s.apr_source == "missing" for _cat, s, _nn in picks)
+    # Scope the data-gap penalty to errors that touch THIS decision's picks.
+    # `snapshot.errors` is a catch-all dominated by benign peripheral failures
+    # — advance_position rate-limits, a perp ticker for an UNPICKED coin like
+    # METH — present on essentially every cycle. A blanket trigger would dock
+    # −0.10 every cycle, pushing the 0.65 anchor below the 0.60 execute gate
+    # and silently halting trading. Match the coin only as a bracketed token
+    # (`[BERA]`), so an unpicked `perp_market[METH]` can't false-trigger an ETH
+    # pick. The missing-APR case is always pick-relevant.
+    picked_coins = {(s.coin or "").upper() for _cat, s, _nn in picks if s.coin}
+    pick_relevant_error = any(
+        f"[{coin}]" in err.upper()
+        for err in snapshot.errors
+        for coin in picked_coins
+    )
+    if picked_missing or pick_relevant_error:
+        new -= CONF_PENALTY_DATA_GAP
+        reasons.append(
+            f"data_gap (pick-relevant snapshot.error={pick_relevant_error} "
+            f"picked_missing_apr={picked_missing}): -{CONF_PENALTY_DATA_GAP}"
+        )
+
+    latest = (priors or [])[-1] if priors else None
+    prior_outcome = (latest or {}).get("_cycle_outcome") or {}
+    failed_legs = int(prior_outcome.get("actions_failed") or 0)
+    if prior_outcome.get("result") in ("executed_partial", "error") or failed_legs > 0:
+        new -= CONF_PENALTY_FAILED_LEGS
+        reasons.append(
+            f"failed_legs (last cycle result={prior_outcome.get('result')!r} "
+            f"failed={failed_legs}): -{CONF_PENALTY_FAILED_LEGS}"
+        )
+
+    if decision_dict.get("_outcome_liquid_clamp_dropped"):
+        new -= CONF_PENALTY_BUDGET_STARVED
+        reasons.append(
+            f"budget_starved (liquid clamp dropped NEW picks): "
+            f"-{CONF_PENALTY_BUDGET_STARVED}"
+        )
+
+    if picks and all(
+        s.apr_source in ("apr_history", "measured_yield") for _cat, s, _nn in picks
+    ):
+        new += CONF_BONUS_ALL_CONFIRMED
+        reasons.append(
+            f"all_confirmed (every pick apr_history/measured_yield): "
+            f"+{CONF_BONUS_ALL_CONFIRMED}"
+        )
+
+    # Floor at MIN_CONFIDENCE so a deterministic penalty never flips a VALID
+    # cycle (base >= floor) to skipped:invalid — but never RESCUE an
+    # already-sub-floor LLM confidence up to the floor either (that would let a
+    # 0.30-conviction cycle pass the validator's confidence gate). So the lower
+    # bound is `min(MIN_CONFIDENCE, base)`.
+    new = max(min(MIN_CONFIDENCE, base), min(1.0, new))
+    # The recompute can RAISE only via the explicit confirmed bonus — never
+    # inflate a low LLM confidence into a live trade by stacking nothing.
+    new = min(new, base + CONF_BONUS_ALL_CONFIRMED)
+    return new, reasons
+
+
+def _confidence_anchor_warning(
+    current_conf: float,
+    priors: list[dict[str, Any]] | None,
+    n: int = CONF_ANCHOR_STREAK_N,
+) -> str | None:
+    """Pure telemetry (`agent-yield-quality.4`): return a warning string when
+    `current_conf` plus the most recent `n-1` prior confidences are ALL equal
+    (within 1e-6) — the fixed-anchor signature (12/14 prod cycles emitted
+    exactly 0.65). Never blocks or mutates; the caller logs + records it.
+
+    Returns None when there aren't enough priors, or the streak is broken."""
+    if n <= 1 or not priors or len(priors) < n - 1:
+        return None
+    recent = [float(d.get("confidence", -1.0)) for d in priors[-(n - 1):]]
+    streak = [current_conf, *recent]
+    if all(abs(c - current_conf) <= 1e-6 for c in streak):
+        return (
+            f"confidence anchored: last {n} cycles all emitted "
+            f"{current_conf:.2f} (≥ a fixed anchor, not a conviction score)"
+        )
+    return None
+
+
+def _recompute_expected_apr(
+    decision_dict: dict[str, Any],
+    snapshot: Snapshot,
+) -> tuple[float, list[dict[str, Any]]]:
+    """Deterministic `expected_blended_apr_pct` from the snapshot's per-pick
+    APR (`agent-yield-quality.5`). The headline feeds the on-chain DecisionLog
+    + IPFS rationale, but it's currently the LLM's hand-computed number. Blend
+    it from data instead:
+
+        weight_in_book = venue.weight * pick.weight
+        pick_apr       = net-of-hedge APR for non-stables
+                         (`effective_apr_net_hedge` if present, else
+                         `effective_apr_net_holding`, else `effective_apr`),
+                         the plain effective APR for stables;
+                         `cash_usdc` (no picks) contributes 0.
+        blended (pct)  = sum(weight_in_book * pick_apr) * 100
+
+    Net-of-hedge matters: a hedged 101% Earn at -37% funding is ~+64% net, not
+    101%. Snapshot APRs are fractional [0,1]; the headline is percent
+    (4.07 = 4.07%), so the blend is ×100. Returns `(apr_pct, breakdown)` where
+    breakdown is one row per contributing pick (for logging / audit). The
+    headline is floored at 0 to satisfy the schema (`expected_blended_apr_pct
+    >= 0`) — a negative net blend means a bleeding hedge, which
+    `check_funding_rate_floor` independently rejects post-recompute. Pure."""
+    idx = _snapshot_index(snapshot)
+    blended_frac = 0.0
+    breakdown: list[dict[str, Any]] = []
+    for v in decision_dict.get("venues", []) or []:
+        vid = v.get("venue_id")
+        vw = float(v.get("weight", 0))
+        meta = VENUE_REGISTRY.get(vid)
+        cat = getattr(meta, "snapshot_category", None) if meta else None
+        if not getattr(meta, "requires_picks", False) or not cat:
+            continue  # cash_usdc + picks-less venues contribute 0
+        cat_idx = idx.get(cat, {})
+        for p in v.get("picks", []) or []:
+            summary = cat_idx.get(str(p.get("product_id", "")))
+            if summary is None:
+                continue
+            weight_in_book = vw * float(p.get("weight", 0))
+            if (summary.coin or "").upper() in STABLES:
+                pick_apr = summary.effective_apr
+            else:
+                pick_apr = (
+                    summary.effective_apr_net_hedge
+                    if summary.effective_apr_net_hedge is not None
+                    else summary.effective_apr_net_holding
+                    if summary.effective_apr_net_holding is not None
+                    else summary.effective_apr
+                )
+            contrib = weight_in_book * float(pick_apr)
+            blended_frac += contrib
+            breakdown.append(
+                {
+                    "venue_id": vid,
+                    "product_id": summary.product_id,
+                    "coin": summary.coin,
+                    "weight_in_book": weight_in_book,
+                    "pick_apr_pct": float(pick_apr) * 100,
+                }
+            )
+    return max(0.0, blended_frac * 100), breakdown
 
 
 def _build_auto_close_decision(
@@ -818,6 +1145,51 @@ async def run_one_cycle(
         except Exception as e:  # noqa: BLE001 — best effort
             log.warning("watcher baseline update failed: %s", e)
 
+        # 1c. Stable consolidation (2026-06-08). Idle NON-CORE stables
+        # (e.g. USD1 principal left by a Flex redeem) are invisible to the
+        # USDC+USDT liquid budget and are never swept by the orphan-seller
+        # (it skips stables), so they sit at 0% forever — observed live:
+        # ~$42 USD1 stranded while the agent reported "budget too thin".
+        # Rebase them to a core stable (USDT) here (live only, every cycle,
+        # independent of the decision — a pure stable→stable move with no
+        # directional risk). The freed USDT re-enters `liquid_stables_usd`
+        # on the NEXT snapshot, so the agent deploys it instead of idling.
+        if live:
+            # Best-effort + isolated: a transient swap failure here must NOT
+            # abort the cycle's decide/execute. (Unlike the post-decide
+            # safety sweep, this runs pre-decide on EVERY live cycle, so an
+            # unguarded raise would block the rebalance.)
+            try:
+                consolidate = _stable_consolidate_actions(
+                    snap, snap_path.stem, idx_offset=700
+                )
+                if consolidate:
+                    consolidate_results = await execute_actions(
+                        bybit_client,
+                        consolidate,
+                        snapshot_ts=snap_path.stem,
+                        dry_run=False,
+                    )
+                    outcome["stable_consolidate"] = [
+                        {
+                            "product_id": r.action.product_id,
+                            "coin": r.action.coin,
+                            "amount": str(r.action.amount),
+                            "status": r.status,
+                            "error": r.error,
+                        }
+                        for r in consolidate_results
+                    ]
+                    done = sum(1 for r in consolidate_results if r.status == "ok")
+                    log.info(
+                        "stable consolidation: rebased %d/%d idle non-core "
+                        "stable balance(s) → USDT (freed liquid deploys next cycle)",
+                        done, len(consolidate),
+                    )
+            except Exception as e:  # noqa: BLE001 — pre-decide side task
+                outcome["stable_consolidate_error"] = f"{type(e).__name__}: {e}"
+                log.warning("stable consolidation failed (non-fatal): %s", e)
+
         # 2. Decide — auto-close fast-path when ANY pick_invalidated
         # event is in the wake set. Deterministic close from the prior
         # decision; skips LLM entirely so the stop-loss closes in
@@ -916,6 +1288,79 @@ async def run_one_cycle(
                 )
                 decision = Decision.model_validate(sf_dict)
                 outcome["subfloor_clamp_clamped"] = sorted(set(sf_clamped))
+
+            # Confidence recompute (`agent-yield-quality.4`) — deterministic,
+            # LLM-path only. The LLM anchors confidence on a fixed 0.65 (one
+            # notch above the 0.60 execute gate); recompute it from this
+            # cycle's data quality so a thin/risky cycle can't auto-execute on
+            # a hand-picked number. Runs after every clamp so the budget-
+            # starved signal (liquid clamp dropped NEW picks) is visible, and
+            # BEFORE write_decision/validate/the conf gate so the recomputed
+            # value is what gets persisted, validated and gated.
+            conf_input = decision.model_dump()
+            # Carry the budget-starved signal into the pure recompute without
+            # widening its signature (Decision drops `extra` on re-validate).
+            conf_input["_outcome_liquid_clamp_dropped"] = outcome.get(
+                "liquid_clamp_dropped"
+            )
+            new_conf, conf_reasons = _recompute_confidence(conf_input, snap, priors)
+            if abs(new_conf - decision.confidence) > 1e-9:
+                from_conf = float(decision.confidence)
+                rebuilt = decision.model_dump()
+                rebuilt["confidence"] = new_conf
+                rebuilt.setdefault("notes", []).append(
+                    f"confidence_recompute {from_conf:.2f}→{new_conf:.2f}: "
+                    f"{'; '.join(conf_reasons) or 'no signals'}"
+                )
+                decision = Decision.model_validate(rebuilt)
+                outcome["confidence_recomputed"] = {
+                    "from": from_conf,
+                    "to": new_conf,
+                    "reasons": conf_reasons,
+                }
+                log.info(
+                    "confidence recompute: %.2f → %.2f (%s)",
+                    from_conf, new_conf, "; ".join(conf_reasons) or "no signals",
+                )
+
+            # Anchor-streak telemetry (`agent-yield-quality.4`) — pure, never
+            # blocks. Load a deeper slice JUST for this check (the global
+            # prior-depth default stays at 3) so a 0.65-anchor run of 5 cycles
+            # is flagged for the operator/dashboard.
+            anchor_priors = _load_recent_prior_decisions(n=CONF_ANCHOR_STREAK_N)
+            anchor_msg = _confidence_anchor_warning(
+                float(decision.confidence), anchor_priors
+            )
+            if anchor_msg:
+                outcome["confidence_anchor_warning"] = anchor_msg
+                log.warning("%s", anchor_msg)
+
+            # Deterministic expected_blended_apr_pct (`agent-yield-quality.5`).
+            # The headline feeds DecisionLog + IPFS; recompute it from the
+            # snapshot's per-pick (net-of-hedge for non-stables) APR instead of
+            # trusting the LLM's hand-computed number. Same `_snapshot_index`
+            # lookup; runs before write_decision so the persisted/anchored
+            # headline is the deterministic blend.
+            new_apr, apr_breakdown = _recompute_expected_apr(
+                decision.model_dump(), snap
+            )
+            if abs(new_apr - decision.expected_blended_apr_pct) > 1e-6:
+                from_apr = float(decision.expected_blended_apr_pct)
+                rebuilt = decision.model_dump()
+                rebuilt["expected_blended_apr_pct"] = new_apr
+                rebuilt.setdefault("notes", []).append(
+                    f"expected_apr_recompute {from_apr:.2f}%→{new_apr:.2f}% "
+                    f"(net-of-hedge blend of snapshot APRs)"
+                )
+                decision = Decision.model_validate(rebuilt)
+                outcome["expected_apr_recomputed"] = {
+                    "from": from_apr,
+                    "to": new_apr,
+                }
+                log.info(
+                    "expected APR recompute: %.2f%% → %.2f%% (%d picks)",
+                    from_apr, new_apr, len(apr_breakdown),
+                )
         decision_path = write_decision(
             decision,
             snap_path,
@@ -1101,6 +1546,18 @@ async def run_one_cycle(
                     log.exception(
                         "carry_state update failed — HALT created"
                     )
+
+        # 6b. Reflection BEFORE anchoring (executed path). `_anchor_onchain`
+        # builds the IPFS pin by re-reading the decision file, so writing the
+        # human note here means the pinned (and on-chain-referenced) rationale
+        # embeds it alongside the structured thesis. Held / skipped:invalid
+        # cycles return earlier and never pin — the run_loop backstop attaches
+        # their reflection for the store/web. Best-effort + idempotent: the
+        # loop-level call then no-ops because the note is already present.
+        try:
+            await _attach_reflection(outcome, anthropic_client)
+        except Exception as e:  # noqa: BLE001 — reflection is best-effort
+            log.warning("reflection generation failed (non-fatal): %s", e)
 
         # 7. Anchor on-chain — best-effort. The decision file + Postgres
         # row remain the source of truth; the on-chain log is the public
@@ -1304,6 +1761,16 @@ async def run_loop(
                     wake_events=cycle_wake_events or None,
                     watcher_baseline_path=watcher_baseline_path,
                 )
+                # Reflection backstop. The executed path already attached its
+                # note inside run_one_cycle (so the IPFS pin embeds it); this
+                # covers the cycles that returned before the pin — held
+                # (no_actions), skipped:invalid, errored — so every recorded
+                # cycle carries a diary note into the store/web. Idempotent:
+                # no-ops when the note is already present. Best-effort.
+                try:
+                    await _attach_reflection(outcome, anthropic_client)
+                except Exception as e:  # noqa: BLE001 — reflection is best-effort
+                    log.warning("reflection generation failed (non-fatal): %s", e)
                 with cycle_log_path.open("a") as f:
                     f.write(json.dumps(outcome) + "\n")
                 log.info("cycle result: %s", outcome.get("result"))
