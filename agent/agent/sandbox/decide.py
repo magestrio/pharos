@@ -51,8 +51,9 @@ TOOL_NAME = "submit_decision"
 DECISION_DIR = Path(__file__).parent / "decisions"
 # Duplicated from `agent.sandbox.loop.CYCLE_LOG` to avoid an import
 # cycle (loop imports decide, not the reverse). Keep in lockstep —
-# both must point at the same cycle history file.
-CYCLE_LOG = Path(__file__).parent / "cycle_log.jsonl"
+# both must point at the same cycle history file (under the persisted
+# state/ volume; see loop.CYCLE_LOG for why).
+CYCLE_LOG = Path(__file__).parent / "state" / "cycle_log.jsonl"
 
 # How many prior decisions to feed Claude per cycle (`mainnet-operations.4`).
 # 3 is the sweet spot — enough to surface trajectory ("I held SOL basis

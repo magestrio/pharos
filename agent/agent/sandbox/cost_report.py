@@ -33,7 +33,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-DEFAULT_CYCLE_LOG = Path(__file__).parent / "cycle_log.jsonl"
+DEFAULT_CYCLE_LOG = Path(__file__).parent / "state" / "cycle_log.jsonl"
 
 # Sentinel for entries that pre-date `event-driven-rebalance.3` (those
 # rows have no `wake_reason` field). Treat them as heartbeat — events

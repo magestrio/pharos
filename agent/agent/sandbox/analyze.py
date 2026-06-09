@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-CYCLE_LOG = Path(__file__).parent / "cycle_log.jsonl"
+CYCLE_LOG = Path(__file__).parent / "state" / "cycle_log.jsonl"
 
 # `error` strings on action results look like `"retCode=110007 Insufficient
 # balance"` (per `_execute_one` formatting). Capture the code for the

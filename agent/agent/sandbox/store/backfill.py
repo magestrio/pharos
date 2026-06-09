@@ -90,7 +90,7 @@ async def backfill(
         "events_processed": 0,
         "events_inserted": 0,
     }
-    cycle_log = sandbox_dir / "cycle_log.jsonl"
+    cycle_log = sandbox_dir / "state" / "cycle_log.jsonl"
     snapshots_dir = sandbox_dir / "snapshots"
     decisions_dir = sandbox_dir / "decisions"
     events_dir = sandbox_dir / "events"

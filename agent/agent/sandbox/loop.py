@@ -184,7 +184,12 @@ from agent.validate.rules import (
 # Re-export the shared cadence (ah.17) under the loop's local name so the
 # argparse default + the system prompt's "heartbeat" narrative stay in sync.
 DEFAULT_INTERVAL_SECONDS = DEFAULT_CYCLE_INTERVAL_SECONDS  # 4h
-CYCLE_LOG = Path(__file__).parent / "cycle_log.jsonl"
+# Lives under state/ (a persisted Docker volume) — NOT the package root, which
+# is ephemeral container FS wiped on every `compose up --build`. The crash-
+# recovery gate cross-references this ledger against the persisted executions/
+# volume; if it resets on rebuild while executions survive, every prior cycle
+# looks unfinished and the gate HALTs the loop forever.
+CYCLE_LOG = Path(__file__).parent / "state" / "cycle_log.jsonl"
 
 
 def detect_unfinished_cycles(
