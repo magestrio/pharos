@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from datetime import UTC, datetime
-from decimal import ROUND_DOWN, Decimal, InvalidOperation
+from decimal import ROUND_DOWN, ROUND_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -149,11 +149,20 @@ async def _ensure_unified_balance(
             return
     else:
         fund_have = fund_have_raw
-    # ROUND_DOWN to the coin's transfer accuracy: `fund_have` carries the
-    # wallet's full precision (8+dp) and can win the min(), so the move
-    # would otherwise 131210 for USDT. See `_transfer_quantum`.
-    move = min(fund_have, gap_with_buffer).quantize(
-        _transfer_quantum(coin), rounding=ROUND_DOWN
+    # Move whole transfer-quanta. `fund_have` is floored to the quantum: it
+    # carries full wallet precision (8+dp) and could win the min(), so the
+    # move would otherwise 131210 for USDT. The GAP, however, is rounded UP
+    # to a quantum — Bybit only moves whole quanta, so a sub-quantum gap
+    # floored to 0 transfers nothing and the spot order is left short by
+    # <1 quantum → 170131 (prod USD1 2026-06-09: gap 0.009 < 0.01 stable
+    # quantum → moved 0 → sell 7.77 vs 7.76 in UNIFIED, every cycle). Over-
+    # moving by <1 quantum just lands a hair extra in UNIFIED (the spot
+    # order sells `required`, the rest stays) — harmless, and the min() cap
+    # never moves more than FUND actually holds. See `_transfer_quantum`.
+    quantum = _transfer_quantum(coin)
+    move = min(
+        fund_have.quantize(quantum, rounding=ROUND_DOWN),
+        gap_with_buffer.quantize(quantum, rounding=ROUND_UP),
     )
     if move <= 0:
         log.info(

@@ -3904,6 +3904,44 @@ async def test_ensure_fund_balance_clamps_move_to_unified_transferable() -> None
 
 
 @pytest.mark.asyncio
+async def test_ensure_unified_balance_rounds_subquantum_gap_up() -> None:
+    """A sub-quantum FUND→UNIFIED gap must round the move UP to one
+    transfer quantum, not floor it to zero. Prod USD1 2026-06-09: the
+    consolidation Sell sized 7.77 (floor(unified 7.761)=7.76 + floor(fund
+    0.0113)=0.01), UNIFIED held 7.761, gap 0.009 < the 0.01 stable quantum
+    → the old ROUND_DOWN move floored to 0 → "no FUND balance to move" →
+    spot Sell 7.77 vs 7.76 available → 170131 every cycle. The fix moves a
+    full quantum (capped at FUND) so the gap is covered."""
+    from types import SimpleNamespace
+    from agent.sandbox.execute import _ensure_unified_balance
+
+    client = AsyncMock()
+    # UNIFIED has 7.761036 USD1 (equity); after the transfer the poll sees
+    # 7.77. FUND holds 0.011308 USD1 (transferable).
+    unified_probe = iter([
+        [SimpleNamespace(coinDetail=[{"coin": "USD1", "equity": "7.761036"}])],
+        [SimpleNamespace(coinDetail=[{"coin": "USD1", "equity": "7.77"}])],
+    ])
+
+    async def _wallet(*, coin: str, account_type: str):
+        return next(unified_probe,
+                   [SimpleNamespace(coinDetail=[{"coin": "USD1", "equity": "7.77"}])])
+
+    client.get_wallet_balance.side_effect = _wallet
+    client.get_account_coin_balance.return_value = Decimal("0.011308")
+
+    await _ensure_unified_balance(client, "USD1", Decimal("7.77"))
+
+    client.internal_transfer.assert_awaited_once()
+    kw = client.internal_transfer.await_args.kwargs
+    assert kw["coin"] == "USD1"
+    assert kw["from_account_type"] == "FUND"
+    assert kw["to_account_type"] == "UNIFIED"
+    # gap 0.009 rounds UP to one 0.01 quantum (capped at FUND 0.0113→0.01).
+    assert Decimal(kw["amount"]) == Decimal("0.01")
+
+
+@pytest.mark.asyncio
 async def test_get_account_coin_balance_prefers_transfer_balance() -> None:
     """`get_account_coin_balance` returns `transferBalance` (what
     inter-transfer honors), not `walletBalance` — the UTA reserves a haircut
