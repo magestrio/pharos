@@ -1895,6 +1895,34 @@ async def test_fetch_perp_info_survives_empty_instruments() -> None:
     assert info.max_leverage is None
 
 
+@pytest.mark.asyncio
+async def test_fetch_perp_info_survives_raising_instruments() -> None:
+    """`snapshot-1`, raising-instruments half (distinct from the empty-list
+    path above): the linear `instruments` call RAISES while the ticker is
+    valid. The inner `return_exceptions=True` gather hands back a
+    BaseException, and `_fetch_perp_info`'s `isinstance(instruments,
+    BaseException)` guard must collapse it to None — not propagate — so the
+    row still builds with sizing fields None."""
+    from agent.bybit_oracle.bybit_client import LinearInstrument
+    from agent.sandbox.snapshot import _fetch_perp_info
+
+    client = _spotless_perp_client("ID", spot_status="Trading")
+    spot = [LinearInstrument(symbol="IDUSDT", status="Trading")]
+
+    def _instruments(*, category, symbol):
+        if category == "linear":
+            raise RuntimeError("linear instruments fan-out flaked")
+        return spot
+
+    client.get_instruments_info.side_effect = _instruments
+    errors: list[str] = []
+    _, info = await _fetch_perp_info(client, "ID", errors)
+    assert info is not None  # ticker still valid → usable hedge reference
+    assert info.qty_step is None
+    assert info.min_order_qty is None
+    assert info.max_leverage is None
+
+
 def test_build_carry_excludes_perp_without_spot_market() -> None:
     """Carry opens a spot Buy leg, so a perp without a spot pair
     (`has_spot_market=False`) must be filtered out — even when funding,
