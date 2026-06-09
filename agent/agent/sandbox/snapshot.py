@@ -396,7 +396,11 @@ class PerpInfo(BaseModel):
     # disk, backtest fixtures); annualization MUST use the interval
     # field below, NOT a hardcoded × 3 × 365.
     funding_rate_8h: Decimal | None = None
-    # 7-day average funding rate (21 periods × interval_hours), signed.
+    # Mean of the last 21 funding periods, signed. The "7d" in the name is
+    # NOMINAL — 21 periods spans 7d only at the 8h cadence; it's ~3.5d at 4h
+    # and ~21h at 1h (snapshot-3). The magnitude is a true 21-period average
+    # regardless; only the time-window label is interval-dependent, and
+    # `_annual_funding` annualizes via the real `funding_interval_hours`.
     # Smoother than `funding_rate_8h` for sizing decisions — single-
     # period noise can flip sign while the regime is unchanged.
     # Validator uses the annualized form of this for the "negative
@@ -1735,6 +1739,12 @@ def _apply_net_hedge_apr(
             if row.effective_apr_gross is None:
                 row.effective_apr_gross = row.effective_apr
             row.effective_apr = row.effective_apr_net_hedge
+            # Net already subsumes the dead-time-adjusted gross (it was the
+            # base above), so leaving the old gross-based `net_holding` set
+            # would show a stale rate that contradicts the net headline
+            # (snapshot-4). Clear it — `_rank_key` uses `net_hedge`
+            # (precedence 1) for these rows, so ordering is unaffected.
+            row.effective_apr_net_holding = None
 
     # LM base legs are auto-hedged on HALF the notional (a single-sided
     # deposit rebalances 50/50). The LP gross yield (`apy_e8`) accrues on
@@ -1780,6 +1790,9 @@ def _apply_net_hedge_apr(
         if row.effective_apr_gross is None:
             row.effective_apr_gross = row.effective_apr
         row.effective_apr = row.effective_apr_net_hedge
+        # Clear any stale gross-based net_holding next to the net headline
+        # (snapshot-4); _rank_key uses net_hedge for these rows.
+        row.effective_apr_net_holding = None
 
 
 def _parse_funding_interval(raw: str | None) -> Decimal | None:
@@ -1838,6 +1851,8 @@ async def _fetch_perp_info(
         and spot_instruments
         and (spot_instruments[0].status or "Trading") == "Trading"
     )
+    # Mean over the last 21 funding periods (limit=21 above) — "7d" only at
+    # 8h cadence; nominal window otherwise (snapshot-3). Magnitude is correct.
     funding_7d_avg: Decimal | None = None
     if isinstance(funding_history, list) and funding_history:
         funding_7d_avg = sum(funding_history, Decimal(0)) / Decimal(len(funding_history))
@@ -2817,8 +2832,11 @@ async def collect_snapshot(
     # Per-coin perp data for non-stable Earn picks (OnChain + Flexible-
     # Saving). Drives the hedging-feasibility rules in the prompt and
     # the validator's auto-hedge gates (`.47` follow-up 2026-05-29).
-    # OnChain is walked first so high-yield non-stable OnChain picks
-    # always claim the fan-out budget before FlexibleSaving non-stables.
+    # Selection is by GLOBAL gross APR across BOTH categories, not by
+    # category order (wt-6): `_hedge_candidate_coins` sorts the merged list
+    # descending, so a higher-APR FlexibleSaving coin claims a fan-out slot
+    # before a lower-APR OnChain one. OnChain is listed first only so it
+    # wins APR ties (Python's sort is stable).
     perp_coins = _hedge_candidate_coins(
         [products["OnChain"], products["FlexibleSaving"]],
         cap=PERP_HEDGE_TOP_K,

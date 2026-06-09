@@ -610,12 +610,18 @@ async def _anchor_onchain(
 
 def _drop_picks_into_cash(
     decision_dict: dict[str, Any],
-    blocked_pids: set[str],
+    blocked_keys: set[tuple[str, str]],
 ) -> tuple[dict[str, Any], list[str]]:
-    """Remove every pick whose `product_id` is in `blocked_pids` and roll
-    its weight into `cash_usdc`. Returns `(new_decision_dict, dropped)`
-    where `dropped` is the list of pids that were actually removed (so
-    the caller can log + add notes).
+    """Remove every pick whose `(family, product_id)` is in `blocked_keys`
+    and roll its weight into `cash_usdc`. Returns `(new_decision_dict,
+    dropped)` where `dropped` is the list of pids actually removed (so the
+    caller can log + add notes).
+
+    Family from `_pick_family(venue_id)` — keying by `(family, pid)` not bare
+    pid stops an earn-namespace id from dropping a same-numeric LM pick, or
+    vice-versa (ah.23). A `("", pid)` wildcard key (legacy bare cooldown
+    entry) matches a pid in ANY family, preserving in-flight cooldowns across
+    the note-format change.
 
     Same rescale logic as `_build_auto_close_decision` (kept-pick weights
     rescale within their venue; venue weight shrinks proportionally;
@@ -631,10 +637,11 @@ def _drop_picks_into_cash(
         if not picks:
             new_venues.append(dict(v))
             continue
+        fam = _pick_family(v.get("venue_id") or "")
         kept = []
         for p in picks:
             pid = str(p.get("product_id", ""))
-            if pid in blocked_pids:
+            if (fam, pid) in blocked_keys or ("", pid) in blocked_keys:
                 dropped.append(pid)
             else:
                 kept.append(p)
@@ -696,15 +703,15 @@ def _strip_carry_coins_from_decision(
     carry_products = {
         p.product_id: p for p in snapshot.products.get(CARRY_CATEGORY, [])
     }
-    drop_pids = {
-        str(pick.product_id)
+    drop_keys = {
+        ("carry", str(pick.product_id))
         for pick in venue.picks
         if (summ := carry_products.get(pick.product_id)) is not None
         and summ.coin.upper() in coins
     }
-    if not drop_pids:
+    if not drop_keys:
         return decision, []
-    new_dict, dropped = _drop_picks_into_cash(decision.model_dump(), drop_pids)
+    new_dict, dropped = _drop_picks_into_cash(decision.model_dump(), drop_keys)
     return Decision.model_validate(new_dict), dropped
 
 
@@ -826,8 +833,10 @@ def _clamp_to_liquid_budget(
         for p in snapshot.products.get(cat, []):
             prod_coin[(cat, p.product_id)] = p.coin.upper()
 
-    new_stable: list[tuple[str, float]] = []
-    new_nonstable: list[tuple[str, float]] = []
+    # (family, pid) keys (ah.23) so a dropped earn pid can't also drop a
+    # same-numeric LM pick in `_drop_picks_into_cash`.
+    new_stable: list[tuple[tuple[str, str], float]] = []
+    new_nonstable: list[tuple[tuple[str, str], float]] = []
     for v in decision_dict.get("venues", []) or []:
         vid = v.get("venue_id")
         if vid not in _LIQUID_CLAMP_VENUES_CARRY:
@@ -836,6 +845,7 @@ def _clamp_to_liquid_budget(
         cat = getattr(meta, "snapshot_category", None) if meta else None
         if not cat:
             continue
+        fam = _pick_family(vid)
         vw = float(v.get("weight", 0))
         for p in v.get("picks", []) or []:
             pid = str(p.get("product_id", ""))
@@ -846,21 +856,23 @@ def _clamp_to_liquid_budget(
             if net_new < _MIN_NEW_ACTION_USD:
                 continue  # hold / reduce — funds nothing
             if prod_coin.get((cat, pid), "") in STABLES:
-                new_stable.append((pid, net_new))
+                new_stable.append(((fam, pid), net_new))
             else:
-                new_nonstable.append((pid, net_new))
+                new_nonstable.append(((fam, pid), net_new))
 
-    to_drop: set[str] = set()
+    to_drop: set[tuple[str, str]] = set()
 
-    def _select(picks: list[tuple[str, float]], budget: float) -> None:
+    def _select(
+        picks: list[tuple[tuple[str, str], float]], budget: float
+    ) -> None:
         total = sum(n for _, n in picks)
         if total <= budget + 1e-9:
             return
         # Drop largest-first so the fewest picks are sacrificed.
-        for pid, n in sorted(picks, key=lambda x: x[1], reverse=True):
+        for key, n in sorted(picks, key=lambda x: x[1], reverse=True):
             if total <= budget + 1e-9:
                 break
-            to_drop.add(pid)
+            to_drop.add(key)
             total -= n
 
     _select(new_nonstable, max_nonstable)
@@ -1245,20 +1257,36 @@ _AUTO_CLOSE_FAMILY_BY_VENUE: dict[str, str] = {
 }
 
 
+def _pick_family(venue_id: str) -> str:
+    """Collision namespace for a pick's `product_id` (ah.23). Earn productIds
+    (flex + onchain share ONE Bybit Earn namespace) and LM productIds are
+    SEPARATE id spaces that numerically overlap (empirically {6,7,13,…}), so a
+    bare-pid match across them drops / closes the WRONG pick. Keying drops and
+    cooldowns by `(family, product_id)` disambiguates. `carry` for the carry
+    venue; the venue_id itself for anything outside the known families (a safe
+    unique fallback)."""
+    return _AUTO_CLOSE_FAMILY_BY_VENUE.get(venue_id) or (
+        "carry" if venue_id == CARRY_VENUE_ID else venue_id
+    )
+
+
 def _build_auto_close_decision(
     prior: dict[str, Any] | None,
     wake_events: list[dict[str, Any]] | None,
-    recently_closed_pids: frozenset[str] = frozenset(),
+    recently_closed_keys: frozenset[tuple[str, str]] = frozenset(),
 ) -> dict[str, Any] | None:
     """Build a deterministic close-only decision from `pick_invalidated`
     wake events — bypasses the LLM entirely so a tripped stop-loss
     closes within seconds, not minutes (LLM round-trip + validator pass).
 
-    `recently_closed_pids` are productIds already auto-closed within the
-    cooldown window (loop-4): an event whose pid is in this set is skipped,
-    so a persistently-firing invalidation (e.g. a redeem stuck in Processing,
-    still echoed in the baseline) doesn't re-trigger an all-cash no-op every
-    wake — once suppressed, the cycle falls through to the normal path.
+    `recently_closed_keys` are `(family, product_id)` pairs already auto-closed
+    within the cooldown window (loop-4 / ah.23): an event whose `(family, pid)`
+    is in this set is skipped, so a persistently-firing invalidation (e.g. a
+    redeem stuck in Processing, still echoed in the baseline) doesn't re-trigger
+    an all-cash no-op every wake. Keying by `(family, pid)` — not bare pid —
+    means a recently-closed LM pick can't suppress a same-numeric Earn close.
+    A `("", pid)` wildcard entry (legacy bare cooldown) still suppresses any
+    family, preserving in-flight cooldowns across the note-format change.
 
     Returns:
       - decision dict (mutated copy of `prior` with affected picks
@@ -1310,9 +1338,12 @@ def _build_auto_close_decision(
         family, sep, pid = position_id.partition(":")
         if not sep or family not in ("earn", "lm") or not pid:
             continue
-        if pid in recently_closed_pids:
+        if (family, pid) in recently_closed_keys or (
+            "", pid
+        ) in recently_closed_keys:
             # Already auto-closed within the cooldown window — suppress so a
             # persistently-firing event doesn't churn all-cash cycles (loop-4).
+            # `(family, pid)` keyed (ah.23); `("", pid)` = legacy bare entry.
             continue
         close_keys.add((family, pid))
         close_pids.add(pid)
@@ -1383,7 +1414,9 @@ def _build_auto_close_decision(
         "hedges": [],
         "confidence": 1.0,
         "risk_flags": [],
-        "notes": [f"auto_close:{pid}" for pid in sorted(close_pids)],
+        "notes": [
+            f"auto_close:{fam}:{pid}" for fam, pid in sorted(close_keys)
+        ],
         "expected_blended_apr_pct": 0.0,
     }
     return out
@@ -1424,6 +1457,55 @@ def _reconcile_carry_state(
         log.exception(
             "carry_state update failed after %s — HALT created", context
         )
+
+
+async def _execute_with_recovery(
+    client: Any,
+    actions: list[Any],
+    snapshot_ts: str,
+    carry_state: CarryState,
+    outcome: dict[str, Any],
+    *,
+    context: str,
+    dry_run: bool,
+) -> list[Any]:
+    """Unified live-execute envelope (ah.24) — shared by the main diff and the
+    de-risk sweep so the sweep stops being a parallel dispatch
+    (executor-1/executor-3). Steps, all skipped on dry-run:
+
+      1. Persist the confirmable order links as a pending-intent marker BEFORE
+         dispatch — a SIGKILL mid-`execute_actions` (esp. a carry close's
+         spot+perp legs the executions scan treats as unconfirmable) is then
+         recoverable by the startup crash gate (ah.7).
+      2. `execute_actions`, then reconcile `carry_state` in a `finally` so a
+         real Bybit close is rolled into state even if later code raises
+         (executor-1/wt-1/state-1).
+      3. Clear the marker once execute + reconcile are durable — but NOT on a
+         reconcile HALT (`carry_state_error`), so the operator keeps the leg
+         links; an `execute_actions` exception propagates past the clear so
+         the marker survives for the next startup to re-verify.
+
+    Returns the per-action results; the caller does its own outcome
+    accounting on them."""
+    results: list[Any] = []
+    if not dry_run:
+        links = _confirmable_order_links(actions)
+        if links:
+            write_pending_intent(
+                PendingIntent(snapshot_ts=snapshot_ts, links=links)
+            )
+    try:
+        results = await execute_actions(
+            client, actions, snapshot_ts=snapshot_ts, dry_run=dry_run
+        )
+    finally:
+        if not dry_run:
+            _reconcile_carry_state(
+                carry_state, results, outcome, context=context
+            )
+    if not dry_run and "carry_state_error" not in outcome:
+        clear_pending_intent()
+    return results
 
 
 async def _execute_redeem_exits(
@@ -1737,9 +1819,9 @@ async def run_one_cycle(
             # the prompt, ping-pong re-entry doesn't reach the executor.
             # Reuses the `cooldown` computed above for the auto-close gate.
             if cooldown:
-                blocked_pids = set(cooldown.keys())
+                blocked_keys = set(cooldown.keys())
                 filtered_dict, dropped = _drop_picks_into_cash(
-                    decision.model_dump(), blocked_pids
+                    decision.model_dump(), blocked_keys
                 )
                 if dropped:
                     notes_list = filtered_dict.setdefault("notes", [])
@@ -1991,8 +2073,14 @@ async def run_one_cycle(
             # runs only when the diff is dry-run, so no executed-id collision.
             _reindex_order_link_ids(sweep, snap_path.stem)
             if sweep:
-                sweep_results = await execute_actions(
-                    bybit_client, sweep, snapshot_ts=snap_path.stem, dry_run=False
+                # ah.24: through the SAME durable envelope as the main diff —
+                # pending-intent persist (crash recovery) + carry-state
+                # reconcile + clear — instead of a raw parallel dispatch. The
+                # sweep is always live here; its confirmable carry-close legs
+                # are now SIGKILL-recoverable like the diff's.
+                sweep_results = await _execute_with_recovery(
+                    bybit_client, sweep, snap_path.stem, carry_state, outcome,
+                    context="de-risk sweep", dry_run=False,
                 )
                 outcome["safety_sweep"] = [
                     {
@@ -2011,14 +2099,6 @@ async def run_one_cycle(
                     "confidence=%.2f < floor %.2f)",
                     swept_ok, len(sweep), ok,
                     float(decision.confidence), float(min_confidence),
-                )
-                # The sweep may have closed funding-carry positions on Bybit
-                # (`_carry_liq_close_actions`) — roll those closures back into
-                # the state file so the next cycle doesn't re-emit a CLOSE for
-                # an already-closed position (executor-1/wt-1/state-1).
-                _reconcile_carry_state(
-                    carry_state, sweep_results, outcome,
-                    context="de-risk sweep",
                 )
                 # Stamp the cooldown for every residual-redeem we emitted (wt-3)
                 # so the settling LP isn't re-redeemed next cycle; prune
@@ -2075,113 +2155,85 @@ async def run_one_cycle(
         # Hard process crashes (OOM, SIGKILL) bypass this finally — that
         # window is covered by the pending-intent marker written just below,
         # which the next startup's crash-recovery gate verifies against Bybit.
-        results: list = []
-        # ah.7 (state-2): persist the confirmable order links BEFORE dispatch.
-        # `execute_actions` flushes each per-action row only AFTER the legs
-        # land, so a SIGKILL mid-dispatch (esp. a carry's spot+perp, which the
-        # executions scan treats as unconfirmable) leaves a real position with
-        # no row. The marker carries the leg link ids so startup can confirm
-        # them on Bybit and HALT. Cleared after execute + reconcile are durable.
-        if not effective_dry_run:
-            _pending_links = _confirmable_order_links(actions)
-            if _pending_links:
-                write_pending_intent(
-                    PendingIntent(snapshot_ts=snapshot_ts, links=_pending_links)
-                )
-        try:
-            results = await execute_actions(
-                bybit_client,
-                actions,
-                snapshot_ts=snapshot_ts,
-                dry_run=effective_dry_run,
+        # ah.24: the durable execute envelope (pending-intent persist BEFORE
+        # dispatch for SIGKILL recovery + carry-state reconcile in a finally +
+        # marker clear once durable) is shared with the de-risk sweep via
+        # `_execute_with_recovery`. An `execute_actions` exception propagates
+        # out of the helper (reconcile still runs in its finally; the marker
+        # survives for the next startup), skipping the accounting below.
+        results = await _execute_with_recovery(
+            bybit_client, actions, snapshot_ts, carry_state, outcome,
+            context="execute", dry_run=effective_dry_run,
+        )
+        outcome["actions_executed"] = sum(
+            1 for r in results if r.status == "ok"
+        )
+        outcome["actions"] = [
+            {
+                "kind": r.action.kind.value,
+                "category": r.action.category,
+                "product_id": r.action.product_id,
+                "coin": r.action.coin,
+                "amount": str(r.action.amount),
+                "status": r.status,
+                "error": r.error,
+            }
+            for r in results
+        ]
+        outcome["stages"].append("execute")
+        if effective_dry_run:
+            outcome["result"] = "ok"
+        else:
+            # `.42`: surface partial completion so the next-cycle startup scan
+            # + post-mortem analyzer can distinguish a clean batch from one
+            # where some actions errored mid-cycle (Bybit transient 5xx,
+            # atomic-pair guard fired, retCode rejected, etc.). Pre-fix the
+            # field said "executed" regardless and operator only knew via
+            # actions_executed < actions_planned in the entry.
+            failed = sum(
+                1 for r in results
+                if r.status in ("error", "orphan")
             )
-            outcome["actions_executed"] = sum(
-                1 for r in results if r.status == "ok"
-            )
-            outcome["actions"] = [
-                {
-                    "kind": r.action.kind.value,
-                    "category": r.action.category,
-                    "product_id": r.action.product_id,
-                    "coin": r.action.coin,
-                    "amount": str(r.action.amount),
-                    "status": r.status,
-                    "error": r.error,
-                }
-                for r in results
-            ]
-            outcome["stages"].append("execute")
-            if effective_dry_run:
-                outcome["result"] = "ok"
+            if failed > 0:
+                outcome["result"] = "executed_partial"
+                outcome["actions_failed"] = failed
             else:
-                # `.42`: surface partial completion so the next-cycle
-                # startup scan + post-mortem analyzer can distinguish a
-                # clean batch from one where some actions errored mid-
-                # cycle (Bybit transient 5xx, atomic-pair guard fired,
-                # retCode rejected, etc.). Pre-fix the field said
-                # "executed" regardless and operator only knew via
-                # actions_executed < actions_planned in the entry.
-                failed = sum(
-                    1 for r in results
-                    if r.status in ("error", "orphan")
-                )
-                if failed > 0:
-                    outcome["result"] = "executed_partial"
-                    outcome["actions_failed"] = failed
+                outcome["result"] = "executed"
+        # ah.9 (state-3): an orphan OPEN_FUNDING_CARRY = the spot filled but
+        # the perp leg never landed. The dispatch atomically unwinds the
+        # spot; surface it P0 so the operator is alerted — especially the
+        # rare case where the unwind ITSELF failed (genuinely naked spot,
+        # swept next cycle by the orphan-seller). NOT a HALT: a HALT would
+        # freeze that very sweep.
+        carry_orphans = [
+            r for r in results
+            if r.action.kind.value == "open_funding_carry"
+            and r.status == "orphan"
+        ]
+        if carry_orphans:
+            details = []
+            for r in carry_orphans:
+                unwind = (r.response or {}).get("legs", {}).get("unwind") or {}
+                details.append({
+                    "coin": r.action.coin,
+                    "error": r.error,
+                    "unwound": unwind.get("unwound"),
+                    "unwind_error": unwind.get("error"),
+                })
+                if unwind.get("unwound"):
+                    log.error(
+                        "P0 carry OPEN orphan (%s): perp leg failed, spot "
+                        "UNWOUND (no naked exposure) — operator review: %s",
+                        r.action.coin, r.error,
+                    )
                 else:
-                    outcome["result"] = "executed"
-            # ah.9 (state-3): an orphan OPEN_FUNDING_CARRY = the spot filled but
-            # the perp leg never landed. The dispatch atomically unwinds the
-            # spot; surface it P0 so the operator is alerted — especially the
-            # rare case where the unwind ITSELF failed (genuinely naked spot,
-            # swept next cycle by the orphan-seller). NOT a HALT: a HALT would
-            # freeze that very sweep.
-            carry_orphans = [
-                r for r in results
-                if r.action.kind.value == "open_funding_carry"
-                and r.status == "orphan"
-            ]
-            if carry_orphans:
-                details = []
-                for r in carry_orphans:
-                    unwind = (r.response or {}).get("legs", {}).get("unwind") or {}
-                    details.append({
-                        "coin": r.action.coin,
-                        "error": r.error,
-                        "unwound": unwind.get("unwound"),
-                        "unwind_error": unwind.get("error"),
-                    })
-                    if unwind.get("unwound"):
-                        log.error(
-                            "P0 carry OPEN orphan (%s): perp leg failed, spot "
-                            "UNWOUND (no naked exposure) — operator review: %s",
-                            r.action.coin, r.error,
-                        )
-                    else:
-                        log.error(
-                            "P0 carry OPEN orphan (%s): perp leg failed AND spot "
-                            "unwind failed (%s) — NAKED spot long; orphan-seller "
-                            "sweeps next cycle — operator review: %s",
-                            r.action.coin, unwind.get("error"), r.error,
-                        )
-                outcome["carry_open_orphan"] = details
-        finally:
-            # Roll forward carry state from the dispatch results (`.5`).
-            # Skipped on dry-run so a `--live` run is required to mutate
-            # the persisted positions ledger. Same reconcile + HALT-on-write-
-            # failure path the de-risk sweep uses (executor-1/wt-1/state-1).
-            if not effective_dry_run:
-                _reconcile_carry_state(
-                    carry_state, results, outcome, context="execute"
-                )
-
-        # ah.7: execute + carry-state reconcile are durable now (the executions
-        # log + carry_state are the record), so drop the pending-intent marker.
-        # An exception in `execute_actions` unwinds past this point (marker
-        # survives → startup re-verifies); a reconcile HALT (carry_state_error)
-        # also keeps it so the operator still has the leg links to reconcile.
-        if not effective_dry_run and "carry_state_error" not in outcome:
-            clear_pending_intent()
+                    log.error(
+                        "P0 carry OPEN orphan (%s): perp leg failed AND spot "
+                        "unwind failed (%s) — NAKED spot long; orphan-seller "
+                        "sweeps next cycle — operator review: %s",
+                        r.action.coin, unwind.get("error"), r.error,
+                    )
+            outcome["carry_open_orphan"] = details
 
         # 6a. Post-execute baseline prune (watcher-2). The baseline was
         # refreshed at step 1a from the START-of-cycle snapshot, so the

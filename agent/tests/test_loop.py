@@ -2071,8 +2071,10 @@ def test_build_auto_close_decision_qualifies_drop_by_venue_family():
 
 
 def test_build_auto_close_decision_suppresses_recently_closed_pid():
-    """A pid already auto-closed within the cooldown window is skipped so a
-    persistently-firing event falls through to the normal path (loop-4)."""
+    """A (family, pid) already auto-closed within the cooldown window is
+    skipped so a persistently-firing event falls through to the normal path
+    (loop-4). ah.23: keyed by (family, pid) — a recently-closed LM pid does
+    NOT suppress a same-numeric Earn close; a legacy ("", pid) wildcard does."""
     from agent.sandbox.loop import _build_auto_close_decision
     prior = {
         "venues": [
@@ -2085,7 +2087,12 @@ def test_build_auto_close_decision_suppresses_recently_closed_pid():
     }
     events = [{"kind": "pick_invalidated", "position_id": "earn:8", "coin": "TON"}]
     assert _build_auto_close_decision(prior, events) is not None
-    assert _build_auto_close_decision(prior, events, frozenset({"8"})) is None
+    # Same family → suppressed.
+    assert _build_auto_close_decision(prior, events, frozenset({("earn", "8")})) is None
+    # Cross-family (lm:8) → does NOT suppress the earn:8 close (ah.23).
+    assert _build_auto_close_decision(prior, events, frozenset({("lm", "8")})) is not None
+    # Legacy bare cooldown entry (wildcard family) → still suppresses.
+    assert _build_auto_close_decision(prior, events, frozenset({("", "8")})) is None
 
 
 def test_build_auto_close_decision_ignores_carry_liq_close():
@@ -3019,3 +3026,128 @@ async def test_run_one_cycle_drawdown_halt_stays_when_still_down(tmp_path: Path)
     assert outcome["result"] == "halted"
     assert outcome["halt_trigger"] == "daily_drawdown"
     assert safety.HALT_FILE.exists()
+
+
+# ─── ah.23: (family, product_id) keying — cross-namespace collision guard ────
+
+def test_drop_picks_into_cash_is_family_scoped() -> None:
+    """ah.23: an earn-namespace pid in blocked_keys drops ONLY the earn pick,
+    never a same-numeric LM pick (earn and LM productIds overlap)."""
+    from agent.sandbox.loop import _drop_picks_into_cash
+    dec = {
+        "venues": [
+            {"venue_id": "cash_usdc", "weight": 0.4, "picks": []},
+            {"venue_id": "bybit_onchain", "weight": 0.3,
+             "picks": [{"product_id": "6", "weight": 1.0}]},
+            {"venue_id": "bybit_lm", "weight": 0.3,
+             "picks": [{"product_id": "6", "weight": 1.0}]},
+        ],
+    }
+    new_dict, dropped = _drop_picks_into_cash(dec, {("earn", "6")})
+    assert dropped == ["6"]  # only one pick removed
+    # The LM pid=6 survives; the onchain pid=6 collapsed into cash.
+    lm = next(v for v in new_dict["venues"] if v["venue_id"] == "bybit_lm")
+    assert [p["product_id"] for p in lm["picks"]] == ["6"]
+    assert not any(v["venue_id"] == "bybit_onchain" for v in new_dict["venues"])
+
+
+def test_drop_picks_into_cash_legacy_wildcard_matches_any_family() -> None:
+    """A legacy ("", pid) key (pre-ah.23 cooldown note) drops the pid in any
+    family, preserving in-flight cooldowns across the format change."""
+    from agent.sandbox.loop import _drop_picks_into_cash
+    dec = {
+        "venues": [
+            {"venue_id": "cash_usdc", "weight": 0.7, "picks": []},
+            {"venue_id": "bybit_lm", "weight": 0.3,
+             "picks": [{"product_id": "6", "weight": 1.0}]},
+        ],
+    }
+    _, dropped = _drop_picks_into_cash(dec, {("", "6")})
+    assert dropped == ["6"]
+
+
+# ─── ah.24: unified execute+reconcile envelope ───────────────────────────────
+
+@pytest.mark.asyncio
+async def test_execute_with_recovery_envelope_ordering() -> None:
+    """ah.24: live dispatch persists the pending-intent BEFORE execute, then
+    reconciles carry_state, then clears the marker — the same durable order
+    the main diff and the de-risk sweep now share."""
+    import agent.sandbox.loop as loop
+    calls: list[str] = []
+
+    async def _fake_exec(*_a, **_k):
+        calls.append("execute")
+        return []
+
+    with (
+        patch.object(loop, "_confirmable_order_links", lambda a: ["lnk-1"]),
+        patch.object(loop, "PendingIntent", lambda **k: MagicMock()),
+        patch.object(loop, "write_pending_intent", lambda _pi: calls.append("write")),
+        patch.object(loop, "clear_pending_intent", lambda: calls.append("clear")),
+        patch.object(loop, "execute_actions", _fake_exec),
+        patch.object(loop, "_reconcile_carry_state",
+                     lambda *a, **k: calls.append("reconcile")),
+    ):
+        res = await loop._execute_with_recovery(
+            MagicMock(), [MagicMock()], "ts", MagicMock(), {},
+            context="execute", dry_run=False,
+        )
+    assert calls == ["write", "execute", "reconcile", "clear"]
+    assert res == []
+
+
+@pytest.mark.asyncio
+async def test_execute_with_recovery_dry_run_skips_envelope() -> None:
+    """Dry-run places no orders and mutates no state — no marker, no reconcile."""
+    import agent.sandbox.loop as loop
+    calls: list[str] = []
+
+    async def _fake_exec(*_a, **_k):
+        calls.append("execute")
+        return []
+
+    with (
+        patch.object(loop, "_confirmable_order_links", lambda a: ["lnk-1"]),
+        patch.object(loop, "PendingIntent", lambda **k: MagicMock()),
+        patch.object(loop, "write_pending_intent", lambda _pi: calls.append("write")),
+        patch.object(loop, "clear_pending_intent", lambda: calls.append("clear")),
+        patch.object(loop, "execute_actions", _fake_exec),
+        patch.object(loop, "_reconcile_carry_state",
+                     lambda *a, **k: calls.append("reconcile")),
+    ):
+        await loop._execute_with_recovery(
+            MagicMock(), [MagicMock()], "ts", MagicMock(), {},
+            context="execute", dry_run=True,
+        )
+    assert calls == ["execute"]
+
+
+@pytest.mark.asyncio
+async def test_execute_with_recovery_keeps_marker_on_carry_halt() -> None:
+    """A reconcile HALT (carry_state_error) must NOT clear the marker — the
+    operator keeps the leg links to reconcile."""
+    import agent.sandbox.loop as loop
+    calls: list[str] = []
+
+    async def _fake_exec(*_a, **_k):
+        return []
+
+    def _fake_reconcile(_cs, _r, outcome, *, context):
+        outcome["carry_state_error"] = "write failed"
+        calls.append("reconcile")
+
+    with (
+        patch.object(loop, "_confirmable_order_links", lambda a: ["lnk-1"]),
+        patch.object(loop, "PendingIntent", lambda **k: MagicMock()),
+        patch.object(loop, "write_pending_intent", lambda _pi: calls.append("write")),
+        patch.object(loop, "clear_pending_intent", lambda: calls.append("clear")),
+        patch.object(loop, "execute_actions", _fake_exec),
+        patch.object(loop, "_reconcile_carry_state", _fake_reconcile),
+    ):
+        await loop._execute_with_recovery(
+            MagicMock(), [MagicMock()], "ts", MagicMock(), {},
+            context="execute", dry_run=False,
+        )
+    assert "clear" not in calls
+    assert calls == ["write", "reconcile"]

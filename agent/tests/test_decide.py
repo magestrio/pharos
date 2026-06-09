@@ -732,3 +732,19 @@ def test_summarize_prior_decision_no_outcome_line_when_unannotated() -> None:
     )
     out = _summarize_prior_decision(blob)
     assert "cycle outcome" not in out
+
+
+def test_collect_recently_invalidated_keys_by_family():
+    """ah.23: `auto_close:<family>:<pid>` notes key by (family, pid); a legacy
+    bare `auto_close:<pid>` note reads under the wildcard family ""."""
+    from datetime import UTC, datetime
+    from agent.sandbox.decide import _collect_recently_invalidated
+    now = datetime(2026, 6, 9, 12, 0, tzinfo=UTC)
+    priors = [{
+        "_meta": {"written_at": "2026-06-09T11:30:00+00:00"},
+        "notes": ["auto_close:earn:6", "auto_close:lm:7", "auto_close:9"],
+    }]
+    cd = _collect_recently_invalidated(priors, now=now)
+    assert ("earn", "6") in cd
+    assert ("lm", "7") in cd
+    assert ("", "9") in cd  # legacy bare → wildcard family

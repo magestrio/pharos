@@ -164,3 +164,23 @@ def test_hedges_example_notional_zeroed() -> None:
     assert "-42" not in p
     assert '"notional_usd": 0,' in p
     assert "notional_usd is IGNORED" in p
+
+
+# ─── ah.19: top-of-prompt cycle-killers checklist (prompt-4) ─────────────────
+
+def test_cycle_killers_checklist_present_and_early() -> None:
+    """prompt-4: a concise cycle-killers checklist is surfaced at the TOP
+    (before the venue registry / verbose bullets) so the reject conditions
+    aren't buried under the repeated max-yield mantra."""
+    p = build_system_prompt()
+    assert "# Cycle-killers" in p
+    assert p.index("# Cycle-killers") < p.index("# Venue registry")
+
+
+def test_cycle_killers_checklist_covers_capital_gates() -> None:
+    """The checklist names the deterministic capital gates that are the
+    most-often-buried killers (capital-flow, stable-spend, peg)."""
+    p = build_system_prompt()
+    section = p[p.index("# Cycle-killers"):p.index("# Hedging discipline")]
+    for needle in ("Capital-flow", "Stable-spend", "Peg stress", "Per-product"):
+        assert needle in section, f"{needle} missing from cycle-killers checklist"

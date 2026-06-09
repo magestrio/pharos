@@ -660,6 +660,28 @@ def _nonstable(coin: str, gross: str, net_holding: str | None = None) -> Product
     )
 
 
+def test_apply_net_hedge_clears_stale_net_holding():
+    """snapshot-4: once `effective_apr` is overwritten with the net rate, the
+    old gross-based `effective_apr_net_holding` is stale (it was the base for
+    the net) and must be cleared so it can't sit beside the net headline
+    contradicting it."""
+    row = _nonstable("SIGN", "0.56", net_holding="0.50")
+    products = {"FlexibleSaving": [row], "OnChain": []}
+    _apply_net_hedge_apr(products, {"SIGN": _info("SIGN", "0.0001")})
+    assert row.effective_apr_net_hedge is not None
+    assert row.effective_apr_net_holding is None
+
+
+def test_apply_net_hedge_keeps_net_holding_when_no_perp():
+    """A non-stable with NO perp data this cycle is NOT overwritten, so its
+    net_holding is retained — `_rank_key` still uses it as the fallback rank."""
+    row = _nonstable("NOPERP", "0.56", net_holding="0.50")
+    products = {"FlexibleSaving": [row], "OnChain": []}
+    _apply_net_hedge_apr(products, {})  # no perp entry for NOPERP
+    assert row.effective_apr_net_hedge is None
+    assert row.effective_apr_net_holding == Decimal("0.50")
+
+
 def test_apply_net_hedge_subtracts_negative_funding():
     """A non-stable Earn pick whose hedge perp has negative funding earns LESS
     than its gross headline — the short pays funding every period."""

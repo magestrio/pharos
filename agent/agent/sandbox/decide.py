@@ -330,7 +330,7 @@ def _build_user_message(
     cooldown = _collect_recently_invalidated(prior_decisions or [])
     if cooldown:
         bullets = []
-        for pid, meta in sorted(cooldown.items()):
+        for (_fam, pid), meta in sorted(cooldown.items()):
             coin = meta.get("coin") or "?"
             closed = meta.get("closed_at", "?")
             eligible = meta.get("eligible_at", "?")
@@ -451,22 +451,25 @@ def _collect_recently_invalidated(
     priors: list[dict[str, Any]],
     ttl_minutes: int = PICK_INVALIDATE_COOLDOWN_MIN,
     now: datetime | None = None,
-) -> dict[str, dict[str, Any]]:
-    """Extract `{product_id: {coin, closed_at, reason}}` from auto-close
-    decisions in `priors` that are still inside the cooldown window.
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Extract `{(family, product_id): {coin, closed_at, reason}}` from
+    auto-close decisions in `priors` still inside the cooldown window.
 
-    Walks priors (any order) and for each one that has at least one
-    `notes` entry of the form `auto_close:<pid>`, records the pid plus
-    the timestamp from `_meta.written_at`. When multiple auto-closes
-    happened for the same pid (loop firing several times before fix),
-    the LATEST `closed_at` wins.
+    Walks priors (any order) and for each one that has at least one `notes`
+    entry of the form `auto_close:<family>:<pid>` (ah.23), records the
+    `(family, pid)` key plus the timestamp from `_meta.written_at`. A legacy
+    `auto_close:<pid>` note (pre-ah.23, no family) is read under the wildcard
+    family `""`, which the drop / cooldown gates match against ANY family — so
+    in-flight cooldowns survive the format change. When multiple auto-closes
+    hit the same key (loop firing several times before fix), the LATEST
+    `closed_at` wins.
 
     Picks older than `ttl_minutes` are dropped. Returns `{}` when no
     in-window auto-close is found — caller skips the cooldown block.
     """
     if now is None:
         now = datetime.now(UTC)
-    out: dict[str, dict[str, Any]] = {}
+    out: dict[tuple[str, str], dict[str, Any]] = {}
     for d in priors:
         notes = d.get("notes") or []
         if not isinstance(notes, list):
@@ -494,12 +497,20 @@ def _collect_recently_invalidated(
         for n in notes:
             if not isinstance(n, str) or not n.startswith("auto_close:"):
                 continue
-            pid = n.removeprefix("auto_close:").strip()
+            payload = n.removeprefix("auto_close:").strip()
+            if not payload:
+                continue
+            # `auto_close:<family>:<pid>` (ah.23); legacy `auto_close:<pid>`
+            # → wildcard family "".
+            fam, sep, pid = payload.partition(":")
+            if not sep:
+                fam, pid = "", payload
             if not pid:
                 continue
-            prior = out.get(pid)
+            key = (fam, pid)
+            prior = out.get(key)
             if prior is None or closed_at > prior["_closed_at_dt"]:
-                out[pid] = {
+                out[key] = {
                     "coin": coin or (prior or {}).get("coin", ""),
                     "closed_at": closed_at.isoformat(),
                     "_closed_at_dt": closed_at,
