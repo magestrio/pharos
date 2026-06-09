@@ -47,6 +47,40 @@ from agent.sandbox.snapshot import (
 log = logging.getLogger(__name__)
 
 
+def _disposal_sell_action(
+    *,
+    symbol: str,
+    dest_coin: str,
+    qty: Decimal,
+    order_link_id: str,
+    reason: str,
+) -> Action:
+    """Build a SWAP_SPOT Sell that DISPOSES a coin into a destination stable —
+    orphan/excess non-stable, redeem-settle freed coin, or idle non-core
+    stable. Two invariants every disposal sell shares, centralised here:
+
+    - `extra={"skip_fund_transfer": True}` is MANDATORY. It forces the real
+      Sell; without it the dispatch's `_transfer_satisfies_swap` optimisation
+      reads `amount` as a *destination*-coin requirement, finds enough of it
+      already in FUND, and no-ops the sell — stranding the source coin (the
+      ETH/POPCAT/IO "never liquidates" bug).
+    - `qty` is the RAW sellable amount. Spot-lot rounding (basePrecision +
+      Bybit min) happens downstream in `place_spot_order` → `validate_qty`;
+      pre-flooring to the coarse PERP qty_step would strand up to ~1 perp lot.
+    """
+    return Action(
+        kind=ActionKind.SWAP_SPOT,
+        category="Spot",
+        product_id=symbol,
+        coin=dest_coin,
+        amount=qty,
+        side="Sell",
+        order_link_id=order_link_id,
+        reason=reason,
+        extra={"skip_fund_transfer": True},
+    )
+
+
 def build_redeem_exit_intents(
     snapshot: Snapshot,
     results: list[ActionResult],
@@ -159,33 +193,22 @@ def exit_actions_from_intent(
     wallet_native = _coin_wallet_native(snapshot, coin_u)
     sell_native = min(intent.expected_redeem_native, wallet_native)
     mark = getattr(info, "mark_price", None) if info else None
-    sell_usd = sell_native * mark if (mark and mark > 0) else None
-    if sell_native > 0 and (sell_usd is None or sell_usd >= MIN_SWAP_USDC):
-        # Spot-sell qty rounds to the SPOT lot at dispatch (validate_qty),
-        # NOT the perp qty_step — flooring to the coarse perp step strands
-        # up to ~1 perp lot of the freed coin (see `_orphan_spot_sell_actions`).
-        qty = sell_native
-        if qty > 0:
-            symbol, dest_coin = _orphan_sell_quote(coin_u)
-            actions.append(
-                Action(
-                    kind=ActionKind.SWAP_SPOT,
-                    category="Spot",
-                    product_id=symbol,
-                    coin=dest_coin,
-                    amount=qty,
-                    side="Sell",
-                    order_link_id=_order_link_id(snapshot_ts, cursor),
-                    reason=(
-                        f"exit hedged Earn {coin_u}: swap {qty} freed → "
-                        f"{dest_coin} on redeem settle (no LLM)"
-                    ),
-                    # Disposal sell — see `_orphan_spot_sell_actions`: the goal
-                    # is to SELL the freed coin, not acquire the dest stable, so
-                    # bypass the FUND-transfer optimization that would no-op it.
-                    extra={"skip_fund_transfer": True},
-                )
+    if sell_native > 0 and mark and mark > 0 and sell_native * mark >= MIN_SWAP_USDC:
+        # Qty rounds to the SPOT lot at dispatch (see `_disposal_sell_action`),
+        # so pass the raw sellable amount, not a perp-step-floored one.
+        symbol, dest_coin = _orphan_sell_quote(coin_u)
+        actions.append(
+            _disposal_sell_action(
+                symbol=symbol,
+                dest_coin=dest_coin,
+                qty=sell_native,
+                order_link_id=_order_link_id(snapshot_ts, cursor),
+                reason=(
+                    f"exit hedged Earn {coin_u}: swap {sell_native} freed → "
+                    f"{dest_coin} on redeem settle (no LLM)"
+                ),
             )
+        )
     return actions
 
 
@@ -390,40 +413,23 @@ def _orphan_spot_sell_actions(
             # Below Bybit's spot minOrderAmt ($5) the sell just bounces with
             # retCode=170140 — the remainder is unsellable micro-dust, leave it.
             continue
-        # Spot-sell qty is rounded to the SPOT pair's lot at dispatch
-        # (place_spot_order → validate_qty: basePrecision + spot min). Do
-        # NOT pre-floor to the PERP qty_step here — the perp step is far
-        # coarser than the spot lot (ETH perp 0.01 vs spot 0.00001), so
-        # flooring a disposal to it strands up to ~1 perp lot (prod
-        # 2026-06-09: 0.0058 ETH ≈ $10 left behind because 0.0058 < perp
-        # step 0.01). The MIN_SWAP_USDC value gate above is the real floor;
-        # validate_qty drops a true sub-spot-min remainder on its own.
-        qty = sellable
         # `.49`: BTC/ETH (DiscountBuy settlement landing spots) ship to
         # USDC directly via `{coin}USDC`. Everything else keeps the
-        # universal `{coin}USDT` route.
+        # universal `{coin}USDT` route. Qty is the raw sellable amount —
+        # `_disposal_sell_action` defers spot-lot rounding to dispatch.
         symbol, dest_coin = _orphan_sell_quote(coin_u)
         swaps.append(
-            Action(
-                kind=ActionKind.SWAP_SPOT,
-                category="Spot",
-                product_id=symbol,
-                coin=dest_coin,
-                amount=qty,
-                side="Sell",
+            _disposal_sell_action(
+                symbol=symbol,
+                dest_coin=dest_coin,
+                qty=sellable,
                 order_link_id=_order_link_id(snapshot_ts, cursor),
                 reason=(
-                    f"sell orphan {qty} {coin_u} → {dest_coin} "
+                    f"sell orphan {sellable} {coin_u} → {dest_coin} "
                     f"(~${usd:.2f}): wallet {balance} (UNIFIED+FUND) + Earn "
                     f"{earn_long.get(coin_u, 0)} - perp short {short} = "
                     f"excess {excess_long}"
                 ),
-                # Disposal sell: force the real Sell. Without this the
-                # dispatch's `_transfer_satisfies_swap` reads `amount` as a
-                # dest-coin (USDC/USDT) requirement, finds it already in FUND,
-                # and no-ops the sell — stranding the non-stable (the ETH/dust
-                # never liquidates). Mirrors the stable-consolidation builder.
-                extra={"skip_fund_transfer": True},
             )
         )
         cursor += 1
@@ -634,20 +640,16 @@ def _stable_consolidate_actions(
             continue
         symbol, dest_coin = pair
         swaps.append(
-            Action(
-                kind=ActionKind.SWAP_SPOT,
-                category="Spot",
-                product_id=symbol,
-                coin=dest_coin,
-                amount=qty,
-                side="Sell",
+            _disposal_sell_action(
+                symbol=symbol,
+                dest_coin=dest_coin,
+                qty=qty,
                 order_link_id=_order_link_id(snapshot_ts, cursor),
                 reason=(
                     f"consolidate idle {qty} {coin_u} → {dest_coin} "
                     f"(~${qty:.2f}): non-core stable invisible to the "
                     f"USDC+USDT liquid budget, rebasing to deployable stable"
                 ),
-                extra={"skip_fund_transfer": True},
             )
         )
         cursor += 1
