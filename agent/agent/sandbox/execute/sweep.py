@@ -148,8 +148,11 @@ def exit_actions_from_intent(
     sell_native = min(intent.expected_redeem_native, wallet_native)
     mark = getattr(info, "mark_price", None) if info else None
     if sell_native > 0 and mark and mark > 0 and sell_native * mark >= MIN_SWAP_USDC:
-        qty = _round_to_qty_step(sell_native, qty_step, min_qty)
-        if qty is not None and qty > 0:
+        # Spot-sell qty rounds to the SPOT lot at dispatch (validate_qty),
+        # NOT the perp qty_step — flooring to the coarse perp step strands
+        # up to ~1 perp lot of the freed coin (see `_orphan_spot_sell_actions`).
+        qty = sell_native
+        if qty > 0:
             symbol, dest_coin = _orphan_sell_quote(coin_u)
             actions.append(
                 Action(
@@ -372,11 +375,15 @@ def _orphan_spot_sell_actions(
         usd = sellable * mark
         if usd < MIN_SWAP_USDC:
             continue
-        qty_step = getattr(perp_info, "qty_step", None) if perp_info else None
-        min_qty = getattr(perp_info, "min_order_qty", None) if perp_info else None
-        qty = _round_to_qty_step(sellable, qty_step, min_qty)
-        if qty is None or qty <= 0:
-            continue
+        # Spot-sell qty is rounded to the SPOT pair's lot at dispatch
+        # (place_spot_order → validate_qty: basePrecision + spot min). Do
+        # NOT pre-floor to the PERP qty_step here — the perp step is far
+        # coarser than the spot lot (ETH perp 0.01 vs spot 0.00001), so
+        # flooring a disposal to it strands up to ~1 perp lot (prod
+        # 2026-06-09: 0.0058 ETH ≈ $10 left behind because 0.0058 < perp
+        # step 0.01). The MIN_SWAP_USDC value gate above is the real floor;
+        # validate_qty drops a true sub-spot-min remainder on its own.
+        qty = sellable
         # `.49`: BTC/ETH (DiscountBuy settlement landing spots) ship to
         # USDC directly via `{coin}USDC`. Everything else keeps the
         # universal `{coin}USDT` route.

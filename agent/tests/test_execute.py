@@ -275,6 +275,7 @@ def _perp(
     mark: str = "2.0",
     min_notional: str = "0.5",
     min_order_qty: str = "0.1",
+    qty_step: str | None = None,
 ) -> PerpInfo:
     return PerpInfo(
         symbol=f"{coin.upper()}USDT",
@@ -284,6 +285,7 @@ def _perp(
         min_order_qty=Decimal(min_order_qty),
         min_notional_usd=Decimal(min_notional),
         max_leverage=Decimal("50"),
+        qty_step=Decimal(qty_step) if qty_step is not None else None,
     )
 
 
@@ -611,6 +613,39 @@ def test_diff_orphan_spot_eth_routes_to_usdc() -> None:
     # else `_transfer_satisfies_swap` reads `amount` as a USDC requirement,
     # finds USDC already in FUND, and no-ops the sell — stranding the ETH.
     assert sells[0].extra.get("skip_fund_transfer") is True
+
+
+def test_diff_orphan_spot_not_floored_to_coarse_perp_step() -> None:
+    """A spot disposal must NOT be floored to the PERP qty_step — that is far
+    coarser than the spot lot (ETH perp 0.01 vs spot 0.00001) and strands up
+    to ~1 perp lot. Prod 2026-06-09: 0.0058 ETH (~$9.6, well above the $5
+    swap floor AND the spot $5 min order) was left behind because 0.0058 <
+    perp step 0.01 floored to 0. The full sellable amount must be emitted;
+    dispatch's place_spot_order→validate_qty does the real spot-lot rounding."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={
+            "ETH": _perp(
+                "ETH", mark="1640", min_notional="1.0",
+                min_order_qty="0.01", qty_step="0.01",
+            )
+        },
+    )
+    snap.wallet.unified_coin_balances = {"ETH": Decimal("0.00585572")}  # ~$9.6
+    d = _decision(
+        [
+            _venue("cash_usdc", 0.5),
+            _venue("bybit_flex", 0.5, [("1131", 1.0)]),
+        ]
+    )
+    actions = diff_to_actions(snap, d, snapshot_ts="20260609T230000Z")
+    sells = [
+        a for a in actions
+        if a.kind == ActionKind.SWAP_SPOT and a.product_id == "ETHUSDC"
+    ]
+    assert len(sells) == 1  # old code floored 0.00585 → 0.01 step → 0 → no sell
+    # Full balance emitted, not floored to the coarse perp step.
+    assert sells[0].amount == Decimal("0.00585572")
 
 
 def test_diff_orphan_spot_other_coin_keeps_usdt_route() -> None:
