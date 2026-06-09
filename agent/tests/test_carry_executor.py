@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -33,12 +34,14 @@ from agent.sandbox.execute import (
     ActionKind,
     ActionResult,
     _carry_liq_close_actions,
+    _confirmable_order_links,
     _funding_carry_diff,
     _funding_carry_targets,
     _execute_one,
     _hedge_diff_actions,
     apply_carry_results_to_state,
     diff_to_actions,
+    verify_order_links,
 )
 from agent.sandbox.snapshot import (
     MarketSnapshot,
@@ -498,11 +501,24 @@ def _close_action() -> Action:
     )
 
 
+def _carry_wallet(usdt: str, usdc: str) -> list[SimpleNamespace]:
+    """UNIFIED wallet-balance shape `_coin_equity_from_wallet` walks: a list of
+    accounts each carrying a `coinDetail` of `{coin, equity}` entries."""
+    return [
+        SimpleNamespace(coinDetail=[
+            {"coin": "USDT", "equity": usdt},
+            {"coin": "USDC", "equity": usdc},
+        ])
+    ]
+
+
 def _mock_client(
     *,
     spot_result: SpotOrderResult | Exception | None = None,
     perp_result: SpotOrderResult | Exception | None = None,
     spot_fill: SpotOrderStatus | Exception | None = None,
+    unified_usdt: str = "100000",
+    unified_usdc: str = "0",
 ) -> AsyncMock:
     """Build a minimal client mock for `_execute_one` happy / failure paths.
     `*_result` may be an `Exception` instance to drive the failure
@@ -514,9 +530,18 @@ def _mock_client(
     Pass a SpotOrderStatus to simulate slippage / partial-fill /
     terminal-bad states. Pass an Exception to simulate the realtime
     lookup raising (e.g. order already cleared from realtime cache).
+
+    `unified_usdt` defaults high so the ah.6 carry funding step finds USDT
+    already provisioned and emits no USDC→USDT swap — pass "0" to simulate a
+    USDC-only vault and exercise the swap path.
     """
     client = AsyncMock()
     client.set_leverage = AsyncMock(return_value=None)
+    client.get_wallet_balance = AsyncMock(
+        return_value=_carry_wallet(unified_usdt, unified_usdc)
+    )
+    client.get_account_coin_balance = AsyncMock(return_value=Decimal("0"))
+    client.internal_transfer = AsyncMock(return_value=None)
     spot_default = SpotOrderResult(orderId="SPOT123", orderLinkId="lid_spot")
     perp_default = SpotOrderResult(orderId="PERP456", orderLinkId="lid_perp")
     if isinstance(spot_result, Exception):
@@ -572,6 +597,36 @@ async def test_dispatch_open_happy_path_sets_leverage_then_spot_then_perp() -> N
 
 
 @pytest.mark.asyncio
+async def test_dispatch_open_funds_usdt_via_swap_on_usdc_vault() -> None:
+    """ah.6 (dispatch-1): on a USDC-only vault (UNIFIED USDT=0) the carry OPEN
+    first swaps USDC→USDT (USDCUSDT Sell) to fund the spot Buy + perp margin,
+    THEN buys the coin. Pre-fix the spot Buy 170131'd for lack of USDT."""
+    client = _mock_client(unified_usdt="0", unified_usdc="100000")
+    res = await _execute_one(client, _open_action(), dry_run=False)
+    assert res.status == "ok"
+    symbols = [c.kwargs["symbol"] for c in client.place_spot_order.await_args_list]
+    sides = [c.kwargs["side"] for c in client.place_spot_order.await_args_list]
+    # USDC→USDT funding swap precedes the {coin}USDT Buy.
+    assert symbols == ["USDCUSDT", "TONUSDT"]
+    assert sides == ["Sell", "Buy"]
+    assert res.response["legs"]["funding"]["swap"] == "USDCUSDT Sell"
+    # Sized to cover spot (1x) + perp margin (1.05x) of the $100 pick.
+    assert res.response["legs"]["funding"]["required_usdt"] == "205.000000"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_open_skips_swap_when_usdt_already_funded() -> None:
+    """When UNIFIED already holds enough USDT, the carry OPEN emits NO funding
+    swap — just the single {coin}USDT spot Buy."""
+    client = _mock_client(unified_usdt="100000")
+    res = await _execute_one(client, _open_action(), dry_run=False)
+    assert res.status == "ok"
+    client.place_spot_order.assert_awaited_once()
+    assert client.place_spot_order.await_args.kwargs["symbol"] == "TONUSDT"
+    assert "funding" not in res.response["legs"]
+
+
+@pytest.mark.asyncio
 async def test_dispatch_open_spot_failure_does_not_call_perp() -> None:
     """Atomic-pair guard: if the spot Buy raises, the perp Sell must
     NOT be submitted — caller is left with no position (and no naked
@@ -622,8 +677,8 @@ async def test_dispatch_open_paired_notional_drift_marks_orphan() -> None:
     the realized fill price diverges from the snapshot mark beyond 5%
     — e.g. a thin order book filled 80 base for $100 quote (fill price
     $1.25 vs mark $2.0), so perp_notional = 80 × 2.0 = $160 while
-    spot_notional = $100 → 60% drift. Perp leg is skipped, naked spot
-    surfaces as orphan, next cycle's CLOSE reconciles."""
+    spot_notional = $100 → 60% drift. Perp leg is skipped; the spot is then
+    UNWOUND atomically (ah.9) so no naked long is left."""
     action = _open_action()
     # Anomalous spot fill: received 80 TON for $100 (slippage to $1.25).
     fill = SpotOrderStatus(
@@ -635,8 +690,12 @@ async def test_dispatch_open_paired_notional_drift_marks_orphan() -> None:
     client = _mock_client(spot_fill=fill)
     res = await _execute_one(client, action, dry_run=False)
     assert res.status == "orphan"
-    # Spot already submitted
-    client.place_spot_order.assert_awaited_once()
+    # Two spot orders: the Buy, then the ah.9 compensating unwind Sell.
+    assert client.place_spot_order.await_count == 2
+    unwind_call = client.place_spot_order.await_args_list[1]
+    assert unwind_call.kwargs["side"] == "Sell"
+    assert unwind_call.kwargs["symbol"] == "TONUSDT"
+    assert res.response["legs"]["unwind"]["unwound"] is True
     # Perp leg NOT submitted (drift gate fires before the place_perp_order)
     client.place_perp_order.assert_not_awaited()
     assert res.error is not None and "paired-notional check failed" in res.error
@@ -1057,3 +1116,175 @@ def test_kill_switch_close_orders_before_open() -> None:
     )
     assert close_idx is not None and open_idx is not None
     assert close_idx < open_idx
+
+
+# ─── ah.7 crash recovery: pending-intent marker + order-link verification ────
+
+
+def test_pending_intent_roundtrip(tmp_path: Path) -> None:
+    """Write → read → clear a pending-intent marker (durable across a crash)."""
+    from agent.sandbox.pending_intent import (
+        PendingIntent,
+        PendingOrderLink,
+        clear_pending_intent,
+        read_pending_intent,
+        write_pending_intent,
+    )
+    path = tmp_path / "pending_intent.json"
+    intent = PendingIntent(
+        snapshot_ts="20260609T120000Z",
+        links=[PendingOrderLink(
+            order_link_id="lid_perp", category="linear", symbol="TONUSDT",
+            kind="open_funding_carry", coin="TON",
+        )],
+    )
+    write_pending_intent(intent, path)
+    loaded = read_pending_intent(path)
+    assert loaded is not None
+    assert loaded.snapshot_ts == "20260609T120000Z"
+    assert loaded.links[0].order_link_id == "lid_perp"
+    clear_pending_intent(path)
+    assert read_pending_intent(path) is None
+    # Clearing an already-absent marker is a no-op (idempotent).
+    clear_pending_intent(path)
+
+
+def test_read_pending_intent_missing_returns_none(tmp_path: Path) -> None:
+    from agent.sandbox.pending_intent import read_pending_intent
+    assert read_pending_intent(tmp_path / "nope.json") is None
+
+
+def test_confirmable_order_links_expands_carry_into_both_legs() -> None:
+    """A carry open contributes BOTH a spot and a linear leg link (under the
+    derived `_spot` / `_perp` ids); a perp short contributes one linear link;
+    an Earn subscribe is unconfirmable and contributes none."""
+    carry = _open_action()  # spot_order_link_id=lid_spot, perp_order_link_id=lid_perp
+    perp = Action(
+        kind=ActionKind.OPEN_PERP_SHORT, category="hedge", product_id="IDUSDT",
+        coin="ID", amount=Decimal("3"), order_link_id="p1", reason="hedge",
+    )
+    subscribe = Action(
+        kind=ActionKind.SUBSCRIBE_EARN, category="FlexibleSaving",
+        product_id="1131", coin="USDC", amount=Decimal("10"),
+        order_link_id="s1", reason="earn",
+    )
+    links = _confirmable_order_links([carry, perp, subscribe])
+    by_link = {link["order_link_id"]: link for link in links}
+    assert by_link["lid_spot"]["category"] == "spot"
+    assert by_link["lid_perp"]["category"] == "linear"
+    assert by_link["p1"]["category"] == "linear"
+    # Earn subscribe is omitted (no order-history endpoint).
+    assert "s1" not in by_link
+    assert len(links) == 3
+
+
+@pytest.mark.asyncio
+async def test_verify_order_links_classifies_landed_and_no_trace() -> None:
+    """`verify_order_links` marks a link whose order is on Bybit as
+    confirmed-landed and one with no order as no-trace."""
+    client = AsyncMock()
+    # First link lands (history non-empty), second doesn't.
+    client.get_order_history = AsyncMock(side_effect=[[{"orderId": "X"}], []])
+    res = await verify_order_links(client, [
+        {"order_link_id": "lid_perp", "category": "linear", "symbol": "TONUSDT"},
+        {"order_link_id": "lid_spot", "category": "spot", "symbol": "TONUSDT"},
+    ])
+    assert res["counts"].get("confirmed-landed") == 1
+    assert res["counts"].get("no-trace") == 1
+
+
+@pytest.mark.asyncio
+async def test_verify_order_links_marks_query_error() -> None:
+    """A history lookup that raises is classified query-error (can't confirm →
+    the startup gate treats it as blocking)."""
+    from agent.bybit_oracle.bybit_client import BybitAPIError
+    client = AsyncMock()
+    client.get_order_history = AsyncMock(
+        side_effect=BybitAPIError(10001, "boom", "/v5/order/history")
+    )
+    res = await verify_order_links(client, [
+        {"order_link_id": "l", "category": "linear", "symbol": "TONUSDT"},
+    ])
+    assert res["counts"].get("query-error") == 1
+
+
+# ─── ah.9 actual-fill persistence + atomic orphan unwind ────────────────────
+
+
+def test_apply_carry_open_records_actual_fill_not_plan() -> None:
+    """dispatch-3: the carry_state record is sized from the ACTUAL spot fill
+    (cumExecQty + realized price), not the planner's amount_native/mark — so a
+    later CLOSE sizes both legs off the real position."""
+    action = _open_action()  # planned amount_native=50, mark=2.0
+    result = ActionResult(
+        action=action,
+        status="ok",
+        response={"legs": {"spot": {"cumExecQty": "80", "cumExecValue": "100"}}},
+        error=None,
+        started_at="2026-06-09T00:00:00+00:00",
+        finished_at="2026-06-09T00:00:01+00:00",
+    )
+    rec = apply_carry_results_to_state(CarryState(), [result]).get("TON")
+    assert rec is not None
+    assert rec.spot_qty_base == Decimal("80")  # actual fill, not planned 50
+    assert rec.perp_qty_base == Decimal("80")
+    assert rec.mark_price_at_open == Decimal("1.25")  # 100/80 realized price
+
+
+def test_apply_carry_open_falls_back_to_plan_without_fill() -> None:
+    """No cumExecQty in the response → fall back to the planned amount_native /
+    mark (older actions / partial response shapes)."""
+    result = ActionResult(
+        action=_open_action(), status="ok", response={"legs": {"spot": {}}},
+        error=None, started_at="t", finished_at="t",
+    )
+    rec = apply_carry_results_to_state(CarryState(), [result]).get("TON")
+    assert rec is not None
+    assert rec.spot_qty_base == Decimal("50.000")  # planned amount_native
+    assert rec.mark_price_at_open == Decimal("2.0")  # planned mark
+
+
+def test_apply_carry_open_orphan_writes_no_record() -> None:
+    """state-3: an orphan OPEN writes NO position record — the dispatch unwinds
+    the spot and the orphan-seller sweeps any residual; a perp_qty=0 record
+    would collide with that sweep."""
+    result = ActionResult(
+        action=_open_action(), status="orphan",
+        response={"legs": {"spot": {"cumExecQty": "50"}, "unwind": {"unwound": True}}},
+        error="perp leg failed", started_at="t", finished_at="t",
+    )
+    state = apply_carry_results_to_state(CarryState(), [result])
+    assert state.get("TON") is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_open_perp_failure_unwinds_spot() -> None:
+    """ah.9: when the perp leg fails after the spot filled, the spot is sold
+    back atomically — no naked long left."""
+    client = _mock_client(
+        perp_result=BybitAPIError(110007, "Insufficient margin", "/v5/order/create")
+    )
+    res = await _execute_one(client, _open_action(), dry_run=False)
+    assert res.status == "orphan"
+    assert client.place_spot_order.await_count == 2  # Buy + unwind Sell
+    assert client.place_spot_order.await_args_list[1].kwargs["side"] == "Sell"
+    assert res.response["legs"]["unwind"]["unwound"] is True
+
+
+@pytest.mark.asyncio
+async def test_dispatch_open_unwind_failure_surfaces_naked() -> None:
+    """If the perp fails AND the compensating unwind Sell also fails, the
+    result flags the genuinely-naked spot (unwound=False) for the operator /
+    next-cycle sweep."""
+    client = _mock_client(
+        perp_result=BybitAPIError(110007, "Insufficient margin", "/v5/order/create")
+    )
+    # Spot Buy succeeds; the unwind Sell (2nd spot call) raises.
+    client.place_spot_order = AsyncMock(side_effect=[
+        SpotOrderResult(orderId="SPOT123", orderLinkId="lid_spot"),
+        BybitAPIError(170131, "Insufficient balance", "/v5/order/create"),
+    ])
+    res = await _execute_one(client, _open_action(), dry_run=False)
+    assert res.status == "orphan"
+    assert res.response["legs"]["unwind"]["unwound"] is False
+    assert "170131" in res.response["legs"]["unwind"]["error"]

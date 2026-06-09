@@ -48,6 +48,7 @@ from agent.sandbox.snapshot import (
     _lm_is_unleveraged,
     _flex_or_onchain_summary,
     _hold_to_earn_summary,
+    _inject_lm_hedge_residuals,
     _is_open_perp,
     _kline_period_return,
     _kline_pct_change,
@@ -62,6 +63,43 @@ from agent.sandbox.snapshot import (
     _usdt_in_unified,
     collect_snapshot,
 )
+
+
+def _lm_catalog_row(coin: str, product_id: str = "24") -> ProductSummary:
+    return ProductSummary(
+        category="LiquidityMining", product_id=product_id, coin=coin,
+        effective_apr=Decimal("0.1"), apr_source="apy_e8",
+        base_apr_string=None, redeem_lockup_minutes=None, notes=[],
+    )
+
+
+def test_inject_lm_residual_no_perp_surfaces_full_base_leg() -> None:
+    """wt-4: a held LM whose base coin has NO perp in the fan-out gets its
+    ENTIRE base leg surfaced as naked residual — the worst case the old
+    `continue` silently dropped, so the de-risk redeem never fired."""
+    products = {"LiquidityMining": [_lm_catalog_row("ID/USDT")]}
+    pos = {"productId": "24", "positionId": "p24",
+           "principalLiquidityValue": "100"}
+    _inject_lm_hedge_residuals([pos], products, {}, Decimal("100"))
+    # base leg = 100 × 0.5 = 50, fully naked (no perp) → 50% of $100 book.
+    assert Decimal(pos["hedge_residual_naked_usd"]) == Decimal("50")
+    assert Decimal(pos["hedge_residual_pct_of_book"]) == Decimal("0.5")
+
+
+def test_inject_lm_residual_with_perp_hedges_partially() -> None:
+    """Regression guard: with a perp present only the lot-rounding remainder
+    is naked, not the whole base leg."""
+    products = {"LiquidityMining": [_lm_catalog_row("ETH/USDT")]}
+    pos = {"productId": "24", "positionId": "p24",
+           "principalLiquidityValue": "100"}
+    perp = PerpInfo(
+        symbol="ETHUSDT", funding_rate_8h=Decimal("0"),
+        mark_price=Decimal("2000"), qty_step=Decimal("0.02"),
+        min_order_qty=Decimal("0.001"),
+    )
+    _inject_lm_hedge_residuals([pos], products, {"ETH": perp}, Decimal("100"))
+    # base leg 50, hedge floor-rounds to 0.02 ETH = $40 → $10 naked < full 50.
+    assert Decimal(pos["hedge_residual_naked_usd"]) == Decimal("10")
 
 
 # ─── WalletSnapshot deployable-budget advisory (`bybit-sandbox.67`) ──────────

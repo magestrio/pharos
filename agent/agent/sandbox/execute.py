@@ -61,6 +61,7 @@ from agent.sandbox.carry_state import (
     CarryPositionRecord,
     CarryState,
 )
+from agent.sandbox.redeem_intent import RedeemExitIntent
 from agent.sandbox.snapshot import (
     HEDGE_MARGIN_BUFFER,
     SNAPSHOT_DIR,
@@ -373,6 +374,13 @@ _UNIFIED_SPEND_RESERVE_FLOOR = Decimal("0.20")
 # inflow by this factor or it over-counts spendable USDT by the fee and the
 # tail Buy leg drops a few cents short at dispatch.
 _FUNDING_SWAP_FEE_FACTOR = Decimal("0.999")
+
+# USDT a funding-carry OPEN consumes per $1 of pick: the spot Buy spends 1×
+# (quote USDT) and the perp short posts HEDGE_MARGIN_BUFFER× margin. Both legs
+# are USDT-denominated, but the vault holds USDC — so the carry dispatch
+# provisions this much USDT (swapping USDC→USDT when short) before firing the
+# legs, else a NEW carry 170131s on a USDC-only book (dispatch-1 / ah.6).
+_CARRY_OPEN_USDT_FACTOR = Decimal(1) + HEDGE_MARGIN_BUFFER
 
 
 @dataclass
@@ -1441,11 +1449,32 @@ def diff_to_actions(
     # count the *actual* `len(hedge_swaps)` — so when no hedge swap is
     # emitted, an `earn_swaps` entry and the `usdt_excess` sweep collided
     # on the same id (`bybit-sandbox.68`: retCode 170141 Duplicate
-    # clientOrderId). Renumbering here is deterministic (same diff → same
-    # ids), so the read-only crash-replay scan still matches.
-    for i, a in enumerate(actions):
-        a.order_link_id = _order_link_id(snapshot_ts, i)
+    # clientOrderId).
+    _reindex_order_link_ids(actions, snapshot_ts)
     return actions
+
+
+def _reindex_order_link_ids(actions: list[Action], snapshot_ts: str) -> None:
+    """Reassign every action's `orderLinkId` by final position (in place) so
+    Bybit-side idempotency keys are unique regardless of how the per-block
+    `idx_offset` arithmetic lined up. Deterministic (same actions → same ids),
+    so the read-only crash-replay scan still matches.
+
+    Carry legs store their own spot/perp ids in `extra`, DERIVED from the
+    action id at construction (`{order_link_id}_spot`/`_perp`). Rewrite those
+    from the NEW id too (executor-4) — otherwise they keep the stale id, which
+    shadows the correct `{order_link_id}_*` fallback at execute time and the
+    legs dispatch under an id that doesn't match the reindexed parent. Shared
+    by `diff_to_actions` and the de-risk sweep (executor-3) so the two paths
+    can't drift."""
+    for i, a in enumerate(actions):
+        new_id = _order_link_id(snapshot_ts, i)
+        a.order_link_id = new_id
+        if a.extra:
+            if "spot_order_link_id" in a.extra:
+                a.extra["spot_order_link_id"] = f"{new_id}_spot"
+            if "perp_order_link_id" in a.extra:
+                a.extra["perp_order_link_id"] = f"{new_id}_perp"
 
 
 def _coin_from_perp_symbol(symbol: str) -> str:
@@ -2674,10 +2703,13 @@ def apply_carry_results_to_state(
     """Roll a fresh `CarryState` forward by walking dispatch results.
 
     Successful `OPEN_FUNDING_CARRY` (status="ok") → insert a position
-    record sized from the planned action. Successful
-    `CLOSE_FUNDING_CARRY` → drop the matching coin's record.
-    OPEN orphans leave naked spot (no record to write — the orphan log
-    captures it for operator reconciliation). CLOSE orphans KEEP the
+    record sized from the ACTUAL spot fill (cumExecQty + realized price),
+    falling back to the planned action only when the response lacks fills
+    (dispatch-3). Successful `CLOSE_FUNDING_CARRY` → drop the matching coin's
+    record. OPEN orphans write NO record: the dispatch already atomically
+    unwinds the half-open (sells the spot back), and any residual naked spot is
+    swept by `_orphan_spot_sell_actions` next cycle — a perp_qty=0 record here
+    would instead collide with that sweep (state-3). CLOSE orphans KEEP the
     record (partial unwind, next cycle's CLOSE retries) AND bump the
     `close_attempts` counter so `_funding_carry_diff` can stop emitting
     after `MAX_CARRY_CLOSE_ATTEMPTS` cycles — protects against
@@ -2689,20 +2721,44 @@ def apply_carry_results_to_state(
     for r in results:
         a = r.action
         if a.kind == ActionKind.OPEN_FUNDING_CARRY and r.status == "ok":
-            if a.amount_native is None or a.amount_native <= 0:
+            # Size the record from the ACTUAL spot fill (cumExecQty + realized
+            # price), not the planned amount_native / mark — the CLOSE later
+            # sizes both legs off this record, and a mark-vs-fill gap would
+            # leave a residual (dispatch-3). Both legs use the same base qty
+            # (the dispatch sizes the perp from the spot fill), so the record
+            # stays delta-neutral. Fall back to planned when the response
+            # lacks fills (older actions / partial response shapes).
+            spot_leg = (r.response or {}).get("legs", {}).get("spot", {})
+            try:
+                filled_qty = Decimal(str(spot_leg.get("cumExecQty")))
+            except (InvalidOperation, TypeError):
+                filled_qty = None
+            base_qty = (
+                filled_qty
+                if filled_qty is not None and filled_qty > 0
+                else a.amount_native
+            )
+            if base_qty is None or base_qty <= 0:
                 continue
             try:
-                mark = Decimal(str(a.extra.get("mark_price") or "0"))
+                filled_value = Decimal(str(spot_leg.get("cumExecValue")))
             except (InvalidOperation, TypeError):
-                mark = Decimal(0)
+                filled_value = None
+            if filled_value is not None and filled_value > 0:
+                realized_mark = filled_value / base_qty
+            else:
+                try:
+                    realized_mark = Decimal(str(a.extra.get("mark_price") or "0"))
+                except (InvalidOperation, TypeError):
+                    realized_mark = Decimal(0)
             next_state = next_state.upsert(
                 CarryPositionRecord(
                     coin=a.coin.upper(),
                     opened_at=datetime.now(UTC),
                     target_pick_usd=a.amount,
-                    spot_qty_base=a.amount_native,
-                    perp_qty_base=a.amount_native,
-                    mark_price_at_open=mark,
+                    spot_qty_base=base_qty,
+                    perp_qty_base=base_qty,
+                    mark_price_at_open=realized_mark,
                     spot_order_link_id=(
                         a.extra.get("spot_order_link_id")
                         or f"{a.order_link_id}_spot"
@@ -3054,6 +3110,62 @@ async def _ensure_unified_balance(
         "letting spot order surface the real shortfall",
         coin,
     )
+
+
+async def _fund_carry_open_usdt(
+    client: Any, pick_usd: Decimal, order_link_id: str
+) -> dict[str, Any] | None:
+    """Ensure UNIFIED holds enough USDT to open a `pick_usd`-sized funding
+    carry — spot Buy quote (1×) + perp short margin (HEDGE_MARGIN_BUFFER×) —
+    creating it from USDC via a `USDCUSDT` Sell when short (dispatch-1 / ah.6).
+
+    A carry's legs are both USDT-denominated but the vault holds USDC, so on a
+    USDC-only book the spot Buy 170131s with no USDT. Mirrors the hedge funding
+    path (`_swap_actions_for_hedges` → SWAP_SPOT → `_ensure_unified_balance`)
+    but inline, since carry is a compound single action with no planned swap.
+
+    Returns a swap receipt dict, or None when existing USDT already covers the
+    need (no swap emitted). Raises only if an underlying client call raises —
+    caught by `_execute_one`'s outer guard, leaving NO open leg (runs first).
+    """
+    required = (pick_usd * _CARRY_OPEN_USDT_FACTOR).quantize(
+        Decimal("0.000001"), rounding=ROUND_DOWN
+    )
+    if required <= 0:
+        return None
+    # Pull any USDT already sitting in FUND into UNIFIED first — it may cover
+    # the need without a fee-bearing swap.
+    await _ensure_unified_balance(client, "USDT", required)
+    try:
+        bal = await client.get_wallet_balance(coin="USDT", account_type="UNIFIED")
+        have = _coin_equity_from_wallet(bal, "USDT")
+    except Exception as e:  # noqa: BLE001
+        log.warning("carry funding: UNIFIED USDT probe failed: %s", e)
+        have = Decimal(0)
+    shortfall = required - have
+    if shortfall < MIN_SWAP_USDC:
+        return None
+    # Over-convert by the taker fee + 0.5% headroom (qty rounds DOWN) so the
+    # netted USDT clears both legs — a bare-shortfall swap under-delivers.
+    usdc_to_sell = (
+        shortfall / _FUNDING_SWAP_FEE_FACTOR * _STABLE_SWAP_HEADROOM
+    ).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+    await _ensure_unified_balance(client, "USDC", usdc_to_sell)
+    swap_out = await client.place_spot_order(
+        symbol="USDCUSDT",
+        side="Sell",
+        qty_base=str(usdc_to_sell),
+        order_link_id=f"{order_link_id}_carryfund",
+    )
+    # Re-pull so the freshly-swapped USDT is in UNIFIED for the spot Buy +
+    # perp margin (the Sell credits UNIFIED; this also drains any FUND dust).
+    await _ensure_unified_balance(client, "USDT", required)
+    return {
+        "swap": "USDCUSDT Sell",
+        "usdc_sold": str(usdc_to_sell),
+        "required_usdt": str(required),
+        "orderId": getattr(swap_out, "orderId", None),
+    }
 
 
 async def _ensure_fund_balance(
@@ -3732,6 +3844,147 @@ def _coin_to_perp_short_size(snapshot: Snapshot) -> dict[str, Decimal]:
     return out
 
 
+def _coin_wallet_native(snapshot: Snapshot, coin: str) -> Decimal:
+    """Native coin balance across UNIFIED + FUND (the freed-Earn coin lands in
+    FUND for OnChain). Mirrors the merge in `_orphan_spot_sell_actions`."""
+    cu = (coin or "").upper()
+    total = Decimal(0)
+    for src in (
+        snapshot.wallet.unified_coin_balances or {},
+        getattr(snapshot.wallet, "fund_coin_balances", None) or {},
+    ):
+        for c, raw in src.items():
+            if (c or "").upper() != cu:
+                continue
+            try:
+                total += raw if isinstance(raw, Decimal) else Decimal(str(raw))
+            except (InvalidOperation, TypeError):
+                continue
+    return total
+
+
+def build_redeem_exit_intents(
+    snapshot: Snapshot,
+    results: list["ExecutionResult"],
+) -> list[RedeemExitIntent]:
+    """Record one `RedeemExitIntent` per successful `REDEEM_EARN` on a
+    non-stable coin (a hedged-Earn exit). Captures the pre-redeem wallet
+    balance (`snapshot` is the cycle's pre-execute snapshot) so the watcher
+    can detect arrival by delta, and the paired short so the exit closes the
+    exact size. Pure: caller persists into the durable store.
+
+    Stables are skipped (no hedge, no swap-back). A non-stable redeem without
+    a live paired short still records (`paired_perp_symbol=None`) — the
+    swap-back is wanted regardless; the handler just skips the perp close."""
+    shorts = _coin_to_perp_short_size(snapshot)
+    opened_at = datetime.now(UTC)
+    intents: list[RedeemExitIntent] = []
+    for r in results:
+        if getattr(r, "status", None) != "ok":
+            continue
+        a = getattr(r, "action", None)
+        if a is None or a.kind != ActionKind.REDEEM_EARN:
+            continue
+        coin = (a.coin or "").upper()
+        if not coin or coin in _STABLES:
+            continue
+        short = shorts.get(coin, Decimal(0))
+        expected = a.amount_native if a.amount_native is not None else a.amount
+        intents.append(
+            RedeemExitIntent(
+                coin=coin,
+                product_id=a.product_id,
+                category=a.category,
+                opened_at=opened_at,
+                expected_redeem_native=expected,
+                baseline_wallet_native=_coin_wallet_native(snapshot, coin),
+                redeem_order_link_id=a.order_link_id,
+                paired_perp_symbol=f"{coin}USDT" if short > 0 else None,
+                perp_qty_base=short,
+            )
+        )
+    return intents
+
+
+def exit_actions_from_intent(
+    snapshot: Snapshot,
+    intent: RedeemExitIntent,
+    *,
+    snapshot_ts: str,
+    idx_offset: int,
+) -> list[Action]:
+    """Build the deterministic exit for ONE settled hedged-Earn redeem: close
+    the paired perp short, then swap the freed coin to a stable — both in the
+    same cycle, sized from the RECORDED redeem (capped at the live wallet so we
+    never over-sell). CLOSE first (a momentary naked-long between the two legs
+    is safer than a naked-short, matching `closes→swaps` ordering).
+
+    Returns [] when nothing is actionable (coin not yet arrived / already
+    flat) — the caller treats an empty result on a vanished Earn row as
+    "fully unwound, drop the intent"."""
+    actions: list[Action] = []
+    cursor = idx_offset
+    coin_u = intent.coin.upper()
+    info = (snapshot.perp_market or {}).get(coin_u) or (
+        snapshot.perp_market or {}
+    ).get(coin_u.lower())
+    qty_step = getattr(info, "qty_step", None) if info else None
+    min_qty = getattr(info, "min_order_qty", None) if info else None
+
+    # 1. Close the paired short (only the size still open, capped at recorded).
+    if intent.paired_perp_symbol:
+        live_short = _coin_to_perp_short_size(snapshot).get(coin_u, Decimal(0))
+        if live_short > 0:
+            want = (
+                min(intent.perp_qty_base, live_short)
+                if intent.perp_qty_base > 0
+                else live_short
+            )
+            qty = _round_to_qty_step(want, qty_step, min_qty)
+            if qty is not None and qty > 0:
+                actions.append(
+                    Action(
+                        kind=ActionKind.CLOSE_PERP,
+                        category="linear",
+                        product_id=intent.paired_perp_symbol,
+                        coin=coin_u,
+                        amount=qty,
+                        order_link_id=_order_link_id(snapshot_ts, cursor),
+                        reason=(
+                            f"exit hedged Earn {coin_u}: close paired short "
+                            f"{qty} on redeem settle (no LLM)"
+                        ),
+                    )
+                )
+                cursor += 1
+
+    # 2. Swap the freed coin to a stable — exactly the redeemed native, capped
+    #    at the live wallet balance (UNIFIED+FUND).
+    wallet_native = _coin_wallet_native(snapshot, coin_u)
+    sell_native = min(intent.expected_redeem_native, wallet_native)
+    mark = getattr(info, "mark_price", None) if info else None
+    if sell_native > 0 and mark and mark > 0 and sell_native * mark >= MIN_SWAP_USDC:
+        qty = _round_to_qty_step(sell_native, qty_step, min_qty)
+        if qty is not None and qty > 0:
+            symbol, dest_coin = _orphan_sell_quote(coin_u)
+            actions.append(
+                Action(
+                    kind=ActionKind.SWAP_SPOT,
+                    category="Spot",
+                    product_id=symbol,
+                    coin=dest_coin,
+                    amount=qty,
+                    side="Sell",
+                    order_link_id=_order_link_id(snapshot_ts, cursor),
+                    reason=(
+                        f"exit hedged Earn {coin_u}: swap {qty} freed → "
+                        f"{dest_coin} on redeem settle (no LLM)"
+                    ),
+                )
+            )
+    return actions
+
+
 def _orphan_perp_close_actions(
     snapshot: Snapshot,
     snapshot_ts: str,
@@ -3967,6 +4220,7 @@ def _lm_residual_redeem_actions(
     snapshot_ts: str,
     *,
     idx_offset: int,
+    blocked_position_ids: set[str] | None = None,
 ) -> list[Action]:
     """Full-redeem any HELD LM position whose un-hedgeable naked base-coin
     residual exceeds `LM_RESIDUAL_NAKED_MAX` of book (lm-residual epic).
@@ -3985,13 +4239,16 @@ def _lm_residual_redeem_actions(
     the short still backs real base exposure; once the LP settles the short
     goes orphan and `_orphan_perp_close_actions` closes it. Full exit only
     (removeRate=100). Skipped: positions at/under `MIN_ACTION_USDC`, and any
-    already `Processing` (redeem in flight) so we don't re-submit a doomed
-    removeRate=100 every non-executing cycle until settlement (Bybit 180020).
-    Only an explicit `Processing` status is skipped — an absent/`Active`
-    status still redeems, so a healthy position is never wrongly held."""
+    positionId in `blocked_position_ids` — the durable redeem cooldown (wt-3)
+    we already submitted a redeem for within the settlement window, so we
+    don't re-submit a doomed removeRate=100 every non-executing cycle (Bybit
+    180020). This replaces an earlier `status=="Processing"` guard the LM
+    payload doesn't reliably populate; positionId + timestamp is robust to a
+    missing status field. After the window a still-naked position retries."""
     actions: list[Action] = []
     cursor = idx_offset
     seen: set[str] = set()
+    blocked = blocked_position_ids or set()
     for pos in snapshot.lm_positions or []:
         raw = pos.get("hedge_residual_pct_of_book")
         if raw is None:
@@ -4002,14 +4259,13 @@ def _lm_residual_redeem_actions(
             continue
         if pct <= LM_RESIDUAL_NAKED_MAX:
             continue
-        # Redeem already in flight — Bybit reports `Processing` and a second
-        # removeRate=100 just 180020-errors. Mirrors the OnChain-Earn guard
-        # (`_is_fully_processing`); guards against per-cycle redeem spam while
-        # the LP settles. Absent/`Active` status falls through and redeems.
-        if str(pos.get("status") or "").strip().lower() == "processing":
-            continue
         position_id = str(pos.get("positionId") or "")
         if not position_id or position_id in seen:
+            continue
+        # Redeem already emitted for this position within the cooldown window
+        # — the LP settles async, so re-emitting removeRate=100 every cycle
+        # just 180020-spams until settlement.
+        if position_id in blocked:
             continue
         held_usd = _lm_principal_usd(pos)
         if held_usd <= MIN_ACTION_USDC:
@@ -4996,6 +5252,31 @@ async def execute_actions(
     return results
 
 
+async def _unwind_carry_spot(
+    client: BybitClient, symbol: str, base_qty: Decimal, order_link_id: str
+) -> dict[str, Any]:
+    """Atomically flatten a half-open funding carry: sell `base_qty` of the
+    just-bought spot back when the perp leg never landed (ah.9 / state-3). A
+    spot Market Sell takes base-coin qty. Returns `{"unwound": True, ...}` on
+    success (zero naked directional exposure left) or `{"unwound": False,
+    "error": ...}` — on failure the genuinely-naked spot is surfaced for the
+    operator and swept by `_orphan_spot_sell_actions` next cycle."""
+    try:
+        out = await client.place_spot_order(
+            symbol=symbol,
+            side="Sell",
+            qty_base=str(base_qty),
+            order_link_id=f"{order_link_id}_unwind",
+        )
+        return {
+            "unwound": True,
+            "orderId": out.orderId,
+            "qty_base": str(base_qty),
+        }
+    except BybitAPIError as e:
+        return {"unwound": False, "error": f"retCode={e.ret_code} {e.ret_msg}"}
+
+
 async def _execute_one(
     client: BybitClient, action: Action, *, dry_run: bool
 ) -> ActionResult:
@@ -5113,6 +5394,15 @@ async def _execute_one(
                 f"{action.order_link_id}_perp"
             )
             response = {"legs": {}}
+            # ah.6 (dispatch-1): both legs are USDT-denominated but the vault
+            # holds USDC — provision UNIFIED USDT (swap USDC→USDT when short)
+            # BEFORE either leg fires, else the spot Buy 170131s on a USDC-only
+            # book. Runs first, so a funding failure leaves no open leg.
+            carry_fund = await _fund_carry_open_usdt(
+                client, action.amount, action.order_link_id
+            )
+            if carry_fund is not None:
+                response["legs"]["funding"] = carry_fund
             await client.set_leverage(action.product_id, 1)
             # Spot Buy uses QUOTE amount (USDT) on V5 market orders —
             # action.amount is the USD-equivalent target. `.27` API now
@@ -5224,10 +5514,14 @@ async def _execute_one(
                             f"paired-notional drift {drift:.2%} > "
                             f"{_CARRY_PAIRED_NOTIONAL_TOLERANCE:.0%} tolerance "
                             f"(spot ${spot_notional_usd:.2f} vs "
-                            f"perp ${perp_notional_usd:.2f}); "
-                            f"naked spot long left — next-cycle CLOSE will reconcile"
+                            f"perp ${perp_notional_usd:.2f}) — unwinding spot"
                         )
                     }
+                    # ah.9: flatten the half-open atomically (sell the spot
+                    # back) instead of leaving a naked long for next cycle.
+                    response["legs"]["unwind"] = await _unwind_carry_spot(
+                        client, action.product_id, base_qty, action.order_link_id
+                    )
                     return ActionResult(
                         action=action,
                         status="orphan",
@@ -5259,8 +5553,13 @@ async def _execute_one(
                 # via the hedge layer fallback).
                 response["legs"]["perp"] = {
                     "error": f"retCode={e.ret_code} {e.ret_msg}",
-                    "skipped": "naked spot long left after perp leg failure",
+                    "skipped": "perp leg failed after spot fill — unwinding spot",
                 }
+                # ah.9: flatten the half-open atomically (sell the spot back)
+                # so the perp-fail leaves zero naked directional exposure.
+                response["legs"]["unwind"] = await _unwind_carry_spot(
+                    client, action.product_id, base_qty, action.order_link_id
+                )
                 return ActionResult(
                     action=action,
                     status="orphan",
@@ -5905,6 +6204,83 @@ async def verify_executions_against_bybit(
     result["counts"] = counts
     result["actions"] = actions
     return result
+
+
+def _confirmable_order_links(actions: list[Action]) -> list[dict[str, Any]]:
+    """Extract the Bybit-confirmable order links a cycle is about to place, for
+    the pending-intent marker (ah.7). Only orders that hit `/v5/order/create`
+    and show in `/v5/order/history` are confirmable: SWAP_SPOT (spot),
+    OPEN_PERP_SHORT / CLOSE_PERP (linear), and BOTH legs of a funding-carry
+    open/close (spot + perp, under the derived `_spot` / `_perp` link ids).
+    Earn / LM / advance-Earn / Alpha have no order-history endpoint and are
+    omitted — a crash there is recoverable from the next snapshot read.
+    """
+    links: list[dict[str, Any]] = []
+    for a in actions:
+        cat = _ORDER_HISTORY_CATEGORY.get(a.kind)
+        if cat is not None:
+            links.append({
+                "order_link_id": a.order_link_id,
+                "category": cat,
+                "symbol": a.product_id,
+                "kind": a.kind.value,
+                "coin": a.coin,
+            })
+        elif a.kind in (
+            ActionKind.OPEN_FUNDING_CARRY, ActionKind.CLOSE_FUNDING_CARRY
+        ):
+            spot_link = (
+                a.extra.get("spot_order_link_id") or f"{a.order_link_id}_spot"
+            )
+            perp_link = (
+                a.extra.get("perp_order_link_id") or f"{a.order_link_id}_perp"
+            )
+            links.append({
+                "order_link_id": spot_link, "category": "spot",
+                "symbol": a.product_id, "kind": a.kind.value, "coin": a.coin,
+            })
+            links.append({
+                "order_link_id": perp_link, "category": "linear",
+                "symbol": a.product_id, "kind": a.kind.value, "coin": a.coin,
+            })
+    return links
+
+
+async def verify_order_links(
+    client: BybitClient, links: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Cross-check `{order_link_id, category, symbol}` links against live Bybit
+    order-history (ah.7 startup gate). READ-ONLY — classifies each link like
+    `verify_executions_against_bybit` but with no log row to compare against:
+
+      - `confirmed-landed`: an order with this link exists on Bybit → a real
+        position the cycle never recorded → caller HALTs.
+      - `no-trace`: no order → nothing opened, safe to clear the marker.
+      - `query-error`: the history lookup failed → can't confirm → caller HALTs
+        (never assume safe next to a possible open position).
+    """
+    counts: dict[str, int] = {}
+    checked: list[dict[str, Any]] = []
+    for link in links:
+        oid = link.get("order_link_id") or ""
+        category = link.get("category") or "linear"
+        symbol = link.get("symbol")
+        try:
+            history = await client.get_order_history(
+                category=category, order_link_id=oid, symbol=symbol,
+            )
+            landed = len(history) > 0
+            classification = "confirmed-landed" if landed else "no-trace"
+            entry = {**link, "bybit_landed": landed, "classification": classification}
+        except BybitAPIError as exc:
+            classification = "query-error"
+            entry = {
+                **link, "bybit_landed": None,
+                "classification": classification, "error": str(exc),
+            }
+        counts[classification] = counts.get(classification, 0) + 1
+        checked.append(entry)
+    return {"checked": len(links), "counts": counts, "actions": checked}
 
 
 def _dry_run_payload(action: Action) -> dict[str, Any]:

@@ -32,11 +32,13 @@ from agent.sandbox.watcher import (
     check_price_drift,
     check_yield_jump,
     poll_once,
+    prune_closed_positions,
     read_baseline,
     update_baseline_from_snapshot,
     write_baseline,
     write_events,
 )
+from types import SimpleNamespace
 
 # ───────────────────────── price drift (event #1) ─────────────────────
 
@@ -316,6 +318,94 @@ def test_baseline_roundtrip(tmp_path: Path):
 
 def test_read_baseline_missing_returns_none(tmp_path: Path):
     assert read_baseline(tmp_path / "nope.json") is None
+
+
+def test_read_baseline_corrupt_json_returns_none(tmp_path: Path):
+    # state-5: a half-written / garbage file must degrade to None, not raise.
+    path = tmp_path / "baseline.json"
+    path.write_text("{not valid json")
+    assert read_baseline(path) is None
+
+
+def test_read_baseline_invalid_schema_returns_none(tmp_path: Path):
+    # state-5: parseable JSON that doesn't match the model degrades too.
+    path = tmp_path / "baseline.json"
+    path.write_text(json.dumps({"captured_at": "not-a-date", "positions": 42}))
+    assert read_baseline(path) is None
+
+
+# ───────────────────────── post-execute prune (watcher-2) ─────────────
+
+def _ok_result(kind: str, **action_fields):
+    action = SimpleNamespace(
+        kind=kind,
+        product_id=action_fields.get("product_id", ""),
+        coin=action_fields.get("coin", ""),
+        position_id=action_fields.get("position_id"),
+    )
+    return SimpleNamespace(status="ok", action=action)
+
+
+def test_prune_closed_positions_drops_executed_exits():
+    baseline = WatcherBaseline(
+        captured_at=datetime.now(UTC),
+        positions=[
+            _earn_pos("600"),          # earn:1131
+            _lm_pos(),                 # lm:LM-9
+            _hedged_pos("100"),        # perp:TONUSDT, coin TON
+            HeldPosition(position_id="earn:9999", venue="earn", coin="USDT"),
+        ],
+        known_h2e_product_ids=["H1", "H2"],
+    )
+    results = [
+        _ok_result("redeem_earn", product_id="1131"),
+        _ok_result("redeem_lm", position_id="LM-9"),
+        _ok_result("close_perp", coin="TON"),
+    ]
+    pruned = prune_closed_positions(baseline, results)
+    kept_ids = {p.position_id for p in pruned.positions}
+    assert kept_ids == {"earn:9999"}
+    assert pruned.known_h2e_product_ids == ["H1", "H2"]
+
+
+def test_prune_closed_positions_keeps_failed_and_unrelated():
+    baseline = WatcherBaseline(
+        captured_at=datetime.now(UTC),
+        positions=[_earn_pos("600"), _lm_pos()],
+    )
+    results = [
+        SimpleNamespace(  # failed redeem — position still live, keep it
+            status="error",
+            action=SimpleNamespace(
+                kind="redeem_earn", product_id="1131", coin="USD1",
+                position_id=None,
+            ),
+        ),
+        _ok_result("subscribe_earn", product_id="1131"),  # non-exit kind
+    ]
+    pruned = prune_closed_positions(baseline, results)
+    assert {p.position_id for p in pruned.positions} == {"earn:1131", "lm:LM-9"}
+
+
+def test_prune_closed_positions_drops_alpha_by_coin():
+    baseline = WatcherBaseline(
+        captured_at=datetime.now(UTC),
+        positions=[
+            HeldPosition(position_id="alpha:WIF-token", venue="alpha", coin="WIF"),
+            HeldPosition(position_id="earn:1", venue="earn", coin="USDC"),
+        ],
+    )
+    pruned = prune_closed_positions(
+        baseline, [_ok_result("alpha_redeem", coin="wif")]
+    )
+    assert {p.position_id for p in pruned.positions} == {"earn:1"}
+
+
+def test_prune_closed_positions_noop_returns_same_object():
+    baseline = WatcherBaseline(
+        captured_at=datetime.now(UTC), positions=[_lm_pos()]
+    )
+    assert prune_closed_positions(baseline, []) is baseline
 
 
 def test_update_baseline_from_snapshot_extracts_fields(tmp_path: Path):
@@ -720,7 +810,7 @@ def test_check_pick_invalidation_non_stable_price_default_fires_on_30pct_drop():
     from agent.sandbox.watcher import check_pick_invalidation
     decision = _decision_with_invalidate("bybit_onchain", "8")
     baseline = _baseline_with_earn("TON", "8", entry_mark="2.0")
-    signals = {"TON": {"mark_price": Decimal("1.30"), "funding_7d": None}}
+    signals = {"TON": {"mark_price": Decimal("1.30"), "funding_8h": None}}
     events = check_pick_invalidation(
         decision=decision, baseline=baseline,
         snapshot_signals=signals, peg_dev_bps=None,
@@ -738,7 +828,7 @@ def test_check_pick_invalidation_non_stable_price_default_silent_on_small_drop()
     from agent.sandbox.watcher import check_pick_invalidation
     decision = _decision_with_invalidate("bybit_onchain", "8")
     baseline = _baseline_with_earn("TON", "8", entry_mark="2.0")
-    signals = {"TON": {"mark_price": Decimal("1.80"), "funding_7d": None}}
+    signals = {"TON": {"mark_price": Decimal("1.80"), "funding_8h": None}}
     events = check_pick_invalidation(
         decision=decision, baseline=baseline,
         snapshot_signals=signals, peg_dev_bps=None,
@@ -755,7 +845,7 @@ def test_check_pick_invalidation_custom_price_below_overrides_default():
         invalidate_at={"price_below": 1.50},
     )
     baseline = _baseline_with_earn("TON", "8", entry_mark="2.0")
-    signals = {"TON": {"mark_price": Decimal("1.45"), "funding_7d": None}}
+    signals = {"TON": {"mark_price": Decimal("1.45"), "funding_8h": None}}
     events = check_pick_invalidation(
         decision=decision, baseline=baseline,
         snapshot_signals=signals, peg_dev_bps=None,
@@ -766,15 +856,16 @@ def test_check_pick_invalidation_custom_price_below_overrides_default():
 
 
 def test_check_pick_invalidation_funding_default_fires_below_neg_2_bps():
-    """Default funding_7d_below=-0.0002 for non-stable — fire when
-    funding sustained more negative."""
+    """Raw-funding FALLBACK gate (`funding_8h_below`=-0.0002) for a non-stable
+    whose baseline lacks a stored gross APR — fires when funding sustained more
+    negative. No dwell_counts passed → fires immediately."""
     from agent.sandbox.watcher import check_pick_invalidation
     decision = _decision_with_invalidate("bybit_onchain", "8")
     baseline = _baseline_with_earn("TON", "8", entry_mark="2.0")
     signals = {
         "TON": {
             "mark_price": Decimal("2.0"),
-            "funding_7d": Decimal("-0.00025"),
+            "funding_8h": Decimal("-0.00025"),
         }
     }
     events = check_pick_invalidation(
@@ -782,7 +873,7 @@ def test_check_pick_invalidation_funding_default_fires_below_neg_2_bps():
         snapshot_signals=signals, peg_dev_bps=None,
     )
     funding_events = [
-        e for e in events if "funding_7d_below" in e.threshold
+        e for e in events if "funding_8h_below" in e.threshold
     ]
     assert len(funding_events) == 1
     assert funding_events[0].severity == "P0"
@@ -827,3 +918,197 @@ def test_check_pick_invalidation_stable_silent_when_peg_within_default():
         peg_dev_bps=Decimal("-150"),
     )
     assert events == []
+
+
+# ───────────────────── ah.10 net-of-hedge + dwell ─────────────────────
+
+
+def _baseline_with_earn_gross(
+    coin: str, product_id: str, gross_apr: str, entry_mark: str = "2.0"
+) -> WatcherBaseline:
+    return WatcherBaseline(
+        captured_at=datetime.now(UTC),
+        positions=[
+            HeldPosition(
+                position_id=f"earn:{product_id}", venue="earn", coin=coin,
+                entry_gross_apr=Decimal(gross_apr),
+            ),
+            HeldPosition(
+                position_id=f"perp:{coin}USDT", venue="perp", coin=coin,
+                entry_mark_price=Decimal(entry_mark),
+            ),
+        ],
+    )
+
+
+def test_net_of_hedge_survives_deep_negative_funding():
+    """promptcode-1: a high-gross-APR pick is NOT force-closed by deeply
+    negative funding while it stays net-positive. 0.30 gross + (-0.0002×1095 =
+    -0.219) funding = +0.081 net > 0 floor → no event."""
+    from agent.sandbox.watcher import check_pick_invalidation
+    decision = _decision_with_invalidate("bybit_onchain", "8")
+    baseline = _baseline_with_earn_gross("TON", "8", "0.30")
+    signals = {"TON": {"mark_price": Decimal("2.0"), "funding_8h": Decimal("-0.0002")}}
+    events = check_pick_invalidation(
+        decision=decision, baseline=baseline, snapshot_signals=signals,
+        peg_dev_bps=None,
+    )
+    assert [e for e in events if e.kind == "pick_invalidated"] == []
+
+
+def test_net_of_hedge_fires_when_net_negative():
+    """A low-gross pick whose funding drags net below 0 fires immediately (no
+    dwell_counts passed). 0.05 gross - 0.219 = -0.169 net < 0."""
+    from agent.sandbox.watcher import check_pick_invalidation
+    decision = _decision_with_invalidate("bybit_onchain", "8")
+    baseline = _baseline_with_earn_gross("TON", "8", "0.05")
+    signals = {"TON": {"mark_price": Decimal("2.0"), "funding_8h": Decimal("-0.0002")}}
+    events = check_pick_invalidation(
+        decision=decision, baseline=baseline, snapshot_signals=signals,
+        peg_dev_bps=None,
+    )
+    fired = [e for e in events if e.kind == "pick_invalidated"]
+    assert len(fired) == 1
+    assert "net_apr_below" in fired[0].threshold
+    assert "funding_8h" in fired[0].current  # ah.10 rename
+    assert fired[0].severity == "P0"
+
+
+def test_dwell_requires_consecutive_breaches_and_resets():
+    """With dwell_counts passed, a single net breach doesn't fire; the 2nd
+    consecutive does; a clean poll resets the counter."""
+    from agent.sandbox.watcher import check_pick_invalidation
+    decision = _decision_with_invalidate("bybit_onchain", "8")
+    baseline = _baseline_with_earn_gross("TON", "8", "0.05")
+    breach = {"TON": {"mark_price": Decimal("2.0"), "funding_8h": Decimal("-0.0002")}}
+    dwell: dict[str, int] = {}
+
+    ev1 = check_pick_invalidation(
+        decision=decision, baseline=baseline, snapshot_signals=breach,
+        peg_dev_bps=None, dwell_counts=dwell,
+    )
+    assert [e for e in ev1 if e.kind == "pick_invalidated"] == []  # 1st breach
+    assert dwell["earn:8"] == 1
+
+    ev2 = check_pick_invalidation(
+        decision=decision, baseline=baseline, snapshot_signals=breach,
+        peg_dev_bps=None, dwell_counts=dwell,
+    )
+    assert len([e for e in ev2 if e.kind == "pick_invalidated"]) == 1  # 2nd → fire
+    assert dwell["earn:8"] == 2
+
+    # A clean poll (positive funding → net positive) resets the counter.
+    clean = {"TON": {"mark_price": Decimal("2.0"), "funding_8h": Decimal("0.0001")}}
+    check_pick_invalidation(
+        decision=decision, baseline=baseline, snapshot_signals=clean,
+        peg_dev_bps=None, dwell_counts=dwell,
+    )
+    assert "earn:8" not in dwell
+
+
+def test_update_baseline_stores_entry_gross_apr(tmp_path: Path) -> None:
+    """The Earn baseline position captures the pick's GROSS Earn APR (snapshot
+    pre-hedge base), not the funding-overwritten net `effective_apr`."""
+    snap = {
+        "captured_at": "2026-06-09T00:00:00+00:00",
+        "earn_positions": [{"productId": "8", "coin": "TON", "amount": "100"}],
+        "products": {"OnChain": [
+            {"product_id": "8", "coin": "TON", "effective_apr": "0.081",
+             "effective_apr_gross": "0.30"},
+        ]},
+    }
+    baseline = update_baseline_from_snapshot(snap, path=tmp_path / "b.json")
+    earn = next(p for p in baseline.positions if p.position_id == "earn:8")
+    assert earn.entry_gross_apr == Decimal("0.30")
+
+
+def test_dwell_state_roundtrip(tmp_path: Path) -> None:
+    from agent.sandbox.watcher import read_dwell_state, write_dwell_state
+    p = tmp_path / "dwell.json"
+    assert read_dwell_state(p) == {}
+    write_dwell_state({"earn:8": 2, "earn:9": 1}, p)
+    assert read_dwell_state(p) == {"earn:8": 2, "earn:9": 1}
+
+
+# ───────────────────── earn redeem settlement (durable exit) ───────────
+
+from decimal import Decimal as _D
+from agent.sandbox.watcher import (
+    REDEEM_SETTLE_DWELL_POLLS,
+    check_earn_redeem_settled,
+    _poll_redeem_settlements,
+)
+from agent.sandbox.redeem_intent import RedeemExitIntent
+
+
+def _exit_intent(expected="100", baseline_wallet="2", coin="TON",
+                 product_id="TON-FLEX", category="FlexibleSaving"):
+    return RedeemExitIntent(
+        coin=coin,
+        product_id=product_id,
+        category=category,
+        opened_at=datetime.now(UTC),
+        expected_redeem_native=_D(expected),
+        baseline_wallet_native=_D(baseline_wallet),
+        redeem_order_link_id="lnk-1",
+        paired_perp_symbol=f"{coin}USDT",
+        perp_qty_base=_D(expected),
+    )
+
+
+def test_redeem_settled_earn_row_gone():
+    assert check_earn_redeem_settled(_exit_intent(), None, _D("2")) is True
+
+
+def test_redeem_settled_earn_amount_zero():
+    assert check_earn_redeem_settled(_exit_intent(), _D("0"), _D("2")) is True
+
+
+def test_redeem_not_settled_row_present_no_arrival():
+    # row still holds 100, wallet unchanged → not settled
+    assert check_earn_redeem_settled(_exit_intent(), _D("100"), _D("2")) is False
+
+
+def test_redeem_settled_via_wallet_delta():
+    # row lingers but 95 of the 100 expected arrived (>90% threshold)
+    assert check_earn_redeem_settled(_exit_intent(), _D("100"), _D("97")) is True
+    # only 50 arrived → still not settled
+    assert check_earn_redeem_settled(_exit_intent(), _D("100"), _D("52")) is False
+
+
+def _earn_row(product_id="TON-FLEX", amount="100"):
+    return SimpleNamespace(productId=product_id, amount=amount)
+
+
+@pytest.mark.asyncio
+async def test_poll_redeem_settlements_dwell_then_fire(tmp_path: Path):
+    dwell_path = tmp_path / "dwell.json"
+    client = AsyncMock()
+    # Earn row gone (settled) on every poll; coin arrived in wallet
+    client.get_earn_positions = AsyncMock(return_value=[])
+    client.get_account_coin_balance = AsyncMock(return_value=_D("102"))
+    intents = [_exit_intent()]
+
+    # Poll 1: settled but dwell=1 < 2 → no event yet
+    ev1 = await _poll_redeem_settlements(client, intents, dwell_path)
+    assert ev1 == []
+    # Poll 2: dwell reaches threshold → fire
+    ev2 = await _poll_redeem_settlements(client, intents, dwell_path)
+    assert len(ev2) == 1
+    assert ev2[0].kind == "earn_redeem_settled"
+    assert ev2[0].coin == "TON"
+    assert ev2[0].position_id == "earn:TON-FLEX"
+
+
+@pytest.mark.asyncio
+async def test_poll_redeem_settlements_not_settled_no_event(tmp_path: Path):
+    dwell_path = tmp_path / "dwell.json"
+    client = AsyncMock()
+    # Earn row still holds full amount, nothing arrived
+    client.get_earn_positions = AsyncMock(return_value=[_earn_row()])
+    client.get_account_coin_balance = AsyncMock(return_value=_D("1"))
+    ev = await _poll_redeem_settlements(client, [_exit_intent()], dwell_path)
+    assert ev == []
+    # dwell must NOT accumulate across genuine not-settled polls
+    ev2 = await _poll_redeem_settlements(client, [_exit_intent()], dwell_path)
+    assert ev2 == []

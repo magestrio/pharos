@@ -4,7 +4,8 @@ anchored `actionHash` reflects ACTUAL execution (not just intent).
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from decimal import Decimal
+from unittest.mock import MagicMock, call
 
 from agent.sandbox.onchain_writer import (
     OnchainWriter,
@@ -93,3 +94,53 @@ def test_record_decision_falls_back_to_intent_hash_when_no_actions() -> None:
     writer.record_decision(d, "snap.json", ipfs_cid="", executed_actions=None)
     _agent, _did, _cid, called_hash = dlog.functions.recordDecision.call_args[0]
     assert called_hash == intent_hash
+
+
+def test_send_uses_pending_nonce() -> None:
+    """state-7: nonce comes from the `pending` count, so a tx still in the
+    mempool doesn't make the next one reuse a consumed nonce."""
+    writer = OnchainWriter.__new__(OnchainWriter)
+    writer.account = MagicMock(address="0xAGENT")
+    signed = MagicMock(raw_transaction=b"raw")
+    writer.account.sign_transaction.return_value = signed
+    w3 = MagicMock()
+    w3.eth.get_transaction_count.return_value = 7
+    w3.eth.wait_for_transaction_receipt.return_value = MagicMock(status=1)
+    writer.w3 = w3
+    fn = MagicMock()
+
+    writer._send(fn)
+
+    assert w3.eth.get_transaction_count.call_args == call("0xAGENT", "pending")
+    assert fn.build_transaction.call_args[0][0]["nonce"] == 7
+
+
+def test_decision_exists_reflects_contract() -> None:
+    writer, dlog = _writer_with_mock_log()
+    dlog.functions.exists.return_value.call.return_value = True
+    assert writer.decision_exists(b"\x01" * 32) is True
+    dlog.functions.exists.return_value.call.return_value = False
+    assert writer.decision_exists(b"\x01" * 32) is False
+
+
+def test_decision_exists_false_on_rpc_error() -> None:
+    writer, dlog = _writer_with_mock_log()
+    dlog.functions.exists.return_value.call.side_effect = RuntimeError("rpc down")
+    # Conservative: an unreadable contract → treat as not-anchored (stays queued).
+    assert writer.decision_exists(b"\x01" * 32) is False
+
+
+def test_anchor_prepared_skips_when_already_on_chain() -> None:
+    writer, dlog = _writer_with_mock_log()
+    dlog.functions.exists.return_value.call.return_value = True
+    assert writer.anchor_prepared(b"\x02" * 32, "cid", b"\x03" * 32) is None
+    dlog.functions.recordDecision.assert_not_called()
+
+
+def test_gas_balance_mnt_converts_wei() -> None:
+    writer = OnchainWriter.__new__(OnchainWriter)
+    writer.account = MagicMock(address="0xAGENT")
+    w3 = MagicMock()
+    w3.eth.get_balance.return_value = 2 * 10**18
+    writer.w3 = w3
+    assert writer.gas_balance_mnt() == Decimal("2")

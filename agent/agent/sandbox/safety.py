@@ -14,9 +14,20 @@ can intervene with `touch` / `rm` without touching the process:
     cycle appends `{ts, total_equity_usd}`. Before execute, the cycle
     compares the current equity against the closest entry ≥ 24h ago.
     If the drop exceeds `DAILY_DRAWDOWN_HALT_PCT` (default 10%) the
-    cycle creates the HALT marker and short-circuits — surfaces a
-    sustained loss rather than letting the agent keep transacting
-    against a deteriorating book.
+    cycle creates the HALT marker (`trigger=daily_drawdown`) and
+    short-circuits — surfaces a sustained loss rather than letting the
+    agent keep transacting against a deteriorating book.
+
+**Drawdown HALT auto-recovery (state-8).** A drawdown-triggered HALT is
+NOT sticky: a halted cycle whose marker carries `trigger=daily_drawdown`
+still snapshots + `record_equity` (so the 24h window keeps advancing) and
+re-checks the drawdown; once the book recovers back within threshold the
+cycle `clear_halt()`s the marker and resumes the same cycle. An OPERATOR
+halt (a bare `touch`ed marker, the carry-state coherence trip, or the
+startup-gate trip — anything without `trigger=daily_drawdown`) stays fully
+manual: it short-circuits before the snapshot and only an operator `rm`
+clears it. This is why `halt_trigger` defaults to `operator` for any
+ambiguous marker — auto-recovery must be opt-in, never the fallback.
 
 Both are best-effort: filesystem failures degrade to "no halt" rather
 than blocking the cycle on a stat() error. The tradeoff is acceptable
@@ -79,20 +90,56 @@ def is_halted(path: Path | None = None) -> tuple[bool, str | None]:
     return True, reason
 
 
-def halt(reason: str, path: Path | None = None) -> None:
+def halt(reason: str, path: Path | None = None, *, trigger: str = "operator") -> None:
     """Create the halt marker with a human-readable reason. Idempotent —
     if the file already exists the reason is overwritten (operator might
     want the latest trigger context). On write failure, log + give up:
     the safety net can't enforce itself when the disk is gone, but the
-    surrounding cycle still records the error in its outcome."""
+    surrounding cycle still records the error in its outcome.
+
+    `trigger` is stamped on a `trigger=` line so the cycle can tell an
+    auto-recoverable `daily_drawdown` halt from a manual `operator` stop
+    (see module docstring). Default `operator` — any non-drawdown caller
+    (carry-coherence trip, startup gate, manual `touch`) stays sticky."""
     path = path or HALT_FILE
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f"{datetime.now(UTC).isoformat()}\n{reason}\n")
-        log.warning("HALT created: %s", reason)
+        path.write_text(
+            f"{datetime.now(UTC).isoformat()}\ntrigger={trigger}\n{reason}\n"
+        )
+        log.warning("HALT created (trigger=%s): %s", trigger, reason)
     except OSError as e:
         log.exception("failed to create HALT marker (%s) — operator must "
                       "intervene manually: %s", path, e)
+
+
+def halt_trigger(path: Path | None = None) -> str:
+    """Parse the halt trigger from the marker. Returns `operator` for a
+    missing marker, a bare `touch`ed file, an unreadable file, or any marker
+    without a `trigger=` line — auto-recovery is strictly opt-in, so anything
+    ambiguous is treated as a manual operator stop that never self-clears."""
+    path = path or HALT_FILE
+    if not path.exists():
+        return "operator"
+    try:
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("trigger="):
+                return line.split("=", 1)[1].strip() or "operator"
+    except OSError:
+        return "operator"
+    return "operator"
+
+
+def clear_halt(path: Path | None = None) -> None:
+    """Remove the halt marker (drawdown auto-recovery). Best-effort — a
+    missing file is already the desired state."""
+    path = path or HALT_FILE
+    try:
+        path.unlink(missing_ok=True)
+        log.warning("HALT cleared")
+    except OSError as e:
+        log.warning("failed to clear HALT marker (%s): %s", path, e)
 
 
 def record_equity(

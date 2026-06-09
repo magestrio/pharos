@@ -30,6 +30,7 @@ import logging
 import os
 import signal
 import sys
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -39,6 +40,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from agent.bybit_oracle.bybit_client import BybitClient
+from agent.sandbox.redeem_intent import RedeemExitIntent, read_redeem_intents
 
 log = logging.getLogger(__name__)
 
@@ -75,27 +77,54 @@ class Thresholds:
 # non-stables get a price-drift + funding floor pair. The fields here
 # mirror `agent.reason.schema.InvalidateAt` semantics: price_drift_pct
 # is "fraction adverse move from entry mark" (not absolute price),
-# funding_7d_below is per-8h signed Decimal, peg_dev_above_bps is
-# absolute deviation from $1.00. 2026-06-03 introduction; tuned vs the
-# existing `check_price_drift` (5% heads-up) and `check_funding_flip`
-# (sign-change) so the invalidate fires at a strictly more conservative
-# level — those events suggest action, invalidate forces a close.
+# `funding_8h_below` is the per-8h signed raw fundingRate fallback;
+# `net_apr_below` is the primary gate — a fractional ANNUAL net-of-hedge floor
+# (`entry_gross_apr + annualized live funding`). peg_dev_above_bps is absolute
+# deviation from $1.00. 2026-06-03 introduction; tuned vs the existing
+# `check_price_drift` (5% heads-up) and `check_funding_flip` (sign-change) so
+# the invalidate fires at a strictly more conservative level — those events
+# suggest action, invalidate forces a close.
 DEFAULT_INVALIDATE_BY_CATEGORY: dict[tuple[str, str], dict[str, Decimal]] = {
     ("FlexibleSaving", "STABLE"): {"peg_dev_above_bps": Decimal("200")},
     ("OnChain", "STABLE"): {"peg_dev_above_bps": Decimal("200")},
     ("FlexibleSaving", "NON_STABLE"): {
         "price_drift_pct": Decimal("0.30"),
-        "funding_7d_below": Decimal("-0.0002"),
+        "net_apr_below": Decimal("0.0"),
+        "funding_8h_below": Decimal("-0.0002"),
     },
     ("OnChain", "NON_STABLE"): {
         "price_drift_pct": Decimal("0.30"),
-        "funding_7d_below": Decimal("-0.0002"),
+        "net_apr_below": Decimal("0.0"),
+        "funding_8h_below": Decimal("-0.0002"),
     },
     # LM and Alpha rely on their own checkers (lm_liq_distance,
     # price_drift on alpha). No invalidate defaults — operator can set
     # explicit `invalidate_at.liq_distance_below` per LM pick if they
     # want tighter than the global 0.10 threshold.
 }
+
+# 8h funding periods per year (365 × 3) — annualizes the live per-8h fundingRate
+# so it composes with the stored annual `entry_gross_apr` into a net-of-hedge
+# yield. A 4h-interval coin is under-annualized here (conservative: net looks
+# less negative → less eager to force-close), matching the gate's 8h heritage.
+FUNDING_PERIODS_PER_YEAR_8H = Decimal("1095")
+
+# Consecutive polls a funding/net breach must persist before `pick_invalidated`
+# fires — a single transient funding spike can't force-close a sound pick
+# (dwell-counter, ah.10). Price-drift / peg gates fire immediately (a 30% move
+# or a depeg is not transient).
+INVALIDATE_DWELL_POLLS = 2
+
+# Consecutive polls a hedged-Earn redeem must read as "settled" (Earn row gone
+# / coin arrived) before `earn_redeem_settled` fires — guards against a Bybit
+# response transiently omitting the row mid-settlement, which would unhedge
+# early.
+REDEEM_SETTLE_DWELL_POLLS = 2
+
+# Fraction of the expected redeem that must show up in the wallet to count as
+# "arrived" via the balance-delta path (the Earn-row-gone path is exact). Loose
+# because fees / dust / rounding shave the credited amount slightly.
+REDEEM_ARRIVAL_FRACTION = Decimal("0.90")
 
 
 # Stable coins — peg drift checked against $1, never flagged for funding
@@ -141,6 +170,12 @@ class HeldPosition(BaseModel):
     last_measured_yield_bps: Decimal | None = None
     last_liq_distance: Decimal | None = None
     settle_time_ts: int | None = None
+    # Earn only: the pick's GROSS annual Earn APR at decision time (fractional),
+    # so the watcher can recompute net-of-hedge yield against LIVE funding
+    # (`net = entry_gross_apr + annualized funding`) instead of force-closing on
+    # the raw funding rate alone (promptcode-1). Sourced from the snapshot's
+    # pre-hedge base (effective_apr_net_holding / _gross / effective_apr).
+    entry_gross_apr: Decimal | None = None
 
 
 class WatcherBaseline(BaseModel):
@@ -156,6 +191,10 @@ class WatcherBaseline(BaseModel):
 DEFAULT_BASELINE_PATH = Path(__file__).parent / "state" / "watcher-baseline.json"
 DEFAULT_EVENTS_DIR = Path(__file__).parent / "events"
 DEFAULT_DECISIONS_DIR = Path(__file__).parent / "decisions"
+# Per-poll dwell counters `{position_id: consecutive_breaches}`. Lives in its
+# own file (not the baseline) because the baseline is rebuilt once per CYCLE
+# while dwell must persist across the watcher's many POLLS within a cycle.
+DEFAULT_DWELL_STATE_PATH = Path(__file__).parent / "state" / "watcher-dwell.json"
 
 
 def _read_latest_decision(
@@ -180,14 +219,25 @@ def _read_latest_decision(
 # ───────────────────────── baseline IO ────────────────────────────────
 
 def read_baseline(path: Path = DEFAULT_BASELINE_PATH) -> WatcherBaseline | None:
-    """Read baseline state. Returns None if the file doesn't exist —
-    caller treats this as "no positions to watch, just poll global
-    signals (peg, new H2E)".
+    """Read baseline state. Returns None when the file is missing OR
+    corrupt/unparseable (state-5): the caller treats None as "no positions
+    to watch, just poll global signals (peg, new H2E)". Degrading instead of
+    raising means a half-written or schema-drifted baseline can't crash the
+    watcher process. Mirrors `carry_state.read_carry_state`'s two-stage
+    truncate-on-corruption — the baseline is derived state, rebuilt next cycle.
     """
     if not path.exists():
         return None
-    raw = json.loads(path.read_text())
-    return WatcherBaseline.model_validate(raw)
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning("watcher baseline unreadable (%s) — degrading to None", e)
+        return None
+    try:
+        return WatcherBaseline.model_validate(raw)
+    except Exception as e:  # noqa: BLE001 — any schema drift degrades, not crashes
+        log.warning("watcher baseline invalid (%s) — degrading to None", e)
+        return None
 
 
 def write_baseline(b: WatcherBaseline, path: Path = DEFAULT_BASELINE_PATH) -> None:
@@ -198,6 +248,37 @@ def write_baseline(b: WatcherBaseline, path: Path = DEFAULT_BASELINE_PATH) -> No
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(b.model_dump_json(indent=2))
+    os.replace(tmp, path)
+
+
+def read_dwell_state(path: Path = DEFAULT_DWELL_STATE_PATH) -> dict[str, int]:
+    """Load the per-poll dwell counters. Missing / corrupt → empty (a fresh
+    dwell window — the worst case is one extra poll before a real breach
+    fires)."""
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for k, v in raw.items():
+        try:
+            out[str(k)] = int(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def write_dwell_state(
+    state: dict[str, int], path: Path = DEFAULT_DWELL_STATE_PATH
+) -> None:
+    """Atomic write of the dwell counters (tmp+rename), same as the baseline."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
     os.replace(tmp, path)
 
 
@@ -216,17 +297,41 @@ def update_baseline_from_snapshot(
     captured_at = _parse_dt(snap.get("captured_at")) or datetime.now(UTC)
     positions: list[HeldPosition] = []
 
+    # productId → GROSS annual Earn APR, from the snapshot's pre-hedge base so
+    # the watcher can recompute net-of-hedge against live funding (ah.10). The
+    # snapshot OVERWRITES `effective_apr` with NET for non-stables, stashing the
+    # original under `effective_apr_gross` and keeping the dead-time-adjusted
+    # gross in `effective_apr_net_holding` — prefer those over the (now-net)
+    # `effective_apr`.
+    gross_apr_by_pid: dict[str, Decimal] = {}
+    for cat in ("FlexibleSaving", "OnChain"):
+        for prod in (snap.get("products") or {}).get(cat) or []:
+            pid = str(prod.get("product_id") or prod.get("productId") or "")
+            if not pid:
+                continue
+            for key in (
+                "effective_apr_net_holding",
+                "effective_apr_gross",
+                "effective_apr",
+            ):
+                val = _to_decimal(prod.get(key))
+                if val is not None:
+                    gross_apr_by_pid[pid] = val
+                    break
+
     # Basic-Earn positions (FlexibleSaving / OnChain)
     for p in snap.get("earn_positions") or []:
         amount = _to_decimal(p.get("amount"))
         if amount is None or amount == 0:
             continue
+        pid = str(p.get("productId") or p.get("id") or "")
         positions.append(
             HeldPosition(
-                position_id=f"earn:{p.get('productId') or p.get('id') or ''}",
+                position_id=f"earn:{pid}",
                 venue="earn",
                 coin=str(p.get("coin") or ""),
                 last_measured_yield_bps=_to_decimal(p.get("measured_yield_bps")),
+                entry_gross_apr=gross_apr_by_pid.get(pid),
             )
         )
 
@@ -300,7 +405,90 @@ def update_baseline_from_snapshot(
     return baseline
 
 
+# Action kinds whose successful execution removes a held position from
+# Bybit (or starts an async redeem we should stop watching). Kept as raw
+# value strings so the watcher needn't import `execute` (its heavy
+# orchestration module) just to read these — results are duck-typed.
+_EXIT_KIND_VALUES = frozenset(
+    {"redeem_earn", "redeem_lm", "close_perp", "close_funding_carry", "alpha_redeem"}
+)
+
+
+def prune_closed_positions(
+    baseline: WatcherBaseline, results: Iterable[Any]
+) -> WatcherBaseline:
+    """Drop positions a just-completed cycle closed/redeemed from `baseline`
+    (watcher-2). The pre-decide baseline reflects start-of-cycle holdings, so
+    until the next cycle the watcher would keep evaluating now-closed positions
+    against live funding/price and fire spurious `pick_invalidated` events in
+    the ~120s post-execute window. A re-snapshot is the WRONG fix — a slow
+    OnChain redeem (~4d Processing) still reads as held — so we prune by what
+    we *intended* to close: successful exit actions.
+
+    `results` is any iterable of execution results (duck-typed: each needs
+    `.status` and `.action` with `.kind`/`.product_id`/`.coin`/`.position_id`).
+    Only `status == "ok"` rows prune. Untouched: `known_h2e_product_ids` and
+    the dwell-counter file (a separate path, rebuilt per poll).
+    """
+    drop_ids: set[str] = set()
+    drop_alpha_coins: set[str] = set()
+    for r in results:
+        if getattr(r, "status", None) != "ok":
+            continue
+        action = getattr(r, "action", None)
+        if action is None:
+            continue
+        kind = getattr(action.kind, "value", action.kind)
+        if kind not in _EXIT_KIND_VALUES:
+            continue
+        if kind == "redeem_earn" and action.product_id:
+            drop_ids.add(f"earn:{action.product_id}")
+        elif kind == "redeem_lm" and action.position_id:
+            drop_ids.add(f"lm:{action.position_id}")
+        elif kind in ("close_perp", "close_funding_carry") and action.coin:
+            drop_ids.add(f"perp:{_coin_to_perp_symbol(action.coin)}")
+        elif kind == "alpha_redeem" and action.coin:
+            # Alpha baseline ids key off tokenCode/symbol, which need not equal
+            # `action.coin`; match by venue+coin instead of a reconstructed id.
+            drop_alpha_coins.add(action.coin.upper())
+
+    if not drop_ids and not drop_alpha_coins:
+        return baseline
+
+    kept = [
+        p for p in baseline.positions
+        if p.position_id not in drop_ids
+        and not (p.venue == "alpha" and (p.coin or "").upper() in drop_alpha_coins)
+    ]
+    return baseline.model_copy(update={"positions": kept})
+
+
 # ───────────────────────── checkers (pure) ────────────────────────────
+
+def check_earn_redeem_settled(
+    intent: RedeemExitIntent,
+    live_earn_amount: Decimal | None,
+    live_wallet_native: Decimal,
+) -> bool:
+    """True when the redeem behind `intent` has settled — the freed coin is on
+    the balance and ready to swap+close.
+
+    Two OR'd signals (the loop's exit handler re-checks against its own
+    snapshot, so a false positive here only wakes a cycle that then no-ops):
+      - Earn row gone or its amount ≈ 0 (`live_earn_amount` is the live amount
+        for `intent.product_id`, or None if the row is absent) — the exact,
+        primary signal (matches what the executing-path hold-hedge guard keys
+        on).
+      - Wallet coin balance rose by ≥ `REDEEM_ARRIVAL_FRACTION` of the expected
+        redeem above the at-redeem baseline — confirmation for the case where
+        the row lingers but the principal already credited.
+    """
+    if live_earn_amount is None or live_earn_amount <= Decimal("0.00000001"):
+        return True
+    arrived = live_wallet_native - intent.baseline_wallet_native
+    threshold = intent.expected_redeem_native * REDEEM_ARRIVAL_FRACTION
+    return threshold > 0 and arrived >= threshold
+
 
 def check_price_drift(
     position: HeldPosition, current_mark: Decimal
@@ -559,6 +747,7 @@ def check_pick_invalidation(
     baseline: WatcherBaseline,
     snapshot_signals: dict[str, dict[str, Decimal | None]],
     peg_dev_bps: Decimal | None = None,
+    dwell_counts: dict[str, int] | None = None,
 ) -> list[EventRecord]:
     """Event #9: per-pick invalidation thresholds (operator-defined OR
     category default) breached against current signals.
@@ -636,7 +825,7 @@ def check_pick_invalidation(
 
             signals = snapshot_signals.get(coin, {}) or {}
             mark = signals.get("mark_price")
-            funding = signals.get("funding_7d")
+            funding = signals.get("funding_8h")
 
             # Peg deviation (stables only). USDC peg comes from CoinGecko
             # via `_fetch_peg_usd`; for non-USDC stables we don't have a
@@ -747,29 +936,88 @@ def check_pick_invalidation(
                     )
                 )
 
-            # Funding 7d sustained below threshold (non-stable hedged).
-            funding_thresh = _eff("funding_7d_below")
+            # Funding-driven invalidation (non-stable hedged). PRIMARY gate is
+            # NET-of-hedge yield — stored entry gross Earn APR + annualized LIVE
+            # funding — so a high-APR pick isn't force-closed merely because raw
+            # funding is deeply negative while the pick is still net-positive
+            # (promptcode-1). Falls back to the raw per-8h funding floor only
+            # when the baseline lacks the stored gross APR (older baselines).
+            # Either breach is DWELL-COUNTED: it must persist
+            # INVALIDATE_DWELL_POLLS consecutive polls before firing, so a
+            # transient funding spike can't force a close.
+            pid_key = f"earn:{product_id}"
+            funding_breached = False
+            breach_current: dict[str, str] = {}
+            breach_threshold: dict[str, str] = {}
+            breach_msg = ""
+            net_floor = _eff("net_apr_below")
             if (
                 not is_stable
-                and funding_thresh is not None
                 and funding is not None
-                and funding < funding_thresh
+                and held.entry_gross_apr is not None
+                and net_floor is not None
             ):
+                net_apr = (
+                    held.entry_gross_apr + funding * FUNDING_PERIODS_PER_YEAR_8H
+                )
+                if net_apr < net_floor:
+                    funding_breached = True
+                    breach_current = {
+                        "funding_8h": str(funding),
+                        "net_apr": str(net_apr),
+                        "entry_gross_apr": str(held.entry_gross_apr),
+                    }
+                    breach_threshold = {"net_apr_below": str(net_floor)}
+                    breach_msg = (
+                        f"pick {category}/{product_id} ({coin}) net-of-hedge "
+                        f"APR {net_apr:.4f} below floor {net_floor} (gross "
+                        f"{held.entry_gross_apr:.4f} + funding {funding}/8h "
+                        f"annualized)"
+                    )
+            else:
+                funding_thresh = _eff("funding_8h_below")
+                if (
+                    not is_stable
+                    and funding_thresh is not None
+                    and funding is not None
+                    and funding < funding_thresh
+                ):
+                    funding_breached = True
+                    breach_current = {"funding_8h": str(funding)}
+                    breach_threshold = {"funding_8h_below": str(funding_thresh)}
+                    breach_msg = (
+                        f"pick {category}/{product_id} ({coin}) invalidated — "
+                        f"funding {funding}/8h below {funding_thresh}/8h "
+                        f"(raw fallback — no stored gross APR)"
+                    )
+
+            # Dwell gate: fire only after INVALIDATE_DWELL_POLLS consecutive
+            # breaches. A clean poll resets the counter. With no dwell state
+            # passed (legacy callers / unit tests), fire immediately.
+            if dwell_counts is not None and not is_stable:
+                if funding_breached:
+                    dwell_counts[pid_key] = dwell_counts.get(pid_key, 0) + 1
+                else:
+                    dwell_counts.pop(pid_key, None)
+                fire = (
+                    funding_breached
+                    and dwell_counts.get(pid_key, 0) >= INVALIDATE_DWELL_POLLS
+                )
+            else:
+                fire = funding_breached
+
+            if fire:
                 events.append(
                     EventRecord(
                         ts=datetime.now(UTC),
                         kind="pick_invalidated",
                         severity="P0",
-                        position_id=f"earn:{product_id}",
+                        position_id=pid_key,
                         coin=coin,
                         baseline={},
-                        current={"funding_7d": str(funding)},
-                        threshold={"funding_7d_below": str(funding_thresh)},
-                        message=(
-                            f"pick {category}/{product_id} ({coin}) "
-                            f"invalidated — funding 7d avg {funding}/8h "
-                            f"below {funding_thresh}/8h (hedge net cost)"
-                        ),
+                        current=breach_current,
+                        threshold=breach_threshold,
+                        message=breach_msg,
                     )
                 )
     return events
@@ -859,8 +1107,85 @@ def _paired_invalidate_event(
     )
 
 
+async def _coin_wallet_native_live(client: BybitClient, coin: str) -> Decimal:
+    """Live transferable coin balance across UNIFIED + FUND (OnChain redeem
+    principal lands in FUND, Flex in UNIFIED). Best-effort: a failed leg
+    contributes 0 (the Earn-row-gone signal is the primary settle trigger)."""
+    total = Decimal(0)
+    for acct in ("UNIFIED", "FUND"):
+        try:
+            total += await client.get_account_coin_balance(
+                account_type=acct, coin=coin
+            )
+        except Exception as e:  # noqa: BLE001 — defensive per-account
+            log.warning("coin balance poll failed (%s/%s): %s", acct, coin, e)
+    return total
+
+
+async def _poll_redeem_settlements(
+    client: BybitClient,
+    intents: list[RedeemExitIntent],
+    dwell_state_path: Path,
+) -> list[EventRecord]:
+    """Emit `earn_redeem_settled` for each intent whose freed coin has arrived,
+    dwell-guarded. Fetches live Earn rows (once per category) + per-coin wallet
+    balance. Pure-ish: reads/writes only the dwell-counter file."""
+    # Live Earn amount per productId, fetched once per distinct category.
+    live_earn_amount: dict[str, Decimal] = {}
+    for category in {i.category for i in intents if i.category}:
+        try:
+            for p in await client.get_earn_positions(category=category):
+                try:
+                    live_earn_amount[str(p.productId)] = Decimal(str(p.amount or "0"))
+                except (InvalidOperation, TypeError):
+                    continue
+        except Exception as e:  # noqa: BLE001 — defensive per-category
+            log.warning("earn positions poll failed (%s): %s", category, e)
+
+    dwell = read_dwell_state(dwell_state_path)
+    events: list[EventRecord] = []
+    for intent in intents:
+        wallet_native = await _coin_wallet_native_live(client, intent.coin)
+        settled = check_earn_redeem_settled(
+            intent,
+            live_earn_amount.get(intent.product_id),
+            wallet_native,
+        )
+        key = f"redeem-settled:{intent.product_id}"
+        if not settled:
+            dwell.pop(key, None)
+            continue
+        dwell[key] = dwell.get(key, 0) + 1
+        if dwell[key] < REDEEM_SETTLE_DWELL_POLLS:
+            continue
+        dwell.pop(key, None)
+        events.append(
+            EventRecord(
+                ts=datetime.now(UTC),
+                kind="earn_redeem_settled",
+                severity="P0",
+                position_id=f"earn:{intent.product_id}",
+                coin=intent.coin,
+                baseline={
+                    "baseline_wallet_native": str(intent.baseline_wallet_native),
+                    "expected_redeem_native": str(intent.expected_redeem_native),
+                },
+                current={"wallet_native": str(wallet_native)},
+                threshold={"dwell_polls": str(REDEEM_SETTLE_DWELL_POLLS)},
+                message=(
+                    f"{intent.coin} redeem ({intent.category}/{intent.product_id}) "
+                    f"settled — swap freed coin + close paired short (no LLM)"
+                ),
+            )
+        )
+    write_dwell_state(dwell, dwell_state_path)
+    return events
+
+
 async def poll_once(
-    client: BybitClient, baseline: WatcherBaseline
+    client: BybitClient,
+    baseline: WatcherBaseline,
+    dwell_state_path: Path = DEFAULT_DWELL_STATE_PATH,
 ) -> list[EventRecord]:
     """Run one polling cycle: gather signals, run all checkers, return
     the list of fired events.
@@ -890,6 +1215,22 @@ async def poll_once(
             events.append(ev)
     except Exception as e:  # noqa: BLE001 — defensive: H2E may 401/rate-limit
         log.warning("hold-to-earn poll failed: %s", e)
+
+    # Hedged-Earn redeem settlement (`earn_redeem_settled`). For each durable
+    # exit intent, check whether the freed coin has arrived; fire the moment it
+    # does so the loop's deterministic exit (swap exact + close paired short)
+    # runs within one poll instead of the next 4h heartbeat. Dwell-guarded so a
+    # transient missing Earn row can't unhedge early.
+    intent_state = read_redeem_intents()
+    if intent_state.intents:
+        try:
+            events.extend(
+                await _poll_redeem_settlements(
+                    client, intent_state.intents, dwell_state_path
+                )
+            )
+        except Exception as e:  # noqa: BLE001 — defensive: balance/earn endpoints
+            log.warning("redeem-settlement poll failed: %s", e)
 
     # ── Per-position signals (skip if no positions held) ─────────────
 
@@ -1050,19 +1391,25 @@ async def poll_once(
                 "mark_price": _to_decimal(
                     t.get("markPrice") or t.get("lastPrice")
                 ),
-                "funding_7d": _to_decimal(t.get("fundingRate")),
+                "funding_8h": _to_decimal(t.get("fundingRate")),
             }
         peg_dev_bps: Decimal | None = None
         if peg_price is not None:
             peg_dev_bps = (peg_price - Decimal("1.0")) * Decimal("10000")
+        # Dwell counters persist across polls (read → mutate in the checker →
+        # write back) so a funding/net breach must hold INVALIDATE_DWELL_POLLS
+        # consecutive polls before `pick_invalidated` fires (ah.10).
+        dwell = read_dwell_state(dwell_state_path)
         events.extend(
             check_pick_invalidation(
                 decision=decision,
                 baseline=baseline,
                 snapshot_signals=signals,
                 peg_dev_bps=peg_dev_bps,
+                dwell_counts=dwell,
             )
         )
+        write_dwell_state(dwell, dwell_state_path)
 
     # Event #7 batch — re-fetch LM positions only when we hold at least one
     lm_positions = [p for p in baseline.positions if p.venue == "lm"]

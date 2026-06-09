@@ -19,6 +19,21 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# Canonical stablecoin set — the coins the executor does NOT auto-hedge and
+# the validator's per-product / peg / hedging rules treat as USD. Single
+# source of truth: `snapshot` re-exports it, the validator imports it, and
+# the system prompt renders it (so the prompt's "stables-set" line can't
+# drift / truncate — ah.17 / prompt-1 / promptcode-3).
+STABLES: frozenset[str] = frozenset(
+    {"USDC", "USDT", "USD1", "FDUSD", "DAI", "USDE", "USDTB", "PYUSD", "RLUSD"}
+)
+
+# Agent decision cadence in seconds. Narrated in the system prompt (so the
+# model knows its own heartbeat) AND consumed by the loop as the default
+# `--interval`; sharing one constant keeps the two from contradicting each
+# other (ah.17 / prompt-2 — the prompt used to say both "4h" and "30 min").
+DEFAULT_CYCLE_INTERVAL_SECONDS: int = 4 * 60 * 60  # 4h
+
 VenueId = Literal[
     "cash_usdc",
     "aave_v3_usdc",

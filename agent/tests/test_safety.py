@@ -21,7 +21,9 @@ import pytest
 from agent.sandbox.safety import (
     DAILY_DRAWDOWN_HALT_PCT,
     check_daily_drawdown,
+    clear_halt,
     halt,
+    halt_trigger,
     is_halted,
     record_equity,
 )
@@ -29,6 +31,24 @@ from agent.sandbox.safety import (
 
 def test_is_halted_false_when_missing(tmp_path: Path) -> None:
     assert is_halted(path=tmp_path / "HALT") == (False, None)
+
+
+def test_halt_trigger_defaults_operator_for_bare_marker(tmp_path: Path) -> None:
+    """A bare `touch`ed marker (no `trigger=` line) is an operator stop —
+    auto-recovery must be opt-in (state-8)."""
+    marker = tmp_path / "HALT"
+    marker.write_text("")
+    assert halt_trigger(path=marker) == "operator"
+    assert halt_trigger(path=tmp_path / "absent") == "operator"
+
+
+def test_halt_stamps_trigger_and_clear_removes(tmp_path: Path) -> None:
+    marker = tmp_path / "HALT"
+    halt("24h drawdown 12%", path=marker, trigger="daily_drawdown")
+    assert halt_trigger(path=marker) == "daily_drawdown"
+    assert is_halted(path=marker)[0] is True
+    clear_halt(path=marker)
+    assert is_halted(path=marker) == (False, None)
 
 
 def test_halt_creates_file_with_reason(tmp_path: Path) -> None:

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from decimal import Decimal
 from typing import Any
 
 from eth_account import Account
@@ -28,6 +29,11 @@ from web3.contract import Contract
 from web3.exceptions import ContractLogicError
 
 log = logging.getLogger(__name__)
+
+# Below this gas balance the EOA can't reliably anchor — the loop surfaces a
+# low-gas alert (state-6) so the operator tops up before the audit trail
+# develops gaps. MNT, override via env. CLAUDE.md keeps the prod EOA ~4 MNT.
+MIN_GAS_MNT: Decimal = Decimal(os.environ.get("VAULT8004_MIN_GAS_MNT", "1.0"))
 
 _DECISION_LOG_ABI: list[dict[str, Any]] = [
     {
@@ -238,7 +244,14 @@ class OnchainWriter:
         try:
             tx = fn.build_transaction({
                 "from": self.account.address,
-                "nonce": self.w3.eth.get_transaction_count(self.account.address),
+                # `pending`, not the default `latest` (state-7): a prior tx
+                # still in the mempool already consumed `latest`'s nonce, so
+                # `latest` here would reuse it and the new tx gets dropped as a
+                # replacement. `pending` counts the in-flight tx and hands out
+                # the next free nonce.
+                "nonce": self.w3.eth.get_transaction_count(
+                    self.account.address, "pending"
+                ),
                 "gas": gas,
             })
             signed = self.account.sign_transaction(tx)
@@ -282,24 +295,30 @@ class OnchainWriter:
             if executed_actions is not None
             else intent_hash
         )
+        cid = ipfs_cid if ipfs_cid is not None else str(
+            (decision.get("_meta") or {}).get("ipfs_cid") or ""
+        )
+        return self.anchor_prepared(decision_id, cid, action_hash)
 
-        # Skip if already recorded — `recordDecision` reverts on
-        # duplicates ("duplicate decision"), which would just spam
-        # warnings on agent restarts.
+    def anchor_prepared(
+        self, decision_id: bytes, cid: str, action_hash: bytes
+    ) -> str | None:
+        """Send `recordDecision` for already-derived ids — the low-level
+        anchor the retry queue replays without the original `executed_actions`
+        (state-6). Skips if already on-chain (`recordDecision` reverts on
+        duplicates, which would just spam on restarts). Returns tx hash or
+        `None` (dup OR send failure — callers distinguish via
+        `decision_exists`)."""
         try:
             if self.decision_log.functions.exists(decision_id).call():
                 log.debug(
-                    "decision %s already on-chain (id=%s) — skipping",
-                    snapshot_filename,
+                    "decision id=%s already on-chain — skipping",
                     decision_id.hex(),
                 )
                 return None
         except Exception as e:
             log.warning("exists() pre-check failed: %s — attempting send anyway", e)
 
-        cid = ipfs_cid if ipfs_cid is not None else str(
-            (decision.get("_meta") or {}).get("ipfs_cid") or ""
-        )
         fn = self.decision_log.functions.recordDecision(
             self.agent_id,
             decision_id,
@@ -307,6 +326,27 @@ class OnchainWriter:
             action_hash,
         )
         return self._send(fn)
+
+    def decision_exists(self, decision_id: bytes) -> bool:
+        """True if `decision_id` is already anchored. Used to drop a queued
+        anchor whose tx landed late, and to tell a genuine send failure (→
+        enqueue) from an already-recorded skip (→ done). RPC error → False
+        (conservative: treat as not-anchored so it stays queued)."""
+        try:
+            return bool(self.decision_log.functions.exists(decision_id).call())
+        except Exception as e:
+            log.warning("exists() check failed: %s", e)
+            return False
+
+    def gas_balance_mnt(self) -> Decimal | None:
+        """EOA native (MNT) balance for the low-gas alert. `None` on RPC
+        error — the caller then skips the alert rather than false-warning."""
+        try:
+            wei = self.w3.eth.get_balance(self.account.address)
+            return Decimal(wei) / Decimal(10**18)
+        except Exception as e:
+            log.warning("gas balance read failed: %s", e)
+            return None
 
     def update_reputation(self) -> str | None:
         """Submit `updateReputation()` if the oracle is wired AND

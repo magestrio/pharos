@@ -32,6 +32,7 @@ from agent.sandbox.execute import (
     ActionKind,
     diff_to_actions,
     execute_actions,
+    exit_actions_from_intent,
     reconcile_executions,
     verify_executions_against_bybit,
     _enforce_usdt_budget,
@@ -41,6 +42,7 @@ from agent.sandbox.execute import (
     _lm_residual_redeem_actions,
     _orphan_perp_close_actions,
     _order_link_id,
+    _reindex_order_link_ids,
     _stable_consolidate_actions,
     _swap_actions_for_hedges,
     _unfunded_nonstable_subscribe_coins,
@@ -1698,6 +1700,48 @@ def test_diff_alpha_redeem_skips_when_no_native_amount(monkeypatch) -> None:
 def test_order_link_id_is_deterministic() -> None:
     assert _order_link_id("20260527T120000Z", 0) == "sandbox-20260527T120000Z-000"
     assert _order_link_id("20260527T120000Z", 42) == "sandbox-20260527T120000Z-042"
+
+
+def test_reindex_rewrites_carry_extra_ids() -> None:
+    """executor-4: reindexing rewrites the carry-leg spot/perp ids in `extra`
+    from the NEW order_link_id, so the legs dispatch under an id that matches
+    the reindexed parent (not the stale construction id that shadows the
+    `{order_link_id}_*` fallback at execute time)."""
+    redeem = Action(
+        kind=ActionKind.REDEEM_EARN, category="FlexibleSaving",
+        product_id="x", coin="USDT", amount=Decimal("1"),
+        order_link_id="old0", reason="r",
+    )
+    carry = Action(
+        kind=ActionKind.CLOSE_FUNDING_CARRY, category="FundingCarry",
+        product_id="TONUSDT", coin="TON", amount=Decimal("5"),
+        amount_native=Decimal("2"), order_link_id="oldX", reason="r",
+        extra={"spot_order_link_id": "oldX_spot",
+               "perp_order_link_id": "oldX_perp"},
+    )
+    _reindex_order_link_ids([redeem, carry], "20260609T000000Z")
+    assert redeem.order_link_id == "sandbox-20260609T000000Z-000"
+    new_id = "sandbox-20260609T000000Z-001"
+    assert carry.order_link_id == new_id
+    assert carry.extra["spot_order_link_id"] == f"{new_id}_spot"
+    assert carry.extra["perp_order_link_id"] == f"{new_id}_perp"
+
+
+def test_reindex_assigns_unique_sequential_ids() -> None:
+    """executor-3: a segment overrunning its 20-slot idx_offset window no
+    longer collides — the final reindex gives every action a unique id."""
+    actions = [
+        Action(
+            kind=ActionKind.REDEEM_EARN, category="FlexibleSaving",
+            product_id=str(i), coin="USDT", amount=Decimal("1"),
+            order_link_id="dup", reason="r",
+        )
+        for i in range(25)
+    ]
+    _reindex_order_link_ids(actions, "20260609T000000Z")
+    ids = [a.order_link_id for a in actions]
+    assert len(set(ids)) == 25
+    assert ids[24] == "sandbox-20260609T000000Z-024"
 
 
 def test_idempotency_keys_unique_within_plan() -> None:
@@ -5647,20 +5691,25 @@ def test_lm_residual_redeem_only_over_floor() -> None:
     assert a.amount == Decimal("53.0")  # full exit (removeRate=100)
 
 
-def test_lm_residual_redeem_skips_processing() -> None:
-    """A position whose redeem is already settling (`Processing`) is NOT
-    re-submitted, even with residual over the floor — avoids 180020 spam."""
+def test_lm_residual_redeem_skips_cooldown_position() -> None:
+    """A positionId in the redeem cooldown (`blocked_position_ids`) — we
+    already submitted a removeRate=100 within the settlement window — is NOT
+    re-submitted, even with residual over the floor. wt-3 replaces the old
+    `status=="Processing"` guard the LM payload doesn't reliably populate."""
     snap = _snapshot(
         lm_positions=[
-            _held_lm(
-                product_id="24",
-                position_id="p24",
-                residual_pct="0.0548",
-                status="Processing",
-            ),
+            _held_lm(product_id="24", position_id="p24", residual_pct="0.0548"),
         ]
     )
-    assert _lm_residual_redeem_actions(snap, "20260609T000000Z", idx_offset=820) == []
+    # No cooldown → redeems.
+    assert len(
+        _lm_residual_redeem_actions(snap, "20260609T000000Z", idx_offset=820)
+    ) == 1
+    # positionId in cooldown → skipped.
+    assert _lm_residual_redeem_actions(
+        snap, "20260609T000000Z", idx_offset=820,
+        blocked_position_ids={"p24"},
+    ) == []
 
 
 def test_lm_residual_redeem_skips_dust() -> None:
@@ -5676,3 +5725,169 @@ def test_lm_residual_redeem_skips_dust() -> None:
         ]
     )
     assert _lm_residual_redeem_actions(snap, "20260609T000000Z", idx_offset=820) == []
+
+
+# ─── build_redeem_exit_intents (hedged-Earn exit recording) ──────────────────
+
+def _redeem_result(
+    *,
+    coin: str = "TON",
+    product_id: str = "TON-FLEX",
+    category: str = "FlexibleSaving",
+    amount_native: str = "100",
+    status: str = "ok",
+):
+    action = Action(
+        kind=ActionKind.REDEEM_EARN,
+        category=category,
+        product_id=product_id,
+        coin=coin,
+        amount=Decimal("250"),
+        amount_native=Decimal(amount_native),
+        order_link_id="lnk-redeem-1",
+        reason="drop pick",
+    )
+    return SimpleNamespace(status=status, action=action, response=None)
+
+
+def _snap_with_short(coin: str = "TON", short_size: str = "100",
+                     wallet_native: str = "2"):
+    snap = _snapshot(
+        perp_positions=[
+            PerpPosition(symbol=f"{coin}USDT", side="Sell", size=short_size),
+        ],
+    )
+    snap.wallet.unified_coin_balances[coin] = Decimal(wallet_native)
+    return snap
+
+
+def test_build_redeem_exit_intents_records_hedged_nonstable():
+    from agent.sandbox.execute import build_redeem_exit_intents
+    snap = _snap_with_short("TON", "100", wallet_native="2")
+    intents = build_redeem_exit_intents(snap, [_redeem_result()])
+    assert len(intents) == 1
+    it = intents[0]
+    assert it.coin == "TON"
+    assert it.product_id == "TON-FLEX"
+    assert it.expected_redeem_native == Decimal("100")
+    assert it.baseline_wallet_native == Decimal("2")
+    assert it.paired_perp_symbol == "TONUSDT"
+    assert it.perp_qty_base == Decimal("100")
+
+
+def test_build_redeem_exit_intents_skips_stables_and_failures():
+    from agent.sandbox.execute import build_redeem_exit_intents
+    snap = _snap_with_short("TON", "100")
+    results = [
+        _redeem_result(coin="USDT", product_id="USDT-FLEX"),   # stable → skip
+        _redeem_result(status="error"),                         # failed → skip
+    ]
+    assert build_redeem_exit_intents(snap, results) == []
+
+
+def test_build_redeem_exit_intents_no_paired_short():
+    """A non-stable redeem with no live short still records (swap-back wanted),
+    with paired_perp_symbol=None so the handler skips the perp close."""
+    from agent.sandbox.execute import build_redeem_exit_intents
+    snap = _snapshot()  # no perp positions
+    snap.wallet.unified_coin_balances["TON"] = Decimal("0")
+    intents = build_redeem_exit_intents(snap, [_redeem_result()])
+    assert len(intents) == 1
+    assert intents[0].paired_perp_symbol is None
+    assert intents[0].perp_qty_base == Decimal("0")
+
+
+# ─── exit_actions_from_intent (deterministic settled-redeem exit) ────────────
+
+from agent.sandbox.redeem_intent import RedeemExitIntent as _RXI
+
+
+def _exit_intent(coin="TON", expected="100", perp_qty="100",
+                 paired=True, baseline_wallet="0"):
+    return _RXI(
+        coin=coin,
+        product_id=f"{coin}-ON",
+        category="OnChain",
+        opened_at=datetime.now(UTC),
+        expected_redeem_native=Decimal(expected),
+        baseline_wallet_native=Decimal(baseline_wallet),
+        redeem_order_link_id="lnk-r",
+        paired_perp_symbol=f"{coin}USDT" if paired else None,
+        perp_qty_base=Decimal(perp_qty),
+    )
+
+
+def _exit_snap(coin="TON", short="100", wallet="100", mark="2.0"):
+    snap = _snapshot(
+        perp_market={coin: PerpInfo(symbol=f"{coin}USDT", mark_price=Decimal(mark))},
+        perp_positions=(
+            [PerpPosition(symbol=f"{coin}USDT", side="Sell", size=short)]
+            if Decimal(short) > 0 else []
+        ),
+    )
+    snap.wallet.unified_coin_balances[coin] = Decimal(wallet)
+    return snap
+
+
+def test_exit_intent_arrived_with_short_closes_and_swaps():
+    snap = _exit_snap(short="100", wallet="100")
+    acts = exit_actions_from_intent(
+        snap, _exit_intent(), snapshot_ts="20260609T000000Z", idx_offset=900
+    )
+    kinds = [a.kind for a in acts]
+    assert kinds == [ActionKind.CLOSE_PERP, ActionKind.SWAP_SPOT]
+    close, swap = acts
+    assert close.product_id == "TONUSDT" and close.amount == Decimal("100.000")
+    assert swap.side == "Sell" and swap.coin == "USDT"
+    assert swap.amount == Decimal("100.000")
+
+
+def test_exit_intent_no_short_only_swaps():
+    snap = _exit_snap(short="0", wallet="100")
+    acts = exit_actions_from_intent(
+        snap, _exit_intent(paired=False), snapshot_ts="20260609T000000Z",
+        idx_offset=900,
+    )
+    assert [a.kind for a in acts] == [ActionKind.SWAP_SPOT]
+
+
+def test_exit_intent_not_arrived_closes_short_only():
+    # coin hasn't landed (wallet 0) but the short is still open → close it,
+    # nothing to swap yet.
+    snap = _exit_snap(short="100", wallet="0")
+    acts = exit_actions_from_intent(
+        snap, _exit_intent(), snapshot_ts="20260609T000000Z", idx_offset=900
+    )
+    assert [a.kind for a in acts] == [ActionKind.CLOSE_PERP]
+
+
+def test_exit_intent_caps_swap_at_live_wallet():
+    # recorded 100 but only 30 actually on the balance → sell 30, not 100.
+    snap = _exit_snap(short="0", wallet="30")
+    acts = exit_actions_from_intent(
+        snap, _exit_intent(paired=False, expected="100"),
+        snapshot_ts="20260609T000000Z", idx_offset=900,
+    )
+    assert len(acts) == 1
+    assert acts[0].amount == Decimal("30.000")
+
+
+def test_exit_intent_caps_close_at_live_short():
+    # recorded 100 short but only 40 still open → close 40.
+    snap = _exit_snap(short="40", wallet="0")
+    acts = exit_actions_from_intent(
+        snap, _exit_intent(perp_qty="100"), snapshot_ts="20260609T000000Z",
+        idx_offset=900,
+    )
+    assert [a.kind for a in acts] == [ActionKind.CLOSE_PERP]
+    assert acts[0].amount == Decimal("40.000")
+
+
+def test_exit_intent_dust_swap_skipped():
+    # tiny freed amount below MIN_SWAP_USDC notional → no swap leg.
+    snap = _exit_snap(short="0", wallet="0.01", mark="2.0")  # $0.02
+    acts = exit_actions_from_intent(
+        snap, _exit_intent(paired=False, expected="0.01"),
+        snapshot_ts="20260609T000000Z", idx_offset=900,
+    )
+    assert acts == []

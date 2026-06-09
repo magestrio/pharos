@@ -48,7 +48,7 @@ from agent.data.allora_client import (
     AlloraClient,
     AlloraInference,
 )
-from agent.reason.venues import CARRY_CATEGORY, LM_BASE_LEG_FRACTION
+from agent.reason.venues import CARRY_CATEGORY, LM_BASE_LEG_FRACTION, STABLES
 from agent.sandbox.on_chain import (
     AAVE_V3_POOL_ADDRESS,
     AaveV3UsdcState,
@@ -141,14 +141,13 @@ HOLDING_HORIZON_MINUTES = 7 * 24 * 60  # 10080
 
 _EARN_PERMISSION_RET_CODE = 10005
 
-# Stables-set used to guarantee USDC-equivalent picks always survive the
-# top-K ranker, even when their APR ranks below alt-coin products. The
-# vault is USDC-denominated, so a stable pick is always strategically
-# interesting — leaving it out of the snapshot just because USDC pays
-# 0.6% while ALT pays 92% would force the LLM into a token-risk trade.
-STABLES: frozenset[str] = frozenset(
-    {"USDC", "USDT", "USD1", "FDUSD", "DAI", "USDE", "USDTB", "PYUSD", "RLUSD"}
-)
+# `STABLES` is the canonical stablecoin set, now homed in `agent.reason.venues`
+# and re-exported here (imported above) so existing `from
+# agent.sandbox.snapshot import STABLES` call sites keep working while the
+# prompt + validator share the same source (ah.17). Used to guarantee
+# USDC-equivalent picks always survive the top-K ranker even when their APR
+# ranks below alt-coin products — the vault is USDC-denominated, so a stable
+# pick is always strategically interesting.
 
 # Multiplier on perp-short notional → USDT margin demand. Both validator
 # (pre-trade reservation) and executor (USDT budget enforcement) read
@@ -1259,6 +1258,46 @@ def _lm_hedge_residual(
         hedge_qty = Decimal(0)
     hedge_usd = hedge_qty * mark
     return (hedge_usd, base_leg_usd - hedge_usd)
+
+
+def _inject_lm_hedge_residuals(
+    lm_positions: list[dict[str, Any]],
+    products: dict[str, list[ProductSummary]],
+    perp_market: dict[str, Any],
+    total_equity: Decimal,
+) -> None:
+    """Surface the un-hedgeable naked base-coin residual on each HELD LM
+    position (mutates the dicts in place), so the LLM and the de-risk redeem
+    reason on a real number instead of "the hedge is automatic". The raw LM
+    row doesn't echo the base coin — resolve it through the LM catalog by
+    productId. Must run post perp-fan-out (needs `perp_market` + `total_equity`)
+    yet PRE the small-vault catalog filter (needs the still-complete catalog).
+
+    When the base coin has NO perp in the fan-out the whole base leg is naked
+    — surface it fully (wt-4); the prior `continue` silently dropped the
+    largest residual of all, so a held LM on a perp-less base never tripped the
+    redeem."""
+    lm_pair_by_pid = {
+        p.product_id: p.coin for p in products.get("LiquidityMining", [])
+    }
+    for pos in lm_positions:
+        pair = lm_pair_by_pid.get(str(pos.get("productId") or ""))
+        if not pair:
+            continue
+        base = pair.split("/", 1)[0].upper()
+        if not base or base in STABLES:
+            continue
+        base_leg_usd = _lm_position_principal_usd(pos) * LM_BASE_LEG_FRACTION
+        info = perp_market.get(base)
+        if info is None:
+            residual_usd = base_leg_usd
+        else:
+            _, residual_usd = _lm_hedge_residual(
+                base_leg_usd, info.mark_price, info.qty_step, info.min_order_qty
+            )
+        pos["hedge_residual_naked_usd"] = str(residual_usd)
+        if total_equity > 0:
+            pos["hedge_residual_pct_of_book"] = str(residual_usd / total_equity)
 
 
 def _rank_key(s: ProductSummary) -> Decimal:
@@ -2894,32 +2933,11 @@ async def collect_snapshot(
     products["OnChain"] = _rank(products["OnChain"], must_include=stable_floor)
 
     # lm-residual epic: surface the un-hedgeable naked base-coin residual on
-    # each HELD LM position so the LLM (and, later, the validator) reasons on
-    # a real number instead of the "hedge is automatic" assumption. The raw
-    # LM row doesn't echo the base coin — resolve it through the LM catalog by
-    # productId, exactly like the executor's `_lm_product_from_snapshot`. Runs
-    # here (post perp fan-out, PRE the small-vault filter below) because it
-    # needs `perp_market` + `total_equity` AND the still-complete LM catalog.
-    lm_pair_by_pid = {
-        p.product_id: p.coin for p in products.get("LiquidityMining", [])
-    }
-    for pos in lm_positions:
-        pair = lm_pair_by_pid.get(str(pos.get("productId") or ""))
-        if not pair:
-            continue
-        base = pair.split("/", 1)[0].upper()
-        if not base or base in STABLES:
-            continue
-        info = perp_market.get(base)
-        if info is None:
-            continue
-        base_leg_usd = _lm_position_principal_usd(pos) * LM_BASE_LEG_FRACTION
-        _, residual_usd = _lm_hedge_residual(
-            base_leg_usd, info.mark_price, info.qty_step, info.min_order_qty
-        )
-        pos["hedge_residual_naked_usd"] = str(residual_usd)
-        if total_equity > 0:
-            pos["hedge_residual_pct_of_book"] = str(residual_usd / total_equity)
+    # each HELD LM position so the LLM (and the de-risk redeem) reason on a
+    # real number instead of the "hedge is automatic" assumption. Runs here
+    # (post perp fan-out, PRE the small-vault filter below) because it needs
+    # `perp_market` + `total_equity` AND the still-complete LM catalog.
+    _inject_lm_hedge_residuals(lm_positions, products, perp_market, total_equity)
 
     # Funding-carry category. Filters + ranks coins from perp_market by
     # friction-adjusted carry APR. Venue `bybit_funding_carry` (`.3`)

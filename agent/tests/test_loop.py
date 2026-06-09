@@ -19,6 +19,7 @@ import pytest
 
 from agent.bybit_oracle.bybit_client import EarnOrderResult
 from agent.reason.schema import Decision, Pick, VenueAllocation
+from agent.sandbox.carry_state import CarryPositionRecord, CarryState
 from agent.sandbox.decide import DecisionUsage
 from agent.sandbox.loop import run_loop, run_one_cycle
 
@@ -228,6 +229,48 @@ def test_clamp_drops_overbudget_carry_to_cash() -> None:
     assert not any(
         p.product_id == "HYPEUSDT" for v in rebuilt.venues for p in v.picks
     )
+
+
+def test_clamp_credits_held_carry_kept_at_size() -> None:
+    """executor-2: re-stating an already-open carry at its held size is NOT
+    fresh spend, so the clamp must not drop it — even though its gross value
+    exceeds the liquid budget. Same setup as the drop test, but with
+    `carry_state` supplied; held value = spot_qty_base × mark = $15 → net_new
+    ≈ 0. Without carry_state the identical pick is dropped (see the drop test)."""
+    from agent.sandbox.loop import _clamp_to_liquid_budget
+    snap = _snapshot_with_ton(liquid_usdc="6")  # max_new_nonstable ≈ $2.93
+    snap.products["FundingCarry"] = [
+        ProductSummary(
+            category="FundingCarry", product_id="HYPEUSDT", coin="HYPE",
+            effective_apr=Decimal("0.08"), apr_source="funding_carry",
+            base_apr_string=None, redeem_lockup_minutes=0, notes=[],
+        ),
+    ]
+    snap.perp_market["HYPE"] = PerpInfo(
+        symbol="HYPEUSDT", mark_price=Decimal("2.0"),
+        min_notional_usd=Decimal("1.0"), funding_interval_hours=Decimal("8"),
+    )
+    carry_state = CarryState(positions=[CarryPositionRecord(
+        coin="HYPE", opened_at=datetime.now(UTC),
+        target_pick_usd=Decimal("15"), spot_qty_base=Decimal("7.5"),
+        perp_qty_base=Decimal("7.5"), mark_price_at_open=Decimal("2.0"),
+        spot_order_link_id="s1", perp_order_link_id="p1",
+    )])
+    dec = Decision(
+        thesis="keep the existing HYPE funding-carry at its current size.",
+        venues=[
+            VenueAllocation(venue_id="cash_usdc", weight=0.85),
+            VenueAllocation(venue_id="bybit_funding_carry", weight=0.15,
+                            picks=[Pick(product_id="HYPEUSDT", weight=1.0)]),
+        ],
+        hedges=[], confidence=0.7, risk_flags=[], notes=[],
+        expected_blended_apr_pct=6.0,
+    )
+    new_dict, dropped, note = _clamp_to_liquid_budget(
+        dec.model_dump(), snap, carry_state=carry_state,
+    )
+    assert dropped == []
+    assert note is None
 
 
 def test_strip_carry_coins_drops_targeted_carry_to_cash() -> None:
@@ -2582,3 +2625,397 @@ async def test_run_one_cycle_recomputes_expected_apr_end_to_end(tmp_path: Path) 
     assert abs(outcome["expected_apr_pct"] - 2.4) < 1e-6
     assert abs(outcome["expected_apr_recomputed"]["to"] - 2.4) < 1e-6
     assert outcome["expected_apr_recomputed"]["from"] == 8.0
+
+
+# ─── ah.7 startup crash-recovery gate ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_crash_gate_halts_on_landed_pending_intent(tmp_path: Path) -> None:
+    """A pending-intent marker surviving a crash whose order LANDED on Bybit
+    trips HALT and keeps the marker for the operator (ah.7 state-2)."""
+    from agent.sandbox.loop import _startup_crash_recovery_gate
+    from agent.sandbox.pending_intent import PendingIntent, PendingOrderLink
+    from agent.sandbox.safety import HALT_FILE
+
+    client = AsyncMock()
+    client.get_order_history = AsyncMock(return_value=[{"orderId": "X"}])  # landed
+    pending = PendingIntent(snapshot_ts="20260609T000000Z", links=[
+        PendingOrderLink(order_link_id="lid_perp", category="linear",
+                         symbol="TONUSDT", kind="open_funding_carry", coin="TON"),
+    ])
+    with (
+        patch("agent.sandbox.loop.detect_unfinished_cycles", lambda *_a, **_k: []),
+        patch("agent.sandbox.loop.read_pending_intent", lambda *_a, **_k: pending),
+        patch("agent.sandbox.loop.clear_pending_intent") as clear_mock,
+    ):
+        halted = await _startup_crash_recovery_gate(
+            tmp_path / "cyc.jsonl", client, live=True
+        )
+    assert halted is True
+    assert HALT_FILE.exists()
+    clear_mock.assert_not_called()  # marker kept for manual reconciliation
+
+
+@pytest.mark.asyncio
+async def test_crash_gate_clears_clean_pending_intent(tmp_path: Path) -> None:
+    """A pending marker whose orders never landed (all no-trace) is cleared and
+    does NOT HALT — nothing opened, safe to resume."""
+    from agent.sandbox.loop import _startup_crash_recovery_gate
+    from agent.sandbox.pending_intent import PendingIntent, PendingOrderLink
+    from agent.sandbox.safety import HALT_FILE
+
+    client = AsyncMock()
+    client.get_order_history = AsyncMock(return_value=[])  # no-trace
+    pending = PendingIntent(snapshot_ts="ts", links=[
+        PendingOrderLink(order_link_id="lid_spot", category="spot",
+                         symbol="TONUSDT", kind="open_funding_carry", coin="TON"),
+    ])
+    with (
+        patch("agent.sandbox.loop.detect_unfinished_cycles", lambda *_a, **_k: []),
+        patch("agent.sandbox.loop.read_pending_intent", lambda *_a, **_k: pending),
+        patch("agent.sandbox.loop.clear_pending_intent") as clear_mock,
+    ):
+        halted = await _startup_crash_recovery_gate(
+            tmp_path / "cyc.jsonl", client, live=True
+        )
+    assert halted is False
+    assert not HALT_FILE.exists()
+    clear_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_crash_gate_skips_verification_when_not_live(tmp_path: Path) -> None:
+    """Not live → no Bybit query (IP-bound key can't reach order-history
+    off-host), no HALT, marker left intact for the next live start."""
+    from agent.sandbox.loop import _startup_crash_recovery_gate
+    from agent.sandbox.pending_intent import PendingIntent, PendingOrderLink
+    from agent.sandbox.safety import HALT_FILE
+
+    client = AsyncMock()
+    client.get_order_history = AsyncMock(return_value=[{"orderId": "X"}])
+    pending = PendingIntent(snapshot_ts="ts", links=[
+        PendingOrderLink(order_link_id="l", category="linear", symbol="TONUSDT",
+                         kind="open_perp_short", coin="TON"),
+    ])
+    with (
+        patch("agent.sandbox.loop.detect_unfinished_cycles", lambda *_a, **_k: []),
+        patch("agent.sandbox.loop.read_pending_intent", lambda *_a, **_k: pending),
+        patch("agent.sandbox.loop.clear_pending_intent") as clear_mock,
+    ):
+        halted = await _startup_crash_recovery_gate(
+            tmp_path / "cyc.jsonl", client, live=False
+        )
+    assert halted is False
+    assert not HALT_FILE.exists()
+    client.get_order_history.assert_not_awaited()
+    clear_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_crash_gate_halts_on_unfinished_cycle_landed(tmp_path: Path) -> None:
+    """An unfinished cycle (executions log, no cycle_log entry) whose
+    confirmable order is confirmed-landed on Bybit trips HALT (ah.7 dispatch-4
+    wires the previously-unwired verifier)."""
+    from agent.sandbox.loop import _startup_crash_recovery_gate
+    from agent.sandbox.safety import HALT_FILE
+
+    client = AsyncMock()
+    unfinished = [{"snapshot_ts": "ts1", "total": 1, "counts": {"ok": 1},
+                   "last_finished_at": None, "path": "x"}]
+    verify = AsyncMock(return_value={"counts": {"confirmed-landed": 1}})
+    with (
+        patch("agent.sandbox.loop.detect_unfinished_cycles", lambda *_a, **_k: unfinished),
+        patch("agent.sandbox.loop.read_pending_intent", lambda *_a, **_k: None),
+        patch("agent.sandbox.loop.verify_executions_against_bybit", verify),
+    ):
+        halted = await _startup_crash_recovery_gate(
+            tmp_path / "cyc.jsonl", client, live=True
+        )
+    assert halted is True
+    assert HALT_FILE.exists()
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_flags_carry_open_orphan_p0(tmp_path: Path) -> None:
+    """ah.9 (state-3): an orphan OPEN_FUNDING_CARRY surfaces P0 in the outcome
+    so the operator sees the spot fill whose perp leg never landed (even though
+    the dispatch already unwound it)."""
+    from agent.sandbox.carry_state import CarryState
+    from agent.sandbox.execute import Action, ActionKind, ActionResult
+
+    bybit = AsyncMock()
+    anthropic_client = AsyncMock()
+    snap = _snapshot()
+    decision = _decision_clean()
+    orphan = ActionResult(
+        action=Action(
+            kind=ActionKind.OPEN_FUNDING_CARRY, category="FundingCarry",
+            product_id="TONUSDT", coin="TON", amount=Decimal("100"),
+            amount_native=Decimal("50"), order_link_id="c1", reason="open carry",
+        ),
+        status="orphan",
+        response={"legs": {"spot": {"cumExecQty": "50"}, "unwind": {"unwound": True}}},
+        error="perp leg failed after spot fill: retCode=110007 Insufficient margin",
+        started_at="t", finished_at="t",
+    )
+    with (
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_k: []),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
+        patch("agent.sandbox.loop.write_decision", lambda d, sp, **_k: tmp_path / "decision.json"),
+        patch("agent.sandbox.loop.read_carry_state", lambda *_a, **_k: CarryState()),
+        patch("agent.sandbox.loop.request_approval", return_value=True),
+        patch("agent.sandbox.loop.diff_to_actions", return_value=[orphan.action]),
+        patch("agent.sandbox.loop.execute_actions", AsyncMock(return_value=[orphan])),
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        outcome = await run_one_cycle(
+            bybit, anthropic_client, live=True, yes=True, min_confidence=0.6,
+        )
+
+    assert "carry_open_orphan" in outcome
+    assert outcome["carry_open_orphan"][0]["coin"] == "TON"
+    assert outcome["carry_open_orphan"][0]["unwound"] is True
+
+
+# ─── deterministic settled-redeem exit (_execute_redeem_exits) ───────────────
+
+def _exit_snap(*, ton_held: str = "0", ton_wallet: str = "100",
+               short: str = "100") -> Snapshot:
+    """Snapshot for the redeem-exit handler: `ton_held` seeds an OnChain TON
+    Earn row (>0 = not yet settled), `ton_wallet` the arrived coin, `short` an
+    open paired perp short."""
+    from agent.bybit_oracle.bybit_client import PerpPosition
+    earn = (
+        [{"productId": "8", "coin": "TON", "amount": ton_held,
+          "category": "OnChain", "status": "Processing"}]
+        if Decimal(ton_held) > 0 else []
+    )
+    snap = Snapshot(
+        captured_at=datetime.now(UTC),
+        wallet=WalletSnapshot(total_equity_usd=Decimal("100")),
+        earn_positions=earn,
+        lm_positions=[],
+        products={"FlexibleSaving": [], "OnChain": [], "LiquidityMining": []},
+        market=MarketSnapshot(),
+        perp_market={"TON": PerpInfo(symbol="TONUSDT", mark_price=Decimal("2.0"))},
+        perp_positions=(
+            [PerpPosition(symbol="TONUSDT", side="Sell", size=short)]
+            if Decimal(short) > 0 else []
+        ),
+        usdc_peg=UsdcPegSnapshot(price_usd=Decimal("1.0"), deviation_bps=Decimal("0"),
+                                 fetched_at=datetime.now(UTC)),
+        errors=[],
+    )
+    snap.wallet.unified_coin_balances["TON"] = Decimal(ton_wallet)
+    return snap
+
+
+def _intent_ton():
+    from agent.sandbox.redeem_intent import RedeemExitIntent
+    return RedeemExitIntent(
+        coin="TON", product_id="8", category="OnChain", opened_at=datetime.now(UTC),
+        expected_redeem_native=Decimal("100"), baseline_wallet_native=Decimal("0"),
+        redeem_order_link_id="r", paired_perp_symbol="TONUSDT",
+        perp_qty_base=Decimal("100"),
+    )
+
+
+def _exec_result(kind: str, status: str = "ok"):
+    return MagicMock(
+        status=status, error=None,
+        action=MagicMock(
+            kind=MagicMock(value=kind), product_id="TONUSDT", coin="TON",
+            amount=Decimal("100"),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_redeem_exit_settled_closes_swaps_clears_intent(monkeypatch):
+    """Settled redeem (Earn row gone, coin in wallet): close paired short +
+    swap, no LLM, and the intent is cleared once both legs confirm."""
+    from agent.sandbox import loop as loop_mod
+    from agent.sandbox.redeem_intent import RedeemIntentState
+
+    captured: dict = {}
+    monkeypatch.setattr(loop_mod, "read_redeem_intents",
+                        lambda *a, **k: RedeemIntentState(intents=[_intent_ton()]))
+    monkeypatch.setattr(loop_mod, "write_redeem_intents",
+                        lambda state, *a, **k: captured.__setitem__("state", state))
+    exec_mock = AsyncMock(return_value=[_exec_result("close_perp"),
+                                        _exec_result("swap_spot")])
+    monkeypatch.setattr(loop_mod, "execute_actions", exec_mock)
+
+    snap = _exit_snap(ton_held="0", ton_wallet="100", short="100")
+    records, executed = await loop_mod._execute_redeem_exits(
+        MagicMock(), snap, "20260609T000000Z"
+    )
+    assert executed == 2
+    assert {r["kind"] for r in records} == {"close_perp", "swap_spot"}
+    assert captured["state"].intents == []  # cleared
+    assert exec_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_redeem_exit_not_settled_keeps_hedge(monkeypatch):
+    """Earn row still holds the principal (Processing) and nothing arrived →
+    the handler must NOT close the short (no naked-long) and must NOT execute."""
+    from agent.sandbox import loop as loop_mod
+    from agent.sandbox.redeem_intent import RedeemIntentState
+
+    monkeypatch.setattr(loop_mod, "read_redeem_intents",
+                        lambda *a, **k: RedeemIntentState(intents=[_intent_ton()]))
+    exec_mock = AsyncMock(return_value=[])
+    monkeypatch.setattr(loop_mod, "execute_actions", exec_mock)
+
+    snap = _exit_snap(ton_held="100", ton_wallet="0", short="100")
+    records, executed = await loop_mod._execute_redeem_exits(
+        MagicMock(), snap, "20260609T000000Z"
+    )
+    assert executed == 0
+    assert records == []
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_redeem_exit_partial_failure_keeps_intent(monkeypatch):
+    """If a leg errors, the intent is retained for next-cycle retry."""
+    from agent.sandbox import loop as loop_mod
+    from agent.sandbox.redeem_intent import RedeemIntentState
+
+    captured: dict = {}
+    monkeypatch.setattr(loop_mod, "read_redeem_intents",
+                        lambda *a, **k: RedeemIntentState(intents=[_intent_ton()]))
+    monkeypatch.setattr(loop_mod, "write_redeem_intents",
+                        lambda state, *a, **k: captured.__setitem__("state", state))
+    exec_mock = AsyncMock(return_value=[_exec_result("close_perp"),
+                                        _exec_result("swap_spot", status="error")])
+    monkeypatch.setattr(loop_mod, "execute_actions", exec_mock)
+
+    snap = _exit_snap(ton_held="0", ton_wallet="100", short="100")
+    records, executed = await loop_mod._execute_redeem_exits(
+        MagicMock(), snap, "20260609T000000Z"
+    )
+    assert executed == 1  # only the close confirmed
+    # intent NOT removed → write_redeem_intents not called with empty (changed
+    # stays False, so no write at all)
+    assert "state" not in captured
+
+
+# ─── on-chain anchor retry queue drain (state-6) ─────────────────────────────
+
+def _pending_anchor(decision_id: str, attempts: int = 0):
+    from agent.sandbox.onchain_anchor_queue import PendingAnchor
+    return PendingAnchor(
+        decision_id=decision_id, snapshot_filename=f"s-{decision_id}.json",
+        ipfs_cid="", action_hash="bb", enqueued_at=datetime.now(UTC),
+        attempts=attempts,
+    )
+
+
+def test_drain_anchor_queue_lands_retains_and_caps() -> None:
+    """state-6: a landed anchor drops, a still-failing one is retained with
+    attempts+1, and one at the attempt cap is dropped for operator review."""
+    from agent.sandbox.loop import _drain_anchor_queue
+    from agent.sandbox.onchain_anchor_queue import AnchorQueue, MAX_ANCHOR_ATTEMPTS
+    writer = MagicMock()
+    writer.anchor_prepared.side_effect = (
+        lambda did, cid, ah: "0xtx" if did == bytes.fromhex("aa") else None
+    )
+    writer.decision_exists.return_value = False
+    q = AnchorQueue(entries=[
+        _pending_anchor("aa"),
+        _pending_anchor("bb", attempts=0),
+        _pending_anchor("cc", attempts=MAX_ANCHOR_ATTEMPTS - 1),
+    ])
+    new_q, drained = _drain_anchor_queue(writer, q)
+    assert drained == 1  # aa landed
+    ids = {e.decision_id for e in new_q.entries}
+    assert ids == {"bb"}  # cc hit the cap and was dropped
+    assert next(e for e in new_q.entries if e.decision_id == "bb").attempts == 1
+
+
+def test_drain_anchor_queue_drops_late_landed() -> None:
+    """An entry whose tx landed on a prior attempt (exists() now True) is
+    dropped even though this cycle's re-send returned no hash."""
+    from agent.sandbox.loop import _drain_anchor_queue
+    from agent.sandbox.onchain_anchor_queue import AnchorQueue
+    writer = MagicMock()
+    writer.anchor_prepared.return_value = None
+    writer.decision_exists.return_value = True
+    new_q, drained = _drain_anchor_queue(writer, AnchorQueue(entries=[_pending_anchor("aa")]))
+    assert drained == 1
+    assert new_q.entries == []
+
+
+# ─── drawdown HALT auto-recovery (state-8) ───────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_operator_halt_short_circuits(tmp_path: Path) -> None:
+    """An operator halt (bare marker, trigger=operator) stops the cycle
+    BEFORE the snapshot — no API round-trip, no auto-recovery."""
+    from agent.sandbox import safety
+    safety.HALT_FILE.write_text("manual emergency stop")
+    collect = AsyncMock(return_value=_snapshot())
+    with patch("agent.sandbox.loop.collect_snapshot", collect):
+        outcome = await run_one_cycle(
+            AsyncMock(), AsyncMock(), live=False, yes=False, min_confidence=0.6
+        )
+    assert outcome["result"] == "halted"
+    collect.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_drawdown_halt_auto_recovers(tmp_path: Path) -> None:
+    """A drawdown halt self-clears once equity is back within threshold:
+    the cycle still snapshots + records equity, sees no drawdown, clears the
+    marker, and resumes."""
+    from datetime import timedelta
+    from agent.sandbox import safety
+    old_ts = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    safety.EQUITY_HISTORY_FILE.write_text(
+        json.dumps({"ts": old_ts, "total_equity_usd": "100"}) + "\n"
+    )
+    safety.halt("24h drawdown 12%", trigger="daily_drawdown")
+    snap = _snapshot("100")  # recovered: current == baseline
+    with (
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: []),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=(_decision_clean(), _stub_usage()))),
+        patch("agent.sandbox.loop.write_decision", lambda d, sp, **_kw: tmp_path / "decision.json"),
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        outcome = await run_one_cycle(
+            AsyncMock(), AsyncMock(), live=False, yes=False, min_confidence=0.6
+        )
+    assert outcome.get("drawdown_recovered") is True
+    assert outcome["result"] != "halted"
+    assert not safety.HALT_FILE.exists()
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_drawdown_halt_stays_when_still_down(tmp_path: Path) -> None:
+    """While still under water the drawdown halt persists — but equity is
+    still recorded so a later cycle can detect recovery."""
+    from datetime import timedelta
+    from agent.sandbox import safety
+    old_ts = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    safety.EQUITY_HISTORY_FILE.write_text(
+        json.dumps({"ts": old_ts, "total_equity_usd": "100"}) + "\n"
+    )
+    safety.halt("24h drawdown 12%", trigger="daily_drawdown")
+    snap = _snapshot("80")  # 20% down > 10% threshold → still hit
+    with (
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+    ):
+        outcome = await run_one_cycle(
+            AsyncMock(), AsyncMock(), live=False, yes=False, min_confidence=0.6
+        )
+    assert outcome["result"] == "halted"
+    assert outcome["halt_trigger"] == "daily_drawdown"
+    assert safety.HALT_FILE.exists()

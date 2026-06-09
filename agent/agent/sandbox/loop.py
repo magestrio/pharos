@@ -35,6 +35,7 @@ import logging
 import signal
 import sys
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -48,7 +49,12 @@ from dotenv import load_dotenv
 
 from agent.bybit_oracle.bybit_client import BybitClient
 from agent.reason.schema import Decision
-from agent.reason.venues import CARRY_CATEGORY, CARRY_VENUE_ID, VENUE_REGISTRY
+from agent.reason.venues import (
+    CARRY_CATEGORY,
+    CARRY_VENUE_ID,
+    DEFAULT_CYCLE_INTERVAL_SECONDS,
+    VENUE_REGISTRY,
+)
 from agent.sandbox.decide import (
     DECISION_DIR,
     _collect_recently_invalidated,
@@ -57,7 +63,19 @@ from agent.sandbox.decide import (
     write_decision,
 )
 from agent.sandbox.ipfs_pin import pin_decision_rationale
-from agent.sandbox.onchain_writer import OnchainWriter
+from agent.sandbox.onchain_writer import (
+    MIN_GAS_MNT,
+    OnchainWriter,
+    derive_execution_hash,
+    derive_ids,
+)
+from agent.sandbox.onchain_anchor_queue import (
+    MAX_ANCHOR_ATTEMPTS,
+    AnchorQueue,
+    PendingAnchor,
+    read_anchor_queue,
+    write_anchor_queue,
+)
 from agent.sandbox.reflect import reflect_on_cycle
 from agent.sandbox.carry_state import (
     CarryState,
@@ -65,23 +83,46 @@ from agent.sandbox.carry_state import (
     read_carry_state,
     write_carry_state,
 )
+from agent.sandbox.lm_redeem_cooldown import (
+    read_lm_redeem_cooldown,
+    write_lm_redeem_cooldown,
+)
 from agent.sandbox.execute import (
     DEFAULT_AUTO_APPROVE_MIN_CONFIDENCE,
     EXECUTIONS_DIR,
     _carry_liq_close_actions,
+    _confirmable_order_links,
     _lm_residual_redeem_actions,
     _orphan_perp_close_actions,
     _orphan_spot_sell_actions,
+    _reindex_order_link_ids,
     _stable_consolidate_actions,
+    _coin_wallet_native,
     apply_carry_results_to_state,
+    build_redeem_exit_intents,
     diff_to_actions,
+    exit_actions_from_intent,
     execute_actions,
     reconcile_executions,
     request_approval,
+    verify_executions_against_bybit,
+    verify_order_links,
+)
+from agent.sandbox.redeem_intent import (
+    read_redeem_intents,
+    write_redeem_intents,
+)
+from agent.sandbox.pending_intent import (
+    PendingIntent,
+    clear_pending_intent,
+    read_pending_intent,
+    write_pending_intent,
 )
 from agent.sandbox.safety import (
     check_daily_drawdown,
+    clear_halt,
     halt,
+    halt_trigger,
     is_halted,
     record_equity,
 )
@@ -106,7 +147,10 @@ from agent.sandbox.watcher import (
 )
 from agent.sandbox.watcher import (
     EventRecord,
+    check_earn_redeem_settled,
+    prune_closed_positions,
     update_baseline_from_snapshot,
+    write_baseline as write_watcher_baseline,
 )
 from agent.sandbox.watcher import (
     poll_once as watcher_poll_once,
@@ -137,7 +181,9 @@ from agent.validate.rules import (
 # the gap between two heartbeats. Cost economics: 4h × 6 cycles/day ×
 # $0.14 ≈ $0.84/day baseline API (vs $6.72/day at 30min), reactive
 # cycles add on top.
-DEFAULT_INTERVAL_SECONDS = 4 * 60 * 60  # 4h
+# Re-export the shared cadence (ah.17) under the loop's local name so the
+# argparse default + the system prompt's "heartbeat" narrative stay in sync.
+DEFAULT_INTERVAL_SECONDS = DEFAULT_CYCLE_INTERVAL_SECONDS  # 4h
 CYCLE_LOG = Path(__file__).parent / "cycle_log.jsonl"
 
 
@@ -185,6 +231,113 @@ def detect_unfinished_cycles(
         if summary.get("total", 0) > 0:
             unfinished.append(summary)
     return unfinished
+
+
+# Verifier classifications that mean "a real or unconfirmable order may be open
+# that the agent never reconciled" — the startup gate HALTs on any of these.
+# `no-trace` (order never landed) is the only safe-to-ignore outcome.
+_CRASH_GATE_BLOCKING = ("confirmed-landed", "desync", "query-error")
+
+
+async def _startup_crash_recovery_gate(
+    cycle_log_path: Path,
+    client: BybitClient,
+    *,
+    live: bool,
+) -> bool:
+    """Block startup when a prior cycle may have left an unreconciled position
+    on Bybit (ah.7 — dispatch-4 + state-2). Two complementary sources:
+
+      1. Unfinished cycles — executions log flushed but no cycle_log entry
+         (`detect_unfinished_cycles`); confirmable rows cross-checked with
+         `verify_executions_against_bybit`. Catches SWAP/perp single actions.
+      2. A surviving pending-intent marker — a crash mid-`execute_actions`,
+         BEFORE the row was flushed, so the scan above can't see it. Its
+         recorded leg links (incl. carry spot+perp, which the executions scan
+         treats as unconfirmable) are cross-checked with `verify_order_links`.
+
+    Any `confirmed-landed` / `desync` / `query-error` → `halt()` so every cycle
+    no-ops until the operator reconciles. A clean (all `no-trace`) marker is
+    cleared. Verification needs live Bybit order-history (IP-bound key), so a
+    non-live start only warns and leaves any marker for the next live start.
+
+    Returns True when a HALT was tripped.
+    """
+    unfinished = detect_unfinished_cycles(cycle_log_path)
+    for u in unfinished:
+        log.warning(
+            "unfinished prior cycle detected (no cycle_log entry): "
+            "ts=%s total=%d counts=%s last_finished=%s — verifying against "
+            "Bybit before next cycle's diff opens new positions",
+            u["snapshot_ts"], u["total"], u["counts"],
+            u.get("last_finished_at"),
+        )
+    pending = read_pending_intent()
+
+    if not live:
+        if unfinished or pending is not None:
+            log.warning(
+                "crash-recovery gate skipped (not live): %d unfinished "
+                "cycle(s), pending_intent=%s — will verify on the next live "
+                "start",
+                len(unfinished),
+                pending.snapshot_ts if pending else None,
+            )
+        return False
+
+    halt_reasons: list[str] = []
+    for u in unfinished:
+        try:
+            v = await verify_executions_against_bybit(u["snapshot_ts"], client)
+        except Exception as e:  # noqa: BLE001 — a failed verify must block, not crash
+            halt_reasons.append(f"verify {u['snapshot_ts']} raised: {e}")
+            continue
+        bad = {k: c for k, c in v["counts"].items() if k in _CRASH_GATE_BLOCKING}
+        if bad:
+            halt_reasons.append(f"unfinished cycle {u['snapshot_ts']}: {bad}")
+            log.error(
+                "crash-recovery: unfinished cycle %s has unreconciled "
+                "orders on Bybit %s", u["snapshot_ts"], bad
+            )
+
+    if pending is not None:
+        try:
+            pv = await verify_order_links(
+                client, [link.model_dump() for link in pending.links]
+            )
+        except Exception as e:  # noqa: BLE001
+            halt_reasons.append(f"pending-intent verify raised: {e}")
+            pv = None
+        if pv is not None:
+            bad = {
+                k: c for k, c in pv["counts"].items()
+                if k in _CRASH_GATE_BLOCKING
+            }
+            if bad:
+                halt_reasons.append(f"pending intent {pending.snapshot_ts}: {bad}")
+                log.error(
+                    "crash-recovery: pending intent %s has unreconciled orders "
+                    "on Bybit %s — possible naked/duplicate position",
+                    pending.snapshot_ts, bad,
+                )
+            else:
+                clear_pending_intent()
+                log.info(
+                    "crash-recovery: pending intent %s clean (no orders "
+                    "landed) — cleared", pending.snapshot_ts
+                )
+
+    if halt_reasons:
+        halt(
+            "startup crash-recovery gate: "
+            + "; ".join(halt_reasons)
+            + " — a prior cycle may hold an unreconciled position; review "
+            "executions/ + Bybit order-history, reconcile carry_state, then "
+            "clear the HALT marker before resume"
+        )
+        return True
+    return False
+
 
 # Endpoints whose failure aborts the loop at startup. If any of these
 # come back !=ok from `permission_probe`, the loop refuses to start —
@@ -282,6 +435,47 @@ async def _attach_reflection(
         log.warning("could not persist reflection into %s: %s", decision_path, e)
 
 
+def _drain_anchor_queue(
+    writer: OnchainWriter, queue: AnchorQueue
+) -> tuple[AnchorQueue, int]:
+    """Retry each queued anchor (state-6). Drops entries that land now (or
+    landed late, per `decision_exists`) and entries past
+    `MAX_ANCHOR_ATTEMPTS` (a standing problem the operator must anchor
+    manually). Returns `(new_queue, drained_count)`. Sync / RPC-bound — call
+    via `asyncio.to_thread`."""
+    remaining: list[PendingAnchor] = []
+    drained = 0
+    for p in queue.entries:
+        try:
+            decision_id = bytes.fromhex(p.decision_id)
+            action_hash = bytes.fromhex(p.action_hash)
+        except ValueError:
+            log.warning(
+                "dropping malformed anchor-queue entry %s", p.snapshot_filename
+            )
+            continue
+        tx = writer.anchor_prepared(decision_id, p.ipfs_cid, action_hash)
+        if tx:
+            drained += 1
+            log.info(
+                "re-anchored queued decision %s: tx=%s", p.snapshot_filename, tx
+            )
+            continue
+        if writer.decision_exists(decision_id):
+            drained += 1  # landed late on a prior attempt → drop
+            continue
+        attempts = p.attempts + 1
+        if attempts >= MAX_ANCHOR_ATTEMPTS:
+            log.error(
+                "dropping decision %s from anchor queue after %d failed "
+                "attempts — operator must anchor manually",
+                p.snapshot_filename, attempts,
+            )
+            continue
+        remaining.append(p.model_copy(update={"attempts": attempts}))
+    return AnchorQueue(entries=remaining), drained
+
+
 async def _anchor_onchain(
     decision: Decision,
     outcome: dict[str, Any],
@@ -313,6 +507,26 @@ async def _anchor_onchain(
         decision_dict = decision.model_dump()
 
     anchor: dict[str, Any] = {}
+
+    # Drain any decisions a prior cycle couldn't anchor (state-6) — done
+    # first so a recovered RPC clears the backlog before the current anchor.
+    queue = read_anchor_queue()
+    if queue.entries:
+        queue, drained = await asyncio.to_thread(
+            _drain_anchor_queue, writer, queue
+        )
+        if drained:
+            anchor["anchor_drained"] = drained
+
+    # Low-gas alert: a near-empty EOA is the dominant anchor-failure cause.
+    gas_mnt = await asyncio.to_thread(writer.gas_balance_mnt)
+    if gas_mnt is not None and gas_mnt < MIN_GAS_MNT:
+        log.warning(
+            "agent EOA low on gas: %.4f MNT < %s threshold — on-chain "
+            "anchoring will start failing until topped up",
+            float(gas_mnt), MIN_GAS_MNT,
+        )
+        anchor["low_gas_mnt"] = str(gas_mnt)
 
     # Anchor ACTUAL execution, not just intent. `outcome` already carries
     # the per-action results (status) by the time we're called (post-
@@ -350,16 +564,39 @@ async def _anchor_onchain(
             except OSError as e:
                 log.warning("could not persist ipfs_cid into %s: %s", decision_path, e)
 
+    # Derive the anchor inputs here (not inside record_decision) so a failed
+    # send can be queued with the exact ids/hash for a later replay (state-6).
+    decision_id, intent_hash = derive_ids(decision_dict, snap_name)
+    action_hash = (
+        derive_execution_hash(executed_actions)
+        if executed_actions is not None
+        else intent_hash
+    )
     tx_hash = await asyncio.to_thread(
-        writer.record_decision,
-        decision_dict,
-        snap_name,
-        ipfs_cid=ipfs_cid or "",
-        executed_actions=executed_actions,
+        writer.anchor_prepared, decision_id, ipfs_cid or "", action_hash
     )
     if tx_hash:
         anchor["decision_tx"] = tx_hash
         log.info("decision anchored on-chain: tx=%s cid=%s", tx_hash, ipfs_cid or "(none)")
+    else:
+        # No tx hash AND not already on-chain → genuine send failure; queue it
+        # for retry so the audit trail self-heals next cycle (state-6).
+        already = await asyncio.to_thread(writer.decision_exists, decision_id)
+        if not already:
+            queue = queue.upsert(PendingAnchor(
+                decision_id=decision_id.hex(),
+                snapshot_filename=snap_name,
+                ipfs_cid=ipfs_cid or "",
+                action_hash=action_hash.hex(),
+                enqueued_at=datetime.now(UTC),
+            ))
+            anchor["anchor_queued"] = True
+            log.warning(
+                "decision %s failed to anchor on-chain — queued for retry",
+                snap_name,
+            )
+
+    write_anchor_queue(queue)
 
     rep_tx = await asyncio.to_thread(writer.update_reputation)
     if rep_tx:
@@ -520,6 +757,7 @@ def _clamp_to_liquid_budget(
     snapshot: Snapshot,
     *,
     decide_captured_at: str | None = None,
+    carry_state: CarryState | None = None,
 ) -> tuple[dict[str, Any], list[str], str | None]:
     """Deterministic backstop (`bybit-sandbox.67`): the LLM repeatedly
     over-commits NEW Earn deployment past the liquid budget even after the
@@ -533,7 +771,9 @@ def _clamp_to_liquid_budget(
     Safe-direction: only REDUCES deployment toward cash (never opens or
     enlarges), so it can't create naked exposure or a bad trade; the
     validator still runs after. Held positions kept at size (net_new <
-    MIN) are never touched — only fresh/grown picks. Per-category, with
+    MIN) are never touched — only fresh/grown picks; passing `carry_state`
+    credits held funding-carry the same way (executor-2), so re-stating an
+    open carry isn't mistaken for fresh spend and dropped to cash. Per-category, with
     the shared-pool looseness documented on `check_stable_earn_funding`;
     this is an upstream nudge, the validator is the hard gate.
 
@@ -576,7 +816,7 @@ def _clamp_to_liquid_budget(
         return decision_dict, [], None
     max_nonstable = float(wallet.max_new_nonstable_usd)
 
-    held = _held_usd_by_product(snapshot)
+    held = _held_usd_by_product(snapshot, carry_state=carry_state)
     prod_coin: dict[tuple[str, str], str] = {}
     for venue_id in _LIQUID_CLAMP_VENUES_CARRY:
         meta = VENUE_REGISTRY.get(venue_id)
@@ -1186,6 +1426,85 @@ def _reconcile_carry_state(
         )
 
 
+async def _execute_redeem_exits(
+    client: BybitClient,
+    snap: Any,
+    snapshot_ts: str,
+) -> tuple[list[dict[str, Any]], int]:
+    """Deterministic (no-LLM) exit for settled hedged-Earn redeems.
+
+    For each durable `RedeemExitIntent` whose coin has arrived in `snap`, close
+    the paired perp short + swap the freed coin to a stable, sized from the
+    RECORDED redeem (capped at the live wallet). Returns `(records, executed)`
+    where `executed` counts confirmed `ok` orders. An intent is removed only
+    when ALL its legs confirm — a partial failure keeps it for next-cycle retry
+    (durable-intent-retry, strictly safer than rolling back a leg). The orphan
+    re-derivation sweep remains the backstop, so this never strands a coin."""
+    state = read_redeem_intents()
+    if not state.intents:
+        return [], 0
+
+    # Live Earn amount per productId from this cycle's snapshot (a vanished /
+    # zeroed row means the redeem fully settled).
+    earn_amt: dict[str, Decimal] = {}
+    for p in snap.earn_positions or []:
+        data = p.model_dump(mode="python") if hasattr(p, "model_dump") else p
+        pid = str(data.get("productId") or data.get("id") or "")
+        if not pid:
+            continue
+        try:
+            earn_amt[pid] = Decimal(str(data.get("amount", "0") or "0"))
+        except (ArithmeticError, TypeError, ValueError):
+            continue
+
+    records: list[dict[str, Any]] = []
+    executed = 0
+    changed = False
+    for i, intent in enumerate(list(state.intents)):
+        # GATE: only act once the redeem has SETTLED (coin arrived / Earn row
+        # gone). Acting earlier would close the paired short while the coin is
+        # still in Earn — the naked-long bug this whole feature avoids.
+        wallet_native = _coin_wallet_native(snap, intent.coin)
+        if not check_earn_redeem_settled(
+            intent, earn_amt.get(intent.product_id), wallet_native
+        ):
+            continue
+        actions = exit_actions_from_intent(
+            snap, intent, snapshot_ts=snapshot_ts, idx_offset=900 + i * 4
+        )
+        if not actions:
+            # Settled but nothing actionable (already flat) → drop the intent.
+            state = state.remove(intent.product_id)
+            changed = True
+            continue
+        results = await execute_actions(
+            client, actions, snapshot_ts=snapshot_ts, dry_run=False
+        )
+        executed += sum(1 for r in results if r.status == "ok")
+        records.extend(
+            {
+                "kind": r.action.kind.value,
+                "product_id": r.action.product_id,
+                "coin": r.action.coin,
+                "amount": str(r.action.amount),
+                "status": r.status,
+                "error": r.error,
+            }
+            for r in results
+        )
+        if all(r.status == "ok" for r in results):
+            state = state.remove(intent.product_id)
+            changed = True
+        else:
+            log.warning(
+                "redeem-exit %s partial (%s) — intent kept for retry",
+                intent.coin, intent.product_id,
+            )
+    if changed:
+        write_redeem_intents(state)
+    return records, executed
+
+
 async def run_one_cycle(
     bybit_client: BybitClient,
     anthropic_client: anthropic.AsyncAnthropic,
@@ -1229,7 +1548,11 @@ async def run_one_cycle(
     # BEFORE snapshot to avoid an unnecessary API round-trip when the
     # agent is already meant to be off.
     halted, halt_reason = is_halted()
-    if halted:
+    if halted and halt_trigger() != "daily_drawdown":
+        # Operator halt (manual touch, carry-coherence trip, startup gate) —
+        # full stop, no API round-trip and no auto-recovery. A drawdown halt
+        # falls through to snapshot below so equity keeps being sampled and
+        # the marker can self-clear once the book recovers (state-8).
         outcome["result"] = "halted"
         outcome["halt_reason"] = halt_reason
         outcome["finished_at"] = datetime.now(UTC).isoformat()
@@ -1258,8 +1581,28 @@ async def run_one_cycle(
         current_equity = snap.wallet.total_equity_usd
         record_equity(current_equity)
         drawdown_hit, drawdown_reason = check_daily_drawdown(current_equity)
-        if drawdown_hit and drawdown_reason is not None:
-            halt(drawdown_reason)
+
+        if halted:
+            # Reached here ONLY on a drawdown halt (operator halts returned
+            # above). We've now extended the equity history with this cycle's
+            # sample — if the 24h drawdown is back within threshold, clear the
+            # marker and resume; otherwise stay halted (state-8 auto-recovery).
+            if drawdown_hit:
+                outcome["result"] = "halted"
+                outcome["halt_reason"] = halt_reason
+                outcome["halt_trigger"] = "daily_drawdown"
+                outcome["finished_at"] = datetime.now(UTC).isoformat()
+                log.warning("drawdown HALT persists (not yet recovered): %s",
+                            halt_reason)
+                return outcome
+            clear_halt()
+            outcome["drawdown_recovered"] = True
+            log.warning(
+                "daily-drawdown HALT auto-cleared: 24h drawdown back within "
+                "threshold (equity=$%s) — resuming cycle", current_equity,
+            )
+        elif drawdown_hit and drawdown_reason is not None:
+            halt(drawdown_reason, trigger="daily_drawdown")
             outcome["result"] = "halted"
             outcome["halt_reason"] = drawdown_reason
             outcome["halt_trigger"] = "daily_drawdown"
@@ -1326,6 +1669,30 @@ async def run_one_cycle(
             except Exception as e:  # noqa: BLE001 — pre-decide side task
                 outcome["stable_consolidate_error"] = f"{type(e).__name__}: {e}"
                 log.warning("stable consolidation failed (non-fatal): %s", e)
+
+        # 1d. Deterministic settled-redeem exit (no LLM). The watcher fires
+        # `earn_redeem_settled` the moment a hedged-Earn redeem's freed coin
+        # lands; this swaps EXACTLY the redeemed amount to a stable + closes the
+        # paired short in one cycle, sized from the durable intent. Pure risk
+        # reduction, so it runs on EVERY live cycle (cheap when no intents) and
+        # never touches the LLM. If it executes anything we return early — the
+        # book is now delta-flat on that coin and the next cycle rebalances
+        # cleanly, sidestepping any double-act with the post-decide sweep.
+        if live:
+            try:
+                redeem_records, redeem_done = await _execute_redeem_exits(
+                    bybit_client, snap, snap_path.stem
+                )
+                if redeem_records:
+                    outcome["redeem_exit"] = redeem_records
+                if redeem_done:
+                    outcome["result"] = "executed_redeem_exit"
+                    outcome["stages"].append("redeem_exit")
+                    outcome["finished_at"] = datetime.now(UTC).isoformat()
+                    return outcome
+            except Exception as e:  # noqa: BLE001 — pre-decide side task
+                outcome["redeem_exit_error"] = f"{type(e).__name__}: {e}"
+                log.warning("redeem-exit step failed (non-fatal): %s", e)
 
         # 2. Decide — auto-close fast-path when ANY pick_invalidated
         # event is in the wake set. Deterministic close from the prior
@@ -1399,6 +1766,9 @@ async def run_one_cycle(
                 # snapshot decide() saw, so a future snapshot-reuse refactor
                 # degrades to a safe no-op instead of a stale clamp.
                 decide_captured_at=raw_snapshot.get("captured_at"),
+                # executor-2: credit held carry so a re-stated open carry
+                # isn't counted as fresh spend and dropped to cash.
+                carry_state=read_carry_state(),
             )
             if clamp_dropped:
                 notes_list = clamped_dict.setdefault("notes", [])
@@ -1583,6 +1953,11 @@ async def run_one_cycle(
             # close stays gated to dry-run and dust never clears).
             carry_state = read_carry_state()
             carry_coins = carry_state.active_coins()
+            # Durable cooldown so a settling LP isn't re-redeemed every
+            # non-executing cycle (wt-3); positions emitted within the window
+            # are skipped, settled/expired entries pruned after execute.
+            lm_redeem_cd = read_lm_redeem_cooldown()
+            lm_redeem_blocked = lm_redeem_cd.blocked_position_ids(snap.captured_at)
             perp_closes = _orphan_perp_close_actions(
                 snap, snap_path.stem, idx_offset=780, carry_coins=carry_coins
             )
@@ -1598,14 +1973,23 @@ async def run_one_cycle(
             # (diff is dry-run). `near_liq_carry_coins` was resolved before
             # write_decision. Intersected with active carry coins inside the
             # helper, so a manual naked short (no carry record) is ignored.
+            lm_residual = _lm_residual_redeem_actions(
+                snap, snap_path.stem, idx_offset=820,
+                blocked_position_ids=lm_redeem_blocked,
+            )
             sweep = perp_closes + _orphan_spot_sell_actions(
                 snap, [], [], perp_closes, [], snap_path.stem, idx_offset=800
-            ) + _lm_residual_redeem_actions(
-                snap, snap_path.stem, idx_offset=820
-            ) + _carry_liq_close_actions(
+            ) + lm_residual + _carry_liq_close_actions(
                 snap, carry_state, near_liq_carry_coins, snap_path.stem,
                 idx_offset=840,
             )
+            # Final reindex over the COMBINED sweep (executor-3): the segment
+            # helpers above use hand-tuned 20-slot idx_offset windows that
+            # collide if any segment overruns its slot. Reassigns sequential
+            # ids + rewrites carry-leg `extra` spot/perp ids (executor-4),
+            # same pass the main diff runs. Safe to renumber from 0: the sweep
+            # runs only when the diff is dry-run, so no executed-id collision.
+            _reindex_order_link_ids(sweep, snap_path.stem)
             if sweep:
                 sweep_results = await execute_actions(
                     bybit_client, sweep, snapshot_ts=snap_path.stem, dry_run=False
@@ -1636,6 +2020,20 @@ async def run_one_cycle(
                     carry_state, sweep_results, outcome,
                     context="de-risk sweep",
                 )
+                # Stamp the cooldown for every residual-redeem we emitted (wt-3)
+                # so the settling LP isn't re-redeemed next cycle; prune
+                # settled/expired entries to keep the file bounded.
+                emitted = {a.position_id for a in lm_residual if a.position_id}
+                if emitted or lm_redeem_cd.entries:
+                    live_lm = {
+                        str(p.get("positionId") or "")
+                        for p in (snap.lm_positions or [])
+                    }
+                    write_lm_redeem_cooldown(
+                        lm_redeem_cd.record(emitted, snap.captured_at).prune(
+                            live_lm, snap.captured_at
+                        )
+                    )
 
         if not ok:
             outcome["result"] = "skipped:invalid"
@@ -1674,10 +2072,22 @@ async def run_one_cycle(
         # write below would leave a real Bybit carry position open
         # with no state record — next cycle's hedge layer would then
         # see an orphan spot+perp pair and likely mis-classify it.
-        # Hard process crashes (OOM, SIGKILL) still bypass this; for
-        # truly transactional state we'd need per-action writes inside
-        # `execute_actions`, deferred for now.
+        # Hard process crashes (OOM, SIGKILL) bypass this finally — that
+        # window is covered by the pending-intent marker written just below,
+        # which the next startup's crash-recovery gate verifies against Bybit.
         results: list = []
+        # ah.7 (state-2): persist the confirmable order links BEFORE dispatch.
+        # `execute_actions` flushes each per-action row only AFTER the legs
+        # land, so a SIGKILL mid-dispatch (esp. a carry's spot+perp, which the
+        # executions scan treats as unconfirmable) leaves a real position with
+        # no row. The marker carries the leg link ids so startup can confirm
+        # them on Bybit and HALT. Cleared after execute + reconcile are durable.
+        if not effective_dry_run:
+            _pending_links = _confirmable_order_links(actions)
+            if _pending_links:
+                write_pending_intent(
+                    PendingIntent(snapshot_ts=snapshot_ts, links=_pending_links)
+                )
         try:
             results = await execute_actions(
                 bybit_client,
@@ -1720,6 +2130,41 @@ async def run_one_cycle(
                     outcome["actions_failed"] = failed
                 else:
                     outcome["result"] = "executed"
+            # ah.9 (state-3): an orphan OPEN_FUNDING_CARRY = the spot filled but
+            # the perp leg never landed. The dispatch atomically unwinds the
+            # spot; surface it P0 so the operator is alerted — especially the
+            # rare case where the unwind ITSELF failed (genuinely naked spot,
+            # swept next cycle by the orphan-seller). NOT a HALT: a HALT would
+            # freeze that very sweep.
+            carry_orphans = [
+                r for r in results
+                if r.action.kind.value == "open_funding_carry"
+                and r.status == "orphan"
+            ]
+            if carry_orphans:
+                details = []
+                for r in carry_orphans:
+                    unwind = (r.response or {}).get("legs", {}).get("unwind") or {}
+                    details.append({
+                        "coin": r.action.coin,
+                        "error": r.error,
+                        "unwound": unwind.get("unwound"),
+                        "unwind_error": unwind.get("error"),
+                    })
+                    if unwind.get("unwound"):
+                        log.error(
+                            "P0 carry OPEN orphan (%s): perp leg failed, spot "
+                            "UNWOUND (no naked exposure) — operator review: %s",
+                            r.action.coin, r.error,
+                        )
+                    else:
+                        log.error(
+                            "P0 carry OPEN orphan (%s): perp leg failed AND spot "
+                            "unwind failed (%s) — NAKED spot long; orphan-seller "
+                            "sweeps next cycle — operator review: %s",
+                            r.action.coin, unwind.get("error"), r.error,
+                        )
+                outcome["carry_open_orphan"] = details
         finally:
             # Roll forward carry state from the dispatch results (`.5`).
             # Skipped on dry-run so a `--live` run is required to mutate
@@ -1729,6 +2174,52 @@ async def run_one_cycle(
                 _reconcile_carry_state(
                     carry_state, results, outcome, context="execute"
                 )
+
+        # ah.7: execute + carry-state reconcile are durable now (the executions
+        # log + carry_state are the record), so drop the pending-intent marker.
+        # An exception in `execute_actions` unwinds past this point (marker
+        # survives → startup re-verifies); a reconcile HALT (carry_state_error)
+        # also keeps it so the operator still has the leg links to reconcile.
+        if not effective_dry_run and "carry_state_error" not in outcome:
+            clear_pending_intent()
+
+        # 6a. Post-execute baseline prune (watcher-2). The baseline was
+        # refreshed at step 1a from the START-of-cycle snapshot, so the
+        # positions this cycle just closed/redeemed still sit in it — and the
+        # watcher (polling every ~120s) would keep evaluating them against live
+        # funding and fire spurious `pick_invalidated` events until the next
+        # cycle. Drop them now, by what we intended to close (a re-snapshot
+        # wouldn't help: a slow OnChain redeem still reads as held). Best-effort
+        # + log: a prune failure only leaves the staleness step 1a already had.
+        if not effective_dry_run and results:
+            try:
+                _bl_path = watcher_baseline_path or WATCHER_BASELINE_PATH
+                _bl = read_watcher_baseline(_bl_path)
+                if _bl is not None:
+                    _pruned = prune_closed_positions(_bl, results)
+                    if _pruned is not _bl:  # no-op prune returns the same object
+                        write_watcher_baseline(_pruned, _bl_path)
+            except Exception as e:  # noqa: BLE001 — best effort
+                log.warning("post-execute baseline prune failed: %s", e)
+
+        # 6a2. Record hedged-Earn exit intents. Each non-stable REDEEM_EARN
+        # this cycle frees a coin that lands only after settlement (OnChain
+        # ~4d). Persist the intent so (a) the watcher can fire an
+        # `earn_redeem_settled` event the moment it arrives — not the next 4h
+        # heartbeat — and (b) the exit swaps EXACTLY the redeemed amount + closes
+        # the paired short, deterministically. The intent is a precise/fast
+        # path; the orphan re-derivation sweep stays the idempotent backstop, so
+        # a write failure here only reverts to heartbeat-speed cleanup.
+        if not effective_dry_run and results:
+            try:
+                new_intents = build_redeem_exit_intents(snap, results)
+                if new_intents:
+                    state = read_redeem_intents()
+                    for it in new_intents:
+                        state = state.upsert(it)
+                    write_redeem_intents(state)
+            except Exception as e:  # noqa: BLE001 — best effort
+                log.warning("redeem-exit intent record failed: %s", e)
 
         # 6b. Reflection BEFORE anchoring (executed path). `_anchor_onchain`
         # builds the IPFS pin by re-reading the decision file, so writing the
@@ -1843,25 +2334,15 @@ async def run_loop(
                 f"{sorted(critical_failures)}"
             )
 
-        # `.42` startup scan: a prior cycle may have crashed between
-        # writing per-action execution lines and writing the cycle
-        # outcome (systemd OOM / SIGKILL). Surface those cycles in the
-        # operator log so manual reconciliation can happen before the
-        # new cycle starts opening positions. Read-only — does NOT
-        # replay; auto-replay would risk duplicating already-executed
-        # actions whose response landed before the crash.
-        unfinished = detect_unfinished_cycles(cycle_log_path)
-        for u in unfinished:
-            log.warning(
-                "unfinished prior cycle detected (no cycle_log entry): "
-                "ts=%s total=%d counts=%s last_finished=%s — "
-                "review %s before next cycle's diff opens new positions",
-                u["snapshot_ts"],
-                u["total"],
-                u["counts"],
-                u.get("last_finished_at"),
-                u["path"],
-            )
+        # `.42` + ah.7 startup crash-recovery gate: a prior cycle may have
+        # crashed (OOM / SIGKILL) between placing an order and recording it.
+        # Cross-check unfinished cycles AND any surviving pending-intent marker
+        # against live Bybit order-history; HALT (cycles then no-op) if a real
+        # or unconfirmable order may be open that was never reconciled, so the
+        # operator fixes it before the next diff opens new positions. Read-only
+        # — never auto-replays (a blind replay inside Bybit's dedup window
+        # could double-spend a response that landed just before the crash).
+        await _startup_crash_recovery_gate(cycle_log_path, bybit_client, live=live)
 
         # Cycle store init (`data-store.3`). Failures degrade gracefully:
         # files are still the source of truth, the loop continues

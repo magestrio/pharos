@@ -20,8 +20,8 @@ time, so they're not re-checked here.
 
 from __future__ import annotations
 
-from decimal import Decimal
-from typing import Any
+from decimal import Decimal, InvalidOperation
+from typing import TYPE_CHECKING, Any
 
 from agent.reason.schema import Decision, VenueAllocation
 from agent.reason.venues import (
@@ -46,6 +46,13 @@ from agent.sandbox.snapshot import (
     _annual_funding,
     _lm_hedge_residual,
 )
+
+if TYPE_CHECKING:
+    from agent.sandbox.carry_state import CarryState
+
+# Snapshot category for the LM venue — held LP positions live in
+# `lm_positions`, keyed under this category in the unified held map.
+_LM_CATEGORY = "LiquidityMining"
 
 MIN_CONFIDENCE = 0.4
 # Cap on a single non-stable product as fraction of TOTAL book.
@@ -217,22 +224,47 @@ def check_risk_flags(d: Decision) -> Check:
 # ─── Conditional caps (snapshot-aware) ─────────────────────────────────────
 
 
+def _stable_share_weight(
+    d: Decision, snapshot: Snapshot, venue_id: VenueId
+) -> float:
+    """Fraction of book held in fast-redeem STABLE picks within `venue_id`:
+    `venue_weight × Σ(pick.weight for picks whose snapshot coin is stable)`.
+
+    `bybit_flex` legitimately holds non-stable hedged picks (ID/IO/AGIX), so
+    crediting its full weight as stables let a peg-stressed book dodge the
+    fast-redeem floor (validator-2). A pick whose product_id doesn't resolve
+    in the snapshot is treated as non-stable (fail-closed)."""
+    venue = d.venue(venue_id)
+    if venue is None or venue.weight <= 0 or not venue.picks:
+        return 0.0
+    category = VENUE_REGISTRY[venue_id].snapshot_category
+    cat_idx = _snapshot_index(snapshot).get(category or "", {})
+    stable_w = 0.0
+    for pick in venue.picks:
+        summary = cat_idx.get(pick.product_id)
+        if summary is not None and summary.coin.upper() in _STABLE_COINS:
+            stable_w += float(pick.weight)
+    return float(venue.weight) * stable_w
+
+
 def check_peg_stress(d: Decision, snapshot: Snapshot) -> Check:
-    """Under peg stress (or missing peg data) majority must sit in
-    fast-redeem stables: `cash_usdc + bybit_flex >= 0.50`. Missing peg
-    data is treated as triggered — fail-closed."""
+    """Under peg stress (or missing peg data) the majority must sit in
+    fast-redeem stables: `cash_usdc + bybit_flex(stable share) >= 0.50`.
+    Only the STABLE share of `bybit_flex` counts — a flex venue full of
+    non-stable hedged picks holds no fast-redeem stables (validator-2).
+    Missing peg data is treated as triggered — fail-closed."""
     dev = snapshot.usdc_peg.deviation_bps
     triggered = dev is None or abs(dev) > PEG_STRESS_BPS
     if not triggered:
         return True, None
     cash = _weight(d, "cash_usdc")
-    flex = _weight(d, "bybit_flex")
-    stables = cash + flex
+    flex_stable = _stable_share_weight(d, snapshot, "bybit_flex")
+    stables = cash + flex_stable
     if stables + 1e-9 < PEG_STRESS_STABLES_FLOOR:
         dev_str = "unavailable" if dev is None else f"{dev:.0f}bps"
         return False, (
-            f"peg deviation={dev_str} requires cash_usdc + bybit_flex "
-            f">= {PEG_STRESS_STABLES_FLOOR:.0%} (got {stables:.2%})"
+            f"peg deviation={dev_str} requires cash_usdc + bybit_flex stable "
+            f"share >= {PEG_STRESS_STABLES_FLOOR:.0%} (got {stables:.2%})"
         )
     return True, None
 
@@ -876,14 +908,16 @@ def check_funding_carry_floor(d: Decision, snapshot: Snapshot) -> Check:
 
 
 def check_no_double_carry_hedge(d: Decision, snapshot: Snapshot) -> Check:
-    """A single coin cannot be carried in `bybit_funding_carry` AND
-    appear as a non-stable Earn pick (`bybit_onchain` / `bybit_flex`) in
-    the same decision. Both layers open a paired spot+perp short on
-    that coin; running both at once would double-lock USDT margin AND
-    double-open the short — neither catastrophic in isolation, but the
-    second short violates the "delta-neutral, sized to spot" invariant
-    that lets the executor reconcile per-coin. See
-    `notes/bybit-funding-carry.md`.
+    """A single coin cannot be carried in `bybit_funding_carry` AND appear as
+    a hedged non-stable Earn pick (`bybit_onchain` / `bybit_flex`) OR a
+    `bybit_lm` pick whose base coin matches, in the same decision. Each layer
+    opens a paired perp short on that coin; running two at once double-locks
+    USDT margin AND double-opens the short — neither catastrophic in isolation,
+    but the second short violates the "delta-neutral, sized to spot" invariant
+    that lets the executor reconcile per-coin. LM is included because its base
+    leg is delta-hedged too (`LM_BASE_LEG_FRACTION` perp short on the base
+    coin), so a carry∩LM-base overlap is the same double-short (validator-1).
+    See `notes/bybit-funding-carry.md`.
     """
     carry = d.venue(_CARRY_VENUE_ID)  # type: ignore[arg-type]
     if carry is None or carry.weight <= 0 or not carry.picks:
@@ -918,6 +952,28 @@ def check_no_double_carry_hedge(d: Decision, snapshot: Snapshot) -> Check:
                 overlaps.append(
                     f"{coin} in {_CARRY_VENUE_ID} AND {venue_id}/{pick.product_id}"
                 )
+
+    # LM base legs are delta-hedged too (a `LM_BASE_LEG_FRACTION` perp short on
+    # the base coin), so a coin held as BOTH a carry AND an LM base double-opens
+    # the short. LM's `.coin` is the pair ("TON/USDT") — take the base side.
+    lm_venue = d.venue("bybit_lm")  # type: ignore[arg-type]
+    if lm_venue is not None and lm_venue.weight > 0 and lm_venue.picks:
+        lm_idx = _snapshot_index(snapshot).get("LiquidityMining", {})
+        for pick in lm_venue.picks:
+            summary = lm_idx.get(pick.product_id)
+            if summary is None:
+                continue
+            parts = summary.coin.split("/", 1)
+            if len(parts) != 2:
+                continue
+            base = parts[0].upper()
+            if not base or base in _STABLE_COINS:
+                continue
+            if base in carry_coins:
+                overlaps.append(
+                    f"{base} in {_CARRY_VENUE_ID} AND bybit_lm/{pick.product_id}"
+                )
+
     if overlaps:
         return False, (
             "coin overlap between funding-carry and non-stable Earn picks "
@@ -1041,14 +1097,57 @@ def _held_earn_detail(snapshot: Snapshot) -> dict[tuple[str, str], dict[str, Any
     return out
 
 
-def _held_usd_by_product(snapshot: Snapshot) -> dict[tuple[str, str], float]:
-    """Total held Earn USD per `(category, product_id)` (incl. Processing
-    chunks). Thin wrapper over `_held_earn_detail`; the net-new screens
-    (stable-spend cap, min-stake, funding floor) compare `target − held`,
-    the delta the live diff acts on. LM / advance-Earn holdings don't live
-    in `earn_positions`, so they collapse to held=0 (gross), preserving
-    pre-net-new behavior for those venues."""
-    return {k: v["usd"] for k, v in _held_earn_detail(snapshot).items()}
+def _held_usd_by_product(
+    snapshot: Snapshot, *, carry_state: "CarryState | None" = None
+) -> dict[tuple[str, str], float]:
+    """Unified held USD per `(category, product_id)` — the single source of
+    truth every net-new screen subtracts from `target` (ah.22). Folds the
+    three position stores that previously each collapsed to held=0 in some
+    consumer:
+
+      • Earn (`earn_positions`, incl. `Processing` chunks) via `_held_earn_detail`.
+      • LM (`lm_positions`), quote+base reconstructed under `LiquidityMining` —
+        without it a held LP read as 0 and re-tripped the LM funding/min-stake
+        floors (validator-3/validator-4).
+      • Carry (`carry_state`), only when the caller supplies it — the validator
+        has no carry_state so carry stays gross there (conservative), while the
+        clamp passes it so a held carry isn't counted as fresh spend and dropped
+        to cash (executor-2).
+
+    Keyed by `(category, product_id)`: each consumer only fetches its own
+    category's keys, so folding extra categories in never perturbs an
+    unrelated lookup."""
+    out = {k: v["usd"] for k, v in _held_earn_detail(snapshot).items()}
+    for pid, usd in _held_lm_usd_by_product(snapshot).items():
+        key = (_LM_CATEGORY, pid)
+        out[key] = out.get(key, 0.0) + usd
+    if carry_state is not None:
+        for key, usd in _held_carry_usd_by_product(snapshot, carry_state).items():
+            out[key] = out.get(key, 0.0) + usd
+    return out
+
+
+def _lm_principal_usd(pos: dict[str, Any]) -> float:
+    """Principal USD of one held LM position. Mirrors snapshot's
+    `_lm_position_principal_usd` (duplicated, not imported, to avoid the
+    rules→snapshot→execute import chain): prefer Bybit's consolidated
+    `principalLiquidityValue`, else reconstruct `quote + base × currentPrice`.
+    A bare `principalLiquidityValue` read collapsed to 0 whenever Bybit
+    omitted that field, so a held LP looked like 0 and re-tripped every LM
+    net-new screen (validator-3); the reconstruction restores its real size."""
+    raw = pos.get("principalLiquidityValue")
+    if raw is not None:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+    try:
+        quote = Decimal(str(pos.get("principalQuoteAmount", "0")))
+        base = Decimal(str(pos.get("principalBaseAmount", "0")))
+        price = Decimal(str(pos.get("currentPrice", "0")))
+    except (InvalidOperation, TypeError):
+        return 0.0
+    return float(quote + base * price)
 
 
 def _held_lm_usd_by_product(snapshot: Snapshot) -> dict[str, float]:
@@ -1056,20 +1155,46 @@ def _held_lm_usd_by_product(snapshot: Snapshot) -> dict[str, float]:
     positions aren't in `earn_positions`, so the funding-floor net-new
     screen needs this separately — without it, KEEPING a held LM whose
     funding turned negative would re-trip the floor and strand the cycle
-    `skipped:invalid` (the `bybit-sandbox.65` failure mode). Reads Bybit's
-    consolidated `principalLiquidityValue`; absent/malformed → 0."""
+    `skipped:invalid` (the `bybit-sandbox.65` failure mode)."""
     out: dict[str, float] = {}
     for pos in getattr(snapshot, "lm_positions", None) or []:
         pid = str(pos.get("productId") or "")
         if not pid:
             continue
-        raw = pos.get("principalLiquidityValue")
-        try:
-            val = float(raw) if raw is not None else 0.0
-        except (TypeError, ValueError):
-            val = 0.0
+        val = _lm_principal_usd(pos)
         if val > 0:
             out[pid] = out.get(pid, 0.0) + val
+    return out
+
+
+def _held_carry_usd_by_product(
+    snapshot: Snapshot, carry_state: "CarryState"
+) -> dict[tuple[str, str], float]:
+    """Held funding-carry USD keyed by `(CARRY_CATEGORY, perp_product_id)`.
+    Carry lives in `carry_state` (keyed by coin), so resolve each open
+    position's coin → its FundingCarry perp symbol via the snapshot's carry
+    products. Valued at the current mark (`spot_qty_base × mark`), falling
+    back to the at-open `target_pick_usd` when the perp is unpriced."""
+    coin_to_pid: dict[str, str] = {}
+    for p in snapshot.products.get(CARRY_CATEGORY, []):
+        coin = (p.coin or "").upper()
+        if coin and coin not in coin_to_pid:
+            coin_to_pid[coin] = p.product_id
+    perp_market = getattr(snapshot, "perp_market", None) or {}
+    out: dict[tuple[str, str], float] = {}
+    for rec in getattr(carry_state, "positions", None) or []:
+        coin = rec.coin.upper()
+        pid = coin_to_pid.get(coin)
+        if not pid:
+            continue
+        info = perp_market.get(coin) or perp_market.get(coin.lower())
+        mark = getattr(info, "mark_price", None) if info else None
+        if mark is not None and float(mark) > 0:
+            usd = float(rec.spot_qty_base) * float(mark)
+        else:
+            usd = float(rec.target_pick_usd)
+        if usd > 0:
+            out[(CARRY_CATEGORY, pid)] = out.get((CARRY_CATEGORY, pid), 0.0) + usd
     return out
 
 
@@ -1100,18 +1225,52 @@ def check_stable_spend_cap(d: Decision, snapshot: Snapshot) -> Check:
     that). This rule scopes specifically to the non-stable case where
     perp + spot demand stack on the USDT side.
     """
-    total_book = float(snapshot.wallet.total_equity_usd)
-    if total_book <= 0:
+    perp_demand, spot_demand, contributors = _nonstable_pool_demand(d, snapshot)
+    if not contributors:
         return True, None
 
+    total_demand = perp_demand + spot_demand
+    liquid_usdc = float(snapshot.wallet.liquid_usdc_usd)
+    liquid_usdt = float(snapshot.wallet.liquid_usdt_usd)
+    supply = liquid_usdc + liquid_usdt
+
+    # When the snapshot didn't populate either field (pre-pivot fixtures,
+    # the test sandbox, or a legacy collector), fall through — same
+    # no-op semantics as the executor-side budget enforcers.
+    if supply <= 0:
+        return True, None
+
+    if total_demand > supply + 1e-9:
+        return False, (
+            f"non-stable spend ${total_demand:.2f} (perp margin "
+            f"${perp_demand:.2f} + spot ${spot_demand:.2f}) exceeds "
+            f"liquid stables ${supply:.2f} "
+            f"(USDC ${liquid_usdc:.2f} + USDT ${liquid_usdt:.2f}) — "
+            f"downsize non-stable picks: {', '.join(contributors)}"
+        )
+    return True, None
+
+
+def _nonstable_pool_demand(
+    d: Decision, snapshot: Snapshot
+) -> tuple[float, float, list[str]]:
+    """USDT-side liquid-stable-pool demand from NEW non-stable hedged Earn +
+    funding-carry picks, as `(perp_margin, spot, contributors)`. Each net-new
+    $ of non-stable spend draws a spot Buy (coinUSDT) plus perp margin
+    (`× HEDGE_MARGIN_BUFFER`) on the paired short; a pick kept at held size
+    reserves nothing. Shared by `check_stable_spend_cap` (own-side gate) and
+    `check_combined_stable_liquidity` (shared-pool cross-check, validator-5).
+    Returns `(0, 0, [])` when total equity is unreadable.
+
+    Only NEW spend draws on the liquid pool — `max(0, target − held)`,
+    mirroring the executor's `delta = target_amt − current_amt` in
+    `diff_to_actions`, so a held non-stable position bigger than the liquid
+    stable balance doesn't falsely reject every hold."""
+    total_book = float(snapshot.wallet.total_equity_usd)
+    if total_book <= 0:
+        return 0.0, 0.0, []
+
     perp_market = getattr(snapshot, "perp_market", None) or {}
-    # Only NEW spend draws on the liquid pool. A pick the LLM keeps at
-    # its current size (target ≈ currently-held) costs the diff nothing —
-    # counting its gross target as fresh spend falsely rejects every hold
-    # whenever a held non-stable position exceeds the liquid stable
-    # balance (the dominant cause of the small-vault `skipped:invalid`
-    # loop). Screen `max(0, target − held)` instead, mirroring the
-    # executor's `delta = target_amt − current_amt` in `diff_to_actions`.
     held_map = _held_usd_by_product(snapshot)
     perp_demand = 0.0
     spot_demand = 0.0
@@ -1176,29 +1335,7 @@ def check_stable_spend_cap(d: Decision, snapshot: Snapshot) -> Check:
                 + (f" (held ${held:.2f})" if held > 0 else "")
             )
 
-    if not contributors:
-        return True, None
-
-    total_demand = perp_demand + spot_demand
-    liquid_usdc = float(snapshot.wallet.liquid_usdc_usd)
-    liquid_usdt = float(snapshot.wallet.liquid_usdt_usd)
-    supply = liquid_usdc + liquid_usdt
-
-    # When the snapshot didn't populate either field (pre-pivot fixtures,
-    # the test sandbox, or a legacy collector), fall through — same
-    # no-op semantics as the executor-side budget enforcers.
-    if supply <= 0:
-        return True, None
-
-    if total_demand > supply + 1e-9:
-        return False, (
-            f"non-stable spend ${total_demand:.2f} (perp margin "
-            f"${perp_demand:.2f} + spot ${spot_demand:.2f}) exceeds "
-            f"liquid stables ${supply:.2f} "
-            f"(USDC ${liquid_usdc:.2f} + USDT ${liquid_usdt:.2f}) — "
-            f"downsize non-stable picks: {', '.join(contributors)}"
-        )
-    return True, None
+    return perp_demand, spot_demand, contributors
 
 
 # ─── Stable Earn funding gate (2026-06-07, `bybit-sandbox.65`) ─────────────
@@ -1238,9 +1375,44 @@ def check_stable_earn_funding(d: Decision, snapshot: Snapshot) -> Check:
         large new stable could overrun. Rare on small vaults.
     A future unified per-coin liquidity model would tighten all three;
     `check_capital_flow_simulation` is the gross-equity backstop."""
+    new_spend, freed, contributors = _new_stable_earn_demand(d, snapshot)
+    if new_spend < _MIN_ACTION_USDC:
+        return True, None
+
+    liquid = float(snapshot.wallet.liquid_usdc_usd) + float(
+        snapshot.wallet.liquid_usdt_usd
+    )
+    supply = liquid + freed
+    # No liquidity signal at all (pre-pivot fixtures / legacy collector) →
+    # no-op, mirroring `check_stable_spend_cap`'s supply<=0 fall-through.
+    if supply <= 0:
+        return True, None
+
+    if new_spend > supply + 1e-9:
+        return False, (
+            f"new stable Earn spend ${new_spend:.2f} exceeds liquid stables "
+            f"${liquid:.2f} + freed-by-redeem ${freed:.2f} = ${supply:.2f} "
+            f"(retCode=180016 at execute) — redeem a held stable to fund the "
+            f"rotation or downsize: {', '.join(contributors)}"
+        )
+    return True, None
+
+
+def _new_stable_earn_demand(
+    d: Decision, snapshot: Snapshot
+) -> tuple[float, float, list[str]]:
+    """NEW stable Earn subscribe spend + freed-by-redeem, with per-pick
+    contributors, as `(new_spend, freed, contributors)`. Net-new +
+    freed-by-redeem, mirroring the executor's redeem-first ordering. Freed
+    counts only the REDEEMABLE, non-slow-settle portion of reduced/dropped
+    stable positions — a ~4d OnChain `Processing` redeem can't fund a
+    same-cycle subscribe (`bybit-sandbox.63`). Shared by
+    `check_stable_earn_funding` (own-side gate) and
+    `check_combined_stable_liquidity` (shared-pool cross-check, validator-5).
+    Returns `(0, 0, [])` when total equity is unreadable."""
     total_book = float(snapshot.wallet.total_equity_usd)
     if total_book <= 0:
-        return True, None
+        return 0.0, 0.0, []
 
     detail = _held_earn_detail(snapshot)
     idx = _snapshot_index(snapshot)
@@ -1285,24 +1457,48 @@ def check_stable_earn_funding(d: Decision, snapshot: Snapshot) -> Check:
             if key[0] not in SLOW_SETTLE_CATEGORIES:
                 freed += min(held - target, redeemable)
 
-    if new_spend < _MIN_ACTION_USDC:
+    return new_spend, freed, contributors
+
+
+def check_combined_stable_liquidity(d: Decision, snapshot: Snapshot) -> Check:
+    """Cross-check the SHARED liquid-stable pool against BOTH demands at once
+    (validator-5). `check_stable_spend_cap` (non-stable USDT draw) and
+    `check_stable_earn_funding` (new stable subscribe) each compare their own
+    demand to `liquid_usdc + liquid_usdt` independently, so two
+    individually-fundable sides can jointly overrun the pool. This gate sums
+    them:
+
+        nonstable_demand (perp margin + spot) + new_stable_spend
+            <= liquid_usdc + liquid_usdt + freed-by-redeem
+
+    Freed-by-redeem credits the stable side only (same slow-settle exclusion
+    as `check_stable_earn_funding`). Pooled, not per-coin — same permissive
+    looseness the two own-side gates document; `check_capital_flow_simulation`
+    is the gross-equity backstop. No-op when neither side spends or the
+    snapshot has no liquidity signal."""
+    perp_demand, spot_demand, nonstable_contribs = _nonstable_pool_demand(
+        d, snapshot
+    )
+    new_stable, freed, stable_contribs = _new_stable_earn_demand(d, snapshot)
+    nonstable_demand = perp_demand + spot_demand
+    combined = nonstable_demand + new_stable
+    if combined < _MIN_ACTION_USDC:
         return True, None
 
-    liquid = float(snapshot.wallet.liquid_usdc_usd) + float(
-        snapshot.wallet.liquid_usdt_usd
-    )
-    supply = liquid + freed
-    # No liquidity signal at all (pre-pivot fixtures / legacy collector) →
-    # no-op, mirroring `check_stable_spend_cap`'s supply<=0 fall-through.
+    liquid_usdc = float(snapshot.wallet.liquid_usdc_usd)
+    liquid_usdt = float(snapshot.wallet.liquid_usdt_usd)
+    supply = liquid_usdc + liquid_usdt + freed
     if supply <= 0:
         return True, None
 
-    if new_spend > supply + 1e-9:
+    if combined > supply + 1e-9:
+        contributors = nonstable_contribs + stable_contribs
         return False, (
-            f"new stable Earn spend ${new_spend:.2f} exceeds liquid stables "
-            f"${liquid:.2f} + freed-by-redeem ${freed:.2f} = ${supply:.2f} "
-            f"(retCode=180016 at execute) — redeem a held stable to fund the "
-            f"rotation or downsize: {', '.join(contributors)}"
+            f"combined stable-pool demand ${combined:.2f} (non-stable "
+            f"${nonstable_demand:.2f} + new stable ${new_stable:.2f}) exceeds "
+            f"liquid stables ${liquid_usdc + liquid_usdt:.2f} + freed "
+            f"${freed:.2f} = ${supply:.2f} — both sides draw the same USDC+USDT "
+            f"pool; downsize: {', '.join(contributors)}"
         )
     return True, None
 
@@ -1527,15 +1723,19 @@ def check_capital_flow_simulation(d: Decision, snapshot: Snapshot) -> Check:
         if v.venue_id == "bybit_lm":
             # LM commits the full deposit as stake (face) PLUS perp margin
             # on the BASE half (`_lm_hedge_targets` shorts half the pick).
-            # margin = (pick_usd × 0.5) × buffer, added only when the base
-            # is non-stable and has a perp. Held LM lives in lm_positions
-            # (not earn_positions), so held=0 here and the stake counts
-            # gross — same conservative treatment as carry; LM's 0.30 cap
-            # bounds any over-count.
-            cat_idx = snapshot_idx.get("LiquidityMining", {})
+            # margin = (net_new × 0.5) × buffer, added only when the base
+            # is non-stable and has a perp. NET-NEW scoped against held LM
+            # (validator-4): held LM is in the unified `held_map` under
+            # LiquidityMining, so KEEPING a held LP commits nothing fresh —
+            # only growing/opening draws margin. Pre-fix it counted gross
+            # (held seen as 0), re-rejecting a pure hold every cycle.
+            cat_idx = snapshot_idx.get(_LM_CATEGORY, {})
             for p in v.picks:
                 pick_usd = venue_usd * float(p.weight)
-                if pick_usd < _MIN_ACTION_USDC:
+                net_new = pick_usd - held_map.get(
+                    (_LM_CATEGORY, p.product_id), 0.0
+                )
+                if net_new < _MIN_ACTION_USDC:
                     continue
                 summary = cat_idx.get(p.product_id)
                 base = ""
@@ -1547,8 +1747,8 @@ def check_capital_flow_simulation(d: Decision, snapshot: Snapshot) -> Check:
                 if base and base not in _STABLE_COINS:
                     info = perp_market.get(base) or perp_market.get(base.lower())
                     if info is not None:
-                        margin = pick_usd * 0.5 * _VALIDATOR_HEDGE_MARGIN_BUFFER
-                slice_usd = pick_usd + margin
+                        margin = net_new * 0.5 * _VALIDATOR_HEDGE_MARGIN_BUFFER
+                slice_usd = net_new + margin
                 committed += slice_usd
                 contributors.append(
                     f"{v.venue_id}/{p.product_id}({base or '?'})=${slice_usd:.2f}"
@@ -1961,6 +2161,7 @@ def validate(decision: Decision, snapshot: Snapshot) -> tuple[bool, list[str]]:
         check_no_double_carry_hedge,
         check_stable_spend_cap,
         check_stable_earn_funding,
+        check_combined_stable_liquidity,
         check_capital_flow_simulation,
         check_min_stake,
         check_slow_settle_cap,

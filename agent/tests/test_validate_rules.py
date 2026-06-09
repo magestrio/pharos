@@ -36,6 +36,7 @@ from agent.validate.rules import (
     PEG_STRESS_BPS,
     PEG_STRESS_STABLES_FLOOR,
     check_capital_flow_simulation,
+    check_combined_stable_liquidity,
     check_confidence,
     check_disabled_venues,
     check_effective_pick_cap,
@@ -60,6 +61,7 @@ from agent.validate.rules import (
     check_venue_floors,
     validate,
 )
+from agent.validate.rules import _held_lm_usd_by_product
 
 
 # ─── Fixture factories ──────────────────────────────────────────────────────
@@ -462,6 +464,42 @@ def test_check_peg_stress_passes_when_stables_meet_floor() -> None:
     assert check_peg_stress(d, s) == (True, None)
 
 
+def test_check_peg_stress_excludes_nonstable_flex_share() -> None:
+    """validator-2: a flex venue holding a NON-stable pick (ID) doesn't count
+    toward the fast-redeem floor. cash 0.30 + flex 0.30 (ID) → stable share
+    0.30 < 0.50 → reject. The old full-flex count read 0.60 and passed."""
+    flex = [_product("9001", "FlexibleSaving", coin="ID", apr_source="estimate_apr")]
+    s = _snapshot(deviation_bps=-150.0, flex_products=flex)
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.30),
+            _venue("bybit_flex", 0.30, [("9001", 1.0)]),
+            _venue("bybit_onchain", 0.40, [("26", 1.0)]),
+        ]
+    )
+    ok, msg = check_peg_stress(d, s)
+    assert ok is False
+    assert "stable share" in (msg or "")
+
+
+def test_check_peg_stress_counts_partial_stable_flex_share() -> None:
+    """A flex venue split 50/50 stable/non-stable contributes only its stable
+    half. cash 0.20 + flex 0.60×0.5 (USD1) = 0.50 → meets the floor."""
+    flex = [
+        _product("1131", "FlexibleSaving", coin="USD1", apr_source="estimate_apr"),
+        _product("9001", "FlexibleSaving", coin="ID", apr_source="estimate_apr"),
+    ]
+    s = _snapshot(deviation_bps=-150.0, flex_products=flex)
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.20),
+            _venue("bybit_flex", 0.60, [("1131", 0.5), ("9001", 0.5)]),
+            _venue("bybit_onchain", 0.20, [("26", 1.0)]),
+        ]
+    )
+    assert check_peg_stress(d, s) == (True, None)
+
+
 def test_check_peg_stress_fails_closed_on_null_deviation() -> None:
     # null peg data treated as triggered — fail-closed.
     s = _snapshot(deviation_bps=None)
@@ -834,6 +872,44 @@ def test_capital_flow_counts_lm_base_leg_margin() -> None:
     ok, msg = check_capital_flow_simulation(d, s)
     assert ok is False
     assert "bybit_lm" in (msg or "")
+
+
+def test_held_lm_usd_reconstructs_without_principal_liquidity_value() -> None:
+    """validator-3: when Bybit omits `principalLiquidityValue`, the held-LM
+    reader rebuilds the principal from `quote + base × currentPrice` instead
+    of collapsing to 0 (which re-tripped every LM net-new screen)."""
+    s = _snapshot(lm_positions=[{
+        "productId": "24",
+        "principalQuoteAmount": "15",
+        "principalBaseAmount": "7.5",
+        "currentPrice": "2.0",
+    }])
+    held = _held_lm_usd_by_product(s)
+    assert held["24"] == pytest.approx(30.0)  # 15 + 7.5 × 2.0
+
+
+def test_capital_flow_nets_held_lm() -> None:
+    """validator-4: a held LM kept at its current size commits nothing fresh,
+    so the same allocation that fails when opening cold (105.75 > 90) passes
+    when the LP is already held — net_new ≈ 0 → no stake, no margin. Held
+    value comes via quote+base reconstruction (no principalLiquidityValue)."""
+    s = _snapshot(
+        perp_market={"ETH": _perp("ETH", min_notional="1.0")},
+        lm_positions=[{
+            "productId": "24",
+            "principalQuoteAmount": "15",
+            "principalBaseAmount": "7.5",
+            "currentPrice": "2.0",  # held $30 == LM target
+        }],
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.10),
+            _venue("bybit_onchain", 0.60, [("26", 1.0)]),
+            _venue("bybit_lm", 0.30, [("24", 1.0)]),
+        ]
+    )
+    assert check_capital_flow_simulation(d, s) == (True, None)
 
 
 def test_check_funding_floor_rejects_lm_when_hedge_bleeds() -> None:
@@ -1463,6 +1539,55 @@ def test_check_stable_earn_funding_holds_pass() -> None:
         ]
     )
     assert check_stable_earn_funding(d, s) == (True, None)
+
+
+def test_check_combined_stable_liquidity_rejects_joint_overrun() -> None:
+    """validator-5: a NEW non-stable hedged pick ($4 → $8.20 USDT draw) and a
+    NEW stable subscribe ($4) each fit the $10 pool alone, but together demand
+    $12.20 > $10. The two own-side gates pass; the combined gate rejects."""
+    s = _snapshot(
+        flex_products=[_product("9001", "FlexibleSaving", coin="ID", apr_source="estimate_apr")],
+        perp_market={"ID": _perp("ID")},
+        total_equity_usd="100",
+        liquid_usdc_usd="10",
+        liquid_usdt_usd="0",
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.92),
+            _venue("bybit_flex", 0.04, [("9001", 1.0)]),     # $4 non-stable → $8.20
+            _venue("bybit_onchain", 0.04, [("26", 1.0)]),    # $4 new USDC stable
+        ]
+    )
+    assert check_stable_spend_cap(d, s) == (True, None)
+    assert check_stable_earn_funding(d, s) == (True, None)
+    ok, msg = check_combined_stable_liquidity(d, s)
+    assert ok is False
+    assert "combined stable-pool demand" in (msg or "")
+
+
+def test_check_combined_stable_liquidity_passes_within_pool() -> None:
+    """Same demands ($8.20 + $4 = $12.20) fit a larger $15 pool → pass."""
+    s = _snapshot(
+        flex_products=[_product("9001", "FlexibleSaving", coin="ID", apr_source="estimate_apr")],
+        perp_market={"ID": _perp("ID")},
+        total_equity_usd="100",
+        liquid_usdc_usd="15",
+        liquid_usdt_usd="0",
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.92),
+            _venue("bybit_flex", 0.04, [("9001", 1.0)]),
+            _venue("bybit_onchain", 0.04, [("26", 1.0)]),
+        ]
+    )
+    assert check_combined_stable_liquidity(d, s) == (True, None)
+
+
+def test_check_combined_stable_liquidity_noop_when_no_spend() -> None:
+    """No new spend on either side → no-op pass (the default clean decision)."""
+    assert check_combined_stable_liquidity(_decision(), _snapshot()) == (True, None)
 
 
 # ─── check_min_stake (2026-06-04, `.51`) ──────────────────────────────────
@@ -2560,6 +2685,46 @@ def test_check_no_double_carry_hedge_ignores_stable_earn_overlap() -> None:
 def test_check_no_double_carry_hedge_noop_when_no_carry_venue() -> None:
     snap = _carry_snapshot()
     d = _decision()  # default = cash + flex stable
+    assert check_no_double_carry_hedge(d, snap) == (True, None)
+
+
+def test_check_no_double_carry_hedge_fails_when_lm_base_matches_carry() -> None:
+    """TON carried in bybit_funding_carry AND a TON/USDT LM pick (base=TON) →
+    the delta-hedged LM base leg would double the carry short (validator-1)."""
+    snap = _carry_snapshot(
+        carry_products=[_carry_product("TON")],
+        perp_market={"TON": _perp("TON", funding_rate_7d_avg="0.0001")},
+    )
+    snap.products["LiquidityMining"] = [
+        _product("ton-lm", "LiquidityMining", coin="TON/USDT",
+                 apr_source="apy_e8", notes=["max_leverage=1"]),
+    ]
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.4),
+            _venue("bybit_lm", 0.4, [("ton-lm", 1.0)]),
+            _venue("bybit_funding_carry", 0.2, [("TONUSDT", 1.0)]),
+        ]
+    )
+    ok, msg = check_no_double_carry_hedge(d, snap)
+    assert ok is False
+    assert msg is not None and "TON" in msg and "bybit_lm" in msg
+
+
+def test_check_no_double_carry_hedge_passes_when_lm_base_disjoint() -> None:
+    """Carry on TON + an LM pick whose base is ETH (the default ETH/USDC LM
+    product) → no overlap, no double short."""
+    snap = _carry_snapshot(
+        carry_products=[_carry_product("TON")],
+        perp_market={"TON": _perp("TON", funding_rate_7d_avg="0.0001")},
+    )
+    d = _decision(
+        venues=[
+            _venue("cash_usdc", 0.4),
+            _venue("bybit_lm", 0.4, [("24", 1.0)]),  # default LM = ETH/USDC
+            _venue("bybit_funding_carry", 0.2, [("TONUSDT", 1.0)]),
+        ]
+    )
     assert check_no_double_carry_hedge(d, snap) == (True, None)
 
 
