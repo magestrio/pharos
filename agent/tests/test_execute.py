@@ -607,6 +607,10 @@ def test_diff_orphan_spot_eth_routes_to_usdc() -> None:
     ]
     assert len(sells) == 1
     assert sells[0].coin == "USDC"
+    # Disposal sell MUST bypass the dispatch FUND-transfer optimization,
+    # else `_transfer_satisfies_swap` reads `amount` as a USDC requirement,
+    # finds USDC already in FUND, and no-ops the sell — stranding the ETH.
+    assert sells[0].extra.get("skip_fund_transfer") is True
 
 
 def test_diff_orphan_spot_other_coin_keeps_usdt_route() -> None:
@@ -836,6 +840,42 @@ def test_close_naked_perp_actions_unit_credits_planned_subscribe() -> None:
         "20260603T180000Z", idx_offset=0,
     )
     # Long post-cycle = 0 + 4.0 (subscribe) = 4.0; short = 4.0. Balanced.
+    assert closes == []
+
+
+def test_close_naked_perp_keeps_hedge_during_flex_redeem_settle() -> None:
+    """A planned FlexibleSaving REDEEM_EARN must NOT pre-trim the paired
+    perp short. Flex redeem is NOT instant (prod POPCAT 2026-06-09: coin
+    not credited within 180s) — the staked coin stays as backing until it
+    actually lands, so closing the short in the redeem cycle would leave a
+    naked directional long for the whole settlement window. The full close
+    + spot sell happen atomically on the redeem-settle exit once the coin
+    arrives. Regression for the POPCAT partial-close / unhedged-window bug."""
+    from agent.sandbox.execute import _close_naked_perp_actions
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"POPCAT": _perp("POPCAT", mark="0.04", min_notional="0.1")},
+        # 180 POPCAT staked in Flex, fully hedged by a 180 perp short.
+        earn_positions=[_pos("FlexibleSaving", "471", "180.0", coin="POPCAT")],
+        perp_positions=[_short_pos("POPCAT", size="180.0", position_value="7.2")],
+    )
+    snap.wallet.unified_coin_balances = {"POPCAT": Decimal("0")}
+    planned_redeem = Action(
+        kind=ActionKind.REDEEM_EARN,
+        category="FlexibleSaving",
+        product_id="471",
+        coin="POPCAT",
+        amount=Decimal("7.2"),
+        amount_native=Decimal("180.0"),
+        order_link_id="x",
+        reason="LLM dropped pick",
+    )
+    closes = _close_naked_perp_actions(
+        snap, [], [], [planned_redeem], [],
+        "20260609T221417Z", idx_offset=0,
+    )
+    # Hedge held: long stays 180 (Earn backing not pre-subtracted), short
+    # 180 → naked 0 → no premature close.
     assert closes == []
 
 

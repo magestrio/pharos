@@ -164,6 +164,10 @@ def exit_actions_from_intent(
                         f"exit hedged Earn {coin_u}: swap {qty} freed → "
                         f"{dest_coin} on redeem settle (no LLM)"
                     ),
+                    # Disposal sell — see `_orphan_spot_sell_actions`: the goal
+                    # is to SELL the freed coin, not acquire the dest stable, so
+                    # bypass the FUND-transfer optimization that would no-op it.
+                    extra={"skip_fund_transfer": True},
                 )
             )
     return actions
@@ -392,6 +396,12 @@ def _orphan_spot_sell_actions(
                     f"{earn_long.get(coin_u, 0)} - perp short {short} = "
                     f"excess {excess_long}"
                 ),
+                # Disposal sell: force the real Sell. Without this the
+                # dispatch's `_transfer_satisfies_swap` reads `amount` as a
+                # dest-coin (USDC/USDT) requirement, finds it already in FUND,
+                # and no-ops the sell — stranding the non-stable (the ETH/dust
+                # never liquidates). Mirrors the stable-consolidation builder.
+                extra={"skip_fund_transfer": True},
             )
         )
         cursor += 1
@@ -686,22 +696,19 @@ def _close_naked_perp_actions(
         native = _lm_base_leg_native(a.amount * LM_BASE_LEG_FRACTION, base, snapshot)
         if native > 0:
             long_now[base] = long_now.get(base, Decimal(0)) + native
-    for a in redeems:
-        if a.kind != ActionKind.REDEEM_EARN or not a.coin:
-            continue
-        # OnChain redeems unbond/settle over time — the staked coin stays
-        # as backing this cycle (Bybit keeps the position until funds
-        # clear), so they must NOT reduce long exposure here, or the perp
-        # gets closed mid-unbond and the in-flight redeem goes naked. The
-        # hedge-diff layer applies the same hold. Pooled FlexibleSaving
-        # redeems are instant and DO reduce backing.
-        if (a.category or "") == "OnChain":
-            continue
-        sub = a.amount_native if a.amount_native is not None else Decimal(0)
-        if sub > 0:
-            long_now[a.coin.upper()] = max(
-                Decimal(0), long_now.get(a.coin.upper(), Decimal(0)) - sub
-            )
+    # A planned REDEEM_EARN does NOT reduce long exposure here, regardless of
+    # category. The staked coin stays as backing until it actually leaves Earn
+    # and lands in the wallet — the next snapshot reflects that on its own
+    # (earn row → 0, wallet credited). Pre-subtracting the in-flight redeem
+    # would close the paired short while the coin is still settling → a naked
+    # directional long for the whole settlement window. FlexibleSaving was
+    # wrongly assumed instant; prod proved it is NOT (POPCAT 2026-06-09:
+    # "redeem not credited within 180s"), the same hazard as OnChain
+    # unbonding. The deterministic redeem-settle exit (gated on
+    # `check_earn_redeem_settled`) closes the FULL short + sells the freed
+    # coin atomically once it arrives; this backstop only trims shorts that
+    # are already naked for other reasons.
+    _ = redeems
 
     perp_short = _coin_to_perp_short_size(snapshot)
     for a in hedge_closes:
