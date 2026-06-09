@@ -1566,7 +1566,7 @@ def _alpha_position(
 def test_diff_alpha_pick_emits_skip_when_gate_off(monkeypatch) -> None:
     """Default state: VAULT8004_ALPHA_EXEC_ENABLED unset → gate is False →
     Alpha picks should NOT fire live API calls during the `.14` smoke."""
-    monkeypatch.setattr("agent.sandbox.execute.ALPHA_EXEC_ENABLED", False)
+    monkeypatch.setattr("agent.sandbox.execute.builders.ALPHA_EXEC_ENABLED", False)
     snap = _snapshot(
         total_equity_usd="100",
         alpha_products=[_alpha_summary_row()],
@@ -1590,7 +1590,7 @@ def test_diff_alpha_pick_emits_skip_when_gate_off(monkeypatch) -> None:
 
 
 def test_diff_alpha_purchase_when_gate_on(monkeypatch) -> None:
-    monkeypatch.setattr("agent.sandbox.execute.ALPHA_EXEC_ENABLED", True)
+    monkeypatch.setattr("agent.sandbox.execute.builders.ALPHA_EXEC_ENABLED", True)
     snap = _snapshot(
         total_equity_usd="100",
         alpha_products=[_alpha_summary_row()],
@@ -1616,7 +1616,7 @@ def test_diff_alpha_purchase_when_gate_on(monkeypatch) -> None:
 def test_diff_alpha_full_exit_when_position_dropped(monkeypatch) -> None:
     """Holding PEPE, LLM no longer picks Alpha — full exit via REDEEM
     with native token amount carried in extra."""
-    monkeypatch.setattr("agent.sandbox.execute.ALPHA_EXEC_ENABLED", True)
+    monkeypatch.setattr("agent.sandbox.execute.builders.ALPHA_EXEC_ENABLED", True)
     snap = _snapshot(
         total_equity_usd="100",
         alpha_positions=[_alpha_position(amount_usd="10", amount_native="1000000")],
@@ -1634,7 +1634,7 @@ def test_diff_alpha_full_exit_when_position_dropped(monkeypatch) -> None:
 
 def test_diff_alpha_partial_reduction_emits_skip(monkeypatch) -> None:
     """MVP: only full exits — partial scale-down SKIPs with reason."""
-    monkeypatch.setattr("agent.sandbox.execute.ALPHA_EXEC_ENABLED", True)
+    monkeypatch.setattr("agent.sandbox.execute.builders.ALPHA_EXEC_ENABLED", True)
     snap = _snapshot(
         total_equity_usd="100",
         alpha_products=[_alpha_summary_row()],
@@ -1657,7 +1657,7 @@ def test_diff_alpha_partial_reduction_emits_skip(monkeypatch) -> None:
 
 def test_diff_alpha_no_op_when_target_matches_current(monkeypatch) -> None:
     """Current ≈ target → no action (within MIN_ACTION_USDC)."""
-    monkeypatch.setattr("agent.sandbox.execute.ALPHA_EXEC_ENABLED", True)
+    monkeypatch.setattr("agent.sandbox.execute.builders.ALPHA_EXEC_ENABLED", True)
     snap = _snapshot(
         total_equity_usd="100",
         alpha_products=[_alpha_summary_row()],
@@ -1678,7 +1678,7 @@ def test_diff_alpha_no_op_when_target_matches_current(monkeypatch) -> None:
 def test_diff_alpha_redeem_skips_when_no_native_amount(monkeypatch) -> None:
     """Position present but tokenAmount missing (degraded fetch) →
     SKIP rather than redeem with garbage."""
-    monkeypatch.setattr("agent.sandbox.execute.ALPHA_EXEC_ENABLED", True)
+    monkeypatch.setattr("agent.sandbox.execute.builders.ALPHA_EXEC_ENABLED", True)
     snap = _snapshot(
         total_equity_usd="100",
         alpha_positions=[
@@ -4873,7 +4873,7 @@ async def test_execute_open_perp_short_retries_set_trading_stop_once(
     retry exhausted (perp stays open under watcher fallback)."""
     from agent.bybit_oracle.bybit_client import SpotOrderResult as PerpOrderResult
     # Stub asyncio.sleep so the 1s backoff doesn't actually wait.
-    import agent.sandbox.execute as exec_mod
+    import agent.sandbox.execute.dispatch as exec_mod
     monkeypatch.setattr(exec_mod.asyncio, "sleep", AsyncMock(return_value=None))
 
     client = AsyncMock()
@@ -4918,7 +4918,7 @@ async def test_execute_open_perp_short_surfaces_sl_error_after_both_attempts(
     the operator sees the gap in the cycle log. Watcher remains the
     fallback safety net."""
     from agent.bybit_oracle.bybit_client import SpotOrderResult as PerpOrderResult
-    import agent.sandbox.execute as exec_mod
+    import agent.sandbox.execute.dispatch as exec_mod
     monkeypatch.setattr(exec_mod.asyncio, "sleep", AsyncMock(return_value=None))
 
     client = AsyncMock()
@@ -5594,7 +5594,7 @@ async def test_dispatch_skip_fund_transfer_forces_the_sell(monkeypatch) -> None:
     transfer-satisfies optimization (which is for ACQUIRING a target) — even
     when FUND holds plenty of the destination coin. Otherwise the sell would
     no-op and the USD1 stays stranded — the exact bug we are fixing."""
-    import agent.sandbox.execute as ex
+    import agent.sandbox.execute.dispatch as ex
 
     called = {"transfer_satisfies": False}
 
@@ -5627,7 +5627,7 @@ async def test_dispatch_default_sell_still_consults_transfer(monkeypatch) -> Non
     """Contrast: a normal SWAP_SPOT Sell (no skip flag) keeps the
     transfer-satisfies optimization — proving the guard is opt-in and the
     legacy funding-swap path is untouched."""
-    import agent.sandbox.execute as ex
+    import agent.sandbox.execute.dispatch as ex
 
     called = {"transfer_satisfies": False}
 

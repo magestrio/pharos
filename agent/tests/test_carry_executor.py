@@ -33,7 +33,9 @@ from agent.sandbox.execute import (
     Action,
     ActionKind,
     ActionResult,
+    _CARRY_OPEN_USDT_FACTOR,
     _carry_liq_close_actions,
+    _carry_open_usdc_reserve,
     _confirmable_order_links,
     _funding_carry_diff,
     _funding_carry_targets,
@@ -244,6 +246,42 @@ def test_carry_targets_skips_pick_when_product_missing_in_snapshot() -> None:
     snap = _carry_snapshot(carry_products=[_carry_product("TON")])
     d = _carry_decision(picks=[("HALLU_USDT", 1.0)])
     assert _funding_carry_targets(d, snap, Decimal("1000")) == {}
+
+
+# ─── _carry_open_usdc_reserve (ah.6 / dispatch-1) ───────────────────────────
+
+
+def test_carry_open_reserve_withholds_usdc_for_new_open() -> None:
+    snap = _carry_snapshot(total_equity_usd="1000")
+    d = _carry_decision(carry_weight=0.1)  # target TON = 100
+    reserve = _carry_open_usdc_reserve(d, snap, CarryState(), Decimal("1000"))
+    assert reserve == Decimal("100") * _CARRY_OPEN_USDT_FACTOR
+
+
+def test_carry_open_reserve_zero_when_already_held() -> None:
+    snap = _carry_snapshot(total_equity_usd="1000")
+    d = _carry_decision(carry_weight=0.1)
+    state = CarryState(positions=[_record("TON", "100")])
+    assert _carry_open_usdc_reserve(d, snap, state, Decimal("1000")) == Decimal(0)
+
+
+def test_carry_open_reserve_zero_when_below_min_action() -> None:
+    snap = _carry_snapshot(total_equity_usd="1000")
+    # target = 1000 × 0.0004 × 1.0 = 0.4 < MIN_ACTION_USDC (0.50)
+    d = _carry_decision(carry_weight=0.0004)
+    assert (
+        _carry_open_usdc_reserve(d, snap, CarryState(), Decimal("1000"))
+        == Decimal(0)
+    )
+
+
+def test_carry_open_reserve_zero_when_perp_market_missing() -> None:
+    snap = _carry_snapshot(total_equity_usd="1000", perp_market={})
+    d = _carry_decision(carry_weight=0.1)
+    assert (
+        _carry_open_usdc_reserve(d, snap, CarryState(), Decimal("1000"))
+        == Decimal(0)
+    )
 
 
 # ─── _funding_carry_diff ────────────────────────────────────────────────────
