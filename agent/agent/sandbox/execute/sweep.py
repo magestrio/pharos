@@ -115,16 +115,23 @@ def exit_actions_from_intent(
     qty_step = getattr(info, "qty_step", None) if info else None
     min_qty = getattr(info, "min_order_qty", None) if info else None
 
-    # 1. Close the paired short (only the size still open, capped at recorded).
+    # 1. Close the paired short — ONLY the now-unbacked portion. ATOMIC HEDGE
+    #    INVARIANT: whatever the coin STILL holds in Earn/LM (a resize-down
+    #    keeps a smaller hedged position; a full exit drops it to 0) MUST stay
+    #    hedged. Closing below that backing strands the kept Earn as a naked
+    #    directional long — the recurring "closed the hedge, left the Earn"
+    #    bug. The recorded `perp_qty_base` is the PRE-resize short and is
+    #    oblivious to a same-cycle hedge-diff resize that already shrank the
+    #    short to match the kept position, so it must NOT drive the close.
+    #    Cap strictly at `live_short - remaining_backing`: for a resize the
+    #    short already equals the backing → close 0; for a full exit the
+    #    backing is 0 → close the whole short.
     if intent.paired_perp_symbol:
         live_short = _coin_to_perp_short_size(snapshot).get(coin_u, Decimal(0))
-        if live_short > 0:
-            want = (
-                min(intent.perp_qty_base, live_short)
-                if intent.perp_qty_base > 0
-                else live_short
-            )
-            qty = _round_to_qty_step(want, qty_step, min_qty)
+        remaining_backing = _coin_to_long_exposure(snapshot).get(coin_u, Decimal(0))
+        closeable = max(Decimal(0), live_short - remaining_backing)
+        if closeable > 0:
+            qty = _round_to_qty_step(closeable, qty_step, min_qty)
             if qty is not None and qty > 0:
                 actions.append(
                     Action(
@@ -142,12 +149,18 @@ def exit_actions_from_intent(
                 )
                 cursor += 1
 
-    # 2. Swap the freed coin to a stable — exactly the redeemed native, capped
-    #    at the live wallet balance (UNIFIED+FUND).
+    # 2. Swap the freed coin to a stable — the redeemed native, capped at the
+    #    live wallet balance (UNIFIED+FUND). MIN_SWAP_USDC ($5) floor: that is
+    #    Bybit's spot minOrderAmt, so a smaller freed amount is physically
+    #    unsellable (retCode=170140) and stays as micro-dust. Step 1 keeps the
+    #    short only for the Earn backing that REMAINS, so a sub-$5 freed sliver
+    #    is bounded naked exposure we can't dispose — accepted, like sub-min
+    #    coin dust elsewhere.
     wallet_native = _coin_wallet_native(snapshot, coin_u)
     sell_native = min(intent.expected_redeem_native, wallet_native)
     mark = getattr(info, "mark_price", None) if info else None
-    if sell_native > 0 and mark and mark > 0 and sell_native * mark >= MIN_SWAP_USDC:
+    sell_usd = sell_native * mark if (mark and mark > 0) else None
+    if sell_native > 0 and (sell_usd is None or sell_usd >= MIN_SWAP_USDC):
         # Spot-sell qty rounds to the SPOT lot at dispatch (validate_qty),
         # NOT the perp qty_step — flooring to the coarse perp step strands
         # up to ~1 perp lot of the freed coin (see `_orphan_spot_sell_actions`).
@@ -374,6 +387,8 @@ def _orphan_spot_sell_actions(
             continue
         usd = sellable * mark
         if usd < MIN_SWAP_USDC:
+            # Below Bybit's spot minOrderAmt ($5) the sell just bounces with
+            # retCode=170140 — the remainder is unsellable micro-dust, leave it.
             continue
         # Spot-sell qty is rounded to the SPOT pair's lot at dispatch
         # (place_spot_order → validate_qty: basePrecision + spot min). Do

@@ -915,13 +915,14 @@ def test_close_naked_perp_keeps_hedge_during_flex_redeem_settle() -> None:
 
 
 def test_diff_orphan_spot_skipped_below_min_swap() -> None:
-    """Dust-sized orphan (< MIN_SWAP_USDC) isn't worth a swap — Bybit
-    spot fees would exceed the recovery."""
+    """Dust-sized orphan (< MIN_SWAP_USDC = $5, Bybit's spot minOrderAmt)
+    isn't sellable — a sub-$5 spot order bounces (170140) and the fee would
+    exceed the recovery anyway."""
     snap = _snapshot(
         total_equity_usd="100",
         perp_market={"LIT": _perp("LIT", mark="0.50", min_notional="1.0")},
     )
-    snap.wallet.unified_coin_balances = {"LIT": Decimal("2.0")}  # $1 USD
+    snap.wallet.unified_coin_balances = {"LIT": Decimal("2.0")}  # $1 < $5
     d = _decision(
         [
             _venue("cash_usdc", 0.5),
@@ -6004,3 +6005,38 @@ def test_exit_intent_dust_swap_skipped():
         snapshot_ts="20260609T000000Z", idx_offset=900,
     )
     assert acts == []
+
+
+def test_exit_intent_resize_keeps_hedge_for_remaining_earn():
+    """ATOMIC HEDGE INVARIANT regression (prod IO 2026-06-09). A resize-down
+    redeem KEEPS a smaller hedged Earn position; the same redeem cycle already
+    shrank the paired short to match it. The settle-exit must NOT close the
+    short below the REMAINING Earn backing — closing it strands the kept Earn
+    as a naked directional long (the recurring "closed the hedge, left the
+    Earn" bug). It must close ONLY the now-unbacked portion and still sell the
+    freed spot."""
+    # Kept: 32.2 IO in Earn, hedged by a 32.2 short (already resized this
+    # cycle). The intent recorded the PRE-resize short (54.2) — it must NOT
+    # drive the close.
+    snap = _snapshot(
+        perp_market={
+            "IO": PerpInfo(
+                symbol="IOUSDT", mark_price=Decimal("0.16"),
+                qty_step=Decimal("0.1"), min_order_qty=Decimal("0.1"),
+            )
+        },
+        perp_positions=[PerpPosition(symbol="IOUSDT", side="Sell", size="32.2")],
+        earn_positions=[_pos("FlexibleSaving", "407", "32.2", coin="IO")],
+    )
+    snap.wallet.unified_coin_balances["IO"] = Decimal("40")  # freed ~$6.4, sellable
+    acts = exit_actions_from_intent(
+        snap, _exit_intent(coin="IO", expected="40", perp_qty="54.2", paired=True),
+        snapshot_ts="20260609T231118Z", idx_offset=900,
+    )
+    closes = [a for a in acts if a.kind == ActionKind.CLOSE_PERP]
+    sells = [a for a in acts if a.kind == ActionKind.SWAP_SPOT and a.side == "Sell"]
+    # Remaining 32.2 Earn stays hedged by the 32.2 short → NO perp close.
+    assert closes == [], "must not close the hedge protecting the kept Earn"
+    # Freed 40 IO (~$6.4 > $5 Bybit min) IS sold.
+    assert len(sells) == 1
+    assert sells[0].amount == Decimal("40")

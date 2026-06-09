@@ -109,6 +109,11 @@ _ADVANCE_EARN_CATEGORIES: frozenset[str] = frozenset({"DualAssets", "DiscountBuy
 HEDGE_NOTIONAL_REBALANCE_THRESHOLD = Decimal("0.10")
 
 
+# Min spot-swap notional. Also the disposal-sell floor (orphan/excess +
+# redeem-settle freed coin): $5 is Bybit's typical spot `minOrderAmt` (e.g.
+# ETHUSDC, USD1USDT, IOUSDT all = $5), so a sub-$5 sell would just bounce with
+# retCode=170140 "Order value exceeded lower limit". A non-stable remainder
+# below this is genuinely unsellable on Bybit — it stays as micro-dust.
 MIN_SWAP_USDC = Decimal("5.00")
 
 
