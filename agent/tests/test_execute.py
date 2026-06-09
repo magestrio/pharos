@@ -38,6 +38,7 @@ from agent.sandbox.execute import (
     _execute_one,
     _hedged_pick_underfunded_coins,
     _lm_hedge_targets,
+    _lm_residual_redeem_actions,
     _orphan_perp_close_actions,
     _order_link_id,
     _stable_consolidate_actions,
@@ -5603,3 +5604,75 @@ async def test_dispatch_default_sell_still_consults_transfer(monkeypatch) -> Non
     assert called["transfer_satisfies"] is True
     client.place_spot_order.assert_not_awaited()  # transfer satisfied the swap
     assert res.status == "ok"
+
+
+# ─── lm-residual: forced redeem sweep ───────────────────────────────────────
+
+
+def _held_lm(
+    *,
+    product_id: str,
+    position_id: str,
+    residual_pct: str | None,
+    principal: str = "53.0",
+    status: str = "Active",
+) -> dict:
+    pos = {
+        "positionId": position_id,
+        "productId": product_id,
+        "principalLiquidityValue": principal,
+        "status": status,
+    }
+    if residual_pct is not None:
+        pos["hedge_residual_pct_of_book"] = residual_pct
+    return pos
+
+
+def test_lm_residual_redeem_only_over_floor() -> None:
+    """Force-redeem ONLY held LM whose naked residual exceeds the 3% floor;
+    sub-floor / no-residual-field positions are left untouched."""
+    snap = _snapshot(
+        lm_positions=[
+            _held_lm(product_id="24", position_id="p24", residual_pct="0.0548"),
+            _held_lm(product_id="30", position_id="p30", residual_pct="0.01"),
+            _held_lm(product_id="31", position_id="p31", residual_pct=None),
+        ]
+    )
+    actions = _lm_residual_redeem_actions(snap, "20260609T000000Z", idx_offset=820)
+    assert len(actions) == 1
+    a = actions[0]
+    assert a.kind == ActionKind.REDEEM_LM
+    assert a.product_id == "24"
+    assert a.position_id == "p24"
+    assert a.amount == Decimal("53.0")  # full exit (removeRate=100)
+
+
+def test_lm_residual_redeem_skips_processing() -> None:
+    """A position whose redeem is already settling (`Processing`) is NOT
+    re-submitted, even with residual over the floor — avoids 180020 spam."""
+    snap = _snapshot(
+        lm_positions=[
+            _held_lm(
+                product_id="24",
+                position_id="p24",
+                residual_pct="0.0548",
+                status="Processing",
+            ),
+        ]
+    )
+    assert _lm_residual_redeem_actions(snap, "20260609T000000Z", idx_offset=820) == []
+
+
+def test_lm_residual_redeem_skips_dust() -> None:
+    """A position at/under MIN_ACTION_USDC isn't worth a redeem order."""
+    snap = _snapshot(
+        lm_positions=[
+            _held_lm(
+                product_id="24",
+                position_id="p24",
+                residual_pct="0.0548",
+                principal="0.40",
+            ),
+        ]
+    )
+    assert _lm_residual_redeem_actions(snap, "20260609T000000Z", idx_offset=820) == []

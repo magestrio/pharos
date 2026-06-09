@@ -48,7 +48,7 @@ from dotenv import load_dotenv
 
 from agent.bybit_oracle.bybit_client import BybitClient
 from agent.reason.schema import Decision
-from agent.reason.venues import VENUE_REGISTRY
+from agent.reason.venues import CARRY_CATEGORY, CARRY_VENUE_ID, VENUE_REGISTRY
 from agent.sandbox.decide import (
     DECISION_DIR,
     _collect_recently_invalidated,
@@ -60,6 +60,7 @@ from agent.sandbox.ipfs_pin import pin_decision_rationale
 from agent.sandbox.onchain_writer import OnchainWriter
 from agent.sandbox.reflect import reflect_on_cycle
 from agent.sandbox.carry_state import (
+    CarryState,
     DEFAULT_CARRY_STATE_PATH,
     read_carry_state,
     write_carry_state,
@@ -67,6 +68,8 @@ from agent.sandbox.carry_state import (
 from agent.sandbox.execute import (
     DEFAULT_AUTO_APPROVE_MIN_CONFIDENCE,
     EXECUTIONS_DIR,
+    _carry_liq_close_actions,
+    _lm_residual_redeem_actions,
     _orphan_perp_close_actions,
     _orphan_spot_sell_actions,
     _stable_consolidate_actions,
@@ -432,6 +435,42 @@ def _drop_picks_into_cash(
     return new_decision, dropped
 
 
+def _strip_carry_coins_from_decision(
+    decision: Decision,
+    snapshot: Snapshot,
+    coins: set[str],
+) -> tuple[Decision, list[str]]:
+    """Drop `bybit_funding_carry` picks for `coins` from `decision`, rolling
+    freed weight into cash_usdc. Used when a `carry_liq_close` stop-loss fires:
+    making the carry target-absent means the diff CLOSEs it (state-present,
+    target-absent) on an executing cycle — including the auto-close fast-path —
+    and crucially cannot RE-OPEN it the same cycle (`_funding_carry_diff` opens
+    only on target-present + state-absent). loop-1/wt-2.
+
+    Resolves each carry pick's coin through the snapshot's FundingCarry
+    products (pick.product_id is the perp symbol). Returns the new decision +
+    the dropped symbols; no-op (same decision, []) when nothing matches.
+    """
+    if not coins:
+        return decision, []
+    venue = decision.venue(CARRY_VENUE_ID)  # type: ignore[arg-type]
+    if venue is None or not venue.picks:
+        return decision, []
+    carry_products = {
+        p.product_id: p for p in snapshot.products.get(CARRY_CATEGORY, [])
+    }
+    drop_pids = {
+        str(pick.product_id)
+        for pick in venue.picks
+        if (summ := carry_products.get(pick.product_id)) is not None
+        and summ.coin.upper() in coins
+    }
+    if not drop_pids:
+        return decision, []
+    new_dict, dropped = _drop_picks_into_cash(decision.model_dump(), drop_pids)
+    return Decision.model_validate(new_dict), dropped
+
+
 # Venues whose NEW picks draw the liquid stable pool (stable subscribes +
 # hedged non-stable spot/margin). LM / advance-Earn are funded / gated
 # separately, so the sub-floor clamp leaves them to the validator.
@@ -457,7 +496,16 @@ _MIN_NEW_ACTION_USD = 0.50
 # Penalties only LOWER; the single bonus can RAISE confidence, but only when
 # every pick is confirmed AND only by `CONF_BONUS_ALL_CONFIRMED` (so the
 # recompute can never inflate a low LLM confidence into a live trade).
-CONF_PENALTY_UNCONFIRMED_APR = 0.10  # any NEW non-stable pick on estimate_apr
+CONF_PENALTY_UNCONFIRMED_APR = 0.10  # MAX penalty for NEW non-stable estimate_apr exposure
+# The unconfirmed-APR penalty scales with how much of the BOOK sits in NEW
+# estimate_apr exposure, reaching the full `CONF_PENALTY_UNCONFIRMED_APR` at
+# this fraction. A flat penalty dropped even a single probe-cap-sized (≤7%)
+# pick below the 0.60 execute gate, so the agent could never START the
+# probe→confirm flow on a high-yield unconfirmed pick and stayed parked in
+# low-yield confirmed stables (live 2026-06-09). Scaling lets a small hedged
+# probe execute (begin confirming the rate) while a large unconfirmed tilt
+# still gates.
+CONF_UNCONFIRMED_FULL_FRAC = 0.30
 CONF_PENALTY_DATA_GAP = 0.10  # snapshot.errors OR a picked apr_source=missing
 CONF_PENALTY_FAILED_LEGS = 0.10  # last cycle executed_partial / error / failed legs
 CONF_PENALTY_BUDGET_STARVED = 0.05  # liquid clamp dropped NEW picks THIS cycle
@@ -777,17 +825,25 @@ def _recompute_confidence(
     reasons: list[str] = []
     new = base
 
-    has_unconfirmed_new = any(
-        net_new > _MIN_NEW_ACTION_USD
+    total_book = float(snapshot.wallet.total_equity_usd)
+    unconfirmed_new_usd = sum(
+        net_new
+        for _cat, s, net_new in picks
+        if net_new > _MIN_NEW_ACTION_USD
         and (s.coin or "").upper() not in STABLES
         and s.apr_source == "estimate_apr"
-        for _cat, s, net_new in picks
     )
-    if has_unconfirmed_new:
-        new -= CONF_PENALTY_UNCONFIRMED_APR
+    if unconfirmed_new_usd > 0 and total_book > 0:
+        # Penalty SCALES with the NEW unconfirmed book fraction (full at
+        # CONF_UNCONFIRMED_FULL_FRAC) so a probe-cap-sized pick barely dents
+        # confidence and the probe→confirm flow can start, while a large
+        # unconfirmed tilt still gates. See CONF_UNCONFIRMED_FULL_FRAC.
+        frac = unconfirmed_new_usd / total_book
+        penalty = CONF_PENALTY_UNCONFIRMED_APR * min(1.0, frac / CONF_UNCONFIRMED_FULL_FRAC)
+        new -= penalty
         reasons.append(
-            f"unconfirmed_apr (NEW non-stable estimate_apr pick): "
-            f"-{CONF_PENALTY_UNCONFIRMED_APR}"
+            f"unconfirmed_apr (NEW non-stable estimate_apr {frac:.1%} of book): "
+            f"-{penalty:.3f}"
         )
 
     picked_missing = any(s.apr_source == "missing" for _cat, s, _nn in picks)
@@ -937,13 +993,32 @@ def _recompute_expected_apr(
     return max(0.0, blended_frac * 100), breakdown
 
 
+# `pick_invalidated` events encode the closed position as "earn:<pid>"
+# (FlexibleSaving/OnChain) or "lm:<pid>" (LiquidityMining). Those productId
+# spaces OVERLAP (confirmed across 108 snapshots: {6,7,13,14,15,18,19,22,24,
+# 26}), so the auto-close walk must qualify a drop by VENUE FAMILY — an
+# `lm:14` event may not drop a same-id earn pick, and vice-versa (loop-2).
+_AUTO_CLOSE_FAMILY_BY_VENUE: dict[str, str] = {
+    "bybit_flex": "earn",
+    "bybit_onchain": "earn",
+    "bybit_lm": "lm",
+}
+
+
 def _build_auto_close_decision(
     prior: dict[str, Any] | None,
     wake_events: list[dict[str, Any]] | None,
+    recently_closed_pids: frozenset[str] = frozenset(),
 ) -> dict[str, Any] | None:
     """Build a deterministic close-only decision from `pick_invalidated`
     wake events — bypasses the LLM entirely so a tripped stop-loss
     closes within seconds, not minutes (LLM round-trip + validator pass).
+
+    `recently_closed_pids` are productIds already auto-closed within the
+    cooldown window (loop-4): an event whose pid is in this set is skipped,
+    so a persistently-firing invalidation (e.g. a redeem stuck in Processing,
+    still echoed in the baseline) doesn't re-trigger an all-cash no-op every
+    wake — once suppressed, the cycle falls through to the normal path.
 
     Returns:
       - decision dict (mutated copy of `prior` with affected picks
@@ -952,16 +1027,30 @@ def _build_auto_close_decision(
         through to the normal LLM decide path).
 
     The mutation logic:
-      • For each `pick_invalidated` event, collect the closed product_id
-        (from `position_id="earn:<pid>"`) + coin.
-      • Walk the prior decision's venues. For each venue with any of
-        those picks: drop the closed picks, rescale remaining picks
-        within the venue to sum to 1.0, scale venue weight down
-        proportionally. If all picks are closed, drop the venue.
+      • For each `pick_invalidated` event, collect the closed
+        `(family, product_id)` key (family from `position_id="earn:<pid>"`
+        OR `"lm:<pid>"`) + coin.
+      • Walk the prior decision's venues. For each venue, a pick is dropped
+        only when its venue family matches the event family AND its
+        product_id matches — productId spaces overlap across families.
+        Remaining picks rescale within the venue to sum to 1.0, venue weight
+        scales down proportionally. If all picks are closed, drop the venue.
       • All freed venue weight goes to cash_usdc (added to its current
         weight, or appended as a new entry if absent).
       • `hedges` array zeroed — auto-hedge derives from picks, so
-        removing the pick auto-closes the paired perp via `diff_to_actions`.
+        removing an Earn pick auto-closes its paired perp via
+        `diff_to_actions`. For a dropped LM pick the diff issues a
+        full REDEEM_LM; the paired short is INTENTIONALLY left open this
+        cycle (the LP redeem is async, so the short still backs real base
+        exposure until the LP settles) — it goes orphan and
+        `_orphan_perp_close_actions` closes it on a later cycle. Do NOT
+        "fix" this by zeroing the LM short here: that would strip the
+        hedge while the LP principal is still live.
+
+    Funding-carry near-liq is NOT handled here (carry has no pick/productId
+    to drop) — the watcher emits a separate `carry_liq_close` event the
+    loop's de-risk sweep consumes; an `carry_liq_close`-only cycle yields no
+    close_pids → this returns None → normal cycle handles it.
 
     The output is structurally a valid Decision dict (sums to 1.0,
     only known venue_ids, picks well-formed). Validator still runs on
@@ -971,18 +1060,26 @@ def _build_auto_close_decision(
     """
     if not prior or not wake_events:
         return None
+    close_keys: set[tuple[str, str]] = set()
     close_pids: set[str] = set()
     close_coins: set[str] = set()
     for e in wake_events:
         if (e.get("kind") or "") != "pick_invalidated":
             continue
-        pid = e.get("position_id") or ""
-        if pid.startswith("earn:"):
-            close_pids.add(pid.removeprefix("earn:"))
+        position_id = e.get("position_id") or ""
+        family, sep, pid = position_id.partition(":")
+        if not sep or family not in ("earn", "lm") or not pid:
+            continue
+        if pid in recently_closed_pids:
+            # Already auto-closed within the cooldown window — suppress so a
+            # persistently-firing event doesn't churn all-cash cycles (loop-4).
+            continue
+        close_keys.add((family, pid))
+        close_pids.add(pid)
         coin = e.get("coin") or ""
         if coin:
             close_coins.add(coin.upper())
-    if not close_pids:
+    if not close_keys:
         return None
 
     new_venues: list[dict[str, Any]] = []
@@ -993,9 +1090,11 @@ def _build_auto_close_decision(
         if not picks:
             new_venues.append(dict(v))
             continue
+        vfam = _AUTO_CLOSE_FAMILY_BY_VENUE.get(v.get("venue_id") or "")
         kept = [
             p for p in picks
-            if str(p.get("product_id", "")) not in close_pids
+            if vfam is None
+            or (vfam, str(p.get("product_id", ""))) not in close_keys
         ]
         if len(kept) == len(picks):
             new_venues.append(dict(v))
@@ -1048,6 +1147,43 @@ def _build_auto_close_decision(
         "expected_blended_apr_pct": 0.0,
     }
     return out
+
+
+def _reconcile_carry_state(
+    carry_state: CarryState,
+    results: list[Any],
+    outcome: dict[str, Any],
+    *,
+    context: str,
+) -> None:
+    """Roll carry state forward from dispatch `results` and persist iff it
+    changed. Used by BOTH the executed-diff path and the de-risk sweep — the
+    sweep closes carry positions on Bybit (`_carry_liq_close_actions`) and
+    MUST write the closure back, else the state file stays stale → dup closes
+    + unbounded retry next cycle (executor-1/wt-1/state-1).
+
+    On write failure trip the HALT marker: the real Bybit position may now be
+    open/closed while the file is stale, so the operator MUST manually
+    reconcile before the agent resumes. `context` labels the call path in the
+    HALT message + logs. No-op on empty `results`.
+    """
+    if not results:
+        return
+    try:
+        new_state = apply_carry_results_to_state(carry_state, results)
+        if new_state.positions != carry_state.positions:
+            write_carry_state(new_state)
+            outcome.setdefault("stages", []).append("carry_state_updated")
+    except Exception as e:  # noqa: BLE001
+        outcome["carry_state_error"] = f"{type(e).__name__}: {e}"
+        halt(
+            f"carry_state write failed after {context} "
+            f"({type(e).__name__}: {e}) — manual reconciliation required "
+            f"before resume"
+        )
+        log.exception(
+            "carry_state update failed after %s — HALT created", context
+        )
 
 
 async def run_one_cycle(
@@ -1204,7 +1340,13 @@ async def run_one_cycle(
         # cares about the latest, taken as `priors[-1]`.
         priors = _load_recent_prior_decisions()
         latest_prior = priors[-1] if priors else None
-        auto_close = _build_auto_close_decision(latest_prior, wake_events)
+        # Pids auto-closed within the cooldown window — gate BOTH the
+        # auto-close fast-path (loop-4: suppress re-firing) and the LLM-path
+        # re-pick filter below off the same set, computed once.
+        cooldown = _collect_recently_invalidated(priors or [])
+        auto_close = _build_auto_close_decision(
+            latest_prior, wake_events, frozenset(cooldown.keys())
+        )
         usage = None  # set only on the LLM path; auto-close skips Anthropic
         if auto_close is not None:
             log.info(
@@ -1226,7 +1368,7 @@ async def run_one_cycle(
             # auto-closed within PICK_INVALIDATE_COOLDOWN_MIN. Hard gate
             # so even if the LLM ignores the COOLDOWN ACTIVE banner in
             # the prompt, ping-pong re-entry doesn't reach the executor.
-            cooldown = _collect_recently_invalidated(priors or [])
+            # Reuses the `cooldown` computed above for the auto-close gate.
             if cooldown:
                 blocked_pids = set(cooldown.keys())
                 filtered_dict, dropped = _drop_picks_into_cash(
@@ -1362,6 +1504,33 @@ async def run_one_cycle(
                     "expected APR recompute: %.2f%% → %.2f%% (%d picks)",
                     from_apr, new_apr, len(apr_breakdown),
                 )
+
+        # carry_liq_close stop-loss (loop-1/wt-2): drop the near-liq carry from
+        # the decision BEFORE persist/validate/diff. Common to BOTH the LLM and
+        # auto-close paths — a carry has no pick to drop in the auto-close
+        # rewrite, so without this a `carry_liq_close` co-occurring with a
+        # `pick_invalidated` is swallowed (auto-close decision is valid +
+        # confidence 1.0 → the de-risk sweep's `not (ok and conf_ok)` gate skips
+        # the close, leaving the short bleeding to liquidation). Dropping the
+        # target makes the diff CLOSE it on the executing path with no re-open;
+        # the standalone sweep below still covers the dry-run / skipped path.
+        near_liq_carry_coins = {
+            (e.get("coin") or "").upper()
+            for e in (wake_events or [])
+            if e.get("kind") == "carry_liq_close" and e.get("coin")
+        }
+        if near_liq_carry_coins:
+            decision, carry_dropped = _strip_carry_coins_from_decision(
+                decision, snap, near_liq_carry_coins
+            )
+            if carry_dropped:
+                outcome["carry_liq_close_dropped"] = sorted(set(carry_dropped))
+                log.warning(
+                    "carry liq-close: dropped near-liq carry %s from the "
+                    "decision so the diff closes (not re-opens) it",
+                    sorted(near_liq_carry_coins),
+                )
+
         decision_path = write_decision(
             decision,
             snap_path,
@@ -1412,12 +1581,30 @@ async def run_one_cycle(
             # longer back. Both are pure risk reduction and must run even
             # when the full allocation won't (else the normal hedge-diff
             # close stays gated to dry-run and dust never clears).
-            carry_coins = read_carry_state().active_coins()
+            carry_state = read_carry_state()
+            carry_coins = carry_state.active_coins()
             perp_closes = _orphan_perp_close_actions(
                 snap, snap_path.stem, idx_offset=780, carry_coins=carry_coins
             )
+            # Plus: force-redeem any held LM whose naked base residual sits
+            # above the floor. It lives INSIDE the LP so the spot/perp sweep
+            # above can't reach it — only the LP redeem can — and a redeem
+            # cycle scores below the 0.60 gate (mostly-cash book), so without
+            # this it would never execute (observed live 2026-06-09).
+            # Plus: close any funding-carry whose short is nearing liquidation
+            # (watcher `carry_liq_close` events). On an EXECUTING cycle the
+            # decision-strip above already routes this through the diff's CLOSE;
+            # here it's the only deterministic exit on a non-executing cycle
+            # (diff is dry-run). `near_liq_carry_coins` was resolved before
+            # write_decision. Intersected with active carry coins inside the
+            # helper, so a manual naked short (no carry record) is ignored.
             sweep = perp_closes + _orphan_spot_sell_actions(
                 snap, [], [], perp_closes, [], snap_path.stem, idx_offset=800
+            ) + _lm_residual_redeem_actions(
+                snap, snap_path.stem, idx_offset=820
+            ) + _carry_liq_close_actions(
+                snap, carry_state, near_liq_carry_coins, snap_path.stem,
+                idx_offset=840,
             )
             if sweep:
                 sweep_results = await execute_actions(
@@ -1440,6 +1627,14 @@ async def run_one_cycle(
                     "confidence=%.2f < floor %.2f)",
                     swept_ok, len(sweep), ok,
                     float(decision.confidence), float(min_confidence),
+                )
+                # The sweep may have closed funding-carry positions on Bybit
+                # (`_carry_liq_close_actions`) — roll those closures back into
+                # the state file so the next cycle doesn't re-emit a CLOSE for
+                # an already-closed position (executor-1/wt-1/state-1).
+                _reconcile_carry_state(
+                    carry_state, sweep_results, outcome,
+                    context="de-risk sweep",
                 )
 
         if not ok:
@@ -1528,34 +1723,12 @@ async def run_one_cycle(
         finally:
             # Roll forward carry state from the dispatch results (`.5`).
             # Skipped on dry-run so a `--live` run is required to mutate
-            # the persisted positions ledger. Empty `results` (execute
-            # itself raised before producing anything) → nothing to roll
-            # forward.
-            if not effective_dry_run and results:
-                try:
-                    new_state = apply_carry_results_to_state(
-                        carry_state, results
-                    )
-                    if new_state.positions != carry_state.positions:
-                        write_carry_state(new_state)
-                        outcome.setdefault("stages", []).append(
-                            "carry_state_updated"
-                        )
-                except Exception as e:  # noqa: BLE001
-                    # Real Bybit position may now be open while the
-                    # state file is stale — next cycle could re-emit
-                    # OPEN and double-position. Trip the HALT marker
-                    # so the operator MUST manually reconcile before
-                    # the agent runs again.
-                    outcome["carry_state_error"] = f"{type(e).__name__}: {e}"
-                    halt(
-                        f"carry_state write failed after execute "
-                        f"({type(e).__name__}: {e}) — manual "
-                        f"reconciliation required before resume"
-                    )
-                    log.exception(
-                        "carry_state update failed — HALT created"
-                    )
+            # the persisted positions ledger. Same reconcile + HALT-on-write-
+            # failure path the de-risk sweep uses (executor-1/wt-1/state-1).
+            if not effective_dry_run:
+                _reconcile_carry_state(
+                    carry_state, results, outcome, context="execute"
+                )
 
         # 6b. Reflection BEFORE anchoring (executed path). `_anchor_onchain`
         # builds the IPFS pin by re-reading the decision file, so writing the

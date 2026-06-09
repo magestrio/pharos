@@ -44,6 +44,7 @@ from agent.validate.rules import (
     check_hedges_for_non_usd_picks,
     check_lm_leverage_forbidden,
     check_lm_leverage_size_cap,
+    check_lm_residual_naked_exposure,
     check_lm_stable_preference,
     check_lockup_cap,
     check_min_stake,
@@ -116,6 +117,7 @@ def _snapshot(
     liquid_usdc_usd: str = "0",
     liquid_usdt_usd: str = "0",
     earn_positions: list[dict[str, Any]] | None = None,
+    lm_positions: list[dict[str, Any]] | None = None,
 ) -> Snapshot:
     """Build a Snapshot with all the bells the validator reads. Defaults
     yield a calm regime — peg fine, one stable in flex, one stable in
@@ -137,7 +139,7 @@ def _snapshot(
             liquid_usdt_usd=Decimal(liquid_usdt_usd),
         ),
         earn_positions=earn_positions or [],
-        lm_positions=[],
+        lm_positions=lm_positions or [],
         products=products,
         market=MarketSnapshot(),
         perp_market=perp_market or {},
@@ -153,6 +155,8 @@ def _perp(
     min_notional: str = "0.5",
     funding_rate_7d_avg: str | None = None,
     funding_interval_hours: str | None = None,
+    qty_step: str | None = None,
+    min_order_qty: str = "0.1",
 ) -> PerpInfo:
     """Build a PerpInfo for validator tests. `funding_interval_hours=None`
     leaves the field unset, triggering the validator's 8h fallback (same
@@ -173,9 +177,10 @@ def _perp(
         ),
         mark_price=Decimal(mark),
         orderbook_depth_50bps_usd=Decimal("100000"),
-        min_order_qty=Decimal("0.1"),
+        min_order_qty=Decimal(min_order_qty),
         min_notional_usd=Decimal(min_notional),
         max_leverage=Decimal("50"),
+        qty_step=Decimal(qty_step) if qty_step is not None else None,
     )
 
 
@@ -2694,3 +2699,73 @@ def test_check_funding_carry_floor_rejects_4h_coin_below_annualized_floor() -> N
     ok, msg = check_funding_carry_floor(d, snap)
     assert ok is False
     assert msg is not None and "below carry floor" in msg
+
+
+# ─── check_lm_residual_naked_exposure (lm-residual.3) ────────────────────────
+
+
+def test_lm_residual_rejects_new_coarse_eth_lm() -> None:
+    """NEW ETH/USDC LM on a small vault: the $26.5 base leg floor-rounds the
+    coarse 0.01-ETH perp lot to leave ~$9.6 naked (>3% of book) → reject."""
+    s = _snapshot(
+        total_equity_usd="100",
+        lm_products=[
+            _product("24", "LiquidityMining", coin="ETH/USDC",
+                     effective_apr="0.05", apr_source="apy_e8",
+                     notes=["max_leverage=1"]),
+        ],
+        # ETH lot = 0.01 × $1691.58 ≈ $16.92; min_order_qty 0.01 so one lot is
+        # tradable → base leg $26.5 floor-rounds to 0.01 ETH, leaving ~$9.58.
+        perp_market={
+            "ETH": _perp("ETH", mark="1691.58", qty_step="0.01", min_order_qty="0.01")
+        },
+    )
+    d = _decision(venues=[
+        _venue("cash_usdc", 0.47),
+        _venue("bybit_lm", 0.53, [("24", 1.0)]),  # pick_usd=$53, base leg $26.5
+    ])
+    ok, msg = check_lm_residual_naked_exposure(d, s)
+    assert ok is False
+    assert msg is not None and "bybit_lm" in msg and "ETH" in msg and "naked" in msg
+
+
+def test_lm_residual_exempts_held_position() -> None:
+    """A HELD ETH/USDC LM kept at its current size (net-new < min) is exempt —
+    the de-risk redeem sweep owns held residual, not a cycle reject."""
+    s = _snapshot(
+        total_equity_usd="100",
+        lm_products=[
+            _product("24", "LiquidityMining", coin="ETH/USDC",
+                     effective_apr="0.05", apr_source="apy_e8",
+                     notes=["max_leverage=1"]),
+        ],
+        perp_market={"ETH": _perp("ETH", mark="1691.58", qty_step="0.01")},
+        lm_positions=[{"productId": "24", "positionId": "p24",
+                       "principalLiquidityValue": "53.0"}],
+    )
+    # Keeps the held $53 position at ~the same weight → net-new ≈ 0.
+    d = _decision(venues=[
+        _venue("cash_usdc", 0.47),
+        _venue("bybit_lm", 0.53, [("24", 1.0)]),
+    ])
+    assert check_lm_residual_naked_exposure(d, s) == (True, None)
+
+
+def test_lm_residual_passes_clean_fine_lot() -> None:
+    """NEW LM whose base leg is a clean multiple of a FINE perp lot leaves
+    ~zero residual → pass."""
+    s = _snapshot(
+        total_equity_usd="100",
+        lm_products=[
+            _product("70", "LiquidityMining", coin="FINE/USDC",
+                     effective_apr="0.05", apr_source="apy_e8",
+                     notes=["max_leverage=1"]),
+        ],
+        # lot = qty_step*mark = 0.001*100 = $0.10; base leg $25 / $0.10 = 250 lots exact
+        perp_market={"FINE": _perp("FINE", mark="100", qty_step="0.001")},
+    )
+    d = _decision(venues=[
+        _venue("cash_usdc", 0.5),
+        _venue("bybit_lm", 0.5, [("70", 1.0)]),  # pick_usd=$50, base leg $25
+    ])
+    assert check_lm_residual_naked_exposure(d, s) == (True, None)

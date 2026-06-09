@@ -26,7 +26,7 @@ import asyncio
 import json
 import os
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any
@@ -234,6 +234,23 @@ class ProductSummary(BaseModel):
     # passing amount as-is (legacy behavior). LM products don't
     # populate this field — their fill is `addLiquidity` not Earn.
     stake_precision: int | None = None
+    # LM only: USD notional of ONE base-coin perp lot (`qty_step × mark`).
+    # The LM base leg is auto-hedged in whole perp lots, so a candidate whose
+    # intended base leg isn't ~a clean multiple of this leaves an
+    # un-hedgeable naked long inside the LP. Surfaced so the LLM can prefer
+    # finer-lot pairs and size NEW LM near a clean multiple (lm-residual
+    # epic). None ⇒ not LM, or no perp/mark/qty_step for the base this cycle.
+    perp_lot_notional_usd: Decimal | None = None
+    # Non-stable Earn/LM candidates: the underlying coin's signed % price
+    # change over the trailing 1 / 7 / 30 days (close-to-close, e.g. -42.7 for
+    # a 42.7% drop). An ENTRY-RISK signal, not a directional one: a coin
+    # bleeding out (scam / delisting / death) makes its Earn APR a trap on a
+    # dying, illiquid-to-exit asset, while a violent pump means an overheated
+    # APR + elevated short-hedge liquidation risk. None ⇒ stable, no perp, or
+    # the kline fetch failed this cycle.
+    price_change_1d_pct: Decimal | None = None
+    price_change_7d_pct: Decimal | None = None
+    price_change_30d_pct: Decimal | None = None
     notes: list[str] = Field(default_factory=list)
 
 
@@ -414,6 +431,14 @@ class PerpInfo(BaseModel):
     # hedge-only fixtures (which never read it) are unaffected; the live
     # fetcher sets it from a spot instruments-info probe.
     has_spot_market: bool = True
+    # Signed % price change of the coin over the trailing 1 / 7 / 30 days
+    # (close-to-close daily klines). Surfaced onto each non-stable Earn/LM
+    # candidate as an ENTRY-RISK signal (dump = trap yield on a dying asset;
+    # pump = overheated APR + short-hedge liquidation risk). None = kline
+    # fetch failed or too few candles for the window.
+    price_change_1d_pct: Decimal | None = None
+    price_change_7d_pct: Decimal | None = None
+    price_change_30d_pct: Decimal | None = None
 
 
 class Snapshot(BaseModel):
@@ -786,6 +811,26 @@ def _kline_period_return(candles: list[dict[str, Any]]) -> Decimal | None:
     return (end_price - start_price) / start_price
 
 
+def _kline_pct_change(candles: list[dict[str, Any]], days: int) -> Decimal | None:
+    """Signed % price change over `days` daily candles, close-to-close.
+
+    Bybit returns daily candles most-recent-first, so `candles[0]` is the
+    latest (in-progress) close ≈ current price and `candles[days]` is the
+    close `days` sessions ago: `(now − then) / then × 100`. Returns None when
+    the window isn't fully covered (fewer than `days + 1` candles) or a price
+    fails to parse — the caller surfaces None rather than a partial signal."""
+    if days <= 0 or not candles or len(candles) <= days:
+        return None
+    try:
+        now = Decimal(str(candles[0].get("close", "")))
+        then = Decimal(str(candles[days].get("close", "")))
+    except (InvalidOperation, TypeError):
+        return None
+    if then <= 0:
+        return None
+    return (now - then) / then * Decimal(100)
+
+
 def _advance_earn_summary(
     p: dict[str, Any], category: str,
     quote: dict[str, Any] | None = None,
@@ -1154,6 +1199,68 @@ def _lm_liquidation_distance_pct(pos: dict[str, Any]) -> Decimal | None:
     return (cur_d - liq_d) / cur_d
 
 
+def _lm_position_principal_usd(pos: dict[str, Any]) -> Decimal:
+    """Principal USD-equivalent of one held LM position. Mirrors
+    `execute._lm_principal_usd` (can't import it — `execute` imports
+    `snapshot`, so the reverse is a cycle): prefer Bybit's consolidated
+    `principalLiquidityValue`, else reconstruct `quote + base × currentPrice`.
+    Returns 0 on parse failure — caller then surfaces a 0 residual."""
+    raw = pos.get("principalLiquidityValue")
+    if raw is not None:
+        try:
+            return Decimal(str(raw))
+        except (InvalidOperation, TypeError):
+            pass
+    try:
+        quote = Decimal(str(pos.get("principalQuoteAmount", "0")))
+        base = Decimal(str(pos.get("principalBaseAmount", "0")))
+        price = Decimal(str(pos.get("currentPrice", "0")))
+    except (InvalidOperation, TypeError):
+        return Decimal(0)
+    return quote + base * price
+
+
+def _lm_hedge_residual(
+    base_leg_usd: Decimal,
+    mark: Decimal | None,
+    qty_step: Decimal | None,
+    min_order_qty: Decimal | None = None,
+) -> tuple[Decimal, Decimal]:
+    """USD the LM base leg can actually hedge vs the naked residual left in
+    the LP. Returns `(hedge_usd, residual_usd)`.
+
+    A single-sided LM deposit rebalances 50/50, so half the position is a
+    long on the base coin. The executor shorts a perp to hedge it, but the
+    perp qty floor-rounds DOWN to `qty_step` (mirrors
+    `execute._round_to_qty_step`, ROUND_DOWN). On a coarse lot (ETH
+    `qty_step=0.01` ≈ $17) the un-hedged remainder is a naked long stuck in
+    the pool — no spot sweep reaches it, only resizing/redeeming the LP.
+
+        hedge_qty = floor(base_leg/mark / step) * step
+        hedge_usd = hedge_qty * mark ; residual_usd = base_leg − hedge_usd
+
+    Floor math is inlined for the same import-cycle reason as
+    `_lm_position_principal_usd`, and mirrors `_round_to_qty_step` exactly so
+    the surfaced residual equals what the executor will really leave: a
+    missing `qty_step` falls back to a 0.001 default (the executor still
+    hedges at that granularity), and a floored qty below `min_order_qty` means
+    the executor opens NO hedge at all (returns None → SKIP), leaving the
+    whole base leg naked. Non-positive `mark`/`qty_step` or a non-positive base
+    leg ⇒ `(0, 0)` (no signal rather than a misleading residual)."""
+    if base_leg_usd <= 0 or mark is None or mark <= 0:
+        return (Decimal(0), Decimal(0))
+    step = qty_step or Decimal("0.001")
+    if step <= 0:
+        return (Decimal(0), Decimal(0))
+    hedge_qty = (base_leg_usd / mark / step).to_integral_value(
+        rounding=ROUND_DOWN
+    ) * step
+    if min_order_qty is not None and hedge_qty < min_order_qty:
+        hedge_qty = Decimal(0)
+    hedge_usd = hedge_qty * mark
+    return (hedge_usd, base_leg_usd - hedge_usd)
+
+
 def _rank_key(s: ProductSummary) -> Decimal:
     """Ranking key, in precedence (`bybit-sandbox.66`):
       1. `effective_apr_net_hedge` — realizable yield AFTER the auto-hedge
@@ -1516,6 +1623,16 @@ def _annual_funding(
     return per_period * HOURS_PER_YEAR / interval
 
 
+def _surface_price_change(row: ProductSummary, info: "PerpInfo") -> None:
+    """Copy the coin's trailing price-change (entry-risk signal) from its
+    PerpInfo onto the candidate row. Independent of the funding/hedge math —
+    it only needs the kline — so it's surfaced whenever a perp exists, even on
+    a cycle the net-hedge APR can't be computed."""
+    row.price_change_1d_pct = info.price_change_1d_pct
+    row.price_change_7d_pct = info.price_change_7d_pct
+    row.price_change_30d_pct = info.price_change_30d_pct
+
+
 def _apply_net_hedge_apr(
     products: dict[str, list[ProductSummary]],
     perp_market: dict[str, "PerpInfo"],
@@ -1553,6 +1670,7 @@ def _apply_net_hedge_apr(
             if info is None:
                 row.net_hedge_source = "perp_missing"
                 continue
+            _surface_price_change(row, info)
             funding_annual = _annual_funding(
                 info.funding_rate_7d_avg, info.funding_interval_hours
             )
@@ -1601,6 +1719,13 @@ def _apply_net_hedge_apr(
         if info is None:
             row.net_hedge_source = "perp_missing"
             continue
+        _surface_price_change(row, info)
+        # Hedge granularity for this candidate (one base-coin perp lot in
+        # USD). Surfaced even when funding is missing below — it only needs
+        # mark + qty_step. Lets the LLM gauge, before sizing a NEW LM, how
+        # coarse the base lot is vs the base leg it intends (lm-residual).
+        if info.qty_step is not None and info.mark_price is not None:
+            row.perp_lot_notional_usd = info.qty_step * info.mark_price
         funding_annual = _annual_funding(
             info.funding_rate_7d_avg, info.funding_interval_hours
         )
@@ -1641,13 +1766,16 @@ async def _fetch_perp_info(
     """
     symbol = f"{coin.upper()}USDT"
     try:
-        tickers, book, instruments, funding_history, spot_instruments = (
+        tickers, book, instruments, funding_history, spot_instruments, klines = (
             await asyncio.gather(
                 client.get_tickers(category="linear", symbol=symbol),
                 client.get_orderbook(symbol=symbol, category="linear", limit=50),
                 client.get_instruments_info(category="linear", symbol=symbol),
                 client.get_funding_history(symbol=symbol, category="linear", limit=21),
                 client.get_instruments_info(category="spot", symbol=symbol),
+                client.get_kline(
+                    symbol=symbol, category="linear", interval="D", limit=31
+                ),
                 return_exceptions=True,
             )
         )
@@ -1680,6 +1808,17 @@ async def _fetch_perp_info(
             f"{type(funding_history).__name__}"
         )
 
+    # Trailing price change (entry-risk signal). Degrades to None per window
+    # on a failed/short fetch — never collapses the row (a missing trend is
+    # softer than a missing hedge).
+    price_change_1d = price_change_7d = price_change_30d = None
+    if isinstance(klines, list) and klines:
+        price_change_1d = _kline_pct_change(klines, 1)
+        price_change_7d = _kline_pct_change(klines, 7)
+        price_change_30d = _kline_pct_change(klines, 30)
+    elif isinstance(klines, BaseException):
+        errors.append(f"perp_market[{coin}]: kline: {type(klines).__name__}")
+
     ticker = tickers[0] if tickers else None
     if ticker is None:
         return coin, None
@@ -1701,6 +1840,7 @@ async def _fetch_perp_info(
 
     min_qty: Decimal | None = None
     max_lev: Decimal | None = None
+    qty_step_d: Decimal | None = None
     if instruments:
         inst = instruments[0]
         lot = inst.lotSizeFilter
@@ -1709,7 +1849,6 @@ async def _fetch_perp_info(
                 min_qty = Decimal(lot.minOrderQty)
             except (InvalidOperation, TypeError):
                 min_qty = None
-        qty_step_d: Decimal | None = None
         if lot and lot.qtyStep:
             try:
                 qty_step_d = Decimal(lot.qtyStep)
@@ -1745,6 +1884,9 @@ async def _fetch_perp_info(
         qty_step=qty_step_d,
         max_leverage=max_lev,
         has_spot_market=has_spot_market,
+        price_change_1d_pct=price_change_1d,
+        price_change_7d_pct=price_change_7d,
+        price_change_30d_pct=price_change_30d,
     )
 
 
@@ -1876,25 +2018,35 @@ def _build_funding_carry_products(
 def _hedge_candidate_coins(
     summaries_groups: list[list[ProductSummary]], cap: int
 ) -> list[str]:
-    """Pick the Earn coins that actually need a perp hedge —
-    everything non-stable, deduped, capped at `cap`. Walks each group
-    in order (OnChain first, then FlexibleSaving) preserving APR-desc
-    ranking from `_rank` so high-yield non-stable picks claim the fan-
-    out budget first. `.47` follow-up 2026-05-29: extended from
-    OnChain-only to cover both auto-hedge categories — non-stable
-    FlexibleSaving picks (ID, IO, AGIX, etc.) also need perp data so
-    the validator's hedge-feasibility gate has real numbers to check."""
+    """Pick the non-stable Earn coins that most need a perp hedge — the
+    HIGHEST gross-APR ones across all auto-hedge categories, deduped, capped
+    at `cap`.
+
+    Sorts by gross `effective_apr` descending because this fan-out runs BEFORE
+    the net-hedge `_rank` — the input lists are NOT yet APR-ordered (build
+    order), so walking them raw fetched perps for arbitrary coins and left the
+    actual top-yield picks (ME, IO, H, …) with `net_hedge=None`. The validator
+    then treated those as un-hedgeable and the agent skipped them, stranding
+    the book in low-yield stables (live 2026-06-09). Global APR sort guarantees
+    the coins the agent would most want to deploy into get real perp data — and
+    thus a computed `effective_apr_net_hedge` — this cycle. `.47` follow-up:
+    covers both auto-hedge categories (non-stable Flex picks like ID/IO/AGIX
+    need perp data too, not just OnChain)."""
+    ranked = sorted(
+        (p for group in summaries_groups for p in group),
+        key=lambda s: s.effective_apr,
+        reverse=True,
+    )
     seen: set[str] = set()
     out: list[str] = []
-    for summaries in summaries_groups:
-        for p in summaries:
-            coin = p.coin.upper()
-            if coin in STABLES or coin in seen:
-                continue
-            seen.add(coin)
-            out.append(coin)
-            if len(out) >= cap:
-                return out
+    for p in ranked:
+        coin = p.coin.upper()
+        if coin in STABLES or coin in seen:
+            continue
+        seen.add(coin)
+        out.append(coin)
+        if len(out) >= cap:
+            break
     return out
 
 
@@ -2712,11 +2864,19 @@ async def collect_snapshot(
             seen_perp.add(coin)
     if perp_coins:
         perp_results = await asyncio.gather(
-            *(_fetch_perp_info(client, c, errors) for c in perp_coins)
+            *(_fetch_perp_info(client, c, errors) for c in perp_coins),
+            return_exceptions=True,
         )
-        perp_market = {
-            coin: info for coin, info in perp_results if info is not None
-        }
+        perp_market = {}
+        for coin, res in zip(perp_coins, perp_results):
+            if isinstance(res, BaseException):
+                errors.append(
+                    f"perp_market[{coin}]: fetch crashed: {type(res).__name__}"
+                )
+                continue
+            rcoin, info = res
+            if info is not None:
+                perp_market[rcoin] = info
     else:
         perp_market = {}
 
@@ -2732,6 +2892,34 @@ async def collect_snapshot(
         products["FlexibleSaving"], must_include=stable_floor
     )
     products["OnChain"] = _rank(products["OnChain"], must_include=stable_floor)
+
+    # lm-residual epic: surface the un-hedgeable naked base-coin residual on
+    # each HELD LM position so the LLM (and, later, the validator) reasons on
+    # a real number instead of the "hedge is automatic" assumption. The raw
+    # LM row doesn't echo the base coin — resolve it through the LM catalog by
+    # productId, exactly like the executor's `_lm_product_from_snapshot`. Runs
+    # here (post perp fan-out, PRE the small-vault filter below) because it
+    # needs `perp_market` + `total_equity` AND the still-complete LM catalog.
+    lm_pair_by_pid = {
+        p.product_id: p.coin for p in products.get("LiquidityMining", [])
+    }
+    for pos in lm_positions:
+        pair = lm_pair_by_pid.get(str(pos.get("productId") or ""))
+        if not pair:
+            continue
+        base = pair.split("/", 1)[0].upper()
+        if not base or base in STABLES:
+            continue
+        info = perp_market.get(base)
+        if info is None:
+            continue
+        base_leg_usd = _lm_position_principal_usd(pos) * LM_BASE_LEG_FRACTION
+        _, residual_usd = _lm_hedge_residual(
+            base_leg_usd, info.mark_price, info.qty_step, info.min_order_qty
+        )
+        pos["hedge_residual_naked_usd"] = str(residual_usd)
+        if total_equity > 0:
+            pos["hedge_residual_pct_of_book"] = str(residual_usd / total_equity)
 
     # Funding-carry category. Filters + ranks coins from perp_market by
     # friction-adjusted carry APR. Venue `bybit_funding_carry` (`.3`)

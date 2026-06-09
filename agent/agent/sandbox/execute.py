@@ -53,6 +53,7 @@ from agent.reason.venues import (
     CARRY_CATEGORY,
     CARRY_VENUE_ID,
     LM_BASE_LEG_FRACTION,
+    LM_RESIDUAL_NAKED_MAX,
     SLOW_SETTLE_CATEGORIES,
     VENUE_REGISTRY,
 )
@@ -3959,6 +3960,147 @@ def _orphan_spot_sell_actions(
         cursor += 1
     _ = redeems  # parameter kept for call-site symmetry / future use
     return swaps
+
+
+def _lm_residual_redeem_actions(
+    snapshot: Snapshot,
+    snapshot_ts: str,
+    *,
+    idx_offset: int,
+) -> list[Action]:
+    """Full-redeem any HELD LM position whose un-hedgeable naked base-coin
+    residual exceeds `LM_RESIDUAL_NAKED_MAX` of book (lm-residual epic).
+
+    The residual is a base-coin long stuck INSIDE the LP — the coarse perp lot
+    under-hedges the base half and no spot/perp sweep can reach the remainder,
+    only redeeming the LP can. So it is pure risk reduction that, like the
+    orphan-perp/spot sweep, MUST run even on a cycle the validator or
+    confidence floor won't execute: the agent's own redeem decision shrinks the
+    book to mostly cash and so scores BELOW the 0.60 execute gate, meaning the
+    de-risk would otherwise never fire (observed live 2026-06-09). Reads only
+    `lm_positions` (the snapshot injects `hedge_residual_pct_of_book` on each
+    held LM), not the decision — absent/unparseable ⇒ skip (no signal).
+
+    Leaves the paired perp short ALONE: the LP redeem is async, so this cycle
+    the short still backs real base exposure; once the LP settles the short
+    goes orphan and `_orphan_perp_close_actions` closes it. Full exit only
+    (removeRate=100). Skipped: positions at/under `MIN_ACTION_USDC`, and any
+    already `Processing` (redeem in flight) so we don't re-submit a doomed
+    removeRate=100 every non-executing cycle until settlement (Bybit 180020).
+    Only an explicit `Processing` status is skipped — an absent/`Active`
+    status still redeems, so a healthy position is never wrongly held."""
+    actions: list[Action] = []
+    cursor = idx_offset
+    seen: set[str] = set()
+    for pos in snapshot.lm_positions or []:
+        raw = pos.get("hedge_residual_pct_of_book")
+        if raw is None:
+            continue
+        try:
+            pct = Decimal(str(raw))
+        except (InvalidOperation, TypeError):
+            continue
+        if pct <= LM_RESIDUAL_NAKED_MAX:
+            continue
+        # Redeem already in flight — Bybit reports `Processing` and a second
+        # removeRate=100 just 180020-errors. Mirrors the OnChain-Earn guard
+        # (`_is_fully_processing`); guards against per-cycle redeem spam while
+        # the LP settles. Absent/`Active` status falls through and redeems.
+        if str(pos.get("status") or "").strip().lower() == "processing":
+            continue
+        position_id = str(pos.get("positionId") or "")
+        if not position_id or position_id in seen:
+            continue
+        held_usd = _lm_principal_usd(pos)
+        if held_usd <= MIN_ACTION_USDC:
+            continue
+        seen.add(position_id)
+        product_id = str(pos.get("productId") or "")
+        actions.append(
+            Action(
+                kind=ActionKind.REDEEM_LM,
+                category=_LM_CATEGORY,
+                product_id=product_id,
+                coin="?",
+                amount=held_usd,
+                order_link_id=_order_link_id(snapshot_ts, cursor),
+                reason=(
+                    f"residual de-risk: LM/{product_id} naked base residual "
+                    f"{float(pct) * 100:.2f}% of book > "
+                    f"{float(LM_RESIDUAL_NAKED_MAX) * 100:.0f}% floor → full "
+                    f"exit (removeRate=100); in-LP naked long no sweep reaches"
+                ),
+                position_id=position_id,
+            )
+        )
+        cursor += 1
+    return actions
+
+
+def _carry_liq_close_actions(
+    snapshot: Snapshot,
+    carry_state: CarryState,
+    near_liq_coins: set[str],
+    snapshot_ts: str,
+    *,
+    idx_offset: int,
+) -> list[Action]:
+    """Deterministically close any held funding-carry whose perp short is
+    nearing liquidation (watcher `carry_liq_close` event), even on a cycle the
+    validator / confidence floor won't execute.
+
+    A carry has NO separate Earn/LM leg to redeem — the perp IS the position
+    (plus its spot Buy leg). So unlike the Earn/LM auto-close (which drops a
+    pick and lets the diff redeem the leg), this emits one
+    `CLOSE_FUNDING_CARRY` per coin in `near_liq_coins ∩ active carry coins` —
+    the same Action the normal carry diff uses, sized from the persisted
+    `CarryPositionRecord` so BOTH legs unwind atomically. A near-liq coin with
+    NO carry record (a manual naked short) is skipped here and left to the
+    orphan-perp / LLM path.
+
+    Mirrors the CLOSE branch of `_funding_carry_diff`: honors
+    `MAX_CARRY_CLOSE_ATTEMPTS` so a persistently-failing close (margin / symbol
+    issue) stops auto-retrying and surfaces for operator review instead of
+    spamming a doomed order every non-executing cycle. `snapshot` is unused for
+    sizing (state carries the qtys) but kept in the signature to match the
+    other sweep helpers and leave room for a future depth/slippage guard."""
+    actions: list[Action] = []
+    cursor = idx_offset
+    for coin in sorted(c.upper() for c in near_liq_coins):
+        existing = carry_state.get(coin)
+        if existing is None:
+            continue
+        if existing.close_attempts >= MAX_CARRY_CLOSE_ATTEMPTS:
+            log.warning(
+                "carry liq-close skipped for %s: close_attempts=%d exceeded "
+                "MAX_CARRY_CLOSE_ATTEMPTS=%d — needs operator review",
+                coin, existing.close_attempts, MAX_CARRY_CLOSE_ATTEMPTS,
+            )
+            continue
+        order_link_id = _order_link_id(snapshot_ts, cursor)
+        cursor += 1
+        symbol = f"{coin}USDT"
+        actions.append(
+            Action(
+                kind=ActionKind.CLOSE_FUNDING_CARRY,
+                category=CARRY_CATEGORY,
+                product_id=symbol,
+                coin=coin,
+                amount=existing.target_pick_usd,
+                amount_native=existing.spot_qty_base,
+                order_link_id=order_link_id,
+                reason=(
+                    f"liq de-risk: funding-carry {coin} short nearing "
+                    f"liquidation — close spot qty={existing.spot_qty_base} + "
+                    f"perp qty={existing.perp_qty_base} (both legs, no LLM)"
+                ),
+                extra={
+                    "spot_order_link_id": f"{order_link_id}_spot",
+                    "perp_order_link_id": f"{order_link_id}_perp",
+                },
+            )
+        )
+    return actions
 
 
 # Non-core stables that, when they settle idle into the wallet (the

@@ -32,6 +32,7 @@ from agent.sandbox.execute import (
     Action,
     ActionKind,
     ActionResult,
+    _carry_liq_close_actions,
     _funding_carry_diff,
     _funding_carry_targets,
     _execute_one,
@@ -321,6 +322,56 @@ def test_carry_diff_skips_close_when_attempts_at_max() -> None:
     assert opens == []
     # No CLOSE emitted — stuck position is left for operator review.
     assert closes == []
+
+
+# ─── _carry_liq_close_actions (liquidation de-risk sweep) ────────────────────
+
+
+def test_carry_liq_close_closes_both_legs() -> None:
+    """A near-liq carry coin present in carry_state emits one
+    CLOSE_FUNDING_CARRY sized from the record (unwinds spot + perp)."""
+    snap = _carry_snapshot()
+    state = CarryState(positions=[_record("TON", "100")])
+    actions = _carry_liq_close_actions(
+        snap, state, {"TON"}, "20260609T000000Z", idx_offset=840
+    )
+    assert len(actions) == 1
+    cl = actions[0]
+    assert cl.kind == ActionKind.CLOSE_FUNDING_CARRY
+    assert cl.coin == "TON"
+    assert cl.product_id == "TONUSDT"
+    assert cl.amount == Decimal("100")
+    assert cl.amount_native == Decimal("50")  # 100/2 from record
+    assert cl.extra["spot_order_link_id"].endswith("_spot")
+    assert cl.extra["perp_order_link_id"].endswith("_perp")
+
+
+def test_carry_liq_close_skips_coin_not_in_state() -> None:
+    """A near-liq coin with no carry record (manual naked short) is left to
+    the orphan-perp / LLM path, not closed here."""
+    snap = _carry_snapshot()
+    state = CarryState(positions=[_record("TON", "100")])
+    assert _carry_liq_close_actions(
+        snap, state, {"SOL"}, "20260609T000000Z", idx_offset=840
+    ) == []
+    # Empty trigger set → nothing closes either.
+    assert _carry_liq_close_actions(
+        snap, state, set(), "20260609T000000Z", idx_offset=840
+    ) == []
+
+
+def test_carry_liq_close_respects_max_attempts() -> None:
+    """A persistently-failing close stops auto-retrying after
+    MAX_CARRY_CLOSE_ATTEMPTS (mirrors the diff-layer guard)."""
+    from agent.sandbox.execute import MAX_CARRY_CLOSE_ATTEMPTS
+    snap = _carry_snapshot()
+    stuck = _record("TON", "100").model_copy(
+        update={"close_attempts": MAX_CARRY_CLOSE_ATTEMPTS}
+    )
+    state = CarryState(positions=[stuck])
+    assert _carry_liq_close_actions(
+        snap, state, {"TON"}, "20260609T000000Z", idx_offset=840
+    ) == []
 
 
 def test_carry_diff_noop_when_both_target_and_state() -> None:

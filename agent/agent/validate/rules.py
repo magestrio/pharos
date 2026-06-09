@@ -30,6 +30,7 @@ from agent.reason.venues import (
     CARRY_VENUE_ID,
     HEDGE_VENUES,
     LM_BASE_LEG_FRACTION,
+    LM_RESIDUAL_NAKED_MAX,
     SLOW_SETTLE_CATEGORIES,
     VENUE_REGISTRY,
     VenueId,
@@ -43,6 +44,7 @@ from agent.sandbox.snapshot import (
     ProductSummary,
     Snapshot,
     _annual_funding,
+    _lm_hedge_residual,
 )
 
 MIN_CONFIDENCE = 0.4
@@ -588,6 +590,82 @@ def net_hedge_yield(summary: Any, perp_info: Any) -> tuple[float | None, bool]:
         float(gross) + float(annual) - float(FUNDING_CARRY_FRICTION_ANNUAL),
         False,
     )
+
+
+def check_lm_residual_naked_exposure(d: Decision, snapshot: Snapshot) -> Check:
+    """Reject a NEW or GROWN LM pick whose post-floor-round naked base-coin
+    residual would exceed `LM_RESIDUAL_NAKED_MAX` of book.
+
+    The LM base leg auto-hedges only in WHOLE perp lots, so a pick whose base
+    leg (pick_usd × ½) isn't ≈ a clean multiple of one lot leaves a naked
+    base-coin long stuck INSIDE the LP that no hedge can reach — only redeeming
+    the LP closes it (lm-residual epic). Gating NEW exposure here stops the
+    agent OPENING an un-cleanly-hedgeable LP and teaches it (via the reject
+    message → next-cycle summary) to size to a clean lot multiple or pick a
+    finer-lot pair.
+
+    HELD positions are EXEMPT (net-new < `_MIN_ACTION_USDC`): their residual is
+    handled by the snapshot/prompt surface + the loop's de-risk redeem sweep,
+    NOT a cycle reject that would amount to force-redeeming a hold. Net-new is
+    scoped exactly like `check_funding_rate_floor`'s LM block; missing/unpriced
+    perp data ⇒ exempt (`check_hedges_for_non_usd_picks` owns un-hedgeable
+    picks, and an unpriced perp yields a 0 residual → pass). Residual math
+    reuses `snapshot._lm_hedge_residual` so the gate, the snapshot surface, and
+    the executor redeem sweep can't drift."""
+    lm_venue = d.venue("bybit_lm")
+    if lm_venue is None or not lm_venue.picks:
+        return True, None
+    total_book = float(snapshot.wallet.total_equity_usd)
+    if total_book <= 0:
+        return True, None
+    perp_market = getattr(snapshot, "perp_market", None) or {}
+    lm_idx = _snapshot_index(snapshot).get("LiquidityMining", {})
+    held_lm = _held_lm_usd_by_product(snapshot)
+    floor_usd = float(LM_RESIDUAL_NAKED_MAX) * total_book
+    bad: list[str] = []
+    for pick in lm_venue.picks:
+        summary = lm_idx.get(pick.product_id)
+        if summary is None:
+            continue
+        parts = summary.coin.split("/", 1)
+        if len(parts) != 2:
+            continue
+        base = parts[0].upper()
+        if not base or base in _STABLE_COINS:
+            continue
+        pick_usd = total_book * float(lm_venue.weight) * float(pick.weight)
+        net_new = pick_usd - held_lm.get(pick.product_id, 0.0)
+        if net_new < _MIN_ACTION_USDC:
+            continue  # hold or reduce — exempt (de-risk handled elsewhere)
+        info = perp_market.get(base) or perp_market.get(base.lower())
+        if info is None:
+            continue  # un-hedgeable — check_hedges_for_non_usd_picks owns this
+        base_leg = Decimal(str(pick_usd)) * LM_BASE_LEG_FRACTION
+        _, residual = _lm_hedge_residual(
+            base_leg, info.mark_price, info.qty_step, info.min_order_qty
+        )
+        residual_usd = float(residual)
+        if residual_usd > floor_usd:
+            lot = (
+                info.qty_step * info.mark_price
+                if info.qty_step is not None and info.mark_price is not None
+                else None
+            )
+            lot_s = f"${float(lot):.2f}" if lot is not None else "n/a"
+            bad.append(
+                f"bybit_lm/{pick.product_id}({base}): NEW base leg "
+                f"${float(base_leg):.2f} floor-rounds the hedge to leave "
+                f"${residual_usd:.2f} naked "
+                f"({residual_usd / total_book * 100:.2f}% of book) > "
+                f"{float(LM_RESIDUAL_NAKED_MAX) * 100:.0f}% floor (one perp lot "
+                f"≈ {lot_s}); size to a clean lot multiple or pick a finer-lot pair"
+            )
+    if bad:
+        return False, (
+            "NEW LM picks leave un-hedgeable naked base residual above the floor: "
+            + " | ".join(bad)
+        )
+    return True, None
 
 
 def check_funding_rate_floor(d: Decision, snapshot: Snapshot) -> Check:
@@ -1877,6 +1955,7 @@ def validate(decision: Decision, snapshot: Snapshot) -> tuple[bool, list[str]]:
         check_lm_leverage_forbidden,
         check_lm_leverage_size_cap,
         check_hedges_for_non_usd_picks,
+        check_lm_residual_naked_exposure,
         check_funding_rate_floor,
         check_funding_carry_floor,
         check_no_double_carry_hedge,

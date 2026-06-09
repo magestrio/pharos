@@ -352,3 +352,13 @@ SLOW_SETTLE_CATEGORIES: frozenset[str] = frozenset({"OnChain"})
 # snapshot.py + execute.py + validate/rules.py (each imports it here so
 # the 0.5 can't drift across the sizing / gating / ranking layers).
 LM_BASE_LEG_FRACTION: Decimal = Decimal("0.5")
+
+# Max tolerated un-hedgeable naked base-coin residual on a HELD LM position,
+# as a fraction of total book (lm-residual epic). The LM base leg hedges only
+# in whole perp lots, so a coarse lot leaves a naked long stuck INSIDE the LP
+# that no spot/perp sweep can reach — only redeeming the LP closes it. Above
+# this floor the residual is uncontrolled directional risk: the prompt tells
+# the agent to downsize/redeem, and the executor force-redeems on any cycle
+# the confidence floor won't otherwise execute. Single source of truth for
+# prompt.py guidance + execute.py sweep (+ future validate/rules.py).
+LM_RESIDUAL_NAKED_MAX: Decimal = Decimal("0.03")

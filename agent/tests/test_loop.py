@@ -230,6 +230,42 @@ def test_clamp_drops_overbudget_carry_to_cash() -> None:
     )
 
 
+def test_strip_carry_coins_drops_targeted_carry_to_cash() -> None:
+    """`_strip_carry_coins_from_decision` removes the targeted carry pick and
+    rolls its weight to cash — so a `carry_liq_close` makes the diff CLOSE (not
+    re-OPEN) the carry on an executing cycle (loop-1/wt-2). No-op when the coin
+    isn't a current carry target."""
+    from agent.sandbox.loop import _strip_carry_coins_from_decision
+    snap = _snapshot_with_ton(liquid_usdc="100")
+    snap.products["FundingCarry"] = [
+        ProductSummary(
+            category="FundingCarry", product_id="HYPEUSDT", coin="HYPE",
+            effective_apr=Decimal("0.08"), apr_source="funding_carry",
+            base_apr_string=None, redeem_lockup_minutes=0, notes=[],
+        ),
+    ]
+    dec = Decision(
+        thesis="hold a HYPE funding-carry while funding stays positive.",
+        venues=[
+            VenueAllocation(venue_id="cash_usdc", weight=0.85),
+            VenueAllocation(venue_id="bybit_funding_carry", weight=0.15,
+                            picks=[Pick(product_id="HYPEUSDT", weight=1.0)]),
+        ],
+        hedges=[], confidence=0.7, risk_flags=[], notes=[],
+        expected_blended_apr_pct=6.0,
+    )
+    stripped, dropped = _strip_carry_coins_from_decision(dec, snap, {"HYPE"})
+    assert dropped == ["HYPEUSDT"]
+    assert not any(
+        p.product_id == "HYPEUSDT" for v in stripped.venues for p in v.picks
+    )
+    assert abs(sum(v.weight for v in stripped.venues) - 1.0) < 1e-6
+
+    same, none_dropped = _strip_carry_coins_from_decision(dec, snap, {"SOL"})
+    assert none_dropped == []
+    assert same.venue("bybit_funding_carry") is not None
+
+
 def test_clamp_keeps_held_position_at_size() -> None:
     """A HELD TON position kept at its current size (net_new≈0) is NOT
     dropped, even though its gross value exceeds the liquid budget."""
@@ -627,6 +663,223 @@ async def test_run_one_cycle_derisk_sweep_skipped_on_full_live(tmp_path: Path) -
 
     assert exec_mock.call_count == 1  # only the main diff, no separate sweep
     assert outcome.get("safety_sweep") is None
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_derisk_sweep_closes_near_liq_carry(tmp_path: Path) -> None:
+    """A `carry_liq_close` wake event on a sub-floor cycle closes the carry
+    LIVE via the safety sweep — carry has no pick to drop, so this is its only
+    deterministic exit when the allocation won't execute."""
+    from agent.sandbox.carry_state import CarryPositionRecord, CarryState
+    from agent.sandbox.execute import ActionKind
+
+    bybit = AsyncMock()
+    anthropic_client = AsyncMock()
+    snap = _snapshot()
+    decision = _decision_clean().model_copy(update={"confidence": 0.5})
+    carry_state = CarryState(positions=[
+        CarryPositionRecord(
+            coin="TON",
+            opened_at=datetime.now(UTC),
+            target_pick_usd=Decimal("100"),
+            spot_qty_base=Decimal("50"),
+            perp_qty_base=Decimal("50"),
+            mark_price_at_open=Decimal("2.0"),
+            spot_order_link_id="x_spot",
+            perp_order_link_id="x_perp",
+        )
+    ])
+    wake_events = [{"kind": "carry_liq_close", "coin": "TON",
+                    "position_id": "perp:TONUSDT"}]
+
+    with (
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: []),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
+        patch("agent.sandbox.loop.write_decision", lambda d, sp, **_kw: tmp_path / "decision.json"),
+        patch("agent.sandbox.loop.read_carry_state", lambda *_a, **_kw: carry_state),
+        patch("agent.sandbox.loop.execute_actions", AsyncMock(return_value=[])) as exec_mock,
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        outcome = await run_one_cycle(
+            bybit, anthropic_client, live=True, yes=True, min_confidence=0.6,
+            wake_events=wake_events,
+        )
+
+    live_carry_closes = [
+        c for c in exec_mock.call_args_list
+        if c.kwargs.get("dry_run") is False
+        and any(
+            a.kind == ActionKind.CLOSE_FUNDING_CARRY and a.coin == "TON"
+            for a in c.args[1]
+        )
+    ]
+    assert live_carry_closes, exec_mock.call_args_list
+    assert outcome.get("safety_sweep") is not None
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_derisk_sweep_reconciles_carry_state(tmp_path: Path) -> None:
+    """After the sweep closes a near-liq carry on Bybit, the closure is rolled
+    back into the state file (executor-1/wt-1/state-1) — without this the next
+    cycle re-emits a CLOSE for an already-closed position. The pre-fix sweep
+    dispatched the close but never wrote state."""
+    from agent.sandbox.carry_state import CarryPositionRecord, CarryState
+    from agent.sandbox.execute import Action, ActionKind, ActionResult
+
+    bybit = AsyncMock()
+    anthropic_client = AsyncMock()
+    snap = _snapshot()
+    decision = _decision_clean().model_copy(update={"confidence": 0.5})
+    carry_state = CarryState(positions=[
+        CarryPositionRecord(
+            coin="TON",
+            opened_at=datetime.now(UTC),
+            target_pick_usd=Decimal("100"),
+            spot_qty_base=Decimal("50"),
+            perp_qty_base=Decimal("50"),
+            mark_price_at_open=Decimal("2.0"),
+            spot_order_link_id="x_spot",
+            perp_order_link_id="x_perp",
+        )
+    ])
+    wake_events = [{"kind": "carry_liq_close", "coin": "TON",
+                    "position_id": "perp:TONUSDT"}]
+    close_result = ActionResult(
+        action=Action(
+            kind=ActionKind.CLOSE_FUNDING_CARRY,
+            category="FundingCarry",
+            product_id="TONUSDT",
+            coin="TON",
+            amount=Decimal("100"),
+            amount_native=Decimal("50"),
+            order_link_id="c-001",
+            reason="liq de-risk close",
+        ),
+        status="ok",
+        response={},
+        error=None,
+        started_at="2026-06-04T00:00:00+00:00",
+        finished_at="2026-06-04T00:00:01+00:00",
+    )
+
+    with (
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: []),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
+        patch("agent.sandbox.loop.write_decision", lambda d, sp, **_kw: tmp_path / "decision.json"),
+        patch("agent.sandbox.loop.read_carry_state", lambda *_a, **_kw: carry_state),
+        patch("agent.sandbox.loop.execute_actions", AsyncMock(return_value=[close_result])),
+        patch("agent.sandbox.loop.write_carry_state") as write_mock,
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        outcome = await run_one_cycle(
+            bybit, anthropic_client, live=True, yes=True, min_confidence=0.6,
+            wake_events=wake_events,
+        )
+
+    assert write_mock.called, "sweep must reconcile carry_state after closing carry"
+    written = write_mock.call_args[0][0]
+    assert written.get("TON") is None  # closed position dropped from state
+    assert "carry_state_updated" in outcome.get("stages", [])
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_derisk_sweep_skips_carry_without_state(tmp_path: Path) -> None:
+    """A `carry_liq_close` for a coin with NO carry record (manual naked
+    short) closes nothing here — left to the orphan-perp / LLM path."""
+    from agent.sandbox.carry_state import CarryState
+    from agent.sandbox.execute import ActionKind
+
+    bybit = AsyncMock()
+    anthropic_client = AsyncMock()
+    snap = _snapshot()
+    decision = _decision_clean().model_copy(update={"confidence": 0.5})
+    wake_events = [{"kind": "carry_liq_close", "coin": "SOL",
+                    "position_id": "perp:SOLUSDT"}]
+
+    with (
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: []),
+        patch("agent.sandbox.loop.decide", AsyncMock(return_value=(decision, _stub_usage()))),
+        patch("agent.sandbox.loop.write_decision", lambda d, sp, **_kw: tmp_path / "decision.json"),
+        patch("agent.sandbox.loop.read_carry_state", lambda *_a, **_kw: CarryState()),
+        patch("agent.sandbox.loop.execute_actions", AsyncMock(return_value=[])) as exec_mock,
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        await run_one_cycle(
+            bybit, anthropic_client, live=True, yes=True, min_confidence=0.6,
+            wake_events=wake_events,
+        )
+
+    assert not [
+        c for c in exec_mock.call_args_list
+        if c.kwargs.get("dry_run") is False
+        and any(a.kind == ActionKind.CLOSE_FUNDING_CARRY for a in c.args[1])
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_one_cycle_carry_liq_close_strips_decision_on_autoclose(
+    tmp_path: Path,
+) -> None:
+    """The bug (loop-1/wt-2): a `carry_liq_close` co-occurring with a
+    `pick_invalidated` took the auto-close fast-path, whose valid confidence-1.0
+    decision skipped the de-risk sweep — leaving the near-liq carry open. The
+    decision-strip drops the carry pre-diff so the executing auto-close cycle
+    CLOSEs (and can't re-OPEN) it."""
+    from agent.sandbox.carry_state import CarryState
+
+    bybit = AsyncMock()
+    anthropic_client = AsyncMock()
+    snap = _snapshot_with_ton(liquid_usdc="100")
+    snap.products["FundingCarry"] = [
+        ProductSummary(
+            category="FundingCarry", product_id="HYPEUSDT", coin="HYPE",
+            effective_apr=Decimal("0.08"), apr_source="funding_carry",
+            base_apr_string=None, redeem_lockup_minutes=0, notes=[],
+        ),
+    ]
+    # Prior holds an OnChain earn pick (dropped by pick_invalidated → auto-close
+    # path) AND a HYPE funding-carry (kept — carry has no family to drop).
+    prior = {
+        "thesis": "hold a TON OnChain pick and a HYPE funding-carry.",
+        "venues": [
+            {"venue_id": "cash_usdc", "weight": 0.5, "picks": []},
+            {"venue_id": "bybit_onchain", "weight": 0.35,
+             "picks": [{"product_id": "8", "weight": 1.0}]},
+            {"venue_id": "bybit_funding_carry", "weight": 0.15,
+             "picks": [{"product_id": "HYPEUSDT", "weight": 1.0}]},
+        ],
+        "hedges": [], "confidence": 0.7, "risk_flags": [], "notes": [],
+        "expected_blended_apr_pct": 5.0,
+    }
+    wake_events = [
+        {"kind": "pick_invalidated", "position_id": "earn:8", "coin": "TON"},
+        {"kind": "carry_liq_close", "coin": "HYPE", "position_id": "perp:HYPEUSDT"},
+    ]
+
+    with (
+        patch("agent.sandbox.loop.collect_snapshot", AsyncMock(return_value=snap)),
+        patch("agent.sandbox.loop.write_snapshot", lambda s: tmp_path / "snap.json"),
+        patch("agent.sandbox.loop._load_recent_prior_decisions", lambda *_a, **_kw: [prior]),
+        patch("agent.sandbox.loop.write_decision", lambda d, sp, **_kw: tmp_path / "decision.json"),
+        patch("agent.sandbox.loop.read_carry_state", lambda *_a, **_kw: CarryState()),
+        patch("agent.sandbox.loop.execute_actions", AsyncMock(return_value=[])),
+    ):
+        (tmp_path / "snap.json").write_text(json.dumps({"foo": "bar"}))
+        outcome = await run_one_cycle(
+            bybit, anthropic_client, live=True, yes=True, min_confidence=0.6,
+            wake_events=wake_events,
+        )
+
+    # Auto-close path taken (pick_invalidated) AND the carry was stripped so the
+    # diff can't re-open it.
+    assert outcome.get("auto_close") is True
+    assert outcome.get("carry_liq_close_dropped") == ["HYPEUSDT"]
 
 
 @pytest.mark.asyncio
@@ -1711,6 +1964,107 @@ def test_build_auto_close_decision_drops_affected_pick_to_cash():
     assert d.confidence == 1.0
 
 
+def test_build_auto_close_decision_drops_lm_pick_to_cash():
+    """An `lm:<productId>` event drops the matching bybit_lm pick (→ diff
+    auto-redeems the LP) exactly like an earn pick."""
+    from agent.sandbox.loop import _build_auto_close_decision
+    prior = {
+        "venues": [
+            {"venue_id": "cash_usdc", "weight": 0.7, "picks": []},
+            {"venue_id": "bybit_lm", "weight": 0.3, "picks": [
+                {"product_id": "24", "weight": 1.0},
+            ]},
+        ],
+        "hedges": [{"coin": "ETH", "notional_usd": -150.0}],
+        "confidence": 0.7,
+    }
+    events = [
+        {"kind": "pick_invalidated", "position_id": "lm:24", "coin": "ETH"}
+    ]
+    out = _build_auto_close_decision(prior, events)
+    assert out is not None
+    venues_by_id = {v["venue_id"]: v for v in out["venues"]}
+    assert "bybit_lm" not in venues_by_id
+    assert venues_by_id["cash_usdc"]["weight"] == pytest.approx(1.0)
+    assert out["hedges"] == []
+    from agent.reason.schema import Decision
+    Decision.model_validate(out)
+
+
+def test_build_auto_close_decision_qualifies_drop_by_venue_family():
+    """earn and lm productId spaces overlap (loop-2): an `lm:14` event drops
+    the bybit_lm pick ONLY — a same-id earn pick survives; `earn:14` is the
+    mirror (drops the earn pick, leaves the lm one)."""
+    from agent.sandbox.loop import _build_auto_close_decision
+    prior = {
+        "venues": [
+            {"venue_id": "cash_usdc", "weight": 0.4, "picks": []},
+            {"venue_id": "bybit_flex", "weight": 0.3, "picks": [
+                {"product_id": "14", "weight": 1.0},
+            ]},
+            {"venue_id": "bybit_lm", "weight": 0.3, "picks": [
+                {"product_id": "14", "weight": 1.0},
+            ]},
+        ],
+        "hedges": [{"coin": "ETH", "notional_usd": -150.0}],
+        "confidence": 0.7,
+    }
+    lm_out = _build_auto_close_decision(
+        prior, [{"kind": "pick_invalidated", "position_id": "lm:14", "coin": "ETH"}]
+    )
+    lm_by_id = {v["venue_id"]: v for v in lm_out["venues"]}
+    assert "bybit_lm" not in lm_by_id
+    assert lm_by_id["bybit_flex"]["weight"] == 0.3  # same pid, other family kept
+    assert lm_by_id["bybit_flex"]["picks"][0]["product_id"] == "14"
+    assert lm_by_id["cash_usdc"]["weight"] == pytest.approx(0.7)
+
+    earn_out = _build_auto_close_decision(
+        prior, [{"kind": "pick_invalidated", "position_id": "earn:14", "coin": "ETH"}]
+    )
+    earn_by_id = {v["venue_id"]: v for v in earn_out["venues"]}
+    assert "bybit_flex" not in earn_by_id
+    assert earn_by_id["bybit_lm"]["weight"] == 0.3
+    assert earn_by_id["cash_usdc"]["weight"] == pytest.approx(0.7)
+
+
+def test_build_auto_close_decision_suppresses_recently_closed_pid():
+    """A pid already auto-closed within the cooldown window is skipped so a
+    persistently-firing event falls through to the normal path (loop-4)."""
+    from agent.sandbox.loop import _build_auto_close_decision
+    prior = {
+        "venues": [
+            {"venue_id": "cash_usdc", "weight": 0.7, "picks": []},
+            {"venue_id": "bybit_onchain", "weight": 0.3, "picks": [
+                {"product_id": "8", "weight": 1.0},
+            ]},
+        ],
+        "confidence": 0.7,
+    }
+    events = [{"kind": "pick_invalidated", "position_id": "earn:8", "coin": "TON"}]
+    assert _build_auto_close_decision(prior, events) is not None
+    assert _build_auto_close_decision(prior, events, frozenset({"8"})) is None
+
+
+def test_build_auto_close_decision_ignores_carry_liq_close():
+    """`carry_liq_close` is not a pick_invalidated and carries no
+    earn:/lm: pid, so it yields no close_pids → falls through to None
+    (the loop's de-risk sweep handles carry, not the decision rewrite)."""
+    from agent.sandbox.loop import _build_auto_close_decision
+    prior = {
+        "venues": [
+            {"venue_id": "cash_usdc", "weight": 0.9, "picks": []},
+            {"venue_id": "bybit_funding_carry", "weight": 0.1, "picks": [
+                {"product_id": "SOLUSDT", "weight": 1.0},
+            ]},
+        ],
+        "confidence": 0.7,
+    }
+    events = [
+        {"kind": "carry_liq_close", "position_id": "perp:SOLUSDT", "coin": "SOL"}
+    ]
+    assert _build_auto_close_decision(prior, events) is None
+
+
 def test_build_auto_close_decision_rescales_multi_pick_venue():
     """Venue with two picks: closing one rescales remaining to sum=1 within
     venue + shrinks venue weight proportionally; freed weight to cash."""
@@ -1947,9 +2301,25 @@ def _dec_recompute(
 
 def test_recompute_confidence_penalizes_unconfirmed_estimate_apr() -> None:
     from agent.sandbox.loop import _recompute_confidence
-    snap = _snap_recompute()  # TON estimate_apr, NEW ($5 net-new)
+    snap = _snap_recompute()  # TON estimate_apr, NEW ($5 net-new = 5% of $100 book)
     new, reasons = _recompute_confidence(_dec_recompute(confidence=0.65), snap, [])
-    assert abs(new - 0.55) < 1e-9  # 0.65 − 0.10
+    # Proportional: 0.10 × (0.05 / 0.30) ≈ 0.0167 → a 5% probe stays ABOVE the
+    # 0.60 execute gate (a flat 0.10 used to drop it to 0.55 and block it).
+    assert 0.60 <= new < 0.65
+    assert abs(new - (0.65 - 0.10 * (0.05 / 0.30))) < 1e-6
+    assert any("unconfirmed_apr" in r for r in reasons)
+
+
+def test_recompute_confidence_unconfirmed_penalty_full_at_large_tilt() -> None:
+    """A LARGE NEW unconfirmed tilt (≥ CONF_UNCONFIRMED_FULL_FRAC of book) takes
+    the full penalty, unlike a small probe."""
+    from agent.sandbox.loop import _recompute_confidence, CONF_PENALTY_UNCONFIRMED_APR
+    snap = _snap_recompute()  # $100 book
+    # 40% of book into the unconfirmed TON pick → past the 30% full-penalty frac.
+    new, reasons = _recompute_confidence(
+        _dec_recompute(confidence=0.65, flex_weight=0.40), snap, []
+    )
+    assert abs(new - (0.65 - CONF_PENALTY_UNCONFIRMED_APR)) < 1e-9
     assert any("unconfirmed_apr" in r for r in reasons)
 
 
@@ -2019,10 +2389,11 @@ def test_recompute_confidence_bonus_cannot_inflate_low_llm_confidence() -> None:
 def test_recompute_confidence_floors_at_min_when_penalties_stack() -> None:
     from agent.sandbox.loop import _recompute_confidence
     from agent.validate.rules import MIN_CONFIDENCE
-    # estimate_apr NEW (−0.10) + snapshot errors (−0.10) + failed legs (−0.10)
-    # + budget starved (−0.05) = −0.35 off 0.65 → 0.30, floored to MIN.
-    snap = _snap_recompute(errors=["bybit 5xx"])
-    dec = _dec_recompute(confidence=0.65)
+    # estimate_apr NEW at a LARGE tilt (40% > 30% full-penalty frac → −0.10)
+    # + pick-relevant snapshot error (−0.10) + failed legs (−0.10) + budget
+    # starved (−0.05) = −0.35 off 0.65 → 0.30, floored to MIN.
+    snap = _snap_recompute(errors=["[TON] bybit 5xx"])
+    dec = _dec_recompute(confidence=0.65, flex_weight=0.40)
     dec["_outcome_liquid_clamp_dropped"] = ["TON1"]
     priors = [{"confidence": 0.65,
                "_cycle_outcome": {"result": "error", "actions_failed": 0}}]
@@ -2117,8 +2488,9 @@ def test_recompute_expected_apr_stable_uses_effective_apr() -> None:
 
 @pytest.mark.asyncio
 async def test_run_one_cycle_recomputes_confidence_end_to_end(tmp_path: Path) -> None:
-    """LLM stub returns the 0.65 anchor + a NEW non-stable estimate_apr pick;
-    `run_one_cycle` lowers it to the deterministic recompute (0.55) and records
+    """LLM stub returns the 0.65 anchor + a NEW non-stable estimate_apr pick
+    (5% of book); `run_one_cycle` lowers it to the deterministic recompute
+    (proportional unconfirmed penalty ≈ 0.633) and records
     `confidence_recomputed`. The lowered value is what gets persisted."""
     bybit = AsyncMock()
     anthropic_client = AsyncMock()
@@ -2139,9 +2511,10 @@ async def test_run_one_cycle_recomputes_confidence_end_to_end(tmp_path: Path) ->
             bybit, anthropic_client, live=False, yes=False, min_confidence=0.6
         )
 
-    assert abs(outcome["confidence"] - 0.55) < 1e-9
+    expected = 0.65 - 0.10 * (0.05 / 0.30)  # proportional: 5% probe ≈ 0.6333
+    assert abs(outcome["confidence"] - expected) < 1e-6
     assert outcome["confidence_recomputed"]["from"] == 0.65
-    assert abs(outcome["confidence_recomputed"]["to"] - 0.55) < 1e-9
+    assert abs(outcome["confidence_recomputed"]["to"] - expected) < 1e-6
 
 
 @pytest.mark.asyncio

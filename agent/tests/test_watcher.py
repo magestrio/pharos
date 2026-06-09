@@ -22,6 +22,7 @@ from agent.sandbox.watcher import (
     HeldPosition,
     Thresholds,
     WatcherBaseline,
+    _perp_to_paired_position,
     check_da_settlement,
     check_funding_flip,
     check_lm_liq_distance,
@@ -423,6 +424,198 @@ async def test_poll_once_no_positions_still_runs_global(monkeypatch):
     assert kinds == {"peg_drift", "new_hold_to_earn"}
     # get_tickers NOT called because no non-stable coins to watch
     client.get_tickers.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_poll_once_perp_liq_distance_fires_companion_pick_invalidated(monkeypatch):
+    """A hedge short nearing liquidation fires `perp_liquidation_distance` AND a
+    companion `pick_invalidated` for the PAIRED Earn → the loop's credit-free
+    auto-close shuts BOTH legs without an LLM cycle."""
+    from types import SimpleNamespace
+    baseline = WatcherBaseline(
+        captured_at=datetime.now(UTC),
+        positions=[
+            HeldPosition(position_id="perp:IOUSDT", venue="perp", coin="IO",
+                         entry_mark_price=Decimal("1.0")),
+            HeldPosition(position_id="earn:407", venue="earn", coin="IO"),
+        ],
+        known_h2e_product_ids=["A"],
+    )
+    client = AsyncMock()
+    client.get_tickers = AsyncMock(
+        return_value=[_FakeTicker("IOUSDT", "1.0", "0.0001")]
+    )
+    client.list_hold_to_earn_products = AsyncMock(return_value=[{"productId": "A"}])
+    # IO short: mark 1.0, liq 1.4 → distance 0.40 ≤ 0.50 threshold → Event #8.
+    client.get_positions = AsyncMock(return_value=[
+        SimpleNamespace(symbol="IOUSDT", side="Sell", size="50",
+                        markPrice="1.0", liqPrice="1.4", coin="IO")
+    ])
+
+    async def _peg_stub() -> Decimal | None:
+        return Decimal("1.0")
+
+    monkeypatch.setattr(watcher, "_fetch_peg_usd", _peg_stub)
+
+    events = await poll_once(client, baseline)
+    kinds = [e.kind for e in events]
+    assert "perp_liquidation_distance" in kinds
+    companions = [
+        e for e in events
+        if e.kind == "pick_invalidated" and e.position_id == "earn:407"
+    ]
+    assert len(companions) == 1
+    assert companions[0].severity == "P0"
+
+
+def test_update_baseline_from_snapshot_extracts_lm_product_id(tmp_path: Path):
+    """LM baseline rows carry the catalog productId so the perp→paired
+    resolver can hand the auto-close path a pid the bybit_lm pick keys on."""
+    path = tmp_path / "baseline.json"
+    snap = {
+        "captured_at": "2026-06-09T16:00:00+00:00",
+        "lm_positions": [
+            {"positionId": "LM-9", "productId": "24", "coin": "ETH",
+             "liquidation_distance_pct": "0.22"},
+        ],
+    }
+    b = update_baseline_from_snapshot(snap, path=path)
+    lm = next(p for p in b.positions if p.venue == "lm")
+    assert lm.position_id == "lm:LM-9"
+    assert lm.product_id == "24"
+    assert lm.coin == "ETH"
+
+
+def test_perp_to_paired_position_resolves_earn_lm_none():
+    """Resolver returns the productId of the paired Earn/LM (Earn wins when
+    both held), or ('', '') for a coin with no held yield leg (carry)."""
+    earn = HeldPosition(position_id="earn:407", venue="earn", coin="IO")
+    lm = HeldPosition(position_id="lm:LM-9", venue="lm", coin="ETH",
+                      product_id="24")
+    base = WatcherBaseline(captured_at=datetime.now(UTC), positions=[earn, lm])
+    assert _perp_to_paired_position("IOUSDT", base) == ("earn", "407")
+    assert _perp_to_paired_position("ETHUSDT", base) == ("lm", "24")
+    assert _perp_to_paired_position("SOLUSDT", base) == ("", "")
+    # LM with no productId can't be matched back to a pick → not resolved.
+    lm_no_pid = HeldPosition(position_id="lm:LM-1", venue="lm", coin="ARB")
+    base2 = WatcherBaseline(captured_at=datetime.now(UTC), positions=[lm_no_pid])
+    assert _perp_to_paired_position("ARBUSDT", base2) == ("", "")
+
+
+@pytest.mark.asyncio
+async def test_poll_once_lm_paired_perp_near_liq_fires_pick_invalidated(monkeypatch):
+    """An LM base-leg hedge nearing liquidation fires a companion
+    `pick_invalidated` carrying the LM PRODUCTID (not the positionId) so the
+    auto-close drops the bybit_lm pick → REDEEM_LM."""
+    from types import SimpleNamespace
+    baseline = WatcherBaseline(
+        captured_at=datetime.now(UTC),
+        positions=[
+            HeldPosition(position_id="perp:ETHUSDT", venue="perp", coin="ETH",
+                         entry_mark_price=Decimal("2000")),
+            HeldPosition(position_id="lm:LM-9", venue="lm", coin="ETH",
+                         product_id="24"),
+        ],
+        known_h2e_product_ids=["A"],
+    )
+    client = AsyncMock()
+    client.get_tickers = AsyncMock(
+        return_value=[_FakeTicker("ETHUSDT", "2000", "0.0001")]
+    )
+    client.list_hold_to_earn_products = AsyncMock(return_value=[{"productId": "A"}])
+    # ETH short: mark 2000, liq 2800 → distance 0.40 ≤ 0.50 → Event #8.
+    client.get_positions = AsyncMock(return_value=[
+        SimpleNamespace(symbol="ETHUSDT", side="Sell", size="1",
+                        markPrice="2000", liqPrice="2800", coin="ETH")
+    ])
+
+    async def _peg_stub() -> Decimal | None:
+        return Decimal("1.0")
+
+    monkeypatch.setattr(watcher, "_fetch_peg_usd", _peg_stub)
+
+    events = await poll_once(client, baseline)
+    assert "perp_liquidation_distance" in {e.kind for e in events}
+    companions = [
+        e for e in events
+        if e.kind == "pick_invalidated" and e.position_id == "lm:24"
+    ]
+    assert len(companions) == 1
+    assert companions[0].severity == "P0"
+
+
+@pytest.mark.asyncio
+async def test_poll_once_lm_paired_perp_gone_fires_pick_invalidated(monkeypatch):
+    """LM base-leg hedge closed out by Bybit (no longer in the position list)
+    → companion `pick_invalidated(lm:<productId>)` so the LP is redeemed."""
+    baseline = WatcherBaseline(
+        captured_at=datetime.now(UTC),
+        positions=[
+            HeldPosition(position_id="perp:ETHUSDT", venue="perp", coin="ETH",
+                         entry_mark_price=Decimal("2000")),
+            HeldPosition(position_id="lm:LM-9", venue="lm", coin="ETH",
+                         product_id="24"),
+        ],
+        known_h2e_product_ids=["A"],
+    )
+    client = AsyncMock()
+    client.get_tickers = AsyncMock(
+        return_value=[_FakeTicker("ETHUSDT", "2000", "0.0001")]
+    )
+    client.list_hold_to_earn_products = AsyncMock(return_value=[{"productId": "A"}])
+    # No ETH short open anymore → "perp gone" branch.
+    client.get_positions = AsyncMock(return_value=[])
+
+    async def _peg_stub() -> Decimal | None:
+        return Decimal("1.0")
+
+    monkeypatch.setattr(watcher, "_fetch_peg_usd", _peg_stub)
+
+    events = await poll_once(client, baseline)
+    companions = [
+        e for e in events
+        if e.kind == "pick_invalidated" and e.position_id == "lm:24"
+    ]
+    assert len(companions) == 1
+    assert companions[0].severity == "P0"
+
+
+@pytest.mark.asyncio
+async def test_poll_once_carry_perp_near_liq_fires_carry_liq_close(monkeypatch):
+    """A near-liq perp with NO paired Earn/LM (funding-carry) fires a distinct
+    `carry_liq_close` keyed by coin — NOT a pick_invalidated (no pick to drop).
+    """
+    from types import SimpleNamespace
+    baseline = WatcherBaseline(
+        captured_at=datetime.now(UTC),
+        positions=[
+            HeldPosition(position_id="perp:SOLUSDT", venue="perp", coin="SOL",
+                         entry_mark_price=Decimal("150")),
+        ],
+        known_h2e_product_ids=["A"],
+    )
+    client = AsyncMock()
+    client.get_tickers = AsyncMock(
+        return_value=[_FakeTicker("SOLUSDT", "150", "0.0001")]
+    )
+    client.list_hold_to_earn_products = AsyncMock(return_value=[{"productId": "A"}])
+    client.get_positions = AsyncMock(return_value=[
+        SimpleNamespace(symbol="SOLUSDT", side="Sell", size="10",
+                        markPrice="150", liqPrice="210", coin="SOL")
+    ])
+
+    async def _peg_stub() -> Decimal | None:
+        return Decimal("1.0")
+
+    monkeypatch.setattr(watcher, "_fetch_peg_usd", _peg_stub)
+
+    events = await poll_once(client, baseline)
+    assert "perp_liquidation_distance" in {e.kind for e in events}
+    carry = [e for e in events if e.kind == "carry_liq_close"]
+    assert len(carry) == 1
+    assert carry[0].coin == "SOL"
+    assert carry[0].severity == "P0"
+    assert not [e for e in events if e.kind == "pick_invalidated"]
 
 
 # ───────────────────────── event sink ─────────────────────────────────

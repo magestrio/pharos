@@ -131,6 +131,11 @@ class HeldPosition(BaseModel):
     position_id: str
     venue: Literal["earn", "advance_earn", "lm", "alpha", "perp", "hold_to_earn"]
     coin: str
+    # LM only: the catalog productId (NOT the instance positionId in
+    # `position_id`). Lets the perp→paired resolver hand the auto-close path
+    # a productId it can match against the decision's `bybit_lm` pick. Earn
+    # encodes its productId directly in `position_id`, so it leaves this None.
+    product_id: str | None = None
     entry_mark_price: Decimal | None = None
     last_funding_rate: Decimal | None = None
     last_measured_yield_bps: Decimal | None = None
@@ -232,6 +237,7 @@ def update_baseline_from_snapshot(
                 position_id=f"lm:{p.get('positionId') or p.get('id') or ''}",
                 venue="lm",
                 coin=str(p.get("coin") or p.get("baseCoin") or ""),
+                product_id=str(p.get("productId") or ""),
                 last_liq_distance=_to_decimal(p.get("liquidation_distance_pct")),
             )
         )
@@ -798,19 +804,59 @@ def _coin_to_perp_symbol(coin: str) -> str:
     return f"{coin.upper()}USDT"
 
 
-def _perp_to_earn_product_id(symbol: str, baseline: WatcherBaseline) -> str:
-    """Resolve the held Earn productId for a given perp symbol's coin.
-    Used by the perp-stopped-out detector to attach the right
-    position_id (`earn:<pid>`) so the auto-close path can match it back
-    to the pick in the decision file. Returns empty string when no
-    matching Earn position is held — caller falls back to the perp
-    position_id."""
+def _perp_to_paired_position(
+    symbol: str, baseline: WatcherBaseline
+) -> tuple[str, str]:
+    """Resolve a perp symbol's coin to the held yield leg it hedges.
+
+    Returns `(venue, pid)`:
+      - `("earn", <earn productId>)` — a held Earn pick on the coin,
+      - `("lm",   <lm productId>)`   — a held LM base leg on the coin,
+      - `("", "")`                   — no paired leg (funding-carry, or a
+        manual naked short).
+
+    The pid is always a **productId** so the auto-close path can match it
+    against the decision's pick (`product_id`). Earn encodes its productId in
+    `position_id`; LM carries it in the dedicated `product_id` field (the
+    `position_id` holds the instance positionId, which the decision does NOT
+    key on). Earn takes precedence when a coin is held both ways."""
     coin = symbol.removesuffix("USDT") if symbol.endswith("USDT") else symbol
     coin_u = coin.upper()
     for p in baseline.positions:
         if p.venue == "earn" and (p.coin or "").upper() == coin_u:
-            return p.position_id.removeprefix("earn:")
-    return ""
+            return "earn", p.position_id.removeprefix("earn:")
+    for p in baseline.positions:
+        if p.venue == "lm" and (p.coin or "").upper() == coin_u and p.product_id:
+            return "lm", p.product_id
+    return "", ""
+
+
+def _paired_invalidate_event(
+    venue: str,
+    pid: str,
+    coin: str,
+    symbol: str,
+    *,
+    trigger: str,
+    current: dict[str, Any],
+) -> EventRecord:
+    """Build the `pick_invalidated` event the loop's deterministic auto-close
+    consumes — `position_id=f"{venue}:{pid}"` lets it drop the matching Earn
+    or LM pick (and, via the zeroed-hedge diff, close the paired short)."""
+    return EventRecord(
+        ts=datetime.now(UTC),
+        kind="pick_invalidated",
+        severity="P0",
+        position_id=f"{venue}:{pid}",
+        coin=coin,
+        baseline={"perp_symbol": symbol, "trigger": trigger},
+        current=current,
+        threshold={},
+        message=(
+            f"perp {symbol} {trigger}: paired {venue} {pid} is now naked — "
+            f"auto-closing both legs (no LLM)"
+        ),
+    )
 
 
 async def poll_once(
@@ -909,31 +955,20 @@ async def poll_once(
                 live = live_by_symbol.get(symbol)
                 if live is None:
                     # Perp WAS in baseline but no longer open. Two cases:
-                    #   1. We held a paired Earn long on the same coin —
-                    #      Bybit (stop / TP / liq) closed the perp out
-                    #      from under us, paired Earn is now naked, fire
-                    #      pick_invalidated so auto-close redeems.
-                    #   2. No paired Earn — the perp was closed by our
-                    #      own planner this cycle, or it's a stale
-                    #      baseline entry. Nothing to clean up, skip.
-                    earn_pid = _perp_to_earn_product_id(symbol, baseline)
-                    if not earn_pid:
+                    #   1. We held a paired Earn/LM leg on the same coin —
+                    #      Bybit (stop / TP / liq) closed the perp out from
+                    #      under us, the paired leg is now naked, fire
+                    #      pick_invalidated so auto-close redeems it.
+                    #   2. No paired leg (carry / own-planner close / stale
+                    #      baseline) — nothing to clean up, skip.
+                    venue, pid = _perp_to_paired_position(symbol, baseline)
+                    if not venue:
                         continue
                     events.append(
-                        EventRecord(
-                            ts=datetime.now(UTC),
-                            kind="pick_invalidated",
-                            severity="P0",
-                            position_id=f"earn:{earn_pid}",
-                            coin=pos.coin,
-                            baseline={"perp_symbol": symbol},
+                        _paired_invalidate_event(
+                            venue, pid, pos.coin, symbol,
+                            trigger="perp_closed_outside_agent",
                             current={"open_size": "0"},
-                            threshold={},
-                            message=(
-                                f"perp {symbol} closed outside the agent "
-                                f"(Bybit stop / TP / liquidation) — paired "
-                                f"Earn long is now naked, auto-closing"
-                            ),
                         )
                     )
                     continue
@@ -943,6 +978,57 @@ async def poll_once(
                     continue
                 if ev := check_perp_liq_distance(pos, mark, liq):
                     events.append(ev)
+                    # Pre-emptive credit-free de-risk: the short is nearing
+                    # liquidation. Fire a companion event so the loop's
+                    # DETERMINISTIC path (no LLM → works even with Anthropic
+                    # credits exhausted) closes BOTH legs before Bybit force-
+                    # liquidates. Without it, Event #8 only woke a normal LLM
+                    # cycle, so a credit-blocked / mis-reasoning cycle left the
+                    # short to liquidate.
+                    venue, pid = _perp_to_paired_position(symbol, baseline)
+                    if venue:
+                        # Earn / LM: pick_invalidated → drop the pick (redeem
+                        # the leg) + zeroed-hedge diff closes the short.
+                        events.append(
+                            _paired_invalidate_event(
+                                venue, pid, pos.coin, symbol,
+                                trigger="perp_liquidation_distance",
+                                current={
+                                    "mark_price": str(mark),
+                                    "liq_price": str(liq),
+                                },
+                            )
+                        )
+                    else:
+                        # No paired leg → funding-carry (or a manual naked
+                        # short). Carry has no pick/productId to drop, so emit
+                        # a distinct coin-keyed signal the loop's de-risk sweep
+                        # consumes to close BOTH carry legs deterministically.
+                        # The sweep intersects with `carry_state.active_coins()`,
+                        # so a genuinely-manual naked short (no carry record)
+                        # falls through to the orphan-perp/LLM path as today.
+                        events.append(
+                            EventRecord(
+                                ts=datetime.now(UTC),
+                                kind="carry_liq_close",
+                                severity="P0",
+                                position_id=f"perp:{symbol}",
+                                coin=pos.coin,
+                                baseline={
+                                    "perp_symbol": symbol,
+                                    "trigger": "perp_liquidation_distance",
+                                },
+                                current={"mark_price": str(mark), "liq_price": str(liq)},
+                                threshold={},
+                                message=(
+                                    f"perp {symbol} short nearing liquidation "
+                                    f"(liq distance ≤ "
+                                    f"{Thresholds.PERP_LIQ_DISTANCE_THRESHOLD * Decimal(100):.0f}%)"
+                                    f" — no paired leg; closing funding-carry "
+                                    f"(both legs) deterministically"
+                                ),
+                            )
+                        )
         except Exception as e:  # noqa: BLE001
             log.warning("perp positions poll failed: %s", e)
 

@@ -50,6 +50,7 @@ from agent.sandbox.snapshot import (
     _hold_to_earn_summary,
     _is_open_perp,
     _kline_period_return,
+    _kline_pct_change,
     _lm_summary,
     _momentum_apr,
     _parse_funding_interval,
@@ -362,6 +363,37 @@ def test_kline_period_return_handles_bad_prices():
     """Non-numeric prices or zero start price → None (fail-soft)."""
     assert _kline_period_return([{"open": "x", "close": "1"}] * 2) is None
     assert _kline_period_return([{"open": "0", "close": "1"}] * 2) is None
+
+
+def _price_candles() -> list[dict[str, str]]:
+    """31 daily candles, most-recent-first: close[0]=100 (now), [1]=125,
+    [7]=200, [30]=400 → 1d −20%, 7d −50%, 30d −75% (a falling coin)."""
+    return (
+        [{"close": "100", "open": "0"}]
+        + [{"close": "125", "open": "0"}]
+        + [{"close": "150", "open": "0"}] * 5
+        + [{"close": "200", "open": "0"}]
+        + [{"close": "300", "open": "0"}] * 22
+        + [{"close": "400", "open": "0"}]
+    )
+
+
+def test_kline_pct_change_close_to_close():
+    candles = _price_candles()
+    assert _kline_pct_change(candles, 1) == Decimal("-20")
+    assert _kline_pct_change(candles, 7) == Decimal("-50")
+    assert _kline_pct_change(candles, 30) == Decimal("-75")
+
+
+def test_kline_pct_change_partial_window_and_bad_prices():
+    candles = _price_candles()
+    # Window not fully covered (need days+1 candles) → None, no partial signal.
+    assert _kline_pct_change(candles[:8], 30) is None
+    assert _kline_pct_change([], 7) is None
+    assert _kline_pct_change(candles, 0) is None  # nonsensical window
+    # Bad / zero reference price → None (fail-soft).
+    assert _kline_pct_change([{"close": "x"}, {"close": "1"}], 1) is None
+    assert _kline_pct_change([{"close": "1"}, {"close": "0"}], 1) is None
 
 
 # ─── _hold_to_earn_summary (`.57`) ─────────────────────────────────────────
@@ -1756,6 +1788,51 @@ async def test_fetch_perp_info_flags_missing_spot_market() -> None:
     )
     assert with_spot is not None
     assert with_spot.has_spot_market is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_perp_info_surfaces_price_change() -> None:
+    """The daily-kline fetch populates 1d/7d/30d price change on PerpInfo; a
+    failed/short kline degrades each window to None without collapsing the
+    row (the perp is still usable for hedging)."""
+    from agent.sandbox.snapshot import _fetch_perp_info
+
+    client = _spotless_perp_client("ID", spot_status="Trading")
+    client.get_kline.return_value = _price_candles()
+    _, info = await _fetch_perp_info(client, "ID", [])
+    assert info is not None
+    assert info.price_change_1d_pct == Decimal("-20")
+    assert info.price_change_7d_pct == Decimal("-50")
+    assert info.price_change_30d_pct == Decimal("-75")
+
+    # Kline failure → all three None, row still built.
+    errors: list[str] = []
+    client_fail = _spotless_perp_client("ID", spot_status="Trading")
+    client_fail.get_kline.side_effect = RuntimeError("kline 500")
+    _, info_fail = await _fetch_perp_info(client_fail, "ID", errors)
+    assert info_fail is not None
+    assert info_fail.price_change_7d_pct is None
+    assert any("kline" in e for e in errors)
+
+
+@pytest.mark.asyncio
+async def test_fetch_perp_info_survives_empty_instruments() -> None:
+    """A valid ticker but empty/failed linear `instruments` must NOT raise
+    (`snapshot-1`: `qty_step_d` was read unconditionally yet only assigned
+    inside `if instruments:`). The row still builds with sizing fields None."""
+    from agent.bybit_oracle.bybit_client import LinearInstrument
+    from agent.sandbox.snapshot import _fetch_perp_info
+
+    client = _spotless_perp_client("ID", spot_status="Trading")
+    spot = [LinearInstrument(symbol="IDUSDT", status="Trading")]
+    client.get_instruments_info.side_effect = lambda *, category, symbol: (
+        [] if category == "linear" else spot
+    )
+    _, info = await _fetch_perp_info(client, "ID", [])
+    assert info is not None  # ticker is valid → still a usable hedge reference
+    assert info.qty_step is None
+    assert info.min_order_qty is None
+    assert info.max_leverage is None
 
 
 def test_build_carry_excludes_perp_without_spot_market() -> None:
