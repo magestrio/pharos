@@ -974,6 +974,87 @@ def test_net_of_hedge_fires_when_net_negative():
     assert fired[0].severity == "P0"
 
 
+def _baseline_with_earn_7d(
+    coin: str, product_id: str, gross_apr: str, funding_7d: str,
+    entry_mark: str = "2.0",
+) -> WatcherBaseline:
+    return WatcherBaseline(
+        captured_at=datetime.now(UTC),
+        positions=[
+            HeldPosition(
+                position_id=f"earn:{product_id}", venue="earn", coin=coin,
+                entry_gross_apr=Decimal(gross_apr),
+                funding_7d_avg=Decimal(funding_7d),
+            ),
+            HeldPosition(
+                position_id=f"perp:{coin}USDT", venue="perp", coin=coin,
+                entry_mark_price=Decimal(entry_mark),
+            ),
+        ],
+    )
+
+
+def test_net_gate_uses_sustained_7d_not_noisy_tick():
+    """Part 2: a transient deeply-negative live funding tick must NOT force-close
+    when the SUSTAINED 7d-avg keeps net positive. live -0.001/8h would give
+    0.30 - 1.095 = -0.795 (fire), but 7d-avg -0.0001 gives 0.30 - 0.1095 =
+    +0.19 (no fire)."""
+    from agent.sandbox.watcher import check_pick_invalidation
+    decision = _decision_with_invalidate("bybit_onchain", "8")
+    baseline = _baseline_with_earn_7d("TON", "8", "0.30", "-0.0001")
+    signals = {"TON": {"mark_price": Decimal("2.0"), "funding_8h": Decimal("-0.001")}}
+    events = check_pick_invalidation(
+        decision=decision, baseline=baseline, snapshot_signals=signals,
+        peg_dev_bps=None,
+    )
+    assert [e for e in events if e.kind == "pick_invalidated"] == []
+
+
+def test_net_gate_fires_on_sustained_negative_7d():
+    """Part 2: when the SUSTAINED 7d-avg drags net below the floor it fires, and
+    the event surfaces funding_7d_avg alongside the live tick."""
+    from agent.sandbox.watcher import check_pick_invalidation
+    decision = _decision_with_invalidate("bybit_onchain", "8")
+    baseline = _baseline_with_earn_7d("TON", "8", "0.05", "-0.0003")
+    signals = {"TON": {"mark_price": Decimal("2.0"), "funding_8h": Decimal("0.0001")}}
+    events = check_pick_invalidation(
+        decision=decision, baseline=baseline, snapshot_signals=signals,
+        peg_dev_bps=None,
+    )
+    fired = [e for e in events if e.kind == "pick_invalidated"]
+    assert len(fired) == 1
+    assert "funding_7d_avg" in fired[0].current
+    assert "funding_8h" in fired[0].current
+
+
+def test_update_baseline_stores_funding_7d_avg(tmp_path: Path) -> None:
+    """Part 2: the Earn baseline captures perp_market[coin].funding_rate_7d_avg."""
+    snap = {
+        "captured_at": "2026-06-09T00:00:00+00:00",
+        "earn_positions": [{"productId": "8", "coin": "TON", "amount": "100"}],
+        "products": {"OnChain": [
+            {"product_id": "8", "coin": "TON", "effective_apr_gross": "0.30"},
+        ]},
+        "perp_market": {"TON": {"funding_rate_7d_avg": "-0.00012"}},
+    }
+    baseline = update_baseline_from_snapshot(snap, path=tmp_path / "b.json")
+    earn = next(p for p in baseline.positions if p.position_id == "earn:8")
+    assert earn.funding_7d_avg == Decimal("-0.00012")
+
+
+def test_seconds_until_close_target():
+    """Part 4: pure timing helper — target ≈ settle-20s, immediate when past,
+    edge-guard rolls to next settlement."""
+    from agent.sandbox.watcher import seconds_until_close_target
+    # settlement 1000s out, now 940s → close at 980s → wait 40s
+    assert seconds_until_close_target(1000_000, 940_000) == 40.0
+    # settlement already past → 0
+    assert seconds_until_close_target(1000_000, 2000_000) == 0.0
+    # now inside [settle-30, settle+5] edge window → roll to next settlement
+    rolled = seconds_until_close_target(1000_000, 990_000, interval_s=8 * 3600)
+    assert rolled > 8 * 3600 - 100  # ~next settlement minus 20s, far in future
+
+
 def test_dwell_requires_consecutive_breaches_and_resets():
     """With dwell_counts passed, a single net breach doesn't fire; the 2nd
     consecutive does; a clean poll resets the counter."""

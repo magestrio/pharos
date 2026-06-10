@@ -32,6 +32,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import signal
 import sys
 from datetime import UTC, datetime
@@ -146,9 +147,11 @@ from agent.sandbox.watcher import (
     DEFAULT_EVENTS_DIR as WATCHER_EVENTS_DIR,
 )
 from agent.sandbox.watcher import (
+    PRE_SETTLE_TARGET_S,
     EventRecord,
     check_earn_redeem_settled,
     prune_closed_positions,
+    seconds_until_close_target,
     update_baseline_from_snapshot,
     write_baseline as write_watcher_baseline,
 )
@@ -1275,6 +1278,49 @@ def _pick_family(venue_id: str) -> str:
     )
 
 
+# Part 4 — time a funding-driven auto-close to ~20s before settlement. OFF by
+# default (immediate close, the pre-existing behavior); flip the env flag to
+# enable. Money path, so kept reversible without a redeploy.
+WATCHER_SETTLEMENT_TIMED_CLOSE = (
+    os.environ.get("VAULT8004_WATCHER_SETTLEMENT_TIMED_CLOSE", "0") == "1"
+)
+# Hard cap on the pre-settlement wait — must stay under the watcher poll interval
+# (120s) so the close never blocks longer than one poll. A settlement further out
+# than this means there's nothing to time yet → close immediately.
+MAX_PRE_SETTLE_SLEEP_S = 110.0
+
+
+def _settlement_close_delay_s(
+    wake_events: list[dict[str, Any]] | None,
+    now_ms: int,
+    enabled: bool = WATCHER_SETTLEMENT_TIMED_CLOSE,
+) -> float:
+    """Seconds to wait before executing an auto-close so a funding-driven exit
+    lands ~20s before settlement (Part 4, bounded best-effort).
+
+    Returns 0.0 (execute immediately) when: the flag is off; no firing
+    `pick_invalidated` event carries `next_funding_ms` (price/peg/liq closes stay
+    immediate); or the soonest settlement is further out than one poll interval
+    (`MAX_PRE_SETTLE_SLEEP_S` — nothing to time yet, close now)."""
+    if not enabled or not wake_events:
+        return 0.0
+    next_fundings: list[int] = []
+    for e in wake_events:
+        if e.get("kind") != "pick_invalidated":
+            continue
+        raw = (e.get("current") or {}).get("next_funding_ms")
+        if raw is None:
+            continue
+        try:
+            next_fundings.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    if not next_fundings:
+        return 0.0
+    delay = seconds_until_close_target(min(next_fundings), now_ms)
+    return delay if delay <= MAX_PRE_SETTLE_SLEEP_S else 0.0
+
+
 def _build_auto_close_decision(
     prior: dict[str, Any] | None,
     wake_events: list[dict[str, Any]] | None,
@@ -1807,6 +1853,20 @@ async def run_one_cycle(
                 "auto-close path: pick_invalidated event(s) — "
                 "skipping LLM, deterministic close"
             )
+            # Part 4: when enabled, hold a funding-driven close until ~20s before
+            # settlement so the exit dodges one more funding tick. Bounded by
+            # MAX_PRE_SETTLE_SLEEP_S; 0 for liq/peg/price closes (always immediate).
+            delay_s = _settlement_close_delay_s(
+                wake_events, int(datetime.now(UTC).timestamp() * 1000)
+            )
+            if delay_s > 0:
+                log.info(
+                    "settlement-timed close: holding %.0fs to land ~%ds before "
+                    "funding settlement",
+                    delay_s,
+                    PRE_SETTLE_TARGET_S,
+                )
+                await asyncio.sleep(delay_s)
             decision = Decision.model_validate(auto_close)
             outcome["auto_close"] = True
         else:

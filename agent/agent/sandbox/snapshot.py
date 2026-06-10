@@ -49,6 +49,11 @@ from agent.data.allora_client import (
     AlloraInference,
 )
 from agent.reason.venues import CARRY_CATEGORY, LM_BASE_LEG_FRACTION, STABLES
+from agent.sandbox.apr_history_cache import (
+    cache_key,
+    read_apr_history_cache,
+    write_apr_history_cache,
+)
 from agent.sandbox.on_chain import (
     AAVE_V3_POOL_ADDRESS,
     AaveV3UsdcState,
@@ -250,6 +255,12 @@ class ProductSummary(BaseModel):
     price_change_1d_pct: Decimal | None = None
     price_change_7d_pct: Decimal | None = None
     price_change_30d_pct: Decimal | None = None
+    # Daily apr-history series, OLDEST → NEWEST (fractional), from
+    # `/v5/earn/apr-history`. `effective_apr`/`apr_history` is the MEAN of these;
+    # the series is the TRAJECTORY so the LLM can tell a stable/rising APR
+    # (hold) from one sliding down (exit) instead of reacting to a single point.
+    # None ⇒ no apr-history this cycle (ranker fell back to measured/estimate).
+    apr_history_points: list[Decimal] | None = None
     notes: list[str] = Field(default_factory=list)
 
 
@@ -535,6 +546,7 @@ def _flex_or_onchain_summary(
     category: str,
     measured_apr: Decimal | None = None,
     apr_history: Decimal | None = None,
+    apr_history_points: list[Decimal] | None = None,
 ) -> ProductSummary:
     # APR resolution order (`.70` re-prioritized apr_history over the
     # noise-prone measured_yield):
@@ -653,6 +665,7 @@ def _flex_or_onchain_summary(
         yield_start_delay_min=yield_start_delay_min,
         min_subscribe_usd=min_stake,
         stake_precision=stake_precision,
+        apr_history_points=apr_history_points,
         notes=notes,
     )
 
@@ -1412,14 +1425,14 @@ async def _measure_realized_apr(
     return sum(aprs, Decimal(0)) / Decimal(len(aprs))
 
 
-async def _measure_apr_history_mean(
+async def _measure_apr_history(
     client: BybitClient,
     category: str,
     product_id: str,
     *,
     days: int = 7,
-) -> Decimal | None:
-    """Mean effective APR from Bybit's `/v5/earn/apr-history` (`.70`).
+) -> tuple[Decimal, list[Decimal]] | None:
+    """Mean + daily series from Bybit's `/v5/earn/apr-history` (`.70`).
 
     Preferred over `_measure_realized_apr` (our 24h position `hourly-yield`):
     apr-history is **pool-level, subsidy-inclusive, and hourly-smoothed**, so
@@ -1428,22 +1441,32 @@ async def _measure_apr_history_mean(
     product 2 to a spurious 4% (`bybit-sandbox.46`). Available for any
     FlexibleSaving / OnChain product without an open position.
 
-    Returns the fractional [0,1] mean over the lookback, or None on no data /
-    error (caller falls back to `measured_yield` → `estimateApr`)."""
+    Returns `(mean, points)` — the fractional [0,1] mean over the lookback and
+    the daily APR series ordered OLDEST → NEWEST (the trajectory the agent reads
+    to tell a sliding APR from a stable one). None on no data / error (caller
+    falls back to `measured_yield` → `estimateApr`)."""
     try:
         data = await client.get_apr_history(
             category=category, product_id=product_id, days=days
         )
     except BybitAPIError:
         return None
-    vals: list[Decimal] = []
+    rows: list[tuple[int, Decimal]] = []
     for row in data.get("list") or []:
         v = _parse_percent(row.get("apr"))
-        if v is not None and v >= 0:
-            vals.append(v)
-    if not vals:
+        if v is None or v < 0:
+            continue
+        try:
+            ts = int(row.get("timestamp") or 0)
+        except (TypeError, ValueError):
+            ts = 0
+        rows.append((ts, v))
+    if not rows:
         return None
-    return sum(vals, Decimal(0)) / Decimal(len(vals))
+    rows.sort(key=lambda r: r[0])  # oldest → newest
+    points = [v for _, v in rows]
+    mean = sum(points, Decimal(0)) / Decimal(len(points))
+    return mean, points
 
 
 async def _collect_allora(errors: list[str]) -> list[AlloraInference]:
@@ -2628,25 +2651,49 @@ async def collect_snapshot(
     # apr-history APR (`.70`): pool-level, subsidy-inclusive effective APR
     # for EVERY FlexibleSaving / OnChain candidate (no open position needed),
     # the ranker's preferred signal over the noise-prone 24h `measured_yield`
-    # (see `_measure_apr_history_mean`). Fans out concurrently; per-product
-    # failures degrade to None so the summary falls back to measured_yield /
-    # estimateApr and the snapshot still builds under rate-limit.
+    # (see `_measure_apr_history`). Returns the MEAN (the ranked value) AND the
+    # daily series (the trajectory the agent reads). Fans out concurrently;
+    # per-product failures degrade to None so the summary falls back to
+    # measured_yield / estimateApr and the snapshot still builds under rate-limit.
     aprhist_pairs = [
         ("FlexibleSaving", p.productId) for p in flex_products if p.productId
     ] + [("OnChain", p.productId) for p in onchain_products if p.productId]
     aprhist_aprs: dict[tuple[str, str], Decimal] = {}
+    aprhist_points: dict[tuple[str, str], list[Decimal]] = {}
     if aprhist_pairs:
-        results = await asyncio.gather(
-            *(_measure_apr_history_mean(client, cat, pid)
-              for cat, pid in aprhist_pairs),
-            return_exceptions=True,
-        )
-        for (cat, pid), apr in zip(aprhist_pairs, results):
-            if isinstance(apr, BaseException):
-                errors.append(f"apr_history[{cat}/{pid}]: {type(apr).__name__}: {apr}")
-                continue
-            if apr is not None:
-                aprhist_aprs[(cat, pid)] = apr
+        # Daily cache: apr-history is daily granularity, so a same-UTC-day hit
+        # serves the cached mean + series and skips the call. Read once before
+        # the gather, write once after — event-loop-thread-safe (no concurrent IO).
+        today = datetime.now(UTC).date().isoformat()
+        apr_cache = read_apr_history_cache()
+        to_fetch: list[tuple[str, str]] = []
+        for cat, pid in aprhist_pairs:
+            cached = apr_cache.get(cat, pid, today)
+            if cached is not None:
+                aprhist_aprs[(cat, pid)], aprhist_points[(cat, pid)] = cached
+            else:
+                to_fetch.append((cat, pid))
+        if to_fetch:
+            results = await asyncio.gather(
+                *(_measure_apr_history(client, cat, pid)
+                  for cat, pid in to_fetch),
+                return_exceptions=True,
+            )
+            for (cat, pid), res in zip(to_fetch, results):
+                if isinstance(res, BaseException):
+                    errors.append(
+                        f"apr_history[{cat}/{pid}]: {type(res).__name__}: {res}"
+                    )
+                    continue
+                # Don't cache None/errors — retry next cycle, don't pin a
+                # transient failure for the whole UTC day.
+                if res is not None:
+                    mean, points = res
+                    aprhist_aprs[(cat, pid)] = mean
+                    aprhist_points[(cat, pid)] = points
+                    apr_cache.put(cat, pid, today, mean, points)
+        live_keys = {cache_key(cat, pid) for cat, pid in aprhist_pairs}
+        write_apr_history_cache(apr_cache.prune(live_keys))
 
     # Wallet
     try:
@@ -2664,7 +2711,15 @@ async def collect_snapshot(
     liquid_usdt = _coin_across_all_accounts(accounts, "USDT")
 
     # Products: normalize + rank with diversification floor.
-    stable_floor = lambda s: s.coin in STABLES  # noqa: E731
+    # Held non-stable Earn positions are PINNED into the ranked list even when
+    # their APR falls out of the top-K — otherwise `check_product_ids_in_snapshot`
+    # rejects referencing them, the executor force-redeems the position, and the
+    # watcher loses its `entry_gross_apr` (net-of-hedge gate falls back to raw
+    # funding noise). Pinning lets the LLM decide hold-vs-exit instead of churning.
+    held_product_ids: set[str] = {
+        str(p.productId) for p in earn_positions if getattr(p, "productId", None)
+    }
+    pin = lambda s: s.coin in STABLES or s.product_id in held_product_ids  # noqa: E731
     # `.66`: LM is restricted to UNLEVERAGED pairs — leveraged LP on a
     # volatile token is speculative directional risk the owner's "controlled
     # risk" mandate rules out, so leveraged rows are DROPPED from the choice
@@ -2678,10 +2733,13 @@ async def collect_snapshot(
                     "FlexibleSaving",
                     measured_apr=measured_aprs.get(("FlexibleSaving", p.productId)),
                     apr_history=aprhist_aprs.get(("FlexibleSaving", p.productId)),
+                    apr_history_points=aprhist_points.get(
+                        ("FlexibleSaving", p.productId)
+                    ),
                 )
                 for p in flex_products
             ],
-            must_include=stable_floor,
+            must_include=pin,
         ),
         "OnChain": _rank(
             [
@@ -2690,10 +2748,13 @@ async def collect_snapshot(
                     "OnChain",
                     measured_apr=measured_aprs.get(("OnChain", p.productId)),
                     apr_history=aprhist_aprs.get(("OnChain", p.productId)),
+                    apr_history_points=aprhist_points.get(
+                        ("OnChain", p.productId)
+                    ),
                 )
                 for p in onchain_products
             ],
-            must_include=stable_floor,
+            must_include=pin,
         ),
         "LiquidityMining": _rank(
             [
@@ -2946,9 +3007,21 @@ async def collect_snapshot(
     # stable floor is re-applied so a hedge-free stable still always appears.
     _apply_net_hedge_apr(products, perp_market)
     products["FlexibleSaving"] = _rank(
-        products["FlexibleSaving"], must_include=stable_floor
+        products["FlexibleSaving"], must_include=pin
     )
-    products["OnChain"] = _rank(products["OnChain"], must_include=stable_floor)
+    products["OnChain"] = _rank(products["OnChain"], must_include=pin)
+
+    # Tag held positions that survive only via the `pin` promotion (ranked
+    # below TOP_K) so the decide prompt treats them as hold-or-exit — keep or
+    # redeem, but don't grow a position that no longer ranks on its own APR.
+    for cat in ("FlexibleSaving", "OnChain"):
+        for idx, s in enumerate(products[cat]):
+            if (
+                s.product_id in held_product_ids
+                and idx >= TOP_K
+                and "held_below_rank" not in s.notes
+            ):
+                s.notes.append("held_below_rank")
 
     # lm-residual epic: surface the un-hedgeable naked base-coin residual on
     # each HELD LM position so the LLM (and the de-risk redeem) reason on a

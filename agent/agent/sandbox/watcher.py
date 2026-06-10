@@ -115,6 +115,36 @@ FUNDING_PERIODS_PER_YEAR_8H = Decimal("1095")
 # or a depeg is not transient).
 INVALIDATE_DWELL_POLLS = 2
 
+# Settlement-timed close (Part 4, behind WATCHER_SETTLEMENT_TIMED_CLOSE). Funding
+# is charged only AT settlement, so a confirmed bad-funding close is timed to
+# land ~PRE_SETTLE_TARGET_S seconds before it to dodge one more funding tick.
+PRE_SETTLE_TARGET_S = 20
+# If `now` is already inside [settle-EDGE, settle+5s], rolling to settle-20s would
+# either be in the past or inside Bybit's ~5s settlement-edge ambiguity, so skip
+# to the NEXT settlement instead.
+SETTLE_EDGE_GUARD_S = 30
+SETTLE_INTERVAL_FALLBACK_S = 8 * 3600
+
+
+def seconds_until_close_target(
+    next_funding_ms: int,
+    now_ms: int,
+    interval_s: int = SETTLE_INTERVAL_FALLBACK_S,
+) -> float:
+    """Seconds to wait so a close lands ~`PRE_SETTLE_TARGET_S` before settlement.
+
+    Returns 0.0 when the target is now-or-past (execute immediately). When `now`
+    is already inside the settlement edge window `[settle - SETTLE_EDGE_GUARD_S,
+    settle + 5s]`, rolls to the next settlement (`+ interval_s`) to avoid Bybit's
+    ~5s settlement-edge ambiguity. Pure function — no clock, no IO.
+    """
+    settle_s = next_funding_ms / 1000.0
+    now_s = now_ms / 1000.0
+    if (settle_s - SETTLE_EDGE_GUARD_S) <= now_s <= (settle_s + 5):
+        settle_s += interval_s
+    target = settle_s - PRE_SETTLE_TARGET_S
+    return max(0.0, target - now_s)
+
 # Consecutive polls a hedged-Earn redeem must read as "settled" (Earn row gone
 # / coin arrived) before `earn_redeem_settled` fires — guards against a Bybit
 # response transiently omitting the row mid-settlement, which would unhedge
@@ -176,6 +206,11 @@ class HeldPosition(BaseModel):
     # the raw funding rate alone (promptcode-1). Sourced from the snapshot's
     # pre-hedge base (effective_apr_net_holding / _gross / effective_apr).
     entry_gross_apr: Decimal | None = None
+    # Earn only: the coin's SUSTAINED 7d-average per-period funding rate, from
+    # the snapshot's `perp_market[coin].funding_rate_7d_avg`. The net-of-hedge
+    # gate prefers this over the live single-period rate so a noisy 8h tick
+    # can't force-close a position whose sustained net is still fine.
+    funding_7d_avg: Decimal | None = None
 
 
 class WatcherBaseline(BaseModel):
@@ -319,19 +354,29 @@ def update_baseline_from_snapshot(
                     gross_apr_by_pid[pid] = val
                     break
 
+    # coin (UPPERCASE) → sustained 7d-average per-period funding rate, so the
+    # net-of-hedge gate keys off the smoothed rate instead of the noisy live tick.
+    perp_market = snap.get("perp_market") or {}
+
+    def _funding_7d(coin: str) -> Decimal | None:
+        info = perp_market.get((coin or "").upper()) or {}
+        return _to_decimal(info.get("funding_rate_7d_avg"))
+
     # Basic-Earn positions (FlexibleSaving / OnChain)
     for p in snap.get("earn_positions") or []:
         amount = _to_decimal(p.get("amount"))
         if amount is None or amount == 0:
             continue
         pid = str(p.get("productId") or p.get("id") or "")
+        coin = str(p.get("coin") or "")
         positions.append(
             HeldPosition(
                 position_id=f"earn:{pid}",
                 venue="earn",
-                coin=str(p.get("coin") or ""),
+                coin=coin,
                 last_measured_yield_bps=_to_decimal(p.get("measured_yield_bps")),
                 entry_gross_apr=gross_apr_by_pid.get(pid),
+                funding_7d_avg=_funding_7d(coin),
             )
         )
 
@@ -937,11 +982,12 @@ def check_pick_invalidation(
                 )
 
             # Funding-driven invalidation (non-stable hedged). PRIMARY gate is
-            # NET-of-hedge yield — stored entry gross Earn APR + annualized LIVE
-            # funding — so a high-APR pick isn't force-closed merely because raw
-            # funding is deeply negative while the pick is still net-positive
-            # (promptcode-1). Falls back to the raw per-8h funding floor only
-            # when the baseline lacks the stored gross APR (older baselines).
+            # NET-of-hedge yield — stored entry gross Earn APR + annualized
+            # SUSTAINED (7d-avg) funding — so a high-APR pick isn't force-closed
+            # merely because a single live tick is deeply negative while the
+            # pick is still net-positive (promptcode-1). Falls back to the raw
+            # per-8h funding floor only when the baseline lacks the stored gross
+            # APR (older baselines).
             # Either breach is DWELL-COUNTED: it must persist
             # INVALIDATE_DWELL_POLLS consecutive polls before firing, so a
             # transient funding spike can't force a close.
@@ -951,19 +997,27 @@ def check_pick_invalidation(
             breach_threshold: dict[str, str] = {}
             breach_msg = ""
             net_floor = _eff("net_apr_below")
+            # Prefer the SUSTAINED 7d-average funding over the live single-period
+            # tick — a noisy 8h spike must not force-close a position whose
+            # sustained net is still fine. Fall back to live funding only when the
+            # baseline carries no 7d average.
+            sustained = (
+                held.funding_7d_avg if held.funding_7d_avg is not None else funding
+            )
             if (
                 not is_stable
-                and funding is not None
+                and sustained is not None
                 and held.entry_gross_apr is not None
                 and net_floor is not None
             ):
                 net_apr = (
-                    held.entry_gross_apr + funding * FUNDING_PERIODS_PER_YEAR_8H
+                    held.entry_gross_apr + sustained * FUNDING_PERIODS_PER_YEAR_8H
                 )
                 if net_apr < net_floor:
                     funding_breached = True
                     breach_current = {
                         "funding_8h": str(funding),
+                        "funding_7d_avg": str(sustained),
                         "net_apr": str(net_apr),
                         "entry_gross_apr": str(held.entry_gross_apr),
                     }
@@ -971,8 +1025,8 @@ def check_pick_invalidation(
                     breach_msg = (
                         f"pick {category}/{product_id} ({coin}) net-of-hedge "
                         f"APR {net_apr:.4f} below floor {net_floor} (gross "
-                        f"{held.entry_gross_apr:.4f} + funding {funding}/8h "
-                        f"annualized)"
+                        f"{held.entry_gross_apr:.4f} + 7d-avg funding "
+                        f"{sustained}/period annualized)"
                     )
             else:
                 funding_thresh = _eff("funding_8h_below")
@@ -1007,6 +1061,16 @@ def check_pick_invalidation(
                 fire = funding_breached
 
             if fire:
+                # Carry the next funding settlement timestamp so the close path
+                # can time the exit to just before it (Part 4). Only funding
+                # invalidations get the field — price/peg/liq events stay
+                # immediate (no field → executed without delay).
+                next_funding = signals.get("next_funding_ms")
+                if next_funding is not None:
+                    breach_current = {
+                        **breach_current,
+                        "next_funding_ms": str(int(next_funding)),
+                    }
                 events.append(
                     EventRecord(
                         ts=datetime.now(UTC),
@@ -1392,6 +1456,10 @@ async def poll_once(
                     t.get("markPrice") or t.get("lastPrice")
                 ),
                 "funding_8h": _to_decimal(t.get("fundingRate")),
+                # ms epoch of the next funding settlement — lets the close path
+                # time the exit to just before settlement (Part 4). Already in
+                # the ticker dump, no extra round-trip.
+                "next_funding_ms": _to_decimal(t.get("nextFundingTime")),
             }
         peg_dev_bps: Decimal | None = None
         if peg_price is not None:

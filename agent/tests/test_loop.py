@@ -3151,3 +3151,45 @@ async def test_execute_with_recovery_keeps_marker_on_carry_halt() -> None:
         )
     assert "clear" not in calls
     assert calls == ["write", "reconcile"]
+
+
+# ─────────────── Part 4: settlement-timed close delay ────────────────
+
+
+def _now_ms() -> int:
+    return int(datetime.now(UTC).timestamp() * 1000)
+
+
+def test_settlement_delay_zero_when_disabled():
+    from agent.sandbox.loop import _settlement_close_delay_s
+    now = _now_ms()
+    events = [{"kind": "pick_invalidated",
+              "current": {"next_funding_ms": str(now + 60_000)}}]
+    assert _settlement_close_delay_s(events, now, enabled=False) == 0.0
+
+
+def test_settlement_delay_zero_for_event_without_next_funding():
+    """Liq/peg/price closes carry no next_funding_ms → execute immediately."""
+    from agent.sandbox.loop import _settlement_close_delay_s
+    now = _now_ms()
+    events = [{"kind": "pick_invalidated", "current": {"funding_8h": "-0.02"}}]
+    assert _settlement_close_delay_s(events, now, enabled=True) == 0.0
+
+
+def test_settlement_delay_zero_when_settlement_far():
+    """Settlement further than one poll interval → nothing to time, close now."""
+    from agent.sandbox.loop import _settlement_close_delay_s
+    now = _now_ms()
+    events = [{"kind": "pick_invalidated",
+              "current": {"next_funding_ms": str(now + 4 * 3600 * 1000)}}]
+    assert _settlement_close_delay_s(events, now, enabled=True) == 0.0
+
+
+def test_settlement_delay_times_close_when_near():
+    """Settlement ~60s out → wait ~40s (land 20s before)."""
+    from agent.sandbox.loop import _settlement_close_delay_s
+    now = _now_ms()
+    events = [{"kind": "pick_invalidated",
+              "current": {"next_funding_ms": str(now + 60_000)}}]
+    delay = _settlement_close_delay_s(events, now, enabled=True)
+    assert 35.0 <= delay <= 45.0

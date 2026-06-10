@@ -227,6 +227,39 @@ def test_flex_summary_falls_back_to_estimate_when_no_effective_sources():
     assert s.apr_source == "estimate_apr"
 
 
+def test_flex_summary_surfaces_apr_history_trajectory():
+    """Part 3: the daily apr-history series rides on the summary so the agent
+    can read the trajectory, not just the mean."""
+    pts = [Decimal("0.030"), Decimal("0.025"), Decimal("0.020")]  # declining
+    p = _flex("1131", "0.83%", coin="USD1")
+    s = _flex_or_onchain_summary(
+        p, "FlexibleSaving", apr_history=Decimal("0.025"), apr_history_points=pts,
+    )
+    assert s.apr_history_points == pts
+
+
+@pytest.mark.asyncio
+async def test_measure_apr_history_returns_mean_and_ordered_points():
+    """Part 3: returns (mean, points) with points ordered oldest→newest by
+    timestamp regardless of Bybit's response order."""
+    from unittest.mock import AsyncMock
+
+    from agent.sandbox.snapshot import _measure_apr_history
+    client = AsyncMock()
+    # out-of-order rows; _parse_percent handles fractional/percent strings
+    # apr field is percent-style ("2.1" → 0.021), parsed by _parse_percent.
+    client.get_apr_history.return_value = {"list": [
+        {"timestamp": "300", "apr": "3"},
+        {"timestamp": "100", "apr": "1"},
+        {"timestamp": "200", "apr": "2"},
+    ]}
+    res = await _measure_apr_history(client, "FlexibleSaving", "8")
+    assert res is not None
+    mean, points = res
+    assert points == [Decimal("0.01"), Decimal("0.02"), Decimal("0.03")]
+    assert mean == Decimal("0.02")
+
+
 def test_flex_summary_marks_missing_when_no_apr_anywhere():
     p = _flex("9999", None)
     s = _flex_or_onchain_summary(p, "FlexibleSaving")
@@ -627,6 +660,23 @@ def test_rank_caps_at_top_k():
     assert len(ranked) == 3
     # top 3 = 0.07, 0.06, 0.05
     assert [p.product_id for p in ranked] == ["0.07", "0.06", "0.05"]
+
+
+def test_rank_pins_held_position_below_top_k():
+    """Part 1: a held non-stable product that ranks below top_k must still
+    survive via the `pin` predicate — otherwise the validator force-redeems it."""
+    items = [_summary(f"0.0{i}") for i in range(1, 8)]  # 0.01..0.07
+    held = ProductSummary(
+        category="FlexibleSaving", product_id="HELD", coin="NEWT",
+        effective_apr=Decimal("0.001"),  # would rank dead last, out of top 3
+        apr_source="estimate_apr",
+    )
+    held_ids = {"HELD"}
+    pin = lambda s: s.coin in {"USDC", "USDT"} or s.product_id in held_ids  # noqa: E731
+    ranked = _rank(items + [held], top_k=3, must_include=pin)
+    ids = {p.product_id for p in ranked}
+    assert "HELD" in ids  # pinned despite ranking last
+    assert "0.07" in ids and "0.06" in ids  # top performers still present
 
 
 def test_rank_uses_net_apr_when_present():
