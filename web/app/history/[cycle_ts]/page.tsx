@@ -17,6 +17,14 @@ import {
   fetchCycle,
 } from "@/lib/agent-api";
 import { ThesisView } from "@/components/thesis-view";
+import { formatDateTime } from "@/lib/datetime";
+import {
+  formatActionKind,
+  formatEventKind,
+  formatResult,
+  formatWakeReason,
+  venueLabel,
+} from "@/lib/labels";
 
 export const dynamic = "force-dynamic";
 
@@ -65,7 +73,7 @@ export default async function CycleDetailPage({
             ← History
           </Link>
           <div className="font-mono text-[11px] uppercase tracking-[0.14em] text-dim-500 truncate">
-            Cycle · {cycle.cycle_ts}
+            Cycle · {formatDateTime(cycle.cycle_ts)}
           </div>
         </div>
       </header>
@@ -86,8 +94,8 @@ function CycleMeta({ cycle }: { cycle: CycleDetail }) {
   const wakeIsEvent = cycle.wake_reason.startsWith("event:");
   return (
     <div className="grid grid-cols-2 md:grid-cols-4 gap-px bg-ink-600/60 border border-ink-600/70 rounded-md overflow-hidden">
-      <MetaCell label="Wake reason" value={cycle.wake_reason} highlight={wakeIsEvent} />
-      <MetaCell label="Result" value={cycle.result} />
+      <MetaCell label="Wake reason" value={formatWakeReason(cycle.wake_reason)} highlight={wakeIsEvent} />
+      <MetaCell label="Result" value={formatResult(cycle.result)} />
       <MetaCell
         label="Confidence"
         value={cycle.confidence !== null ? cycle.confidence.toFixed(2) : "—"}
@@ -100,8 +108,11 @@ function CycleMeta({ cycle }: { cycle: CycleDetail }) {
             : "—"
         }
       />
-      <MetaCell label="Started" value={cycle.started_at} />
-      <MetaCell label="Finished" value={cycle.finished_at ?? "—"} />
+      <MetaCell label="Started" value={formatDateTime(cycle.started_at)} />
+      <MetaCell
+        label="Finished"
+        value={cycle.finished_at ? formatDateTime(cycle.finished_at) : "—"}
+      />
       <MetaCell
         label="Actions"
         value={`${cycle.actions_executed ?? "—"} / ${cycle.actions_planned ?? "—"}`}
@@ -174,7 +185,7 @@ function DecisionPanel({ decision }: { decision: Decision | null }) {
         <div className="space-y-1.5">
           {(decision.venues ?? []).map((v) => (
             <div key={v.venue_id} className="text-[12px] font-mono">
-              <span className="text-white">{v.venue_id}</span>
+              <span className="text-white">{venueLabel(v.venue_id)}</span>
               <span className="text-dim-500"> · </span>
               <span className="text-neon tabular">
                 {(v.weight * 100).toFixed(2)}%
@@ -236,7 +247,7 @@ function PositionsPanel({ positions }: { positions: PositionRow[] }) {
             key={`${p.venue}-${p.product_id}`}
             className="grid grid-cols-12 gap-2 py-1.5 text-[12px] font-mono"
           >
-            <div className="col-span-2 text-dim-300">{p.venue}</div>
+            <div className="col-span-2 text-dim-300">{venueLabel(p.venue)}</div>
             <div className="col-span-3 text-white truncate">{p.product_id}</div>
             <div className="col-span-2 text-dim-200">{p.coin ?? "—"}</div>
             <div className="col-span-3 text-right text-dim-200 tabular">
@@ -279,7 +290,7 @@ function ExecutionsPanel({ executions }: { executions: ExecutionRow[] }) {
               {ex.status}
             </span>
             <span className="text-dim-500"> · </span>
-            <span className="text-white">{String(ex.action.kind ?? "?")}</span>
+            <span className="text-white">{formatActionKind(String(ex.action.kind ?? "?"))}</span>
             {Boolean(ex.action.coin) && (
               <>
                 <span className="text-dim-500"> · </span>
@@ -329,7 +340,7 @@ function EventsPanel({ events }: { events: EventRow[] }) {
               [{e.severity}]
             </span>
             <span className="text-dim-500"> </span>
-            <span className="text-white">{e.kind}</span>
+            <span className="text-white">{formatEventKind(e.kind)}</span>
             <span className="text-dim-500"> · </span>
             <span className="text-dim-200">
               {String(e.payload.message ?? "")}

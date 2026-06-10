@@ -10,6 +10,7 @@ import Link from "next/link";
 
 import { ApiError, fetchCycles, type CycleSummary } from "@/lib/agent-api";
 import { formatDateTime } from "@/lib/datetime";
+import { formatResult, formatWakeReason } from "@/lib/labels";
 
 export const dynamic = "force-dynamic";
 export const metadata = { title: "Vault8004 — Cycle History" };
@@ -92,9 +93,9 @@ function CycleRow({ row }: { row: CycleSummary }) {
         {fmtTs(row.cycle_ts)}
       </div>
       <div className={`col-span-2 ${wakeIsEvent ? "text-neon" : "text-dim-400"} truncate`}>
-        {row.wake_reason}
+        {formatWakeReason(row.wake_reason)}
       </div>
-      <div className={`col-span-2 ${resultTone}`}>{row.result}</div>
+      <div className={`col-span-2 ${resultTone}`}>{formatResult(row.result)}</div>
       <div className="col-span-1 text-right text-dim-300 tabular">
         {row.confidence !== null ? row.confidence.toFixed(2) : "—"}
       </div>

@@ -4,6 +4,7 @@ import { useMemo, useState } from "react";
 
 import { RISK_FLAGS, type Decision } from "@/lib/data";
 import { formatTime } from "@/lib/datetime";
+import { venueLabel } from "@/lib/labels";
 import { useDecisions } from "@/lib/hooks/use-decisions";
 import { useCycleDetail } from "@/lib/agent-store-context";
 import type { CycleDetail, EventRow, ExecutionRow } from "@/lib/agent-api";
@@ -539,22 +540,6 @@ function DecisionThesis({
       </div>
     </div>
   );
-}
-
-const VENUE_LABELS: Record<string, string> = {
-  cash_usdc: "Cash USDC",
-  aave_usdc: "Aave V3 USDC",
-  aave_weth: "Aave V3 WETH",
-  bybit_flex: "Bybit Flex",
-  bybit_onchain: "Bybit OnChain",
-  bybit_lm: "Bybit LM",
-  bybit_dual_asset: "Bybit DualAsset",
-  bybit_discount_buy: "Bybit DiscountBuy",
-  bybit_hold_to_earn: "Bybit Hold-to-Earn",
-};
-
-function venueLabel(id: string): string {
-  return VENUE_LABELS[id] ?? id;
 }
 
 function VenueAllocationsBlock({
