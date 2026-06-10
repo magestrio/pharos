@@ -21,6 +21,12 @@ import { formatDateTime } from "@/lib/datetime";
 import { BRAND } from "@/lib/brand";
 import { useActiveHedges } from "@/lib/hooks/use-active-hedges";
 import {
+  useAlloraForecast,
+  type AlloraForecast,
+  type MarketBias,
+} from "@/lib/hooks/use-allora-forecast";
+import { useIsMounted } from "@/lib/hooks/use-is-mounted";
+import {
   useAllocationStats,
   usePlannedVsActual,
   type AllocationRow,
@@ -64,6 +70,7 @@ export function VaultCard() {
     <div className="space-y-10 sm:space-y-12">
       <HeroBlock stats={stats} />
       <StatsRow stats={stats} />
+      <AlloraForecastSection />
       <MintRedeemPanel />
       {/* Capital-growth section pulls its own series from
           /api/capital-history - real per-cycle equity reconstructed
@@ -504,6 +511,135 @@ function StatsRow({ stats }: { stats: VaultStats }) {
         value={String(cycles.length)}
         sub={<span>Event-driven · 4h cron fallback</span>}
       />
+    </section>
+  );
+}
+
+// ─── Allora price forecast ───────────────────────────────────────────
+//
+// The agent pulls Allora's 8h directional price forecast per coin into
+// each snapshot; this surfaces the latest one as a market-context card.
+// Spot exists only for BTC/ETH in the snapshot, so SOL renders
+// price-only (no delta). The headline bias is read off the BTC forecast.
+
+const BIAS_META: Record<MarketBias, { label: string; tone: "pos" | "red" | "neutral" }> = {
+  bullish: { label: "Market · Bullish", tone: "pos" },
+  bearish: { label: "Market · Bearish", tone: "red" },
+  neutral: { label: "Market · Neutral", tone: "neutral" },
+};
+
+function fmtPrice(usd: number): string {
+  const digits = usd >= 1000 ? 0 : usd >= 1 ? 2 : 4;
+  return (
+    "$" +
+    usd.toLocaleString("en-US", {
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    })
+  );
+}
+
+function AlloraForecastRow({ f }: { f: AlloraForecast }) {
+  const arrow = f.direction === "up" ? "▲" : f.direction === "down" ? "▼" : "≈";
+  const tone: "pos" | "red" | "neutral" =
+    f.direction === "up" ? "pos" : f.direction === "down" ? "red" : "neutral";
+  const accent =
+    f.direction === "up"
+      ? "border-l-pos/50"
+      : f.direction === "down"
+        ? "border-l-danger/50"
+        : "border-l-ink-500";
+
+  return (
+    <div
+      className={`flex items-center gap-4 px-4 py-4 bg-ink-900 border border-ink-600/60 border-l-2 ${accent} rounded-md`}
+    >
+      <span className="inline-flex items-center justify-center min-w-[48px] h-[30px] px-2 rounded-sm bg-accent/[0.10] border border-accent/30 text-accent font-mono text-[12px] tracking-[0.06em]">
+        {f.token}
+      </span>
+      <div className="flex-1 min-w-0">
+        <Eyebrow tone="dim" className="!text-[9.5px] mb-1">
+          Allora expects · 8h
+        </Eyebrow>
+        <div className="font-serif text-[24px] leading-none text-white tabular tracking-[-0.02em]">
+          {fmtPrice(f.inferenceUsd)}
+        </div>
+      </div>
+      <div className="text-right shrink-0">
+        {f.deltaPct !== null ? (
+          <Tag tone={tone} className="!text-[12px]">
+            {arrow} {f.deltaPct >= 0 ? "+" : ""}
+            {f.deltaPct.toFixed(2)}%
+          </Tag>
+        ) : (
+          <Tag tone="neutral" className="!text-[10px]">
+            no spot
+          </Tag>
+        )}
+        <div className="text-[11px] font-mono text-dim-500 mt-1.5 tabular">
+          {f.spotUsd !== null ? <>spot {fmtPrice(f.spotUsd)}</> : <>spot n/a</>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AlloraForecastSection() {
+  const mounted = useIsMounted();
+  const { forecasts, marketBias, isLoading, isError, isLive } = useAlloraForecast();
+  const asOf = forecasts.length > 0 ? Math.max(...forecasts.map((f) => f.asOf)) : 0;
+  const bias = BIAS_META[marketBias];
+
+  // Gate all data-dependent rendering behind mount: the forecast comes
+  // from a client-only detail fetch, so server + first-client paint must
+  // render the same stable skeleton to avoid a hydration mismatch.
+  const ready = mounted && isLive;
+
+  return (
+    <section>
+      <SectionHead
+        eyebrow="Allora · decentralized AI oracle"
+        title="Price forecast · 8h"
+        subtitle="Allora's on-chain AI oracle predicts each coin's price 8 hours out - the directional signal the agent factors into every decision. 8h is the longest window the oracle exposes for these assets."
+        right={
+          ready && (
+            <div className="flex items-center gap-3">
+              <Tag tone={bias.tone}>{bias.label}</Tag>
+              {asOf > 0 && (
+                <span className="hidden sm:inline font-mono text-[11px] text-dim-500">
+                  as of {formatDateTime(asOf * 1000)}
+                </span>
+              )}
+            </div>
+          )
+        }
+      />
+      <Card className="p-5 sm:p-6">
+        {!mounted || (isLoading && !isLive) ? (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
+            <SkeletonRow width="100%" />
+            <SkeletonRow width="100%" />
+            <SkeletonRow width="100%" />
+          </div>
+        ) : isError && !isLive ? (
+          <div className="font-mono text-[12px] text-dim-500">
+            Could not load Allora forecast.
+          </div>
+        ) : !isLive ? (
+          <div className="flex flex-col items-center justify-center gap-2 py-6 font-mono text-[12px] text-dim-400 text-center">
+            <span className="text-dim-500 uppercase tracking-[0.16em] text-[10px]">
+              no allora signal this cycle
+            </span>
+            <span>The latest cycle carries no 8h price inference.</span>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5">
+            {forecasts.map((f) => (
+              <AlloraForecastRow key={f.token} f={f} />
+            ))}
+          </div>
+        )}
+      </Card>
     </section>
   );
 }
