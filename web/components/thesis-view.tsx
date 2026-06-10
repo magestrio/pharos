@@ -211,13 +211,13 @@ const ALLOC_LEG_RX = /([A-Za-z0-9 _.-]+?)\s+(\d+(?:\.\d+)?)\s*%/g;
 
 const ALLOC_PALETTE: Record<string, string> = {
   cash: "#3F4860",
-  "usd1 flex": "#F5B400",
-  "usd1 flexible": "#F5B400",
+  "usd1 flex": "#F6A94B",
+  "usd1 flexible": "#F6A94B",
   "ton onchain": "#D9A005",
   "atom onchain": "#C99500",
-  flex: "#F5B400",
+  flex: "#F6A94B",
   onchain: "#D9A005",
-  perp: "#5B8FF9",
+  perp: "#A78BFA",
 };
 
 function legColor(label: string, idx: number): string {
@@ -225,7 +225,7 @@ function legColor(label: string, idx: number): string {
   for (const k of Object.keys(ALLOC_PALETTE)) {
     if (lower.includes(k)) return ALLOC_PALETTE[k];
   }
-  const fallback = ["#F5B400", "#FFC533", "#D9A005", "#5B8FF9", "#3F4860"];
+  const fallback = ["#F6A94B", "#FFC97A", "#D9A005", "#A78BFA", "#3F4860"];
   return fallback[idx % fallback.length];
 }
 

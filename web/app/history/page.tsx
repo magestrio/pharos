@@ -11,9 +11,10 @@ import Link from "next/link";
 import { ApiError, fetchCycles, type CycleSummary } from "@/lib/agent-api";
 import { formatDateTime } from "@/lib/datetime";
 import { formatResult, formatWakeReason } from "@/lib/labels";
+import { Card, Eyebrow, SectionHead, Tag } from "@/components/ui";
 
 export const dynamic = "force-dynamic";
-export const metadata = { title: "Vault8004 — Cycle History" };
+export const metadata = { title: "Pharos — Cycle History" };
 
 export default async function HistoryPage() {
   let cycles: CycleSummary[] = [];
@@ -32,7 +33,7 @@ export default async function HistoryPage() {
             href="/"
             className="font-mono text-[13px] text-white font-semibold tracking-tight hover:text-neon"
           >
-            ← VAULT8004
+            ← PHAROS
           </Link>
           <div className="font-mono text-[11px] uppercase tracking-[0.14em] text-dim-500">
             Cycle History · {cycles.length} cycles
@@ -41,6 +42,16 @@ export default async function HistoryPage() {
       </header>
 
       <section className="max-w-[1440px] mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-10">
+        <SectionHead
+          eyebrow="Decision cycles"
+          title="Cycle History"
+          subtitle="Every re-decide the agent has run — heartbeat and event-driven — with its wake trigger, outcome, confidence and expected APR. Click a row for the full thesis, positions and on-chain proofs."
+          right={
+            <Eyebrow tone="dim" className="tabular">
+              {cycles.length} cycles
+            </Eyebrow>
+          }
+        />
         {errorMessage ? (
           <ErrorBanner message={errorMessage} />
         ) : cycles.length === 0 ? (
@@ -55,9 +66,9 @@ export default async function HistoryPage() {
 
 function CycleTable({ rows }: { rows: CycleSummary[] }) {
   return (
-    <div className="border border-ink-600/70 rounded-md overflow-hidden bg-ink-900">
-      <div className="grid grid-cols-12 gap-2 px-4 py-2.5 text-[10.5px] font-mono uppercase tracking-[0.14em] text-dim-500 border-b border-ink-600/70 bg-ink-950">
-        <div className="col-span-3">Cycle TS</div>
+    <Card className="overflow-hidden">
+      <div className="grid grid-cols-12 gap-2 px-4 py-3 text-[10.5px] font-mono uppercase tracking-[0.14em] text-dim-500 border-b border-ink-600/70 bg-ink-850/60">
+        <div className="col-span-3">Cycle</div>
         <div className="col-span-2">Wake reason</div>
         <div className="col-span-2">Result</div>
         <div className="col-span-1 text-right">Conf</div>
@@ -70,32 +81,35 @@ function CycleTable({ rows }: { rows: CycleSummary[] }) {
           <CycleRow key={row.cycle_ts} row={row} />
         ))}
       </div>
-    </div>
+    </Card>
   );
+}
+
+type Tone = "neutral" | "pos" | "warn" | "red" | "accent";
+
+function resultTagTone(result: string): Tone {
+  if (result === "executed") return "pos";
+  if (result === "error") return "red";
+  if (result.startsWith("skipped") || result === "halted") return "warn";
+  return "neutral";
 }
 
 function CycleRow({ row }: { row: CycleSummary }) {
   const wakeIsEvent = row.wake_reason.startsWith("event:");
-  const resultTone =
-    row.result === "executed" || row.result === "ok"
-      ? "text-neon"
-      : row.result === "error"
-      ? "text-danger"
-      : row.result.startsWith("skipped")
-      ? "text-warn"
-      : "text-dim-300";
   return (
     <Link
       href={`/history/${encodeURIComponent(row.cycle_ts)}`}
-      className="grid grid-cols-12 gap-2 px-4 py-2.5 items-center text-[12px] font-mono hover:bg-ink-800/60"
+      className="group grid grid-cols-12 gap-2 px-4 py-3 items-center text-[12px] font-mono hover:bg-ink-800/40 transition-colors"
     >
       <div className="col-span-3 text-dim-200 tabular truncate">
         {fmtTs(row.cycle_ts)}
       </div>
-      <div className={`col-span-2 ${wakeIsEvent ? "text-neon" : "text-dim-400"} truncate`}>
-        {formatWakeReason(row.wake_reason)}
+      <div className="col-span-2 truncate">
+        <Tag tone={wakeIsEvent ? "accent" : "neutral"}>{formatWakeReason(row.wake_reason)}</Tag>
       </div>
-      <div className={`col-span-2 ${resultTone}`}>{formatResult(row.result)}</div>
+      <div className="col-span-2">
+        <Tag tone={resultTagTone(row.result)}>{formatResult(row.result)}</Tag>
+      </div>
       <div className="col-span-1 text-right text-dim-300 tabular">
         {row.confidence !== null ? row.confidence.toFixed(2) : "—"}
       </div>
@@ -106,7 +120,9 @@ function CycleRow({ row }: { row: CycleSummary }) {
         {row.actions_executed ?? "—"}
         <span className="text-dim-600">/{row.actions_planned ?? "—"}</span>
       </div>
-      <div className="col-span-2 text-right text-dim-500 hover:text-neon">view →</div>
+      <div className="col-span-2 text-right text-dim-500 group-hover:text-accent transition-colors">
+        view →
+      </div>
     </Link>
   );
 }

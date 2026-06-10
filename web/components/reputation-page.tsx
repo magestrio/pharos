@@ -59,14 +59,14 @@ function HeaderBlock({ tokenId, isVaultAgent }: { tokenId: bigint; isVaultAgent:
       <p className="mt-3 text-[14px] text-dim-300 max-w-2xl leading-relaxed">
         {isVaultAgent ? (
           <>
-            Canonical Vault8004 agent. Reputation = annualized APR in basis points, computed
+            Canonical Pharos agent. Reputation = annualized APR in basis points, computed
             on-chain from <code className="font-mono text-white">vault.totalAssets()</code> growth
             since the baseline. Every update is verifiable in the Mantle Explorer + Reputation
             Registry.
           </>
         ) : (
           <>
-            Generic ERC-8004 agent view. Live data is Vault8004-scoped — other agents would render
+            Generic ERC-8004 agent view. Live data is Pharos-scoped — other agents would render
             their own oracle reads through the same component once wired.
           </>
         )}
@@ -201,10 +201,10 @@ function Sparkline({ points }: { points: ReputationHistoryPoint[] }) {
       {min < 0 && (
         <line x1={padX} x2={width - padX} y1={zeroY} y2={zeroY} stroke="#3F4860" strokeDasharray="2 3" />
       )}
-      <path d={areaD} fill="rgba(245,180,0,0.12)" />
-      <path d={pathD} fill="none" stroke="#F5B400" strokeWidth={1.5} />
+      <path d={areaD} fill="rgba(246,169,75,0.12)" />
+      <path d={pathD} fill="none" stroke="#F6A94B" strokeWidth={1.5} />
       {points.map((p, i) => (
-        <circle key={p.updateIndex} cx={padX + i * stepX} cy={yFor(p.scoreBps)} r={2.5} fill="#F5B400" />
+        <circle key={p.updateIndex} cx={padX + i * stepX} cy={yFor(p.scoreBps)} r={2.5} fill="#F6A94B" />
       ))}
     </svg>
   );
@@ -311,7 +311,7 @@ function LeaderboardPlaceholder() {
   return (
     <Card title="Leaderboard">
       <div className="text-[12px] text-dim-300 leading-relaxed">
-        Vault8004 is the first agent registered against the canonical ERC-8004 registries on Mantle.
+        Pharos is the first agent registered against the canonical ERC-8004 registries on Mantle.
         As other agents register, their token ids will appear here sorted by current score —
         provided the same `ReputationOracle` write pattern is used. A multi-agent leaderboard view
         is filed under the judge verification surface (`.18`).

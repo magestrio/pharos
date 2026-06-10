@@ -89,7 +89,7 @@ function rows(): ContractRow[] {
       label: "ERC-8004 Identity Registry",
       address: IDENTITY_REGISTRY_ADDRESS,
       status: "live",
-      note: `Canonical agent NFT registry. Vault8004 token id = ${VAULT_AGENT_ID.toString()}.`,
+      note: `Canonical agent NFT registry. Pharos token id = ${VAULT_AGENT_ID.toString()}.`,
     },
     {
       label: "ERC-8004 Reputation Registry",

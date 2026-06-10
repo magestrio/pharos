@@ -38,22 +38,22 @@ const VENUE_META: Record<
   aave_v3_usdc: {
     label: "Aave V3 USDC",
     sub: "lending · on-chain",
-    color: "#F5B400",
+    color: "#F6A94B",
   },
   aave_v3_weth: {
     label: "Aave V3 WETH",
     sub: "lending · on-chain",
-    color: "#FFC533",
+    color: "#FFC97A",
   },
   bybit_flex: {
     label: "Bybit Flexible Earn",
     sub: "off-chain · 200+ stable products",
-    color: "#5B8FF9",
+    color: "#A78BFA",
   },
   bybit_onchain: {
     label: "Bybit OnChain Earn",
     sub: "off-chain · staked yield (TON, ATOM, USDE, ...)",
-    color: "#7AA5FB",
+    color: "#C4B5FD",
   },
   bybit_lm: {
     label: "Bybit Liquidity Mining",
@@ -83,7 +83,7 @@ const VENUE_META: Record<
   perp: {
     label: "Bybit USDT-Perp",
     sub: "off-chain · delta-neutral hedge leg",
-    color: "#345FC2",
+    color: "#7C5CD6",
   },
   cash_usdc: {
     label: "Cash USDC",
@@ -93,14 +93,14 @@ const VENUE_META: Record<
 };
 
 const FALLBACK_COLORS = [
-  "#5B8FF9",
-  "#7AA5FB",
+  "#A78BFA",
+  "#C4B5FD",
   "#A6BEFC",
   "#9C7BFB",
   "#B488FB",
   "#7BCBFB",
   "#FBBF24",
-  "#345FC2",
+  "#7C5CD6",
 ];
 
 function venueMeta(venue: string, idx: number): { label: string; sub: string; color: string } {

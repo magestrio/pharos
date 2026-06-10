@@ -18,6 +18,7 @@ import {
 } from "@/lib/contracts";
 import { mantleExplorerAddress, mantleExplorerTx } from "@/lib/explorer";
 import { formatDateTime } from "@/lib/datetime";
+import { BRAND } from "@/lib/brand";
 import { useActiveHedges } from "@/lib/hooks/use-active-hedges";
 import {
   useAllocationStats,
@@ -150,7 +151,7 @@ function HeroBadgeLine() {
 
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-2 font-mono text-[11px] uppercase tracking-[0.16em]">
-      <span className="text-white font-semibold">VAULT8004</span>
+      <span className="text-white font-semibold">{BRAND.wordmark}</span>
       <span className="h-2.5 w-px bg-dim-600/70" />
       <span className="text-dim-400">
         ERC-8004 <span className="text-accent">#{VAULT_AGENT_ID}</span>
@@ -242,7 +243,7 @@ function ReputationNFTCard() {
         className="absolute -inset-[2px] rounded-lg pointer-events-none"
         style={{
           background:
-            "radial-gradient(120% 80% at 50% 0%, rgba(245,180,0,0.25), transparent 60%)",
+            "radial-gradient(120% 80% at 50% 0%, rgba(246,169,75,0.25), transparent 60%)",
         }}
       />
       <div className="relative bg-gradient-to-b from-ink-850 to-ink-900 border border-ink-500/70 rounded-md overflow-hidden shadow-card-premium ring-1 ring-inset ring-white/[0.04]">
@@ -252,7 +253,7 @@ function ReputationNFTCard() {
         />
         <div className="flex items-center justify-between px-4 py-2.5 border-b border-ink-600/60 bg-ink-900/50">
           <Eyebrow tone="dim" className="flex items-center gap-2">
-            <span className="w-1.5 h-1.5 rounded-sm bg-accent shadow-[0_0_8px_rgba(245,180,0,0.6)]"></span>
+            <span className="w-1.5 h-1.5 rounded-sm bg-accent shadow-[0_0_8px_rgba(246,169,75,0.6)]"></span>
             ERC-8004 Reputation
           </Eyebrow>
           <div className="text-[10px] font-mono text-dim-500 tracking-[0.16em]">TOKEN #001</div>
@@ -272,7 +273,7 @@ function ReputationNFTCard() {
           </div>
           <div className="mt-5 h-[5px] bg-ink-700 overflow-hidden rounded-full">
             <div
-              className="h-full rounded-full bg-gradient-to-r from-accent-dim via-accent to-accent-soft transition-all duration-700 shadow-[0_0_12px_rgba(245,180,0,0.45)]"
+              className="h-full rounded-full bg-gradient-to-r from-accent-dim via-accent to-accent-soft transition-all duration-700 shadow-[0_0_12px_rgba(246,169,75,0.45)]"
               style={{ width: pct + "%" }}
             />
           </div>
@@ -300,10 +301,10 @@ function ReputationNFTCard() {
             className={`w-full inline-flex items-center justify-center gap-2 px-4 h-11 rounded-[3px] font-mono tracking-[0.14em] uppercase text-[12px] font-semibold transition-all
               ${
                 updateReceipt.isSuccess
-                  ? "bg-accent text-[#1B1300] shadow-[inset_0_1px_0_rgba(255,255,255,0.3),0_0_0_1px_rgba(245,180,0,0.6)]"
+                  ? "bg-accent text-[#1B1300] shadow-[inset_0_1px_0_rgba(255,255,255,0.3),0_0_0_1px_rgba(246,169,75,0.6)]"
                   : buttonDisabled
                     ? "bg-ink-800 border border-ink-600 text-dim-400 cursor-not-allowed"
-                    : "bg-accent text-[#1B1300] shadow-[inset_0_1px_0_rgba(255,255,255,0.3),0_0_0_1px_rgba(245,180,0,0.6),0_8px_24px_-10px_rgba(245,180,0,0.45)] hover:bg-accent-soft active:translate-y-px"
+                    : "bg-accent text-[#1B1300] shadow-[inset_0_1px_0_rgba(255,255,255,0.3),0_0_0_1px_rgba(246,169,75,0.6),0_8px_24px_-10px_rgba(246,169,75,0.45)] hover:bg-accent-soft active:translate-y-px"
               }`}
           >
             {!rep.isLive && <span className="btn-bracket">Update Reputation</span>}
@@ -622,7 +623,7 @@ function CapitalGrowthSection({ stats: _stats }: { stats: VaultStats }) {
           <div className="h-[240px] sm:h-[280px] -mx-2">
             <LineChart
               series={numericSeries}
-              color="#F5B400"
+              color="#F6A94B"
               label="capitalusd"
               baseline={startUsd}
               width={1200}
@@ -638,7 +639,7 @@ function CapitalGrowthSection({ stats: _stats }: { stats: VaultStats }) {
 }
 
 
-const BYBIT_SUB_PALETTE = ["#5B8FF9", "#7AA5FB", "#A6BEFC", "#345FC2"] as const;
+const BYBIT_SUB_PALETTE = ["#A78BFA", "#C4B5FD", "#A6BEFC", "#7C5CD6"] as const;
 
 function portfolioToBybitSubRows(positions: PositionRow[]): Allocation[] {
   const filtered = positions.filter((p) => p.venue.startsWith("bybit_"));
@@ -852,28 +853,28 @@ const ALLOC_VENUE_META: Record<
   string,
   { label: string; sub: string; color: string }
 > = {
-  aave_v3_usdc: { label: "Aave V3 USDC", sub: "lending · on-chain", color: "#F5B400" },
-  aave_v3_weth: { label: "Aave V3 WETH", sub: "lending · on-chain", color: "#FFC533" },
-  bybit_flex: { label: "Bybit Flexible Earn", sub: "stable yield", color: "#F5B400" },
+  aave_v3_usdc: { label: "Aave V3 USDC", sub: "lending · on-chain", color: "#F6A94B" },
+  aave_v3_weth: { label: "Aave V3 WETH", sub: "lending · on-chain", color: "#FFC97A" },
+  bybit_flex: { label: "Bybit Flexible Earn", sub: "stable yield", color: "#F6A94B" },
   bybit_onchain: { label: "Bybit OnChain Earn", sub: "staked / hedged", color: "#D9A005" },
-  bybit_lm: { label: "Bybit Liquidity Mining", sub: "CPMM LP", color: "#FFC533" },
+  bybit_lm: { label: "Bybit Liquidity Mining", sub: "CPMM LP", color: "#FFC97A" },
   bybit_discount_buy: { label: "Bybit DiscountBuy", sub: "range payoff", color: "#E8B428" },
   bybit_dual_asset: { label: "Bybit DualAsset", sub: "either-side delivery", color: "#C99500" },
   bybit_hold_to_earn: { label: "Bybit Hold-to-Earn", sub: "stables", color: "#B89800" },
   bybit_alpha: { label: "Bybit Alpha Farm", sub: "DEX exposure", color: "#A88500" },
-  perp: { label: "Bybit USDT-Perp", sub: "hedge leg · off-book", color: "#5B8FF9" },
+  perp: { label: "Bybit USDT-Perp", sub: "hedge leg · off-book", color: "#A78BFA" },
   cash_usdc: { label: "Cash buffer", sub: "idle · liquidity", color: "#3F4860" },
 };
 
 const ALLOC_FALLBACK_PALETTE = [
-  "#5B8FF9",
-  "#7AA5FB",
+  "#A78BFA",
+  "#C4B5FD",
   "#A6BEFC",
   "#9C7BFB",
   "#B488FB",
   "#7BCBFB",
   "#FBBF24",
-  "#345FC2",
+  "#7C5CD6",
 ];
 
 const VENUE_KIND_LABELS: Record<string, string> = {

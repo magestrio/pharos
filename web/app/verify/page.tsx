@@ -16,9 +16,9 @@ import { VerifyPage } from "@/components/verify-page";
 
 export const dynamic = "force-dynamic";
 export const metadata = {
-  title: "Vault8004 — Judge Verification Surface",
+  title: "Pharos — Judge Verification Surface",
   description:
-    "All on-chain verification paths for Vault8004 in one page: contract addresses, decision log proofs, reputation history, attestor Safe.",
+    "All on-chain verification paths for Pharos in one page: contract addresses, decision log proofs, reputation history, attestor Safe.",
 };
 
 export default function VerifyRoute() {
@@ -30,7 +30,7 @@ export default function VerifyRoute() {
             href="/"
             className="font-mono text-[13px] text-white font-semibold tracking-tight hover:text-neon"
           >
-            ← VAULT8004
+            ← PHAROS
           </Link>
           <div className="font-mono text-[11px] uppercase tracking-[0.14em] text-dim-500">
             Judge Verification Surface

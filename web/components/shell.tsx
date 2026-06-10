@@ -6,6 +6,7 @@ import { useConnectModal } from "@rainbow-me/rainbowkit";
 import { useAccount, useDisconnect } from "wagmi";
 
 import { Button, Eyebrow, HashChip, Icon, LiveDot } from "@/components/ui";
+import { BRAND } from "@/lib/brand";
 import { LiveTicker } from "@/components/live-ticker";
 import { DecisionLog } from "@/components/screens/decision-log";
 import { VaultCard } from "@/components/screens/vault-card";
@@ -111,7 +112,7 @@ function ShellBody({
         aria-hidden
         style={{
           background:
-            "radial-gradient(80% 100% at 50% 0%, rgba(245,180,0,0.05), transparent 70%)",
+            "radial-gradient(80% 100% at 50% 0%, rgba(246,169,75,0.05), transparent 70%)",
         }}
       />
 
@@ -143,7 +144,7 @@ function ShellBody({
               >
                 {t.label}
                 {tab === t.id && (
-                  <span className="absolute bottom-[-5px] left-3 right-3 h-[2px] bg-accent rounded-full shadow-[0_0_8px_rgba(245,180,0,0.6)]" />
+                  <span className="absolute bottom-[-5px] left-3 right-3 h-[2px] bg-accent rounded-full shadow-[0_0_8px_rgba(246,169,75,0.6)]" />
                 )}
               </button>
             ))}
@@ -193,13 +194,13 @@ function Logo() {
   return (
     <a href="#" className="flex items-center gap-2.5 group">
       <div className="relative w-8 h-8 grid place-items-center bg-gradient-to-b from-ink-850 to-ink-900 border border-accent/30 rounded-[3px] shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]">
-        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#F5B400" strokeWidth="1.8" strokeLinejoin="round">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#F6A94B" strokeWidth="1.8" strokeLinejoin="round">
           <path d="M12 3 21 7.5v9L12 21 3 16.5v-9z" />
-          <circle cx="12" cy="12" r="2.5" fill="#F5B400" stroke="none" />
+          <circle cx="12" cy="12" r="2.5" fill="#F6A94B" stroke="none" />
         </svg>
         <span
           className="absolute -inset-px rounded-[3px] pointer-events-none"
-          style={{ boxShadow: "inset 0 0 14px rgba(245,180,0,0.25)" }}
+          style={{ boxShadow: "inset 0 0 14px rgba(246,169,75,0.25)" }}
         />
       </div>
       <div className="leading-none">
@@ -207,7 +208,7 @@ function Logo() {
           vUSDC
         </div>
         <div className="font-mono text-[12.5px] text-white font-semibold tracking-tight">
-          VAULT8004
+          {BRAND.wordmark}
         </div>
         <div className="font-mono text-[9px] text-dim-500 tracking-[0.18em] uppercase mt-0.5">
           ERC-8004 · #001
@@ -241,7 +242,7 @@ function ConnectWalletButton() {
     <button
       onClick={() => openConnectModal?.()}
       disabled={!openConnectModal}
-      className="inline-flex items-center gap-2 px-4 h-9 bg-accent text-[#1B1300] rounded-[3px] text-[11px] font-mono font-bold uppercase tracking-[0.14em] shadow-[inset_0_1px_0_rgba(255,255,255,0.3),0_0_0_1px_rgba(245,180,0,0.5),0_6px_18px_-8px_rgba(245,180,0,0.45)] hover:bg-accent-soft active:translate-y-px transition-all disabled:opacity-50"
+      className="inline-flex items-center gap-2 px-4 h-9 bg-accent text-[#1B1300] rounded-[3px] text-[11px] font-mono font-bold uppercase tracking-[0.14em] shadow-[inset_0_1px_0_rgba(255,255,255,0.3),0_0_0_1px_rgba(246,169,75,0.5),0_6px_18px_-8px_rgba(246,169,75,0.45)] hover:bg-accent-soft active:translate-y-px transition-all disabled:opacity-50"
     >
       <Icon.Wallet />
       Connect Wallet
@@ -298,7 +299,7 @@ function Footer() {
 
         <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 text-[11px] font-mono text-dim-500 pt-5 border-t border-ink-600/40">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-            <span className="text-white font-semibold tracking-[0.05em]">Vault8004 · vUSDC</span>
+            <span className="text-white font-semibold tracking-[0.05em]">{BRAND.name} · {BRAND.token}</span>
             <span className="text-dim-600">·</span>
             <span>ERC-8004 · Mantle Mainnet</span>
             <span className="text-dim-600">·</span>

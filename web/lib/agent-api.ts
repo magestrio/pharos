@@ -1,5 +1,5 @@
 /**
- * Typed client for the Vault8004 read-only API (`data-store.5`).
+ * Typed client for the Pharos read-only API (`data-store.5`).
  *
  * Server-side fetch helpers — call from Server Components or Route
  * Handlers. Base URL comes from `AGENT_API_URL` env (default

@@ -12,7 +12,7 @@ import Link from "next/link";
 import { ReputationPage } from "@/components/reputation-page";
 
 export const dynamic = "force-dynamic";
-export const metadata = { title: "Vault8004 — ERC-8004 Reputation" };
+export const metadata = { title: "Pharos — ERC-8004 Reputation" };
 
 export default function ReputationTokenPage({
   params,
@@ -28,7 +28,7 @@ export default function ReputationTokenPage({
             href="/"
             className="font-mono text-[13px] text-white font-semibold tracking-tight hover:text-neon"
           >
-            ← VAULT8004
+            ← PHAROS
           </Link>
           <div className="font-mono text-[11px] uppercase tracking-[0.14em] text-dim-500">
             ERC-8004 Reputation · Token #{tokenId.toString()}

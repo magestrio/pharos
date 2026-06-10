@@ -218,7 +218,7 @@ function DecisionItem({
           <div
             className={`w-3 h-3 rounded-full border-2 transition-all ${
               open
-                ? "bg-accent border-accent shadow-[0_0_12px_rgba(245,180,0,0.6)]"
+                ? "bg-accent border-accent shadow-[0_0_12px_rgba(246,169,75,0.6)]"
                 : first
                   ? "bg-ink-900 border-accent"
                   : "bg-ink-900 border-ink-500"
@@ -234,7 +234,7 @@ function DecisionItem({
           className={`w-full text-left bg-ink-900 border rounded-md transition-all
             ${
               open
-                ? "border-accent/40 shadow-[0_0_0_1px_rgba(245,180,0,0.18),0_8px_24px_-12px_rgba(245,180,0,0.30)] bg-gradient-to-b from-ink-850/80 to-ink-900"
+                ? "border-accent/40 shadow-[0_0_0_1px_rgba(246,169,75,0.18),0_8px_24px_-12px_rgba(246,169,75,0.30)] bg-gradient-to-b from-ink-850/80 to-ink-900"
                 : "border-ink-600/70 hover:border-ink-500 hover:bg-ink-900/80"
             }`}
         >
@@ -277,7 +277,7 @@ function ConfidenceBadge({ value }: { value: number }) {
   // High-confidence = brand amber (this is the agent's "I'm sure"),
   // medium = warn ochre, low = dim. Threshold 0.6/0.75 matches the
   // legend the validator uses internally.
-  const color = value >= 0.75 ? "#F5B400" : value >= 0.6 ? "#F7B955" : "#7A8499";
+  const color = value >= 0.75 ? "#F6A94B" : value >= 0.6 ? "#F7B955" : "#7A8499";
   return (
     <div className="hidden lg:flex items-center gap-2.5 font-mono text-[11px] text-dim-400">
       <span className="text-dim-500 uppercase tracking-[0.16em] text-[9.5px]">conf</span>
@@ -507,7 +507,7 @@ function DecisionThesis({
             </div>
             <div className="mt-3 h-2 bg-ink-700 rounded-full overflow-hidden">
               <div
-                className="h-full rounded-full bg-gradient-to-r from-accent-dim via-accent to-accent-soft shadow-[0_0_10px_rgba(245,180,0,0.45)]"
+                className="h-full rounded-full bg-gradient-to-r from-accent-dim via-accent to-accent-soft shadow-[0_0_10px_rgba(246,169,75,0.45)]"
                 style={{ width: d.confidence * 100 + "%" }}
               />
             </div>

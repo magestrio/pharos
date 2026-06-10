@@ -25,7 +25,7 @@ export function truncHash(h: string, head = 6, tail = 4): string {
   return h.slice(0, head) + "…" + h.slice(-tail);
 }
 
-export function LiveDot({ color = "#F5B400", size = 8 }: { color?: string; size?: number }) {
+export function LiveDot({ color = "#F6A94B", size = 8 }: { color?: string; size?: number }) {
   return (
     <span
       className="inline-block rounded-full live-dot"
@@ -192,7 +192,7 @@ export function Button({
     "group relative inline-flex items-center justify-center gap-2 select-none font-mono uppercase tracking-[0.12em] text-[12.5px] transition-all";
 
   const variantCls: Record<typeof variant, string> = {
-    primary: `bg-accent text-[#1B1300] font-semibold px-5 rounded-[3px] shadow-[inset_0_1px_0_rgba(255,255,255,0.30),0_0_0_1px_rgba(245,180,0,0.6),0_8px_24px_-10px_rgba(245,180,0,0.45)] hover:bg-accent-soft hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.35),0_0_0_1px_rgba(255,197,51,0.7),0_10px_30px_-8px_rgba(245,180,0,0.55)] active:translate-y-px ${heightBy.primary}`,
+    primary: `bg-accent text-[#1B1300] font-semibold px-5 rounded-[3px] shadow-[inset_0_1px_0_rgba(255,255,255,0.30),0_0_0_1px_rgba(246,169,75,0.6),0_8px_24px_-10px_rgba(246,169,75,0.45)] hover:bg-accent-soft hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.35),0_0_0_1px_rgba(255,201,122,0.7),0_10px_30px_-8px_rgba(246,169,75,0.55)] active:translate-y-px ${heightBy.primary}`,
     secondary: `bg-transparent border border-ink-500 text-white px-5 rounded-[3px] hover:border-accent/60 hover:bg-accent/[0.06] hover:text-accent active:translate-y-px ${heightBy.secondary}`,
     terminal: `border border-ink-600/70 bg-ink-900 text-dim-300 px-3 rounded-[3px] hover:text-white hover:bg-ink-800 ${
       active
@@ -350,7 +350,7 @@ export function DonutChart({
   let acc = 0;
   return (
     <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="overflow-visible">
-      <circle cx={size / 2} cy={size / 2} r={r} stroke="#11172A" strokeWidth={thickness} fill="none" />
+      <circle cx={size / 2} cy={size / 2} r={r} stroke="#161D38" strokeWidth={thickness} fill="none" />
       {data.map((d, i) => {
         const frac = d.pct / total;
         const len = C * frac - C * gap;
@@ -406,7 +406,7 @@ export function LineChart({
   series,
   width = 600,
   height = 220,
-  color = "#F5B400",
+  color = "#F6A94B",
   baseline = 1000,
   pad = { t: 16, r: 16, b: 24, l: 40 },
   showAxis = true,
@@ -501,7 +501,7 @@ export function LineChart({
             x2={width - pad.r}
             y1={g.y}
             y2={g.y}
-            stroke="#161C32"
+            stroke="#1C2442"
             strokeDasharray="2 4"
             strokeWidth="1"
           />
@@ -512,7 +512,7 @@ export function LineChart({
         x2={width - pad.r}
         y1={baseY}
         y2={baseY}
-        stroke="#2F3A55"
+        stroke="#3A4567"
         strokeDasharray="3 3"
         strokeWidth="1"
       />
@@ -579,7 +579,7 @@ export function LineChart({
 
 export function Sparkline({
   series,
-  color = "#F5B400",
+  color = "#F6A94B",
   width = 120,
   height = 28,
 }: {

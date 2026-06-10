@@ -1,5 +1,5 @@
 /**
- * Vault8004 home page (`frontend-complete.5`).
+ * Pharos home page (`frontend-complete.5`).
  *
  * Server Component — fetches the cycle history list + current
  * portfolio from the agent FastAPI once per request, then hands the

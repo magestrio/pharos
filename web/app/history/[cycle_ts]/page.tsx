@@ -17,6 +17,7 @@ import {
   fetchCycle,
 } from "@/lib/agent-api";
 import { ThesisView } from "@/components/thesis-view";
+import { Tag } from "@/components/ui";
 import { formatDateTime } from "@/lib/datetime";
 import {
   formatActionKind,
@@ -278,17 +279,9 @@ function ExecutionsPanel({ executions }: { executions: ExecutionRow[] }) {
           <div key={ex.idx} className="text-[12px] font-mono">
             <span className="text-dim-500">#{ex.idx}</span>
             <span className="text-dim-500"> · </span>
-            <span
-              className={
-                ex.status === "ok"
-                  ? "text-neon"
-                  : ex.status === "error"
-                  ? "text-danger"
-                  : "text-warn"
-              }
-            >
+            <Tag tone={ex.status === "ok" ? "pos" : ex.status === "error" ? "red" : "warn"}>
               {ex.status}
-            </span>
+            </Tag>
             <span className="text-dim-500"> · </span>
             <span className="text-white">{formatActionKind(String(ex.action.kind ?? "?"))}</span>
             {Boolean(ex.action.coin) && (
@@ -328,17 +321,9 @@ function EventsPanel({ events }: { events: EventRow[] }) {
       <div className="space-y-1.5">
         {events.map((e) => (
           <div key={e.id} className="text-[12px] font-mono">
-            <span
-              className={
-                e.severity === "P0"
-                  ? "text-danger"
-                  : e.severity === "P1"
-                  ? "text-warn"
-                  : "text-dim-400"
-              }
-            >
-              [{e.severity}]
-            </span>
+            <Tag tone={e.severity === "P0" ? "red" : e.severity === "P1" ? "warn" : "neutral"}>
+              {e.severity}
+            </Tag>
             <span className="text-dim-500"> </span>
             <span className="text-white">{formatEventKind(e.kind)}</span>
             <span className="text-dim-500"> · </span>
