@@ -56,7 +56,7 @@ export const REPUTATION_ORACLE_ADDRESS = pickAddress(
   "NEXT_PUBLIC_REPUTATION_ORACLE_ADDRESS",
   M.reputationOracle,
 );
-// ERC-8004 registries — already deployed on Mantle Mainnet, no env
+// ERC-8004 registries - already deployed on Mantle Mainnet, no env
 // override needed (immutable canonical addresses per CLAUDE.md).
 export const IDENTITY_REGISTRY_ADDRESS = M.erc8004IdentityRegistry;
 export const REPUTATION_REGISTRY_ADDRESS = M.erc8004ReputationRegistry;
@@ -139,7 +139,7 @@ export const reputationOracleContract = {
   chainId: VUSDC_CHAIN_ID,
 } as const;
 
-// ERC-20 fragment — covers everything the mint/redeem flow + cash
+// ERC-20 fragment - covers everything the mint/redeem flow + cash
 // venue allocation need: balanceOf (cash + user), allowance + approve
 // (mint approval path), decimals (display formatting).
 export const ERC20_ABI = [

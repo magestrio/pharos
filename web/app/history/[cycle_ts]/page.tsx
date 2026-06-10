@@ -26,6 +26,7 @@ import {
   formatWakeReason,
   venueLabel,
 } from "@/lib/labels";
+import { dedash } from "@/lib/text";
 
 export const dynamic = "force-dynamic";
 
@@ -99,26 +100,26 @@ function CycleMeta({ cycle }: { cycle: CycleDetail }) {
       <MetaCell label="Result" value={formatResult(cycle.result)} />
       <MetaCell
         label="Confidence"
-        value={cycle.confidence !== null ? cycle.confidence.toFixed(2) : "—"}
+        value={cycle.confidence !== null ? cycle.confidence.toFixed(2) : "-"}
       />
       <MetaCell
         label="Expected APR"
         value={
           cycle.expected_apr_pct !== null
             ? `${cycle.expected_apr_pct.toFixed(2)}%`
-            : "—"
+            : "-"
         }
       />
       <MetaCell label="Started" value={formatDateTime(cycle.started_at)} />
       <MetaCell
         label="Finished"
-        value={cycle.finished_at ? formatDateTime(cycle.finished_at) : "—"}
+        value={cycle.finished_at ? formatDateTime(cycle.finished_at) : "-"}
       />
       <MetaCell
         label="Actions"
-        value={`${cycle.actions_executed ?? "—"} / ${cycle.actions_planned ?? "—"}`}
+        value={`${cycle.actions_executed ?? "-"} / ${cycle.actions_planned ?? "-"}`}
       />
-      <MetaCell label="Error" value={cycle.error ?? "—"} tone={cycle.error ? "danger" : "dim"} />
+      <MetaCell label="Error" value={cycle.error ?? "-"} tone={cycle.error ? "danger" : "dim"} />
     </div>
   );
 }
@@ -170,7 +171,7 @@ function DecisionPanel({ decision }: { decision: Decision | null }) {
             Agent&apos;s notes
           </div>
           <p className="font-sans text-[15px] leading-[1.7] text-dim-100 whitespace-pre-wrap">
-            {decision.reflection}
+            {dedash(decision.reflection)}
           </p>
         </div>
       )}
@@ -250,12 +251,12 @@ function PositionsPanel({ positions }: { positions: PositionRow[] }) {
           >
             <div className="col-span-2 text-dim-300">{venueLabel(p.venue)}</div>
             <div className="col-span-3 text-white truncate">{p.product_id}</div>
-            <div className="col-span-2 text-dim-200">{p.coin ?? "—"}</div>
+            <div className="col-span-2 text-dim-200">{p.coin ?? "-"}</div>
             <div className="col-span-3 text-right text-dim-200 tabular">
-              {p.amount ?? "—"}
+              {p.amount ?? "-"}
             </div>
             <div className="col-span-2 text-right text-dim-300 tabular">
-              {p.amount_usd ?? "—"}
+              {p.amount_usd ?? "-"}
             </div>
           </div>
         ))}
@@ -311,7 +312,7 @@ function EventsPanel({ events }: { events: EventRow[] }) {
     return (
       <Panel title="Wake events">
         <div className="text-[12px] font-mono text-dim-500">
-          Heartbeat cycle — no watcher events triggered this re-decide.
+          Heartbeat cycle - no watcher events triggered this re-decide.
         </div>
       </Panel>
     );
@@ -328,7 +329,7 @@ function EventsPanel({ events }: { events: EventRow[] }) {
             <span className="text-white">{formatEventKind(e.kind)}</span>
             <span className="text-dim-500"> · </span>
             <span className="text-dim-200">
-              {String(e.payload.message ?? "")}
+              {dedash(String(e.payload.message ?? ""))}
             </span>
           </div>
         ))}

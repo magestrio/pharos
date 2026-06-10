@@ -27,7 +27,7 @@ import {
 import { mantleExplorerAddress } from "@/lib/explorer";
 
 // Gnosis Safe (2-of-3) that owns the agent NFT + signs attestations.
-// Canonical address from CLAUDE.md — not an env-driven deploy artifact.
+// Canonical address from CLAUDE.md - not an env-driven deploy artifact.
 const SAFE_OWNER_ADDRESS = "0x4dc4a70Ae02d7ca2F3A06b1231b3A9312d82a037";
 
 type ContractEntry = {
@@ -55,7 +55,7 @@ const FOOTER_CONTRACTS: ContractEntry[] = [
 ];
 
 // "Human vs AI" tab removed pending mainnet-operations.3 (Human PM
-// baseline) — no real comparison data yet, mocking it is dishonest.
+// baseline) - no real comparison data yet, mocking it is dishonest.
 const TABS = [
   { id: "vault", label: "Agent Dashboard", short: "Dashboard" },
   { id: "decisions", label: "Decision Log", short: "Decisions" },
@@ -65,7 +65,7 @@ type TabId = (typeof TABS)[number]["id"];
 
 type ShellProps = {
   /** Server-fetched cycle list (`frontend-complete.5`). When the API
-   * was unreachable at render time the parent passes `[]` — child
+   * was unreachable at render time the parent passes `[]` - child
    * tabs handle the empty state. */
   initialCycles?: CycleSummary[];
   initialPortfolio?: Portfolio | null;

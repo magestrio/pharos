@@ -52,7 +52,7 @@ export async function GET() {
   });
 }
 
-// Rough USD hint for the dust filter — only need stablecoins to be 1:1
+// Rough USD hint for the dust filter - only need stablecoins to be 1:1
 // and the rest to be priced at zero (they'll fall under the dust threshold).
 function usdHint(coin: string, snap: { market: { btc_price: string; eth_price: string } }): number {
   const c = coin.toUpperCase();

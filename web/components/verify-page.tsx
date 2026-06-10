@@ -124,7 +124,7 @@ function Header() {
       </h1>
       <p className="mt-3 text-[14px] text-dim-300 max-w-2xl leading-relaxed">
         This is the bench: every contract, every decision, every reputation update, every Safe
-        signature in one page. No screenshots, no off-chain assertions — only links to Mantle
+        signature in one page. No screenshots, no off-chain assertions - only links to Mantle
         Explorer + the IPFS gateway.
       </p>
     </div>
@@ -231,7 +231,7 @@ function DecisionsSection() {
                     {ev.ipfsCid.slice(0, 8)}…
                   </a>
                 ) : (
-                  <span className="text-dim-500">—</span>
+                  <span className="text-dim-500">-</span>
                 )}
               </div>
               <div className="col-span-2 text-right">
@@ -285,7 +285,7 @@ function ReputationSection() {
       )}
       {rep.isLive && !history.isLoading && !history.isError && !latest && (
         <div className="text-[12px] text-dim-300 font-mono">
-          No ReputationUpdated events yet — current value:{" "}
+          No ReputationUpdated events yet - current value:{" "}
           <span className="text-white">{formatBpsAsPct(rep.lastScoreBps)}</span>.
         </div>
       )}
@@ -324,7 +324,7 @@ function AttestorSafeSection() {
 
   return (
     <SectionCard
-      title="Bybit attestor — Safe verification"
+      title="Bybit attestor - Safe verification"
       subtitle="2-of-3 Gnosis Safe pushing attested off-chain Bybit Earn balance. Owners are verifiable on Mantle Explorer + the Safe app."
     >
       {!health.isLive && <DeployNotice what="BybitAttestor" />}
@@ -381,7 +381,7 @@ function ExternalDashboardSection() {
   return (
     <SectionCard
       title="External dashboards"
-      subtitle="Mantle supports Dune. Once a public dashboard is published it lands here — TVL, decision rate, reputation curve, hedge funding earned."
+      subtitle="Mantle supports Dune. Once a public dashboard is published it lands here - TVL, decision rate, reputation curve, hedge funding earned."
     >
       <div className="flex flex-wrap gap-3 text-[12px] font-mono">
         <a
@@ -493,7 +493,7 @@ function RowCard({
 function DeployNotice({ what }: { what: string }) {
   return (
     <div className="bg-ink-850/60 border border-ink-600/40 rounded-sm px-3 py-3 text-[12px] font-mono text-warn">
-      {what} not deployed yet — this section populates after mainnet-deploy.
+      {what} not deployed yet - this section populates after mainnet-deploy.
     </div>
   );
 }

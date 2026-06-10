@@ -10,12 +10,12 @@ export const dynamic = "force-static";
 const AGENT_MANIFEST = {
   name: "Vault8004 Agent",
   description:
-    "Autonomous AI portfolio manager for vUSDC — AI-managed yield-bearing USDC wrapper on Mantle. Allocates capital across Aave V3 (on-chain) and Bybit Earn (200+ products via attested oracle) with event-driven rebalancing and 4h cron fallback. Every decision logged on-chain in DecisionLog with rationale pinned to IPFS. Reputation pushed to canonical ERC-8004 ReputationRegistry as cumulative annualized APR in basis points, computed from vUSDC.exchangeRate() growth.",
+    "Autonomous AI portfolio manager for vUSDC - AI-managed yield-bearing USDC wrapper on Mantle. Allocates capital across Aave V3 (on-chain) and Bybit Earn (200+ products via attested oracle) with event-driven rebalancing and 4h cron fallback. Every decision logged on-chain in DecisionLog with rationale pinned to IPFS. Reputation pushed to canonical ERC-8004 ReputationRegistry as cumulative annualized APR in basis points, computed from vUSDC.exchangeRate() growth.",
   image: "ipfs://bafkreidcnwysk4xipcl7mnlkgirrxd6euoe7qq2uhk2opv5lgn7vbp33xa",
   endpoint: "https://vault8004.xyz/agent.json",
   attributes: [
     { trait_type: "Model", value: "Claude Opus 4.7" },
-    { trait_type: "Product", value: "vUSDC — yield-bearing USDC wrapper" },
+    { trait_type: "Product", value: "vUSDC - yield-bearing USDC wrapper" },
     { trait_type: "Strategy", value: "Multi-venue: Aave V3 USDC + Bybit Earn (200+ products) + delta-neutral hedging" },
     { trait_type: "Risk Profile", value: "AI-curated, hedged volatile + stable yield" },
     { trait_type: "Cycle Interval", value: "Event-driven + 4h fallback" },

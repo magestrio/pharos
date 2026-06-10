@@ -68,15 +68,15 @@ function pairPositions(positions: PositionRow[]): ActiveHedge[] {
       spotUsd: Math.round(earnUsd),
       hedgeQty: `${coin}-PERP short`,
       hedgeUsd: Math.round(Math.abs(perpUsd)),
-      // perp leg should be negative (short) — earn leg is positive.
+      // perp leg should be negative (short) - earn leg is positive.
       // Delta = earn + perp; <0.01 of either leg counts as neutral.
       netDelta: earnAmt + perpAmt,
       fundingEarned24h: 0,
       spotApr: 0,
       fundingApr: 0,
       blendedApr: 0,
-      openedAgo: "—",
-      closeTrigger: "—",
+      openedAgo: "-",
+      closeTrigger: "-",
     });
   }
   return hedges.sort((a, b) => b.hedgeUsd - a.hedgeUsd);
@@ -91,7 +91,7 @@ export function useActiveHedges(): ActiveHedgesResult {
     }
     const positions = portfolioQuery.data?.positions ?? [];
     const live = pairPositions(positions);
-    // No mock fallback — when there are no live hedge pairs (no perp leg
+    // No mock fallback - when there are no live hedge pairs (no perp leg
     // matched to an earn leg) the panel renders an empty/honest state.
     return { hedges: live, isLive: live.length > 0, isLoading: portfolioQuery.isLoading };
   }, [mounted, portfolioQuery.data, portfolioQuery.isLoading]);

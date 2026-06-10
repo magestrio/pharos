@@ -5,6 +5,7 @@ import { useMemo, useState } from "react";
 import { RISK_FLAGS, type Decision } from "@/lib/data";
 import { formatTime } from "@/lib/datetime";
 import { venueLabel } from "@/lib/labels";
+import { dedash } from "@/lib/text";
 import { useDecisions } from "@/lib/hooks/use-decisions";
 import { useCycleDetail } from "@/lib/agent-store-context";
 import type { CycleDetail, EventRow, ExecutionRow } from "@/lib/agent-api";
@@ -140,7 +141,7 @@ export function DecisionLog() {
               {isLoading
                 ? "Loading agent decisions…"
                 : decisions.length === 0
-                  ? "No decisions recorded yet — the log fills in once the agent completes its first cycle."
+                  ? "No decisions recorded yet - the log fills in once the agent completes its first cycle."
                   : "No decisions match this filter."}
             </div>
           )}
@@ -197,12 +198,12 @@ function DecisionItem({
   onToggle: () => void;
   first: boolean;
 }) {
-  // Risk LOW reads better as teal `pos` — green = "low risk, safe" stays
+  // Risk LOW reads better as teal `pos` - green = "low risk, safe" stays
   // intuitive, and we free amber up for brand accents.
   const riskTone: "pos" | "warn" | "red" =
     d.risk === "LOW" ? "pos" : d.risk === "MED" ? "warn" : "red";
   const summaryHasNoOp = /held|no-op/i.test(d.summary);
-  // Off-chain rich detail fetched lazily — only when the row is open
+  // Off-chain rich detail fetched lazily - only when the row is open
   // and the join produced a cycle_ts (live row, not a mock fallback).
   const detailQuery = useCycleDetail(open && d.cycleTs ? d.cycleTs : null);
   return (
@@ -361,7 +362,7 @@ function RationaleView({
       <div className="space-y-2.5">
         <Eyebrow tone="accent">Agent&apos;s notes</Eyebrow>
         <p className="font-sans text-[15px] leading-[1.7] text-dim-100 whitespace-pre-wrap">
-          {reflection}
+          {dedash(reflection)}
         </p>
       </div>
       <div className="bg-ink-850/60 border border-ink-600/50 rounded-md overflow-hidden">
@@ -459,7 +460,7 @@ function DecisionThesis({
               </div>
             )}
           </div>
-          {d.allora && d.allora.trim() !== "—" && d.allora.trim() !== "" && (
+          {d.allora && d.allora.trim() !== "-" && d.allora.trim() !== "" && (
             <div>
               <ThesisBlock title="Allora signal used" body={d.allora} accent="elec" />
             </div>
@@ -579,7 +580,7 @@ function VenueAllocationsBlock({
                           </span>
                         </div>
                         {note && (
-                          <div className="text-[11px] text-dim-400 leading-snug mt-0.5">{note}</div>
+                          <div className="text-[11px] text-dim-400 leading-snug mt-0.5">{dedash(note)}</div>
                         )}
                       </div>
                     );
@@ -676,7 +677,7 @@ function ValidatorStatusBlock({
     <div>
       <SubBlockTitle>Validator</SubBlockTitle>
       {ok ? (
-        <div className="text-[12px] font-mono text-pos">validator passed — all hard caps respected</div>
+        <div className="text-[12px] font-mono text-pos">validator passed - all hard caps respected</div>
       ) : (
         <div className="space-y-1.5">
           <div className="text-[12px] font-mono text-danger">validator rejected · {errors.length} issue(s)</div>

@@ -1,13 +1,13 @@
 // Human-readable labels for the technical enums the agent emits.
 //
-// Single source of truth for the UI — venue ids, wake reasons, cycle
+// Single source of truth for the UI - venue ids, wake reasons, cycle
 // results, watcher event kinds, and executed-action kinds all surface as
 // raw snake/colon strings in the API; this module maps them to branded,
 // readable text. Venue ids mirror `VenueId` in
 // `agent/agent/reason/venues.py`; event kinds mirror
 // `agent/agent/sandbox/watcher.py`.
 //
-// All functions are pure and deterministic — safe for SSR (no locale or
+// All functions are pure and deterministic - safe for SSR (no locale or
 // timezone dependence).
 
 /** snake_case / colon-delimited → Title Case. Fallback for unknown kinds. */
@@ -18,7 +18,7 @@ function humanize(s: string): string {
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-// Branded venue casing (LM, OnChain) — explicit, not derivable from humanize.
+// Branded venue casing (LM, OnChain) - explicit, not derivable from humanize.
 const VENUE_LABELS: Record<string, string> = {
   cash_usdc: "Cash USDC",
   aave_v3_usdc: "Aave V3 USDC",

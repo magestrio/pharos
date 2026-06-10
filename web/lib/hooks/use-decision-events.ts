@@ -24,7 +24,7 @@ export interface OnChainDecisionEvent {
   decisionId: `0x${string}`;
   ipfsCid: string;
   actionHash: `0x${string}`;
-  timestamp: number; // Unix seconds — from event payload, NOT block timestamp
+  timestamp: number; // Unix seconds - from event payload, NOT block timestamp
   txHash: `0x${string}`;
   blockNumber: bigint;
   logIndex: number;

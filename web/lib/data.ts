@@ -2,7 +2,7 @@
  * Shared UI types + the static validator risk-flag legend.
  *
  * All fabricated pre-mainnet numbers (mock VAULT stats, AI/Human race
- * series, placeholder addresses, ticker items) have been removed — the
+ * series, placeholder addresses, ticker items) have been removed - the
  * UI now reads everything from live hooks (`use-vault-stats`,
  * `use-reputation`, `agent-store-context`, `/api/capital-history`, …)
  * and contract addresses from `@/lib/contracts`. What's left here is

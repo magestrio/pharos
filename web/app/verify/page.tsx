@@ -16,7 +16,7 @@ import { VerifyPage } from "@/components/verify-page";
 
 export const dynamic = "force-dynamic";
 export const metadata = {
-  title: "Pharos — Judge Verification Surface",
+  title: "Pharos - Judge Verification Surface",
   description:
     "All on-chain verification paths for Pharos in one page: contract addresses, decision log proofs, reputation history, attestor Safe.",
 };

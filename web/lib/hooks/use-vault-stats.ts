@@ -16,7 +16,7 @@ const SSR_PLACEHOLDER_STATS: VaultStats = {
 };
 
 const EXCHANGE_RATE_SCALE = 1_000_000_000_000_000_000n; // 1e18
-const USDC_SCALE = 1_000_000n; // 1e6 — vUSDC + USDC raw units
+const USDC_SCALE = 1_000_000n; // 1e6 - vUSDC + USDC raw units
 const MS_PER_DAY = 86_400_000;
 const REFETCH_INTERVAL_MS = 30_000;
 
@@ -103,7 +103,7 @@ export function useVaultStats(): VaultStats {
       daysLive,
       isLoading: portfolioQuery.isLoading,
       isError: portfolioQuery.isError,
-      // "Live" means we have real numbers to show — off-chain equity counts.
+      // "Live" means we have real numbers to show - off-chain equity counts.
       isLive: offchainTvlUsd !== null,
     };
   }

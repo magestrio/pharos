@@ -53,7 +53,7 @@ import {
   Tag,
 } from "@/components/ui";
 
-// 2-of-3 Gnosis Safe owner / attestor signer — canonical address from
+// 2-of-3 Gnosis Safe owner / attestor signer - canonical address from
 // CLAUDE.md, a real static fact (not an env-driven deploy artifact).
 const SAFE_OWNER_ADDRESS = "0x4dc4a70Ae02d7ca2F3A06b1231b3A9312d82a037";
 
@@ -66,7 +66,7 @@ export function VaultCard() {
       <StatsRow stats={stats} />
       <MintRedeemPanel />
       {/* Capital-growth section pulls its own series from
-          /api/capital-history — real per-cycle equity reconstructed
+          /api/capital-history - real per-cycle equity reconstructed
           from store positions, falls back to a clear empty state when
           there's not enough history yet. */}
       <CapitalGrowthSection stats={stats} />
@@ -93,7 +93,7 @@ function HeroBlock({ stats }: { stats: VaultStats }) {
             <span className="font-mono text-accent align-middle text-[0.72em] mr-2">
               vUSDC
             </span>
-            <span className="text-dim-500 font-normal">—</span> AI-Managed
+            <span className="text-dim-500 font-normal">-</span> AI-Managed
             <br />
             Yield-Bearing USDC
             <span className="font-mono text-accent">.</span>
@@ -119,7 +119,7 @@ function HeroBlock({ stats }: { stats: VaultStats }) {
             <span className="text-white tabular">Claude Sonnet 4.6</span>
             <span className="h-2.5 w-px bg-dim-600/70" />
             <span className="text-white tabular">
-              {stats.daysLive > 0 ? `${stats.daysLive}d live` : "—"}
+              {stats.daysLive > 0 ? `${stats.daysLive}d live` : "-"}
             </span>
             <span className="h-2.5 w-px bg-dim-600/70" />
             <span>Mantle Mainnet</span>
@@ -142,7 +142,7 @@ function HeroBlock({ stats }: { stats: VaultStats }) {
 function HeroBadgeLine() {
   // ERC-8004 AGENT_ID=99 is the only on-chain identity actually wired
   // (registered 2026-05-24, owner = SAFE). Reputation NFT score is
-  // not yet readable — ReputationOracle deferred to Phase B. Showing
+  // not yet readable - ReputationOracle deferred to Phase B. Showing
   // a mock "1247" was the bug; just omit it until live.
   const rep = useReputation();
   const repLabel = rep.isLive && rep.lastScoreBps !== null
@@ -215,7 +215,7 @@ function ReputationNFTCard() {
 
   // This card only renders when `rep.isLive` (the non-live branch shows
   // ReputationNFTCardLive's placeholder), so every value here is real
-  // on-chain data — no mock fallback.
+  // on-chain data - no mock fallback.
   const liveScoreBps = rep.lastScoreBps;
   const liveScoreLabel = liveScoreBps !== null ? formatBpsAsPct(liveScoreBps) : null;
   // Cap live bar at +50% APR (5000 bps) for visual scaling; anything
@@ -265,7 +265,7 @@ function ReputationNFTCard() {
           </Eyebrow>
           <div className="flex items-baseline gap-2">
             <div className="font-serif text-[88px] leading-[0.85] font-semibold text-white tabular tracking-[-0.04em]">
-              {liveScoreLabel ?? "—"}
+              {liveScoreLabel ?? "-"}
             </div>
             <div className="text-dim-500 font-mono text-[18px] tabular self-start mt-3">
               ERC-8004
@@ -283,14 +283,14 @@ function ReputationNFTCard() {
           </div>
         </div>
 
-        {/* Sharpe / Max DD / Win Rate are realized-performance metrics —
+        {/* Sharpe / Max DD / Win Rate are realized-performance metrics -
             no live source exists yet (needs vUSDC exchangeRate history),
-            so they render "—" rather than fabricated numbers. Decisions
+            so they render "-" rather than fabricated numbers. Decisions
             is the real cycle count. */}
         <div className="grid grid-cols-2 gap-px bg-ink-600/40 border-t border-ink-600/60">
-          <MetricCell label="Sharpe" value="—" />
-          <MetricCell label="Max DD" value="—" />
-          <MetricCell label="Win Rate" value="—" />
+          <MetricCell label="Sharpe" value="-" />
+          <MetricCell label="Max DD" value="-" />
+          <MetricCell label="Win Rate" value="-" />
           <MetricCell label="Decisions" value={String(decisionsCount)} />
         </div>
 
@@ -334,13 +334,13 @@ function ReputationNFTCard() {
           <div className="min-h-[42px] text-[11px] font-mono">
             {!rep.isLive && (
               <div className="text-warn leading-relaxed">
-                ReputationOracle not deployed yet — wire `NEXT_PUBLIC_REPUTATION_ORACLE_ADDRESS` after the mainnet-deploy epic.
+                ReputationOracle not deployed yet - wire `NEXT_PUBLIC_REPUTATION_ORACLE_ADDRESS` after the mainnet-deploy epic.
               </div>
             )}
             {rep.isLive && !update.data && previewLabel && rep.canUpdate && (
               <div className="text-dim-300 leading-relaxed">
                 Next call sets score to <span className="text-accent">{previewLabel}</span>{" "}
-                from {liveScoreLabel ?? "—"} (annualized over {Math.round((rep.previewElapsedSec ?? 0) / 86400)}d).
+                from {liveScoreLabel ?? "-"} (annualized over {Math.round((rep.previewElapsedSec ?? 0) / 86400)}d).
               </div>
             )}
             {rep.isLive && !update.data && !rep.canUpdate && (
@@ -348,7 +348,7 @@ function ReputationNFTCard() {
                 Throttle: 1 update / hour. Last call was{" "}
                 {rep.lastUpdateTimestamp
                   ? formatCountdown(rep.minIntervalSec - rep.secondsUntilNext)
-                  : "—"}{" "}
+                  : "-"}{" "}
                 ago.
               </div>
             )}
@@ -378,7 +378,7 @@ function ReputationNFTCard() {
                   <LiveDot /> Confirmed
                 </div>
                 <div className="text-dim-400">
-                  Score → <span className="text-white">{liveScoreLabel ?? "—"}</span>
+                  Score → <span className="text-white">{liveScoreLabel ?? "-"}</span>
                 </div>
                 <a
                   href={mantleExplorerTx(update.data)}
@@ -444,14 +444,14 @@ function MetricCell({ label, value }: { label: string; value: string; border?: s
 }
 
 function formatTvl(tvlUsdc: number | undefined): string {
-  if (tvlUsdc === undefined) return "—";
+  if (tvlUsdc === undefined) return "-";
   if (tvlUsdc >= 1_000_000) return "$" + (tvlUsdc / 1_000_000).toFixed(3) + "M";
   if (tvlUsdc >= 1_000) return "$" + (tvlUsdc / 1_000).toFixed(2) + "k";
   return "$" + tvlUsdc.toFixed(2);
 }
 
 function StatsRow({ stats }: { stats: VaultStats }) {
-  // Live data — derive APY + decisions count from the cycle history so
+  // Live data - derive APY + decisions count from the cycle history so
   // numbers reflect what the agent actually did (vs. mock VAULT consts).
   const cyclesQuery = useCycles({ limit: 50 });
   const cycles = cyclesQuery.data ?? [];
@@ -467,7 +467,7 @@ function StatsRow({ stats }: { stats: VaultStats }) {
     <section className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
       <StatCard
         label="vUSDC Exchange Rate"
-        value={stats.exchangeRate !== undefined ? stats.exchangeRate.toFixed(5) : "—"}
+        value={stats.exchangeRate !== undefined ? stats.exchangeRate.toFixed(5) : "-"}
         tone="green"
         sub={
           stats.cumReturnPct !== undefined ? (
@@ -490,7 +490,7 @@ function StatsRow({ stats }: { stats: VaultStats }) {
       />
       <StatCard
         label="Avg Expected APR"
-        value={avgApr !== null ? avgApr.toFixed(1) + "%" : "—"}
+        value={avgApr !== null ? avgApr.toFixed(1) + "%" : "-"}
         sub={
           avgApr !== null ? (
             <span>mean across {aprSamples.length} cycles</span>
@@ -526,7 +526,7 @@ function useCapitalHistory(limit = 60) {
 }
 
 function CapitalGrowthSection({ stats: _stats }: { stats: VaultStats }) {
-  // Real series — each point is `Σ positions[cycle].amount_usd` for one
+  // Real series - each point is `Σ positions[cycle].amount_usd` for one
   // historical cycle. No mock fallback: when the agent hasn't logged
   // enough cycles yet, the chart renders an honest empty state instead
   // of a fabricated curve.
@@ -556,7 +556,7 @@ function CapitalGrowthSection({ stats: _stats }: { stats: VaultStats }) {
   const endUsd = series.length > 0 ? series[series.length - 1].equityUsd : 0;
   const gainUsd = endUsd - startUsd;
   const gainPct = startUsd > 0 ? (gainUsd / startUsd) * 100 : 0;
-  const startDate = series.length > 0 ? series[0].ts.slice(0, 10) : "—";
+  const startDate = series.length > 0 ? series[0].ts.slice(0, 10) : "-";
 
   const numericSeries = series.map((p) => p.equityUsd);
   const enoughForChart = numericSeries.length >= 3;
@@ -612,7 +612,7 @@ function CapitalGrowthSection({ stats: _stats }: { stats: VaultStats }) {
             </span>
             <span>
               {points.length} historical {points.length === 1 ? "point" : "points"} ·
-              live equity {liveEquity !== undefined ? fmtUsd(liveEquity) : "—"}
+              live equity {liveEquity !== undefined ? fmtUsd(liveEquity) : "-"}
             </span>
             <span className="text-dim-500">
               Chart fills in once the agent logs at least 3 cycles with positions.
@@ -665,18 +665,18 @@ function portfolioToBybitSubRows(positions: PositionRow[]): Allocation[] {
 // ─── Grouped allocation: trades vs passive earn vs cash ──────────────
 //
 // Positions arrive as a flat venue-level list. For the dashboard the
-// useful unit is a "trade" — a base leg + its hedge — not a venue. We
+// useful unit is a "trade" - a base leg + its hedge - not a venue. We
 // pair perp shorts with same-coin earn legs into one delta-neutral
 // trade card; stable earns with no hedge become "passive earn";
 // idle USDC becomes the cash buffer.
 //
 // Data sources (merged):
-//   • `/api/portfolio` (live Bybit snapshot) — every active earn
+//   • `/api/portfolio` (live Bybit snapshot) - every active earn
 //     position row + Spot/Funding holdings. The store-cycle row often
 //     only saves a single OnChain Earn record per coin even when Bybit
-//     holds three sub-orders — live is the only honest source for the
+//     holds three sub-orders - live is the only honest source for the
 //     full earn breakdown.
-//   • agent-store `/portfolio/current` — perp positions (hedge legs).
+//   • agent-store `/portfolio/current` - perp positions (hedge legs).
 //     Live `/api/portfolio` doesn't include perp side; the store does.
 // We rebuild `positions[]` from both so the grouping operates on the
 // real, complete set.
@@ -699,7 +699,7 @@ function categoryToVenue(category: string | undefined | null): string {
   return EARN_CATEGORY_TO_VENUE[category] ?? "bybit_flex";
 }
 
-// Bybit's `holdings[].equity` is the COIN AMOUNT, not USD — even when
+// Bybit's `holdings[].equity` is the COIN AMOUNT, not USD - even when
 // `valuationCurrency: USD` sits on the parent account. For non-stables
 // we have to derive the unit price ourselves. We do it per-account:
 //   USD-priced totalEquity − Σ(stable amounts at $1)
@@ -736,7 +736,7 @@ type AccountLike = {
  * portion from `totalEquity` and divide the remainder across the
  * non-stable holdings. The single-non-stable case (Earn account holding
  * just TON next to a stable) yields an exact price; the multi-coin case
- * falls back to an amount-weighted average — better than zero.
+ * falls back to an amount-weighted average - better than zero.
  */
 function derivePrices(accounts: AccountLike[]): Map<string, number> {
   const prices = new Map<string, number>();
@@ -761,7 +761,7 @@ function derivePrices(accounts: AccountLike[]): Map<string, number> {
       const h = nonStables[0];
       if (h.equity > 0) prices.set(h.coin, remainder / h.equity);
     } else {
-      // Multi-coin non-stable bucket — fall back to a single
+      // Multi-coin non-stable bucket - fall back to a single
       // amount-weighted price applied uniformly. Imprecise but better
       // than 0; only kicks in for messy accounts (Unified spot dust).
       const totalAmt = nonStables.reduce((s, h) => s + h.equity, 0);
@@ -778,7 +778,7 @@ function derivePrices(accounts: AccountLike[]): Map<string, number> {
  * Rebuild a complete `positions[]` from the live Bybit snapshot, with
  * accurate USD per position. Bybit returns `active_earn_positions[]`
  * with coin amounts but no per-row USD; we infer it from the Earn
- * account's `holdings[coin].equity` — the authoritative USD figure —
+ * account's `holdings[coin].equity` - the authoritative USD figure -
  * and split it across same-coin rows proportionally to `amount`. Spot
  * balances (USDT/USDC in UnifiedTrading + Funding) become cash rows.
  * Perp legs are taken from the agent-store positions because Bybit's
@@ -795,7 +795,7 @@ function buildPositionsFromLive(
   const prices = derivePrices(accounts);
   const priceOf = (coin: string): number => prices.get(coin) ?? (isStable(coin) ? 1 : 0);
 
-  // 1. Earn positions — every active_earn_positions row gets its own
+  // 1. Earn positions - every active_earn_positions row gets its own
   //    PositionRow. USD = amount × derived price. Stables resolve
   //    exactly; non-stables (TON) use the per-account price inferred
   //    from `accounts[Earn].totalEquity`.
@@ -836,7 +836,7 @@ function buildPositionsFromLive(
     });
   }
 
-  // 3. Perp legs — only the store knows about derivatives. Live
+  // 3. Perp legs - only the store knows about derivatives. Live
   //    `/api/portfolio` omits the perp side entirely.
   for (const p of storePositions) {
     if (p.venue === "perp") out.push(p);
@@ -845,7 +845,7 @@ function buildPositionsFromLive(
   return out;
 }
 
-// Donut palette — aligned with the per-leg colours used inside trade
+// Donut palette - aligned with the per-leg colours used inside trade
 // cards: gold/amber for base earn venues, blue for perp hedge legs (we
 // no longer show them in the donut but the legend item uses the same
 // hue), neutral grey for cash buffer.
@@ -966,7 +966,7 @@ function groupPositions(positions: PositionRow[]): {
       for (const e of earns) {
         passive.push({
           key: `${e.venue}/${e.product_id}/${e.coin ?? ""}`,
-          coin: coin === "_nocoin" ? (e.coin ?? "—") : coin,
+          coin: coin === "_nocoin" ? (e.coin ?? "-") : coin,
           venue: e.venue,
           productId: e.product_id,
           amountUsd: numStr(e.amount_usd),
@@ -1047,9 +1047,9 @@ function TradeCard({ trade, totalUsd }: { trade: HedgedTrade; totalUsd: number }
     exposed: "red" as const,
   }[status];
   const statusTitle = {
-    neutral: `Within ±${(NEUTRAL_BAND * 100).toFixed(0)}% tolerance — treated as delta-neutral.`,
-    drift: `Drift ${driftPct.toFixed(1)}% — within operator band (±${(DRIFT_BAND * 100).toFixed(0)}%). Re-hedge next cycle.`,
-    exposed: `Drift ${driftPct.toFixed(1)}% — beyond ±${(DRIFT_BAND * 100).toFixed(0)}% band. Position is directionally exposed until re-hedge.`,
+    neutral: `Within ±${(NEUTRAL_BAND * 100).toFixed(0)}% tolerance - treated as delta-neutral.`,
+    drift: `Drift ${driftPct.toFixed(1)}% - within operator band (±${(DRIFT_BAND * 100).toFixed(0)}%). Re-hedge next cycle.`,
+    exposed: `Drift ${driftPct.toFixed(1)}% - beyond ±${(DRIFT_BAND * 100).toFixed(0)}% band. Position is directionally exposed until re-hedge.`,
   }[status];
 
   const netUsd =
@@ -1295,7 +1295,7 @@ function AllocationSection({
     if (positions.length === 0) return allocation.rows;
     const usdByVenue = new Map<string, number>();
     for (const p of positions) {
-      // Perp is the hedge leg, not a capital allocation — including it
+      // Perp is the hedge leg, not a capital allocation - including it
       // would double-count the base leg and overstate TVL.
       if (p.venue === "perp") continue;
       const usd = numStr(p.amount_usd);
@@ -1334,7 +1334,7 @@ function AllocationSection({
         subtitle={
           <>
             TVL = base earn + cash buffer. Perp hedge margin is shown paired
-            with its base inside each trade (off-book — adding it would
+            with its base inside each trade (off-book - adding it would
             double-count exposure).
           </>
         }
@@ -1345,13 +1345,13 @@ function AllocationSection({
             data={donutSource.map((a) => ({ pct: a.pct, color: a.color, label: a.key }))}
             size={220}
             thickness={18}
-            centerValue={tvlUsdc ? formatTvl(tvlUsdc) : "—"}
+            centerValue={tvlUsdc ? formatTvl(tvlUsdc) : "-"}
             centerLabel="TVL · USD"
           />
           <div className="mt-5 grid grid-cols-1 gap-2 w-full">
             {donutSource.length === 0 && (
               <div className="text-[11px] font-mono text-dim-500 text-center py-4">
-                No positions held — agent fully in cash this cycle.
+                No positions held - agent fully in cash this cycle.
               </div>
             )}
             {donutSource.map((a) => (
@@ -1366,7 +1366,7 @@ function AllocationSection({
             ))}
             {/* Hedge margin sits OUTSIDE the donut percentages because it
                 represents perp collateral, not capital exposure. Show it
-                explicitly so the reader sees it isn't missing — just
+                explicitly so the reader sees it isn't missing - just
                 accounted for separately. */}
             {trades.length > 0 && (
               <div className="flex items-center gap-2 text-[11px] font-mono pt-2 mt-1 border-t border-ink-600/40">
@@ -1472,7 +1472,7 @@ function AllocationSection({
                       <div className="font-mono text-[10.5px] text-dim-500 tabular mt-0.5">
                         {tvlUsdc > 0
                           ? `${((c.amountUsd / tvlUsdc) * 100).toFixed(1)}%`
-                          : "—"}
+                          : "-"}
                       </div>
                     </div>
                   </div>
@@ -1490,7 +1490,7 @@ function AttestorAndHedgesSection() {
   const health = useAttestorHealth();
   const hedges = useActiveHedges();
   // Both legs need real signal to keep this section visible. Mock-only
-  // attestor + zero hedges is not "what the agent does today" — hide.
+  // attestor + zero hedges is not "what the agent does today" - hide.
   if (!health.isLive && !hedges.isLive) return null;
   return (
     <section>
@@ -1537,7 +1537,7 @@ function AttestorHealthCard() {
         </div>
         <div className="p-5 space-y-4 flex-1 text-[12px] text-dim-300 leading-relaxed">
           <p>
-            The BybitAttestor contract isn&apos;t deployed on mainnet yet — once
+            The BybitAttestor contract isn&apos;t deployed on mainnet yet - once
             live, this panel shows the real attestation lag, push count, and
             freeze status read straight from the chain.
           </p>
@@ -1559,12 +1559,12 @@ function AttestorHealthCard() {
     );
   }
 
-  // Live path — every value below is read from the on-chain attestor.
+  // Live path - every value below is read from the on-chain attestor.
   const lagMin = Math.floor(health.lagSec / 60);
   const lagSubMin = health.lagSec < 60;
   const warnMin = Math.floor(health.warnThresholdSec / 60);
   const criticalMin = Math.floor(health.criticalThresholdSec / 60);
-  const pushStreak = health.pushCount ?? "—";
+  const pushStreak = health.pushCount ?? "-";
   const attestorAddr = health.attestorAddress ?? SAFE_OWNER_ADDRESS;
   const cadence = formatHeartbeatShort(health.heartbeatSec);
   const status = health.status;
@@ -1630,7 +1630,7 @@ function AttestorHealthCard() {
           </div>
           <div className="bg-ink-900 px-3 py-2.5">
             <div className="text-[9.5px] font-mono uppercase tracking-[0.16em] text-dim-500">Lagged 24h</div>
-            <div className="font-mono text-base text-neon tabular mt-1">—</div>
+            <div className="font-mono text-base text-neon tabular mt-1">-</div>
           </div>
         </div>
 
@@ -1666,7 +1666,7 @@ function AttestorHealthCard() {
 
 function HedgeTransparencyCard() {
   const { hedges, isLive } = useActiveHedges();
-  const dash = (live: boolean) => (live ? "—" : null);
+  const dash = (live: boolean) => (live ? "-" : null);
   return (
     <div className="bg-ink-900 border border-ink-600/70 rounded-md overflow-hidden h-full flex flex-col">
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-ink-600/70 bg-ink-850">
@@ -1752,7 +1752,7 @@ function HedgeTransparencyCard() {
       </div>
       <div className="border-t border-ink-600/70 bg-ink-850 px-4 py-2.5 flex items-center justify-between text-[11px] font-mono">
         <span className="text-dim-500 uppercase tracking-[0.14em] text-[9.5px]">Lifetime funding harvested</span>
-        <span className="text-dim-400 tabular">—</span>
+        <span className="text-dim-400 tabular">-</span>
       </div>
     </div>
   );
@@ -1785,7 +1785,7 @@ function cycleToRecentRow(cycle: CycleSummary): RecentRow {
   const summary = cycle.error
     ? `Cycle errored: ${cycle.error.slice(0, 80)}`
     : acted === 0 || cycle.result === "no_change"
-      ? `Held — ${cycle.wake_reason}`
+      ? `Held - ${cycle.wake_reason}`
       : `${acted} action${acted === 1 ? "" : "s"} executed (${cycle.wake_reason})`;
   const risk: "LOW" | "MED" | "HIGH" = cycle.error
     ? "HIGH"
@@ -1856,7 +1856,7 @@ function PlannedVsActualSection() {
       <SectionHead
         eyebrow="Planned vs Actual"
         title="Decision target vs what's actually held"
-        subtitle="Latest cycle's allocation intent (left) compared to the snapshot's real positions (right). Non-zero `Δ` means the executor hasn't filled the rebalance yet — happens in dry-run, mid-cycle, or when a rate-limited subscribe is pending."
+        subtitle="Latest cycle's allocation intent (left) compared to the snapshot's real positions (right). Non-zero `Δ` means the executor hasn't filled the rebalance yet - happens in dry-run, mid-cycle, or when a rate-limited subscribe is pending."
         right={
           <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-sm border border-ink-500 bg-ink-900 font-mono text-[10.5px] uppercase tracking-[0.14em] ${fillTone}`}>
             {fillStatus}
@@ -1919,7 +1919,7 @@ function RecentWatcherEventsWidget() {
       <SectionHead
         eyebrow="Watcher Feed"
         title="Recent watcher events"
-        subtitle="Position-level watchers that wake the agent off the 4h cron cadence — funding flips, attestor lag, peg deviations, pending redemptions. Each event links to the cycle it triggered."
+        subtitle="Position-level watchers that wake the agent off the 4h cron cadence - funding flips, attestor lag, peg deviations, pending redemptions. Each event links to the cycle it triggered."
         right={
           <Link
             href="/history"
@@ -2010,7 +2010,7 @@ function RecentDecisionsPreview() {
         )}
         {showEmpty && (
           <div className="px-4 sm:px-5 py-5 text-center text-[12px] font-mono text-dim-400">
-            No cycles recorded yet — the agent will populate this once the first loop completes.
+            No cycles recorded yet - the agent will populate this once the first loop completes.
           </div>
         )}
         {recent.map((r, i) => {

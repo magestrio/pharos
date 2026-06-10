@@ -1,5 +1,5 @@
 /**
- * Cycle history — server-rendered list (`data-store.6`).
+ * Cycle history - server-rendered list (`data-store.6`).
  *
  * Hits the FastAPI `/cycles` endpoint on every request (no caching;
  * this is live data). Each row links to the detail panel at
@@ -14,7 +14,7 @@ import { formatResult, formatWakeReason } from "@/lib/labels";
 import { Card, Eyebrow, SectionHead, Tag } from "@/components/ui";
 
 export const dynamic = "force-dynamic";
-export const metadata = { title: "Pharos — Cycle History" };
+export const metadata = { title: "Pharos - Cycle History" };
 
 export default async function HistoryPage() {
   let cycles: CycleSummary[] = [];
@@ -45,7 +45,7 @@ export default async function HistoryPage() {
         <SectionHead
           eyebrow="Decision cycles"
           title="Cycle History"
-          subtitle="Every re-decide the agent has run — heartbeat and event-driven — with its wake trigger, outcome, confidence and expected APR. Click a row for the full thesis, positions and on-chain proofs."
+          subtitle="Every re-decide the agent has run - heartbeat and event-driven - with its wake trigger, outcome, confidence and expected APR. Click a row for the full thesis, positions and on-chain proofs."
           right={
             <Eyebrow tone="dim" className="tabular">
               {cycles.length} cycles
@@ -111,14 +111,14 @@ function CycleRow({ row }: { row: CycleSummary }) {
         <Tag tone={resultTagTone(row.result)}>{formatResult(row.result)}</Tag>
       </div>
       <div className="col-span-1 text-right text-dim-300 tabular">
-        {row.confidence !== null ? row.confidence.toFixed(2) : "—"}
+        {row.confidence !== null ? row.confidence.toFixed(2) : "-"}
       </div>
       <div className="col-span-1 text-right text-dim-300 tabular">
-        {row.expected_apr_pct !== null ? row.expected_apr_pct.toFixed(2) : "—"}
+        {row.expected_apr_pct !== null ? row.expected_apr_pct.toFixed(2) : "-"}
       </div>
       <div className="col-span-1 text-right text-dim-300 tabular">
-        {row.actions_executed ?? "—"}
-        <span className="text-dim-600">/{row.actions_planned ?? "—"}</span>
+        {row.actions_executed ?? "-"}
+        <span className="text-dim-600">/{row.actions_planned ?? "-"}</span>
       </div>
       <div className="col-span-2 text-right text-dim-500 group-hover:text-accent transition-colors">
         view →

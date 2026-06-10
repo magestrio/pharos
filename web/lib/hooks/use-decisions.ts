@@ -64,7 +64,7 @@ function deriveSummary(cycle: CycleSummary | null): string {
   if (cycle.error) return `Cycle errored: ${cycle.error.slice(0, 80)}`;
   const acted = cycle.actions_executed ?? 0;
   if (cycle.result === "no_change" || acted === 0) {
-    return `Held — ${cycle.wake_reason}`;
+    return `Held - ${cycle.wake_reason}`;
   }
   return `${acted} action${acted === 1 ? "" : "s"} executed (${cycle.wake_reason})`;
 }
@@ -77,9 +77,9 @@ function deriveRisk(cycle: CycleSummary | null): "LOW" | "MED" | "HIGH" {
 }
 
 function deriveExec(cycle: CycleSummary | null): string {
-  if (!cycle || !cycle.finished_at) return "—";
+  if (!cycle || !cycle.finished_at) return "-";
   const ms = new Date(cycle.finished_at).getTime() - new Date(cycle.started_at).getTime();
-  if (!Number.isFinite(ms) || ms < 0) return "—";
+  if (!Number.isFinite(ms) || ms < 0) return "-";
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
@@ -113,7 +113,7 @@ function buildDecision(
       ? `Cycle ${cycle.cycle_ts} · wake=${cycle.wake_reason} · result=${cycle.result}. Full rationale loads on expand (.9).`
       : "Full rationale loads from off-chain cycle data once available.",
     risks: cycle?.error ? `Cycle errored: ${cycle.error}` : "None.",
-    allora: "—",
+    allora: "-",
     flags: [],
     ipfs: event.ipfsCid,
     tx: event.txHash,
@@ -138,7 +138,7 @@ function decisionFromCycle(cycle: CycleSummary, nowMs: number): Decision {
     conviction: deriveConviction(cycle),
     thesis: `Cycle ${cycle.cycle_ts} · wake=${cycle.wake_reason} · result=${cycle.result}. Expand for full snapshot + decision detail.`,
     risks: cycle.error ? `Cycle errored: ${cycle.error}` : "None.",
-    allora: "—",
+    allora: "-",
     flags: [],
     ipfs: "",
     tx: "",
@@ -155,7 +155,7 @@ function decisionFromCycle(cycle: CycleSummary, nowMs: number): Decision {
  *
  * Pre-deploy fallback: when the DecisionLog contract isn't configured
  * (Phase A on-chain leg deferred), we derive decisions directly from
- * the agent cycle history — no on-chain join, no mock data.
+ * the agent cycle history - no on-chain join, no mock data.
  */
 export function useDecisions(): DecisionsResult {
   const mounted = useIsMounted();

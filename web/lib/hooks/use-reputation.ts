@@ -11,7 +11,7 @@ import { useIsMounted } from "@/lib/hooks/use-is-mounted";
 const REFETCH_INTERVAL_MS = 30_000;
 
 export interface ReputationState {
-  // Last on-chain score in bps (signed — negative if underwater).
+  // Last on-chain score in bps (signed - negative if underwater).
   lastScoreBps: number | null;
   // Preview of what the next call to updateReputation() would set.
   previewScoreBps: number | null;
@@ -33,7 +33,7 @@ export interface ReputationState {
 
 // Returned during SSR + the very first client render, so the
 // hydration tree matches whatever the server emitted (server has no
-// wagmi data and no wall clock — we MUST NOT diverge here).
+// wagmi data and no wall clock - we MUST NOT diverge here).
 const SSR_PLACEHOLDER: ReputationState = {
   lastScoreBps: null,
   previewScoreBps: null,
@@ -149,7 +149,7 @@ function pickBigSigned(
 }
 
 export function formatBpsAsPct(bps: number | null): string {
-  if (bps === null) return "—";
+  if (bps === null) return "-";
   return `${(bps / 100).toFixed(2)}%`;
 }
 

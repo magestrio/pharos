@@ -4,7 +4,7 @@
  * Structured render of an agent decision thesis.
  *
  * The Claude prompt produces a single rationale blob. We parse it into
- * the canonical sections a quant reader expects — TL;DR, market
+ * the canonical sections a quant reader expects - TL;DR, market
  * SIGNALS as chips, REGIME (1-2 lines), REASONING, optional SELF-CORRECTION
  * inside a `[show working ▾]` toggle, and the final ALLOCATION shown as
  * a stacked-bar with the blended-APR formula spelled out.
@@ -19,12 +19,14 @@
  *   • reasoning = whatever's left after removing the categories above
  *
  * Anything that doesn't parse falls back to a clean mono pre-wrap. We
- * deliberately avoid italic serif on the body — the editorial pull-quote
+ * deliberately avoid italic serif on the body - the editorial pull-quote
  * read clearly hurts readability of dense numeric prose. Serif italic
  * is reserved for short headlines / eyebrows.
  */
 
 import React, { useState } from "react";
+
+import { dedash } from "@/lib/text";
 
 // ─────────────────────────── parsing ─────────────────────────────────
 
@@ -95,7 +97,7 @@ function looksLikeSelfCorrection(sentence: string): boolean {
 }
 
 function splitSentences(text: string): string[] {
-  // Conservative sentence splitter — won't break on decimals or
+  // Conservative sentence splitter - won't break on decimals or
   // shorthand like `$1.99/TON`. Splits on `. `, `! `, `? ` followed
   // by an uppercase letter.
   return text
@@ -243,7 +245,7 @@ function parseAllocationLegs(text: string | null): AllocationLeg[] {
       color: legColor(m[1], legs.length),
     });
   }
-  // Drop legs that summed to >120% — likely false-positives from prose
+  // Drop legs that summed to >120% - likely false-positives from prose
   // where multiple "%" tokens get mis-paired with random words.
   const sum = legs.reduce((s, l) => s + l.pct, 0);
   if (sum > 120) return [];
@@ -563,7 +565,8 @@ export function ThesisView({
   className?: string;
 }) {
   const [showWorking, setShowWorking] = useState(false);
-  const parsed = parseThesis(body);
+  const clean = dedash(body);
+  const parsed = parseThesis(clean);
 
   // No structure detected → keep raw text but in clean mono prose so
   // long technical strings remain readable.
@@ -577,7 +580,7 @@ export function ThesisView({
       <div
         className={`font-sans text-[14px] leading-[1.6] whitespace-pre-wrap text-dim-200 ${className}`}
       >
-        {body}
+        {clean}
       </div>
     );
   }
@@ -634,7 +637,7 @@ export function ThesisView({
                 Show working
               </span>
               <span className="text-[12px] text-dim-300">
-                Agent caught and corrected itself — open to see the loop.
+                Agent caught and corrected itself - open to see the loop.
               </span>
             </div>
             <span

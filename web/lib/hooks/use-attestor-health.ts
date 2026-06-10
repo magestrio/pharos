@@ -15,8 +15,8 @@ import {
 import { useIsMounted } from "@/lib/hooks/use-is-mounted";
 
 const REFETCH_INTERVAL_MS = 30_000;
-const WARN_THRESHOLD_SEC = 30 * 60; // 30 minutes — soft alert
-const CRITICAL_THRESHOLD_SEC = 60 * 60; // 60 minutes — vault freezes allocations
+const WARN_THRESHOLD_SEC = 30 * 60; // 30 minutes - soft alert
+const CRITICAL_THRESHOLD_SEC = 60 * 60; // 60 minutes - vault freezes allocations
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as const;
 
 const BALANCE_UPDATED_EVENT = (BybitAttestorABI as readonly AbiEvent[]).find(
@@ -91,7 +91,7 @@ export function useAttestorHealth(): AttestorHealthState {
     },
   });
 
-  // Lifetime BalanceUpdated count via getLogs — cached on the same
+  // Lifetime BalanceUpdated count via getLogs - cached on the same
   // cadence; separate from the multicall since it's a different
   // primitive.
   const pushCountQuery = useQuery({
@@ -167,7 +167,7 @@ export function formatLagShort(seconds: number): string {
 }
 
 export function formatHeartbeatShort(seconds: number | null): string {
-  if (seconds === null) return "—";
+  if (seconds === null) return "-";
   if (seconds % 60 === 0) {
     const m = seconds / 60;
     return `~${m} min cron`;

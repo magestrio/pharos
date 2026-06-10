@@ -31,7 +31,7 @@ const fraunces = Fraunces({
 });
 
 export const metadata: Metadata = {
-  title: "Pharos — vUSDC, AI-Managed Yield-Bearing USDC Wrapper",
+  title: "Pharos - vUSDC, AI-Managed Yield-Bearing USDC Wrapper",
   description:
     "AI yield vault on Mantle. Mint USDC, receive vUSDC. Every decision logged on-chain. Reputation verifiable through ERC-8004.",
 };

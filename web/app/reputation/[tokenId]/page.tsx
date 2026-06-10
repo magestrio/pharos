@@ -1,7 +1,7 @@
 /**
  * ERC-8004 reputation card page (`frontend-complete.15`).
  *
- * Dedicated route per agent NFT — score history, current value via
+ * Dedicated route per agent NFT - score history, current value via
  * ReputationOracle, links to canonical registries on Mantle Explorer,
  * leaderboard placeholder. Reads are entirely on-chain so this is a
  * thin Server Component shell wrapping the client-side reputation
@@ -12,7 +12,7 @@ import Link from "next/link";
 import { ReputationPage } from "@/components/reputation-page";
 
 export const dynamic = "force-dynamic";
-export const metadata = { title: "Pharos — ERC-8004 Reputation" };
+export const metadata = { title: "Pharos - ERC-8004 Reputation" };
 
 export default function ReputationTokenPage({
   params,

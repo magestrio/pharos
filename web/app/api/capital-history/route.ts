@@ -82,7 +82,7 @@ export async function GET(request: Request) {
       const d = details[i];
       if (!d) continue;
       const equityUsd = sumPositions(d.positions ?? []);
-      // Skip cycles with no positions recorded — they're noise (errors,
+      // Skip cycles with no positions recorded - they're noise (errors,
       // skipped:invalid cycles that never made it to the executor).
       if (equityUsd <= 0) continue;
       points.push({

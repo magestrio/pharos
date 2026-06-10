@@ -5,7 +5,7 @@ import { ACTIVE_CHAIN, anvilLocal } from "@/lib/chains";
 const EXPLORER_BASE: Record<number, string> = {
   [mantle.id]: "https://explorer.mantle.xyz",
   [mantleSepoliaTestnet.id]: "https://explorer.sepolia.mantle.xyz",
-  // Local anvil — no real explorer. Surface a deterministic placeholder
+  // Local anvil - no real explorer. Surface a deterministic placeholder
   // so the UI link is still clickable (opens a tab with "anvil-local")
   // instead of silently 404'ing on Mantle's site.
   [anvilLocal.id]: "https://anvil-local.invalid",

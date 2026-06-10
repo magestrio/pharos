@@ -27,7 +27,7 @@ export interface AllocationStats {
   cycleTs?: string;
 }
 
-// Venue metadata — one row per real venue. Bybit Attestor used to be a
+// Venue metadata - one row per real venue. Bybit Attestor used to be a
 // single bucket; now every sub-venue (Flex, LM, OnChain, DiscountBuy,
 // DualAsset, Hold-to-Earn, perp) renders independently. Cash + Aave
 // legs included so the donut can hold them when there's signal.
@@ -106,7 +106,7 @@ const FALLBACK_COLORS = [
 function venueMeta(venue: string, idx: number): { label: string; sub: string; color: string } {
   const known = VENUE_META[venue];
   if (known) return known;
-  // Unknown venue — derive a label from the snake_case key.
+  // Unknown venue - derive a label from the snake_case key.
   const pretty = venue
     .split("_")
     .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
@@ -138,7 +138,7 @@ function parseTotalEquityUsd(
 
 /**
  * Build allocation rows from the latest decision's `venues[]`. This is
- * the TARGET state the agent picked this cycle — what we want to show
+ * the TARGET state the agent picked this cycle - what we want to show
  * on the dashboard so the donut reflects the agent's intent, not the
  * executor's lag. Each venue becomes one row sized at `venue.weight ×
  * totalEquityUsd`; if the venue lists multiple picks, we keep the
@@ -239,7 +239,7 @@ function buildFromPositions(
       sub: meta.sub,
       color: meta.color,
       pct,
-      apy: 0, // no real-time APY here yet — left as 0; the donut hides it.
+      apy: 0, // no real-time APY here yet - left as 0; the donut hides it.
       notional: Math.round(valueUsdc),
       valueUsdc,
     };

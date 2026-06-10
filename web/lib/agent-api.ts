@@ -1,7 +1,7 @@
 /**
  * Typed client for the Pharos read-only API (`data-store.5`).
  *
- * Server-side fetch helpers — call from Server Components or Route
+ * Server-side fetch helpers - call from Server Components or Route
  * Handlers. Base URL comes from `AGENT_API_URL` env (default
  * http://localhost:8000 for local dev against `uvicorn agent.api.server:app`).
  *
@@ -68,7 +68,7 @@ export type Portfolio = {
 };
 
 /**
- * All fetchers run with `cache: "no-store"` — history is live data.
+ * All fetchers run with `cache: "no-store"` - history is live data.
  * Server Components built against these helpers re-fetch on every
  * request (or follow whatever the page-level revalidate config sets).
  */

@@ -87,7 +87,7 @@ export function HashChip({
   );
 }
 
-// `green` is kept as an alias on the amber tone — existing callsites
+// `green` is kept as an alias on the amber tone - existing callsites
 // using `tone="green"` for "active / agent / live" semantics keep working
 // and inherit the new brand colour. `pos` is the new explicit tone for
 // "positive delta" (price up, profitable cycle) using teal so up/down
@@ -299,7 +299,7 @@ export function StatCard({
   mono?: boolean;
 }) {
   // `green` aliased to `accent` so legacy callsites pick up the new amber
-  // hue. `pos` is teal — reserved for explicit positive-delta semantics.
+  // hue. `pos` is teal - reserved for explicit positive-delta semantics.
   const toneCls: Record<StatTone, string> = {
     neutral: "text-white",
     accent: "text-accent",

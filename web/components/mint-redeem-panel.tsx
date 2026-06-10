@@ -99,7 +99,7 @@ function FlowExplainer({ mode }: { mode: Mode }) {
         </p>
         <p>
           As the agent allocates the underlying USDC across Aave + Bybit Earn, the exchange rate
-          grows. Your vUSDC redeems for more USDC than it costs today — yield realised, never
+          grows. Your vUSDC redeems for more USDC than it costs today - yield realised, never
           marked-to-market.
         </p>
       </div>
@@ -114,7 +114,7 @@ function FlowExplainer({ mode }: { mode: Mode }) {
       </p>
       <p>
         Redemption settles from the on-chain cash buffer. If the buffer is depleted, the agent
-        unwinds positions to refill it before your redeem succeeds — usually within one cycle.
+        unwinds positions to refill it before your redeem succeeds - usually within one cycle.
       </p>
     </div>
   );
@@ -130,7 +130,7 @@ function MintForm() {
   // Mount-gate: SSR has no wallet / no on-chain reads. Server may also
   // see a different .env snapshot than the cached client bundle. Render
   // the PreDeployNotice placeholder on first paint, then swap to the
-  // real form after mount — guarantees SSR/client HTML matches.
+  // real form after mount - guarantees SSR/client HTML matches.
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
 
@@ -189,7 +189,7 @@ function MintForm() {
       />
       <PreviewRow
         label="You receive"
-        value={parsed === null ? "—" : `${formatAmount(previewVusdc)} vUSDC`}
+        value={parsed === null ? "-" : `${formatAmount(previewVusdc)} vUSDC`}
         tone="neon"
       />
       {!isConnected ? (
@@ -298,7 +298,7 @@ function RedeemForm() {
       />
       <PreviewRow
         label="You receive"
-        value={parsed === null ? "—" : `${formatAmount(previewUsdc)} USDC`}
+        value={parsed === null ? "-" : `${formatAmount(previewUsdc)} USDC`}
         tone="neon"
       />
       {!isConnected ? (
@@ -327,7 +327,7 @@ function RedeemForm() {
       )}
       {redeem.error && redeem.error.message.toLowerCase().includes("insufficient") && (
         <ErrorRow>
-          On-chain cash buffer depleted — the agent will unwind a position to refill it.
+          On-chain cash buffer depleted - the agent will unwind a position to refill it.
         </ErrorRow>
       )}
       <TxStatus label="Redeem" hash={redeem.data} receipt={redeemReceipt} error={redeem.error} />

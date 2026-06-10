@@ -4,7 +4,7 @@ import { mantle, mantleSepoliaTestnet } from "wagmi/chains";
 // Local anvil-fork of Mantle mainnet, spun up by `pnpm start` /
 // `scripts/vault.sh`. Custom chainId (31337) because anvil defaults
 // to that and we want MetaMask to clearly distinguish the local
-// devnet from real Mantle (5000) — same RPC behavior, different id.
+// devnet from real Mantle (5000) - same RPC behavior, different id.
 export const anvilLocal = defineChain({
   id: 31337,
   name: "Anvil (Mantle fork)",
@@ -20,7 +20,7 @@ export const anvilLocal = defineChain({
 });
 
 // Resolve which chain the deployed contract addresses correspond to.
-// Driven by NEXT_PUBLIC_CHAIN_ID — `scripts/vault.sh` writes "31337"
+// Driven by NEXT_PUBLIC_CHAIN_ID - `scripts/vault.sh` writes "31337"
 // into .env.local at local-deploy time, prod env sets "5000".
 function resolveActiveChain() {
   const raw = process.env.NEXT_PUBLIC_CHAIN_ID;

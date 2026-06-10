@@ -9,7 +9,7 @@ import { useIsMounted } from "@/lib/hooks/use-is-mounted";
 type TickerItem = { k: string; v: string; d: string; up: boolean };
 
 // `fallback` is kept for API compatibility but no longer renders by
-// default — showing mock ticker items behind real data is exactly the
+// default - showing mock ticker items behind real data is exactly the
 // kind of dishonest UI we're stripping out.
 export function LiveTicker({ fallback: _fallback }: { fallback?: TickerItem[] } = {}) {
   const mounted = useIsMounted();
@@ -100,13 +100,13 @@ export function LiveTicker({ fallback: _fallback }: { fallback?: TickerItem[] } 
 }
 
 function formatUsd(n: number, digits = 2): string {
-  if (!Number.isFinite(n)) return "—";
+  if (!Number.isFinite(n)) return "-";
   if (n >= 1000) return n.toLocaleString("en-US", { maximumFractionDigits: 0 });
   return n.toFixed(digits);
 }
 
 function formatPct(n: number): string {
-  if (!Number.isFinite(n)) return "—";
+  if (!Number.isFinite(n)) return "-";
   return `${n >= 0 ? "+" : ""}${n.toFixed(2)}%`;
 }
 

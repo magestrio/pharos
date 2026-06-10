@@ -17,7 +17,7 @@ const BASE = (process.env.AGENT_API_URL ?? "http://localhost:8000").replace(/\/$
  * Returns:
  *  - 200 with upstream body on success
  *  - 404 / 503 verbatim from upstream
- *  - 502 if upstream is unreachable (network error) — surfaces a
+ *  - 502 if upstream is unreachable (network error) - surfaces a
  *    distinct status code so the client knows it's an infra issue,
  *    not a missing resource.
  */

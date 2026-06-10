@@ -9,7 +9,7 @@
  * focus so the demo feels live.
  *
  * All client-side fetches go through `/api/store/*` proxy routes
- * (same-origin Next.js), NOT direct to the FastAPI on Hetzner — keeps
+ * (same-origin Next.js), NOT direct to the FastAPI on Hetzner - keeps
  * Postgres firewalled to localhost and avoids CORS.
  */
 "use client";
@@ -24,7 +24,7 @@ import type {
   Portfolio,
 } from "@/lib/agent-api";
 
-// Revalidate cadence — matches the FastAPI's expected refresh rate
+// Revalidate cadence - matches the FastAPI's expected refresh rate
 // (agent heartbeat is ~4h plus reactive cycles, so 30s is plenty fast
 // for the demo without hammering the proxy).
 const REFETCH_INTERVAL_MS = 30_000;
@@ -92,7 +92,7 @@ export function useCycles(opts: { limit?: number } = {}): UseQueryResult<
 }
 
 /**
- * Per-cycle detail. NOT hydrated from initial data — the detail
+ * Per-cycle detail. NOT hydrated from initial data - the detail
  * blob is heavy (full snapshot JSONB), only fetch when a row is
  * actually expanded. `enabled` lets callers gate this on
  * `expanded === true`.
@@ -139,7 +139,7 @@ export function usePortfolio(): UseQueryResult<Portfolio | null> {
 }
 
 /**
- * Recent watcher events. Lazy — used by the wake-events widget on
+ * Recent watcher events. Lazy - used by the wake-events widget on
  * Vault Card (`.11`); not part of the server-rendered initial data
  * because it's a secondary signal.
  */

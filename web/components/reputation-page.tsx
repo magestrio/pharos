@@ -66,7 +66,7 @@ function HeaderBlock({ tokenId, isVaultAgent }: { tokenId: bigint; isVaultAgent:
           </>
         ) : (
           <>
-            Generic ERC-8004 agent view. Live data is Pharos-scoped — other agents would render
+            Generic ERC-8004 agent view. Live data is Pharos-scoped - other agents would render
             their own oracle reads through the same component once wired.
           </>
         )}
@@ -132,7 +132,7 @@ function HistorySparklineCard({
     return (
       <Card title="Score History" wide>
         <div className="text-warn text-[12px] font-mono">
-          ReputationOracle not deployed yet — history will populate as updates accumulate.
+          ReputationOracle not deployed yet - history will populate as updates accumulate.
         </div>
       </Card>
     );
@@ -231,7 +231,7 @@ function RegistryLinksCard({ tokenId }: { tokenId: bigint }) {
         />
         <RegistryLink
           label="NFT image"
-          sub="agent.json image field is the rendered token graphic — wire IPFS fetch next iter."
+          sub="agent.json image field is the rendered token graphic - wire IPFS fetch next iter."
         />
       </div>
     </Card>
@@ -312,7 +312,7 @@ function LeaderboardPlaceholder() {
     <Card title="Leaderboard">
       <div className="text-[12px] text-dim-300 leading-relaxed">
         Pharos is the first agent registered against the canonical ERC-8004 registries on Mantle.
-        As other agents register, their token ids will appear here sorted by current score —
+        As other agents register, their token ids will appear here sorted by current score -
         provided the same `ReputationOracle` write pattern is used. A multi-agent leaderboard view
         is filed under the judge verification surface (`.18`).
       </div>

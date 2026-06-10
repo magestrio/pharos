@@ -14,7 +14,7 @@ const config: Config = {
         serif: ["var(--font-serif)", "Fraunces", "ui-serif", "Georgia", "serif"],
       },
       colors: {
-        // Twilight neutrals — warm deep-indigo (not near-black). Lower
+        // Twilight neutrals - warm deep-indigo (not near-black). Lower
         // numbers are lighter. Lifted off pure black so dense data reads
         // softer; hue leans indigo to match the dusk/beacon theme.
         ink: {
@@ -34,7 +34,7 @@ const config: Config = {
           500: "#5B6679",
           600: "#3F4860",
         },
-        // Brand primary — soft sunset gold (Twilight beacon light).
+        // Brand primary - soft sunset gold (Twilight beacon light).
         // `neon` is kept as a name-alias so legacy `text-neon` / `bg-neon`
         // callsites pick up the new hue without a 50-file rename.
         accent: {
@@ -56,7 +56,7 @@ const config: Config = {
           soft: "#86EFAC",
           dim: "#15803D",
         },
-        // Secondary "beam" accent — lavender. Repurposed from the old
+        // Secondary "beam" accent - lavender. Repurposed from the old
         // electric-blue `elec` token (callsites unchanged); pairs the warm
         // gold beacon with a cool dusk sweep.
         elec: {
