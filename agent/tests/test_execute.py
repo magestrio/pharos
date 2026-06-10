@@ -42,6 +42,7 @@ from agent.sandbox.execute import (
     _lm_residual_redeem_actions,
     _orphan_perp_close_actions,
     _order_link_id,
+    _reconcile_hedge_to_earn_actions,
     _reindex_order_link_ids,
     _stable_consolidate_actions,
     _swap_actions_for_hedges,
@@ -6040,3 +6041,167 @@ def test_exit_intent_resize_keeps_hedge_for_remaining_earn():
     # Freed 40 IO (~$6.4 > $5 Bybit min) IS sold.
     assert len(sells) == 1
     assert sells[0].amount == Decimal("40")
+
+
+# ───────────────── Phase A: hedge→earn reconciliation ─────────────────
+
+
+def _reconcile(snap, *, subscribes=None, redeems=None, hedge_closes=None,
+               hedge_opens=None, carry_coins=None):
+    return _reconcile_hedge_to_earn_actions(
+        snap, subscribes or [], redeems or [], hedge_closes or [],
+        hedge_opens or [], "20260610T120000Z", idx_offset=0,
+        carry_coins=carry_coins,
+    )
+
+
+def test_reconcile_trims_overhedge_and_sells_orphan() -> None:
+    """Live IO shape: earn 138.9, short 204.6, wallet 65.46. Trim short to
+    earn AND sell the orphan spot, CLOSE_PERP emitted before the SELL."""
+    snap = _snapshot(
+        perp_market={"IO": _perp("IO", mark="0.167", min_order_qty="0.1",
+                                 qty_step="0.1")},
+        earn_positions=[_pos("FlexibleSaving", "407", "138.9178", coin="IO")],
+        perp_positions=[_short_pos("IO", size="204.6")],
+    )
+    snap.wallet.unified_coin_balances = {"IO": Decimal("65.461283")}
+    actions, reconciled = _reconcile(snap)
+    assert reconciled == {"IO"}
+    closes = [a for a in actions if a.kind == ActionKind.CLOSE_PERP]
+    sells = [a for a in actions if a.kind == ActionKind.SWAP_SPOT and a.side == "Sell"]
+    assert len(closes) == 1 and len(sells) == 1
+    # CLOSE before SELL (never transiently naked-short)
+    assert actions.index(closes[0]) < actions.index(sells[0])
+    assert closes[0].coin == "IO" and closes[0].product_id == "IOUSDT"
+    # trim ≈ short - earn = 65.68, floored to 0.1 step
+    assert Decimal("65.6") <= closes[0].amount <= Decimal("65.7")
+    # post-state stays delta-safe: long(earn+wallet-sold) >= short(orig-trim)
+    post_long = Decimal("138.9178") + Decimal("65.461283") - sells[0].amount
+    post_short = Decimal("204.6") - closes[0].amount
+    assert post_long >= post_short
+
+
+def test_reconcile_pure_orphan_no_overhedge() -> None:
+    """short == earn, wallet > 0 → sell the orphan only, no perp trim."""
+    snap = _snapshot(
+        perp_market={"TON": _perp("TON", mark="2.0")},
+        earn_positions=[_pos("OnChain", "8", "100", coin="TON")],
+        perp_positions=[_short_pos("TON", size="100")],
+    )
+    snap.wallet.unified_coin_balances = {"TON": Decimal("50")}
+    actions, reconciled = _reconcile(snap)
+    assert reconciled == {"TON"}
+    assert [a.kind for a in actions] == [ActionKind.SWAP_SPOT]
+    assert actions[0].amount == Decimal("50")
+
+
+def test_reconcile_skips_when_overhedge_below_min_lot() -> None:
+    """0 < short-earn < min_order_qty → can't trim the perp, so selling the
+    matching spot would go naked. Must emit NOTHING (critical naked guard)."""
+    snap = _snapshot(
+        perp_market={"X": _perp("X", mark="2.0", min_order_qty="0.1")},
+        earn_positions=[_pos("OnChain", "8", "100", coin="X")],
+        perp_positions=[_short_pos("X", size="100.05")],
+    )
+    snap.wallet.unified_coin_balances = {"X": Decimal("5")}
+    actions, reconciled = _reconcile(snap)
+    assert actions == [] and reconciled == set()
+
+
+def test_reconcile_caps_sell_to_stay_delta_safe() -> None:
+    """Coarse qty_step floors the trim, leaving post_short > earn; the sell
+    is capped so post_long >= post_short."""
+    snap = _snapshot(
+        perp_market={"X": _perp("X", mark="2.0", min_order_qty="5", qty_step="5")},
+        earn_positions=[_pos("OnChain", "8", "100", coin="X")],
+        perp_positions=[_short_pos("X", size="113")],
+    )
+    snap.wallet.unified_coin_balances = {"X": Decimal("20")}
+    actions, reconciled = _reconcile(snap)
+    closes = [a for a in actions if a.kind == ActionKind.CLOSE_PERP]
+    sells = [a for a in actions if a.kind == ActionKind.SWAP_SPOT]
+    assert len(closes) == 1 and len(sells) == 1
+    # trim 13 floored to step 5 → 10; post_short = 103; sell capped to
+    # 20 - (103-100) = 17.
+    assert closes[0].amount == Decimal("10")
+    assert sells[0].amount == Decimal("17")
+
+
+def test_reconcile_skips_pending_subscribe_coin() -> None:
+    snap = _snapshot(
+        perp_market={"TON": _perp("TON", mark="2.0")},
+        earn_positions=[_pos("OnChain", "8", "100", coin="TON")],
+        perp_positions=[_short_pos("TON", size="100")],
+    )
+    snap.wallet.unified_coin_balances = {"TON": Decimal("50")}
+    sub = Action(kind=ActionKind.SUBSCRIBE_EARN, category="OnChain",
+                 product_id="8", coin="TON", amount=Decimal("10"),
+                 order_link_id="x", reason="")
+    actions, reconciled = _reconcile(snap, subscribes=[sub])
+    assert actions == [] and reconciled == set()
+
+
+def test_reconcile_skips_pending_redeem_coin() -> None:
+    snap = _snapshot(
+        perp_market={"TON": _perp("TON", mark="2.0")},
+        earn_positions=[_pos("OnChain", "8", "100", coin="TON")],
+        perp_positions=[_short_pos("TON", size="100")],
+    )
+    snap.wallet.unified_coin_balances = {"TON": Decimal("50")}
+    red = Action(kind=ActionKind.REDEEM_EARN, category="OnChain",
+                 product_id="8", coin="TON", amount=Decimal("10"),
+                 order_link_id="x", reason="")
+    actions, reconciled = _reconcile(snap, redeems=[red])
+    assert actions == [] and reconciled == set()
+
+
+def test_reconcile_skips_carry_coin() -> None:
+    snap = _snapshot(
+        perp_market={"TON": _perp("TON", mark="2.0")},
+        earn_positions=[_pos("OnChain", "8", "100", coin="TON")],
+        perp_positions=[_short_pos("TON", size="100")],
+    )
+    snap.wallet.unified_coin_balances = {"TON": Decimal("50")}
+    actions, reconciled = _reconcile(snap, carry_coins={"TON"})
+    assert actions == [] and reconciled == set()
+
+
+def test_reconcile_skips_lm_only_long() -> None:
+    """A coin backed only by an LM base leg (no Earn row) is out of scope —
+    the reconciler iterates earn_positions, so it never enters the loop."""
+    snap = _snapshot(
+        perp_market={"ETH": _perp("ETH", mark="2.0")},
+        lm_products=[_lm_product("9", base="ETH", quote="USDC")],
+        lm_positions=[_lm_position(product_id="9", position_id="p1",
+                                   principal_usd="20")],
+        perp_positions=[_short_pos("ETH", size="100")],
+    )
+    snap.wallet.unified_coin_balances = {"ETH": Decimal("50")}
+    actions, reconciled = _reconcile(snap)
+    assert actions == [] and reconciled == set()
+
+
+def test_reconcile_skips_wallet_dust() -> None:
+    snap = _snapshot(
+        perp_market={"TON": _perp("TON", mark="2.0")},
+        earn_positions=[_pos("OnChain", "8", "100", coin="TON")],
+        perp_positions=[_short_pos("TON", size="100")],
+    )
+    snap.wallet.unified_coin_balances = {"TON": Decimal("0.001")}  # ~$0.002
+    actions, reconciled = _reconcile(snap)
+    assert actions == [] and reconciled == set()
+
+
+def test_reconcile_close_before_sell_ordering() -> None:
+    """Explicit ordering guarantee: for an over-hedged coin the CLOSE_PERP must
+    precede the SWAP_SPOT Sell so the book is never transiently naked-short."""
+    snap = _snapshot(
+        perp_market={"IO": _perp("IO", mark="0.167", min_order_qty="0.1",
+                                 qty_step="0.1")},
+        earn_positions=[_pos("FlexibleSaving", "407", "138.9178", coin="IO")],
+        perp_positions=[_short_pos("IO", size="204.6")],
+    )
+    snap.wallet.unified_coin_balances = {"IO": Decimal("65.461283")}
+    actions, _ = _reconcile(snap)
+    kinds = [a.kind for a in actions]
+    assert kinds == [ActionKind.CLOSE_PERP, ActionKind.SWAP_SPOT]

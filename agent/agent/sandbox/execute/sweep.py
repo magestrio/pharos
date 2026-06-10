@@ -308,6 +308,7 @@ def _orphan_spot_sell_actions(
     snapshot_ts: str,
     *,
     idx_offset: int,
+    reconciled_coins: frozenset[str] = frozenset(),
 ) -> list[Action]:
     """Defensive cleanup: sell to USDT the wallet portion (UNIFIED + FUND)
     of a non-stable coin that exceeds what's needed to balance an open perp
@@ -390,6 +391,10 @@ def _orphan_spot_sell_actions(
         if balance <= 0:
             continue
         if coin_u in pending_subscribe_coins:
+            continue
+        if coin_u in reconciled_coins:
+            # Already handled by `_reconcile_hedge_to_earn_actions` this cycle —
+            # acting again would double-sell off the same pre-cycle snapshot.
             continue
         perp_info = (snapshot.perp_market or {}).get(coin_u) or (
             snapshot.perp_market or {}
@@ -665,6 +670,7 @@ def _close_naked_perp_actions(
     snapshot_ts: str,
     *,
     idx_offset: int,
+    reconciled_coins: frozenset[str] = frozenset(),
 ) -> list[Action]:
     """Safety net: when a coin's perp SHORT exceeds its post-cycle LONG
     exposure (UNIFIED wallet + Earn staked, adjusted for this cycle's
@@ -753,6 +759,11 @@ def _close_naked_perp_actions(
     for coin_u, short in perp_short.items():
         if short <= 0:
             continue
+        if coin_u in reconciled_coins:
+            # `_reconcile_hedge_to_earn_actions` already trimmed this coin's
+            # short to earn_staked this cycle — re-trimming off the stale
+            # snapshot would over-close into a naked long.
+            continue
         long_amt = long_now.get(coin_u, Decimal(0))
         naked = short - long_amt
         if naked <= 0:
@@ -786,3 +797,176 @@ def _close_naked_perp_actions(
         )
         cursor += 1
     return closes
+
+
+def _reconcile_hedge_to_earn_actions(
+    snapshot: Snapshot,
+    subscribes: list[Action],
+    redeems: list[Action],
+    hedge_closes: list[Action],
+    hedge_opens: list[Action],
+    snapshot_ts: str,
+    *,
+    idx_offset: int,
+    carry_coins: set[str] | None = None,
+) -> tuple[list[Action], set[str]]:
+    """Drive each HEDGED-EARN coin to the invariant `perp_short == earn_staked`
+    AND `wallet_spot == 0`, by emitting a PAIRED `CLOSE_PERP(short − earn)` +
+    `SWAP_SPOT Sell(orphan wallet spot)`.
+
+    Why this exists: a failed/partial `SUBSCRIBE_EARN` (live retCode=180016)
+    leaves the bought spot orphaned in UNIFIED while the perp short was already
+    opened to the full pick size. The two existing sweeps then DEADLOCK on it —
+    `_orphan_spot_sell_actions` sees `(wallet+earn) ≈ short` so `excess ≤ 0` and
+    won't sell; `_close_naked_perp_actions` counts wallet as backing so `naked
+    ≈ 0` and won't trim. They enforce `short ≈ wallet+earn`; the correct hedge
+    invariant is `short == earn` with the spot productive in Earn (or sold).
+
+    Decision: SELL the orphan, don't re-subscribe. Subscribe is the exact path
+    that failed and created the orphan; selling needs only spot liquidity already
+    held and is an atomic de-risk. The round-trip fee is the accepted cost of
+    removing an over-hedge / naked directional remnant.
+
+    CLOSE_PERP is emitted BEFORE the SELL: trimming the short first can only
+    increase delta-safety, so the book is never transiently naked-short. Selling
+    first would drop long below short for the inter-order window.
+
+    Returns `(actions, reconciled_coins)`. The caller passes `reconciled_coins`
+    into `_orphan_spot_sell_actions` / `_close_naked_perp_actions` so they SKIP
+    these coins — otherwise they'd double-emit off the same pre-cycle snapshot.
+
+    Scope: only coins with `earn_staked > 0 AND perp_short > 0 AND wallet > 0`,
+    not pending subscribe/redeem this cycle, not carry, with a perp mark. LM-only
+    longs are excluded (earn_staked is read from `earn_positions`, not LM).
+    """
+    carry = {c.upper() for c in (carry_coins or set())}
+    pending = {
+        (a.coin or "").upper()
+        for a in (*subscribes, *redeems)
+        if a.coin
+        and a.kind
+        in (
+            ActionKind.SUBSCRIBE_EARN,
+            ActionKind.SUBSCRIBE_LM,
+            ActionKind.REDEEM_EARN,
+            ActionKind.REDEEM_LM,
+        )
+    }
+
+    # EARN-only staked native per coin (excludes LM base — LM hedge has its own
+    # residual handling). Mirrors the earn branch of `_coin_to_long_exposure`.
+    earn_staked: dict[str, Decimal] = {}
+    for p in snapshot.earn_positions or []:
+        data = p.model_dump(mode="python") if hasattr(p, "model_dump") else p
+        coin = (data.get("coin") or "").upper()
+        if not coin or coin in _STABLES:
+            continue
+        try:
+            amt = Decimal(str(data.get("amount", "0") or "0"))
+        except (InvalidOperation, TypeError):
+            continue
+        if amt > 0:
+            earn_staked[coin] = earn_staked.get(coin, Decimal(0)) + amt
+
+    perp_short = _coin_to_perp_short_size(snapshot)
+    for a in hedge_closes:
+        if a.kind == ActionKind.CLOSE_PERP and a.coin:
+            cu = a.coin.upper()
+            perp_short[cu] = max(Decimal(0), perp_short.get(cu, Decimal(0)) - a.amount)
+    for a in hedge_opens:
+        if a.kind == ActionKind.OPEN_PERP_SHORT and a.coin:
+            cu = a.coin.upper()
+            perp_short[cu] = perp_short.get(cu, Decimal(0)) + a.amount
+
+    wallet: dict[str, Decimal] = {}
+    for src in (
+        snapshot.wallet.unified_coin_balances or {},
+        getattr(snapshot.wallet, "fund_coin_balances", None) or {},
+    ):
+        for coin, raw in src.items():
+            if not coin:
+                continue
+            try:
+                bal = raw if isinstance(raw, Decimal) else Decimal(str(raw))
+            except (InvalidOperation, TypeError):
+                continue
+            cu = coin.upper()
+            wallet[cu] = wallet.get(cu, Decimal(0)) + bal
+
+    actions: list[Action] = []
+    reconciled: set[str] = set()
+    cursor = idx_offset
+    for coin_u, earn in earn_staked.items():
+        if coin_u in _STABLES or coin_u == "USDC":
+            continue
+        short = perp_short.get(coin_u, Decimal(0))
+        bal = wallet.get(coin_u, Decimal(0))
+        if earn <= 0 or short <= 0 or bal <= 0:
+            continue
+        if coin_u in pending or coin_u in carry:
+            continue
+        perp_info = (snapshot.perp_market or {}).get(coin_u) or (
+            snapshot.perp_market or {}
+        ).get(coin_u.title())
+        mark = getattr(perp_info, "mark_price", None) if perp_info else None
+        if not mark or mark <= 0:
+            continue
+        qty_step = getattr(perp_info, "qty_step", None) if perp_info else None
+        min_qty = getattr(perp_info, "min_order_qty", None) if perp_info else None
+
+        # Over-hedge to remove (0 when short already <= earn).
+        trim_qty = Decimal(0)
+        if short - earn > 0:
+            rounded = _round_to_qty_step(short - earn, qty_step, min_qty)
+            if rounded is None or rounded <= 0:
+                # Over-hedge is below the min perp lot — we cannot trim it, so
+                # selling the matching spot would leave a NAKED short. Leave both
+                # legs intact this cycle.
+                continue
+            trim_qty = rounded
+
+        # Cap the sell so post-long >= post-short. `_round_to_qty_step` floors,
+        # so post_short = short - trim_qty >= earn; keep enough spot to back any
+        # residual (short - trim_qty) - earn.
+        post_short = short - trim_qty
+        safe_sellable = bal - max(Decimal(0), post_short - earn)
+        sell_native = min(bal, safe_sellable)
+        if sell_native <= 0:
+            continue
+        usd = sell_native * mark
+        if usd < MIN_SWAP_USDC:
+            continue
+
+        if trim_qty > 0:
+            actions.append(
+                Action(
+                    kind=ActionKind.CLOSE_PERP,
+                    category="linear",
+                    product_id=f"{coin_u}USDT",
+                    coin=coin_u,
+                    amount=trim_qty,
+                    order_link_id=_order_link_id(snapshot_ts, cursor),
+                    reason=(
+                        f"reconcile hedge→earn {coin_u}: trim over-hedge short "
+                        f"{short} → earn {earn} (close {trim_qty})"
+                    ),
+                )
+            )
+            cursor += 1
+        sell_symbol, dest_coin = _orphan_sell_quote(coin_u)
+        actions.append(
+            _disposal_sell_action(
+                symbol=sell_symbol,
+                dest_coin=dest_coin,
+                qty=sell_native,
+                order_link_id=_order_link_id(snapshot_ts, cursor),
+                reason=(
+                    f"reconcile hedge→earn {coin_u}: sell orphan spot "
+                    f"{sell_native} → {dest_coin} (~${usd:.2f}); "
+                    f"short→earn {earn}, wallet→0"
+                ),
+            )
+        )
+        cursor += 1
+        reconciled.add(coin_u)
+    return actions, reconciled

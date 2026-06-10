@@ -96,6 +96,7 @@ from agent.sandbox.execute import (
     _lm_residual_redeem_actions,
     _orphan_perp_close_actions,
     _orphan_spot_sell_actions,
+    _reconcile_hedge_to_earn_actions,
     _reindex_order_link_ids,
     _stable_consolidate_actions,
     _coin_wallet_native,
@@ -2108,6 +2109,14 @@ async def run_one_cycle(
             perp_closes = _orphan_perp_close_actions(
                 snap, snap_path.stem, idx_offset=780, carry_coins=carry_coins
             )
+            # Reconcile over-hedged Earn coins (short > earn with orphan spot)
+            # even on non-executing cycles — that's exactly when a trapped orphan
+            # (failed subscribe) would otherwise persist for hours.
+            reconcile_actions, reconciled_coins = _reconcile_hedge_to_earn_actions(
+                snap, [], [], perp_closes, [], snap_path.stem,
+                idx_offset=760, carry_coins=carry_coins,
+            )
+            reconciled_frozen = frozenset(reconciled_coins)
             # Plus: force-redeem any held LM whose naked base residual sits
             # above the floor. It lives INSIDE the LP so the spot/perp sweep
             # above can't reach it — only the LP redeem can — and a redeem
@@ -2124,8 +2133,9 @@ async def run_one_cycle(
                 snap, snap_path.stem, idx_offset=820,
                 blocked_position_ids=lm_redeem_blocked,
             )
-            sweep = perp_closes + _orphan_spot_sell_actions(
-                snap, [], [], perp_closes, [], snap_path.stem, idx_offset=800
+            sweep = reconcile_actions + perp_closes + _orphan_spot_sell_actions(
+                snap, [], [], perp_closes, [], snap_path.stem, idx_offset=800,
+                reconciled_coins=reconciled_frozen,
             ) + lm_residual + _carry_liq_close_actions(
                 snap, carry_state, near_liq_carry_coins, snap_path.stem,
                 idx_offset=840,

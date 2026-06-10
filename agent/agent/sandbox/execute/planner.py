@@ -50,6 +50,7 @@ from agent.sandbox.execute.swaps import (
 from agent.sandbox.execute.sweep import (
     _close_naked_perp_actions,
     _orphan_spot_sell_actions,
+    _reconcile_hedge_to_earn_actions,
 )
 from agent.sandbox.execute.types import (
     Action,
@@ -1043,6 +1044,31 @@ def diff_to_actions(
             extra_usdt_demand=buy_usdt_demand,
         )
 
+    # Hedge→Earn reconciliation: drive every hedged-Earn coin to
+    # `perp_short == earn_staked, wallet_spot == 0` via a paired CLOSE_PERP(over-
+    # hedge) + SELL(orphan spot). Fixes the deadlock where a failed/partial
+    # SUBSCRIBE_EARN left orphan spot that the two sweeps below mutually protect
+    # (one sees the short as needing the spot, the other sees the spot as backing
+    # the short). Runs FIRST and its `reconciled_coins` make the sweeps skip those
+    # coins so they don't double-emit off the same pre-cycle snapshot.
+    reconcile_actions, reconciled_coins = _reconcile_hedge_to_earn_actions(
+        snapshot,
+        subscribes,
+        redeems,
+        hedge_closes,
+        hedge_opens,
+        snapshot_ts,
+        idx_offset=(
+            len(all_pids)
+            + len(hedge_closes)
+            + len(hedge_opens)
+            + len(hedge_swaps)
+            + len(earn_swaps)
+        ),
+        carry_coins=carry_state.active_coins(),
+    )
+    reconciled_frozen = frozenset(reconciled_coins)
+
     # Defensive orphan-cleanup: sells UNIFIED-wallet non-stable balance
     # that EXCEEDS the post-cycle perp short coverage. Critically does
     # NOT sell the spot leg of an active hedge — pre-2026-06-03 it did,
@@ -1060,7 +1086,9 @@ def diff_to_actions(
             + len(hedge_opens)
             + len(hedge_swaps)
             + len(earn_swaps)
+            + len(reconcile_actions)
         ),
+        reconciled_coins=reconciled_frozen,
     )
     # Safety net: any perp short whose post-cycle long backing comes up
     # short (UNIFIED + Earn(staked) + subscribes - redeems < perp_short)
@@ -1080,8 +1108,10 @@ def diff_to_actions(
             + len(hedge_opens)
             + len(hedge_swaps)
             + len(earn_swaps)
+            + len(reconcile_actions)
             + len(orphan_sells)
         ),
+        reconciled_coins=reconciled_frozen,
     )
 
     # Funding-carry plan (`.5`). Sits in its own offset block past
@@ -1096,6 +1126,7 @@ def diff_to_actions(
         + len(hedge_opens)
         + len(hedge_swaps)
         + len(earn_swaps)
+        + len(reconcile_actions)
         + len(orphan_sells)
         + len(naked_closes)
     )
@@ -1129,6 +1160,7 @@ def diff_to_actions(
         + carry_closes
         + hedge_closes
         + naked_closes
+        + reconcile_actions
         + hedge_swaps
         + earn_swaps
         + orphan_sells

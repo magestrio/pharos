@@ -146,6 +146,7 @@ from agent.sandbox.execute.sweep import (  # noqa: F401
     _lm_residual_redeem_actions,
     _orphan_perp_close_actions,
     _orphan_spot_sell_actions,
+    _reconcile_hedge_to_earn_actions,
     _stable_consolidate_actions,
     build_redeem_exit_intents,
     exit_actions_from_intent,
