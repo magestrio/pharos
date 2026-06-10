@@ -7,6 +7,7 @@ import { useAccount, useDisconnect } from "wagmi";
 
 import { Button, Eyebrow, HashChip, Icon, LiveDot } from "@/components/ui";
 import { BRAND } from "@/lib/brand";
+import { useIsMounted } from "@/lib/hooks/use-is-mounted";
 import { LiveTicker } from "@/components/live-ticker";
 import { DecisionLog } from "@/components/screens/decision-log";
 import { VaultCard } from "@/components/screens/vault-card";
@@ -220,11 +221,17 @@ function Logo() {
 
 function ConnectWalletButton() {
   const [hover, setHover] = useState(false);
+  // Gate the connected branch behind mount: wagmi (`ssr: true`) restores
+  // the wallet from a cookie on the client, so the server renders the
+  // disconnected button while the first client paint would otherwise
+  // render the connected one - a hydration mismatch. Until mounted we
+  // render the same disconnected button the server did.
+  const mounted = useIsMounted();
   const { address, isConnected } = useAccount();
   const { openConnectModal } = useConnectModal();
   const { disconnect } = useDisconnect();
 
-  if (isConnected && address) {
+  if (mounted && isConnected && address) {
     const short = `${address.slice(0, 6)}…${address.slice(-4)}`;
     return (
       <button

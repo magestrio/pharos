@@ -22,8 +22,24 @@ type EnvKey =
   | "NEXT_PUBLIC_DECISION_LOG_ADDRESS"
   | "NEXT_PUBLIC_REPUTATION_ORACLE_ADDRESS";
 
+// Static `process.env.NEXT_PUBLIC_*` access so Next.js inlines each value
+// into the client bundle. A dynamic `process.env[envKey]` is NOT inlined
+// client-side, so the browser would read `undefined` and fall back to the
+// mainnet address while the server reads the real override - a hydration
+// mismatch when the two differ (e.g. local `.env.local` anvil overrides).
+const ENV_OVERRIDES: Record<EnvKey, string | undefined> = {
+  NEXT_PUBLIC_VUSDC_ADDRESS: process.env.NEXT_PUBLIC_VUSDC_ADDRESS,
+  NEXT_PUBLIC_CAPITAL_MANAGER_ADDRESS: process.env.NEXT_PUBLIC_CAPITAL_MANAGER_ADDRESS,
+  NEXT_PUBLIC_AAVE_USDC_ADAPTER_ADDRESS: process.env.NEXT_PUBLIC_AAVE_USDC_ADAPTER_ADDRESS,
+  NEXT_PUBLIC_AAVE_WETH_ADAPTER_ADDRESS: process.env.NEXT_PUBLIC_AAVE_WETH_ADAPTER_ADDRESS,
+  NEXT_PUBLIC_BYBIT_ATTESTOR_ADDRESS: process.env.NEXT_PUBLIC_BYBIT_ATTESTOR_ADDRESS,
+  NEXT_PUBLIC_USDC_ADDRESS: process.env.NEXT_PUBLIC_USDC_ADDRESS,
+  NEXT_PUBLIC_DECISION_LOG_ADDRESS: process.env.NEXT_PUBLIC_DECISION_LOG_ADDRESS,
+  NEXT_PUBLIC_REPUTATION_ORACLE_ADDRESS: process.env.NEXT_PUBLIC_REPUTATION_ORACLE_ADDRESS,
+};
+
 function pickAddress(envKey: EnvKey, fallback: `0x${string}`): `0x${string}` {
-  const override = process.env[envKey] as `0x${string}` | undefined;
+  const override = ENV_OVERRIDES[envKey] as `0x${string}` | undefined;
   if (override && override !== ZERO_ADDRESS) return override;
   return fallback;
 }
