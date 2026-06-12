@@ -46,6 +46,7 @@ from agent.sandbox.snapshot import (
     _annual_funding,
     _lm_hedge_residual,
 )
+from agent.sandbox.position_ledger import MIN_HOLD_HOURS
 
 if TYPE_CHECKING:
     from agent.sandbox.carry_state import CarryState
@@ -2129,7 +2130,76 @@ def check_estimate_apr_probe_cap(d: Decision, snapshot: Snapshot) -> Check:
 # ─── Aggregate ─────────────────────────────────────────────────────────────
 
 
-def validate(decision: Decision, snapshot: Snapshot) -> tuple[bool, list[str]]:
+def _retained_nonstable_coins(d: Decision, snapshot: Snapshot) -> set[str]:
+    """UPPERCASE non-stable coins the decision KEEPS exposure to this cycle —
+    any venue pick (weight > 0) whose product resolves to a non-stable coin,
+    plus every hedge coin. Rotating WITHIN a coin (flex↔onchain, or
+    product↔product) keeps the coin here, so only a full exit of the coin's
+    exposure counts as leaving — which matches the friction semantics (the
+    round-trip is paid on the spot-sell + perp-close, not on a same-coin
+    product swap)."""
+    idx = _snapshot_index(snapshot)
+    retained: set[str] = set()
+    for v in d.venues:
+        category = VENUE_REGISTRY[v.venue_id].snapshot_category
+        if not category:
+            continue
+        cat_idx = idx.get(category, {})
+        for pick in v.picks:
+            if pick.weight <= 0:
+                continue
+            summary = cat_idx.get(pick.product_id)
+            if summary is None:
+                continue
+            base = summary.coin.split("/", 1)[0].upper()
+            if base and base not in _STABLE_COINS:
+                retained.add(base)
+    for h in d.hedges:
+        coin = (h.coin or "").upper()
+        if coin and coin not in _STABLE_COINS:
+            retained.add(coin)
+    return retained
+
+
+def check_min_hold(d: Decision, snapshot: Snapshot) -> Check:
+    """Block a VOLUNTARY exit from a non-stable position younger than
+    `MIN_HOLD_HOURS` — the anti-churn gate.
+
+    A hedged non-stable exposure pays ~1.8% round-trip friction (spot swap +
+    perp open/close) per entry/exit. Flipping out of one within a cycle or two
+    is a near-guaranteed net loss regardless of headline APR (the anti-churn
+    rule in the prompt). This makes that rule deterministic: if the decision
+    drops a held non-stable coin whose age (from `snapshot.held_coin_ages`) is
+    below the floor, reject so the book HOLDS this cycle instead.
+
+    Scoped to non-stable coins only — stable↔stable rotation is ~free. Danger
+    exits bypass this entirely: the watcher auto-close path runs through
+    `validate(..., allow_exits=True)`, and any `risk_flags` cycle is already
+    rejected by `check_risk_flags`. Fails open — no ages surfaced (fresh
+    deploy / ledger IO error) blocks nothing."""
+    ages: dict[str, float] = getattr(snapshot, "held_coin_ages", None) or {}
+    young = {
+        coin.upper(): age
+        for coin, age in ages.items()
+        if age < MIN_HOLD_HOURS and coin.upper() not in _STABLE_COINS
+    }
+    if not young:
+        return True, None
+    retained = _retained_nonstable_coins(d, snapshot)
+    exited = sorted(c for c in young if c not in retained)
+    if not exited:
+        return True, None
+    details = ", ".join(f"{c} ({young[c]:.1f}h < {MIN_HOLD_HOURS:.0f}h)" for c in exited)
+    return False, (
+        "min-hold: voluntary exit of non-stable position(s) too young to earn "
+        f"back round-trip friction: {details}. Hold them this cycle (danger "
+        "exits bypass via the watcher auto-close path)."
+    )
+
+
+def validate(
+    decision: Decision, snapshot: Snapshot, *, allow_exits: bool = False
+) -> tuple[bool, list[str]]:
     """Run every rule against `(decision, snapshot)` and aggregate the
     failures. `ok=True` iff `errors` is empty.
 
@@ -2137,6 +2207,10 @@ def validate(decision: Decision, snapshot: Snapshot) -> tuple[bool, list[str]]:
     because the operator wants to see *every* problem in one pass when
     debugging a flaky prompt. This is a cheap, deterministic pipeline;
     no rule depends on another's outcome.
+
+    `allow_exits=True` skips the min-hold anti-churn gate — set by the loop on
+    the watcher's danger-exit (auto-close) path so a peg break / crash / funding
+    flip can unwind a young position without being blocked.
     """
     pure_checks = [
         check_disabled_venues,
@@ -2176,6 +2250,14 @@ def validate(decision: Decision, snapshot: Snapshot) -> tuple[bool, list[str]]:
             errors.append(msg)
     for check_with_snap in snapshot_checks:
         ok, msg = check_with_snap(decision, snapshot)
+        if not ok and msg:
+            errors.append(msg)
+    # Min-hold anti-churn gate. Separate from the list above because it's the
+    # only rule that (a) consumes loop-injected position-age state and (b) is
+    # conditionally skipped: danger exits (allow_exits) and risk_flags cycles
+    # — which already reject — must not also trip a confusing min-hold error.
+    if not allow_exits and not decision.risk_flags:
+        ok, msg = check_min_hold(decision, snapshot)
         if not ok and msg:
             errors.append(msg)
     return (not errors), errors

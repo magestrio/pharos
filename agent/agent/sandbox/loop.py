@@ -128,6 +128,7 @@ from agent.sandbox.safety import (
     is_halted,
     record_equity,
 )
+from agent.sandbox.position_ledger import update_ledger_and_ages
 from agent.sandbox.snapshot import (
     SNAPSHOT_DIR,
     STABLES,
@@ -1700,6 +1701,18 @@ async def run_one_cycle(
             mantle_rpc_url=mantle_rpc_url,
             mantle_vault_address=mantle_vault_address,
         )
+        # Min-hold ledger: stamp/age every non-stable exposure so the
+        # `check_min_hold` validator gate can block a voluntary churn out of a
+        # position too young to have earned back its round-trip friction. Done
+        # BEFORE write_snapshot so the on-disk snapshot, the LLM input, and the
+        # validator all see the same ages. Best-effort — a ledger IO failure
+        # leaves ages empty (gate fails open) and never aborts the cycle.
+        try:
+            snap.held_coin_ages = update_ledger_and_ages(
+                snap, now=datetime.now(UTC)
+            )
+        except Exception as e:  # noqa: BLE001 — best effort, never abort a cycle
+            log.warning("position ledger update failed: %s", e)
         snap_path = write_snapshot(snap)
         outcome["snapshot_filename"] = snap_path.name
         outcome["stages"].append("snapshot")
@@ -2060,8 +2073,12 @@ async def run_one_cycle(
         outcome["expected_apr_pct"] = float(decision.expected_blended_apr_pct)
         outcome["stages"].append("decide")
 
-        # 3. Validate
-        ok, errors = validate(decision, snap)
+        # 3. Validate. The watcher's danger-exit (auto_close) path skips the
+        # min-hold gate so a peg break / crash / funding flip can unwind a
+        # young position — "don't lose principal" overrides "hold to recoup".
+        ok, errors = validate(
+            decision, snap, allow_exits=bool(outcome.get("auto_close"))
+        )
         outcome["validator_ok"] = ok
         outcome["validator_errors"] = errors
         outcome["stages"].append("validate")

@@ -507,6 +507,14 @@ class Snapshot(BaseModel):
     # `decision.hedges` instead of blindly opening new ones (.32).
     perp_positions: list[PerpPosition] = Field(default_factory=list)
     usdc_peg: UsdcPegSnapshot
+    # Per-coin age in HOURS of each currently-held NON-STABLE exposure, keyed
+    # by UPPERCASE coin. Populated by the loop from `position_ledger` BEFORE
+    # decide/validate so both the LLM (whipsaw discipline) and the min-hold
+    # validator gate (`check_min_hold`) see how long a position has been held:
+    # a coin too young to have earned back its round-trip friction may not be
+    # voluntarily exited. Empty on the first cycle after deploy or on a ledger
+    # IO failure — the gate then fails open (blocks nothing).
+    held_coin_ages: dict[str, float] = Field(default_factory=dict)
     # Non-fatal per-source warnings (e.g. Earn permission gate). Fatal
     # errors propagate from `collect_snapshot` — the caller decides
     # whether a missing snapshot is recoverable.
