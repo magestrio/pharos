@@ -120,12 +120,18 @@ from agent.sandbox.pending_intent import (
     read_pending_intent,
     write_pending_intent,
 )
+from agent.sandbox.reputation import (
+    compute_realized_apr_bps,
+    record_push,
+    should_push,
+)
 from agent.sandbox.safety import (
     check_daily_drawdown,
     clear_halt,
     halt,
     halt_trigger,
     is_halted,
+    read_equity_history,
     record_equity,
 )
 from agent.sandbox.position_ledger import update_ledger_and_ages
@@ -608,14 +614,42 @@ async def _anchor_onchain(
 
     write_anchor_queue(queue)
 
-    rep_tx = await asyncio.to_thread(writer.update_reputation)
-    if rep_tx:
-        anchor["reputation_tx"] = rep_tx
-        log.info("reputation updated on-chain: tx=%s", rep_tx)
-
     if anchor:
         outcome["onchain"] = anchor
         outcome.setdefault("stages", []).append("anchor_onchain")
+
+
+async def _push_reputation_heartbeat() -> dict[str, Any] | None:
+    """Best-effort: attest the agent's realized APR to the canonical
+    ERC-8004 registry from the live equity history.
+
+    Runs every cycle (post-snapshot, BEFORE the early returns) so
+    reputation is a true heartbeat — independent of whether the cycle
+    actually traded — unlike decision anchoring, which only fires on the
+    execute path. Throttled to once an hour off-chain (`reputation`'s own
+    state file); the push is recorded only after a confirmed tx so a
+    failed send retries next cycle. Anything missing / not-yet-due → `None`.
+    """
+    if not should_push():
+        return None
+    score = compute_realized_apr_bps(read_equity_history())
+    if score is None:
+        return None
+    writer = await asyncio.to_thread(OnchainWriter.from_env)
+    if writer is None:
+        return None
+    tx = await asyncio.to_thread(writer.push_apr_reputation, score.apr_bps)
+    if not tx:
+        return None
+    record_push(score, tx)
+    log.info(
+        "reputation attested on-chain: apr=%d bps (%.1f%%) tx=%s "
+        "window=%.1fd baseline=$%.2f current=$%.2f",
+        score.apr_bps, score.apr_bps / 100, tx,
+        float(score.elapsed_seconds) / 86400,
+        float(score.baseline_equity), float(score.current_equity),
+    )
+    return {"reputation_tx": tx, "apr_bps": score.apr_bps}
 
 
 def _drop_picks_into_cash(
@@ -1727,6 +1761,16 @@ async def run_one_cycle(
         # from "halted by operator".
         current_equity = snap.wallet.total_equity_usd
         record_equity(current_equity)
+
+        # Reputation heartbeat — attest realized APR to ERC-8004 from the
+        # equity history we just extended. Done here (before the drawdown
+        # early-returns) so reputation reflects reality every cycle, not
+        # only on the execute path. Best-effort + throttled internally.
+        rep = await _push_reputation_heartbeat()
+        if rep:
+            outcome["reputation"] = rep
+            outcome["stages"].append("reputation_heartbeat")
+
         drawdown_hit, drawdown_reason = check_daily_drawdown(current_equity)
 
         if halted:

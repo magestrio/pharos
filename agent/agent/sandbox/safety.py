@@ -189,6 +189,16 @@ def _read_history(path: Path) -> list[tuple[datetime, Decimal]]:
     return out
 
 
+def read_equity_history(
+    path: Path | None = None,
+) -> list[tuple[datetime, Decimal]]:
+    """Public accessor for the persisted `{ts, total_equity_usd}` series —
+    the realized-NAV track the reputation heartbeat annualizes
+    (`reputation.compute_realized_apr_bps`). Same malformed-line tolerance
+    as the drawdown check."""
+    return _read_history(path or EQUITY_HISTORY_FILE)
+
+
 def check_daily_drawdown(
     current_equity: Decimal,
     *,

@@ -1,10 +1,14 @@
-"""On-chain writer for `DecisionLog` + `ReputationOracle`.
+"""On-chain writer for `DecisionLog` + the canonical ERC-8004
+`ReputationRegistry`.
 
 After each cycle the loop calls `record_decision` so every decision the
 agent emits is anchored on-chain — `(agentId, decisionId, ipfsCid,
-actionHash)`. Periodically (and best-effort) it also calls
-`update_reputation` so the canonical ERC-8004 ReputationRegistry sees
-the live APR score.
+actionHash)`. Separately (best-effort, throttled) it calls
+`push_apr_reputation` so the canonical ERC-8004 ReputationRegistry sees
+the agent's realized APR — attested straight from the agent EOA via
+`giveFeedback`, with no vault/oracle coupling (the vUSDC-derived
+`ReputationOracle` never initializes because the on-chain vault is empty;
+reputation here reflects the live Bybit book — see `reputation.py`).
 
 Both methods are best-effort: any RPC blip / revert / missing config
 returns `None`. The off-chain decision file + Postgres row remain the
@@ -64,20 +68,26 @@ _DECISION_LOG_ABI: list[dict[str, Any]] = [
     },
 ]
 
-_REPUTATION_ORACLE_ABI: list[dict[str, Any]] = [
+# Canonical ERC-8004 ReputationRegistry. `giveFeedback` is permissionless
+# for a registered agentId (verified on Mantle: a call for agentId=99
+# simulates clean from the agent EOA, a bogus id reverts). VALUE_DECIMALS=2
+# convention: a `value` of 1234 reads as 12.34%.
+_REPUTATION_REGISTRY_ABI: list[dict[str, Any]] = [
     {
         "type": "function",
-        "name": "updateReputation",
+        "name": "giveFeedback",
         "stateMutability": "nonpayable",
-        "inputs": [],
-        "outputs": [{"name": "scoreBps", "type": "int128"}],
-    },
-    {
-        "type": "function",
-        "name": "canUpdate",
-        "stateMutability": "view",
-        "inputs": [],
-        "outputs": [{"name": "", "type": "bool"}],
+        "inputs": [
+            {"name": "agentId", "type": "uint256"},
+            {"name": "value", "type": "int128"},
+            {"name": "valueDecimals", "type": "uint8"},
+            {"name": "tag1", "type": "string"},
+            {"name": "tag2", "type": "string"},
+            {"name": "endpoint", "type": "string"},
+            {"name": "feedbackURI", "type": "string"},
+            {"name": "feedbackHash", "type": "bytes32"},
+        ],
+        "outputs": [],
     },
 ]
 
@@ -158,20 +168,20 @@ class OnchainWriter:
         account: Account,
         agent_id: int,
         decision_log: Contract,
-        oracle: Contract | None,
+        registry: Contract | None,
     ) -> None:
         self.w3 = w3
         self.account = account
         self.agent_id = agent_id
         self.decision_log = decision_log
-        self.oracle = oracle
+        self.registry = registry
 
     @classmethod
     def from_env(cls) -> OnchainWriter | None:
         pk = os.environ.get("PRIVATE_KEY")
         rpc = os.environ.get("MANTLE_RPC_URL")
         dlog_addr = os.environ.get("DECISION_LOG_ADDRESS")
-        oracle_addr = os.environ.get("REPUTATION_ORACLE_ADDRESS")
+        registry_addr = os.environ.get("REGISTRY_8004")
         agent_id_raw = os.environ.get("AGENT_ID")
 
         if not (pk and rpc and dlog_addr and agent_id_raw):
@@ -201,11 +211,11 @@ class OnchainWriter:
             abi=_DECISION_LOG_ABI,
         )
 
-        oracle: Contract | None = None
-        if oracle_addr and oracle_addr != _ZERO_ADDRESS:
-            oracle = w3.eth.contract(
-                address=Web3.to_checksum_address(oracle_addr),
-                abi=_REPUTATION_ORACLE_ABI,
+        registry: Contract | None = None
+        if registry_addr and registry_addr != _ZERO_ADDRESS:
+            registry = w3.eth.contract(
+                address=Web3.to_checksum_address(registry_addr),
+                abi=_REPUTATION_REGISTRY_ABI,
             )
 
         # Sanity: refuse to run if the EOA isn't the configured agent
@@ -226,10 +236,10 @@ class OnchainWriter:
             return None
 
         log.info(
-            "onchain writer ready: agent=%s decision_log=%s oracle=%s agent_id=%d",
+            "onchain writer ready: agent=%s decision_log=%s registry=%s agent_id=%d",
             account.address,
             dlog_addr,
-            oracle_addr or "(none)",
+            registry_addr or "(none)",
             agent_id,
         )
         return cls(
@@ -237,7 +247,7 @@ class OnchainWriter:
             account=account,
             agent_id=agent_id,
             decision_log=decision_log,
-            oracle=oracle,
+            registry=registry,
         )
 
     def _send(self, fn: Any, *, gas: int = 250_000) -> str | None:
@@ -348,16 +358,24 @@ class OnchainWriter:
             log.warning("gas balance read failed: %s", e)
             return None
 
-    def update_reputation(self) -> str | None:
-        """Submit `updateReputation()` if the oracle is wired AND
-        `canUpdate()` returns true (throttle gate). Returns `None`
-        otherwise — the oracle's own MIN_INTERVAL handles cadence."""
-        if self.oracle is None:
+    def push_apr_reputation(self, apr_bps: int) -> str | None:
+        """Attest the agent's realized annualized APR (signed bps,
+        VALUE_DECIMALS=2) to the canonical ERC-8004 ReputationRegistry via
+        `giveFeedback`. Permissionless for a registered agentId — no oracle
+        contract, no vUSDC coupling. The score itself is computed off-chain
+        from the live equity series (`reputation.compute_realized_apr_bps`)
+        and the loop throttles cadence. Returns tx hash, or `None` when no
+        registry is configured / the send fails."""
+        if self.registry is None:
             return None
-        try:
-            if not self.oracle.functions.canUpdate().call():
-                return None
-        except Exception as e:
-            log.warning("canUpdate() check failed: %s", e)
-            return None
-        return self._send(self.oracle.functions.updateReputation())
+        fn = self.registry.functions.giveFeedback(
+            self.agent_id,
+            int(apr_bps),
+            2,  # VALUE_DECIMALS — 1234 reads as 12.34%
+            "apr",
+            "cumulative",
+            "",
+            "",
+            b"\x00" * 32,
+        )
+        return self._send(fn)

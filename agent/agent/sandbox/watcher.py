@@ -1348,6 +1348,16 @@ async def poll_once(
     # match by symbol back to the baseline.
     perp_positions = [p for p in baseline.positions if p.venue == "perp"]
     if perp_positions:
+        # Dwell-guard the "perp vanished" detection. A single
+        # `get_positions` poll that comes back empty / partial (transient
+        # Bybit hiccup, rate limit, mid-update size=0) would otherwise read
+        # EVERY held short as closed and auto-close the whole hedged book on
+        # one bad read — observed live 2026-06-12: PARTI + TREE perps both read
+        # gone in the same poll on FLAT price (no liquidation), churning two
+        # fresh hedged-Earn positions back to cash. Require a perp to read GONE
+        # for INVALIDATE_DWELL_POLLS consecutive polls before firing: a real
+        # external close confirms within ~2 polls, a glitch resets the counter.
+        dwell = read_dwell_state(dwell_state_path)
         try:
             live_perps = await client.get_positions(category="linear", settle_coin="USDT")
             live_by_symbol = {
@@ -1358,6 +1368,7 @@ async def poll_once(
             for pos in perp_positions:
                 symbol = pos.position_id.removeprefix("perp:")
                 live = live_by_symbol.get(symbol)
+                gone_key = f"perp_gone:{symbol}"
                 if live is None:
                     # Perp WAS in baseline but no longer open. Two cases:
                     #   1. We held a paired Earn/LM leg on the same coin —
@@ -1368,7 +1379,14 @@ async def poll_once(
                     #      baseline) — nothing to clean up, skip.
                     venue, pid = _perp_to_paired_position(symbol, baseline)
                     if not venue:
+                        dwell.pop(gone_key, None)
                         continue
+                    # Confirm across consecutive polls before churning the
+                    # hedged book on a possibly-bad read.
+                    dwell[gone_key] = dwell.get(gone_key, 0) + 1
+                    if dwell[gone_key] < INVALIDATE_DWELL_POLLS:
+                        continue
+                    dwell.pop(gone_key, None)
                     events.append(
                         _paired_invalidate_event(
                             venue, pid, pos.coin, symbol,
@@ -1377,6 +1395,9 @@ async def poll_once(
                         )
                     )
                     continue
+                # Perp present this poll → reset the gone-counter so a prior
+                # transient miss can't accumulate toward a false close.
+                dwell.pop(gone_key, None)
                 mark = _to_decimal(live.markPrice)
                 liq = _to_decimal(live.liqPrice)
                 if mark is None or liq is None:
@@ -1434,6 +1455,7 @@ async def poll_once(
                                 ),
                             )
                         )
+            write_dwell_state(dwell, dwell_state_path)
         except Exception as e:  # noqa: BLE001
             log.warning("perp positions poll failed: %s", e)
 

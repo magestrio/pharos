@@ -634,11 +634,8 @@ async def test_poll_once_lm_paired_perp_near_liq_fires_pick_invalidated(monkeypa
     assert companions[0].severity == "P0"
 
 
-@pytest.mark.asyncio
-async def test_poll_once_lm_paired_perp_gone_fires_pick_invalidated(monkeypatch):
-    """LM base-leg hedge closed out by Bybit (no longer in the position list)
-    → companion `pick_invalidated(lm:<productId>)` so the LP is redeemed."""
-    baseline = WatcherBaseline(
+def _eth_baseline() -> WatcherBaseline:
+    return WatcherBaseline(
         captured_at=datetime.now(UTC),
         positions=[
             HeldPosition(position_id="perp:ETHUSDT", venue="perp", coin="ETH",
@@ -648,26 +645,78 @@ async def test_poll_once_lm_paired_perp_gone_fires_pick_invalidated(monkeypatch)
         ],
         known_h2e_product_ids=["A"],
     )
+
+
+def _lm_companions(events):
+    return [
+        e for e in events
+        if e.kind == "pick_invalidated" and e.position_id == "lm:24"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_poll_once_lm_paired_perp_gone_fires_after_dwell(monkeypatch, tmp_path):
+    """LM base-leg hedge reads as gone → companion `pick_invalidated(lm:<pid>)`
+    so the LP is redeemed — but ONLY after INVALIDATE_DWELL_POLLS consecutive
+    'gone' polls. A single transient empty `get_positions` read must NOT churn
+    the hedged book (regression: 2026-06-12 PARTI/TREE auto-closed on flat
+    price from one bad poll)."""
+    baseline = _eth_baseline()
     client = AsyncMock()
     client.get_tickers = AsyncMock(
         return_value=[_FakeTicker("ETHUSDT", "2000", "0.0001")]
     )
     client.list_hold_to_earn_products = AsyncMock(return_value=[{"productId": "A"}])
-    # No ETH short open anymore → "perp gone" branch.
+    # ETH short reads gone on every poll.
     client.get_positions = AsyncMock(return_value=[])
 
     async def _peg_stub() -> Decimal | None:
         return Decimal("1.0")
 
     monkeypatch.setattr(watcher, "_fetch_peg_usd", _peg_stub)
+    dwell = tmp_path / "dwell.json"
 
-    events = await poll_once(client, baseline)
-    companions = [
-        e for e in events
-        if e.kind == "pick_invalidated" and e.position_id == "lm:24"
-    ]
+    # Poll 1: gone, dwell not yet met → NO fire.
+    events1 = await poll_once(client, baseline, dwell_state_path=dwell)
+    assert _lm_companions(events1) == []
+    # Poll 2: still gone → dwell threshold met → fires.
+    events2 = await poll_once(client, baseline, dwell_state_path=dwell)
+    companions = _lm_companions(events2)
     assert len(companions) == 1
     assert companions[0].severity == "P0"
+
+
+@pytest.mark.asyncio
+async def test_poll_once_perp_transient_gone_then_present_no_fire(monkeypatch, tmp_path):
+    """A perp that reads gone for one poll then present again (transient API
+    miss) must NOT fire perp_closed — the gone-counter resets on a present
+    read, so a later single 'gone' poll never reaches the dwell threshold."""
+    baseline = _eth_baseline()
+    client = AsyncMock()
+    client.get_tickers = AsyncMock(
+        return_value=[_FakeTicker("ETHUSDT", "2000", "0.0001")]
+    )
+    client.list_hold_to_earn_products = AsyncMock(return_value=[{"productId": "A"}])
+
+    async def _peg_stub() -> Decimal | None:
+        return Decimal("1.0")
+
+    monkeypatch.setattr(watcher, "_fetch_peg_usd", _peg_stub)
+    dwell = tmp_path / "dwell.json"
+
+    present = [SimpleNamespace(symbol="ETHUSDT", side="Sell", size="1",
+                              markPrice="2000", liqPrice="4000", coin="ETH")]
+    # Poll 1: gone (counter → 1).
+    client.get_positions = AsyncMock(return_value=[])
+    e1 = await poll_once(client, baseline, dwell_state_path=dwell)
+    # Poll 2: present again → counter resets.
+    client.get_positions = AsyncMock(return_value=present)
+    e2 = await poll_once(client, baseline, dwell_state_path=dwell)
+    # Poll 3: gone again (counter → 1, below threshold) → still no fire.
+    client.get_positions = AsyncMock(return_value=[])
+    e3 = await poll_once(client, baseline, dwell_state_path=dwell)
+    for evs in (e1, e2, e3):
+        assert _lm_companions(evs) == []
 
 
 @pytest.mark.asyncio
