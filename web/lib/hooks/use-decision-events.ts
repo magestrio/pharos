@@ -12,6 +12,7 @@ import {
   isDecisionLogConfigured,
 } from "@/lib/contracts";
 import { DecisionLogABI } from "@vault8004/abi";
+import { collectLogsInRanges } from "@/lib/get-logs-chunked";
 
 const DECISION_RECORDED_EVENT = (DecisionLogABI as readonly AbiEvent[]).find(
   (item) => item.type === "event" && item.name === "DecisionRecorded",
@@ -96,12 +97,18 @@ export function useDecisionEvents(): DecisionEventsResult {
     queryKey: QUERY_KEY,
     queryFn: async (): Promise<OnChainDecisionEvent[]> => {
       if (!publicClient || !isDecisionLogConfigured) return [];
-      const logs = await publicClient.getLogs({
-        address: DECISION_LOG_ADDRESS,
-        event: DECISION_RECORDED_EVENT,
-        fromBlock: DECISION_LOG_DEPLOY_BLOCK,
-        toBlock: "latest",
-      });
+      const latest = await publicClient.getBlockNumber();
+      const logs = await collectLogsInRanges(
+        DECISION_LOG_DEPLOY_BLOCK,
+        latest,
+        (from, to) =>
+          publicClient.getLogs({
+            address: DECISION_LOG_ADDRESS,
+            event: DECISION_RECORDED_EVENT,
+            fromBlock: from,
+            toBlock: to,
+          }),
+      );
       const normalized = (logs as unknown as RawEventLog[])
         .map(normalize)
         .filter((e): e is OnChainDecisionEvent => e !== null);

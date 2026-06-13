@@ -103,13 +103,19 @@ export const isAllocationConfigured =
 export const isDecisionLogConfigured = DECISION_LOG_ADDRESS !== ZERO_ADDRESS;
 export const isReputationOracleConfigured = REPUTATION_ORACLE_ADDRESS !== ZERO_ADDRESS;
 
+// Mantle-mainnet DecisionLog (0xB55d…) creation block, verified on-chain via a
+// getCode binary search. The event scan starts here so it never walks from
+// genesis (96.5M blocks ÷ 10k window ≈ 10_700 requests). Override per
+// environment (anvil fork) with NEXT_PUBLIC_DECISION_LOG_DEPLOY_BLOCK.
+const DECISION_LOG_DEPLOY_BLOCK_DEFAULT = 96_314_874n;
+
 export const DECISION_LOG_DEPLOY_BLOCK: bigint = (() => {
   const raw = process.env.NEXT_PUBLIC_DECISION_LOG_DEPLOY_BLOCK;
-  if (!raw) return 0n;
+  if (!raw) return DECISION_LOG_DEPLOY_BLOCK_DEFAULT;
   try {
     return BigInt(raw);
   } catch {
-    return 0n;
+    return DECISION_LOG_DEPLOY_BLOCK_DEFAULT;
   }
 })();
 

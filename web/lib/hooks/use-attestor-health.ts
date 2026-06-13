@@ -13,6 +13,7 @@ import {
   bybitAttestorContract,
 } from "@/lib/contracts";
 import { useIsMounted } from "@/lib/hooks/use-is-mounted";
+import { collectLogsInRanges } from "@/lib/get-logs-chunked";
 
 const REFETCH_INTERVAL_MS = 30_000;
 const WARN_THRESHOLD_SEC = 30 * 60; // 30 minutes - soft alert
@@ -98,12 +99,18 @@ export function useAttestorHealth(): AttestorHealthState {
     queryKey: ["attestor-push-count", BYBIT_ATTESTOR_ADDRESS],
     queryFn: async (): Promise<number> => {
       if (!publicClient || !isConfigured) return 0;
-      const logs = await publicClient.getLogs({
-        address: BYBIT_ATTESTOR_ADDRESS,
-        event: BALANCE_UPDATED_EVENT,
-        fromBlock: DECISION_LOG_DEPLOY_BLOCK,
-        toBlock: "latest",
-      });
+      const latest = await publicClient.getBlockNumber();
+      const logs = await collectLogsInRanges(
+        DECISION_LOG_DEPLOY_BLOCK,
+        latest,
+        (from, to) =>
+          publicClient.getLogs({
+            address: BYBIT_ATTESTOR_ADDRESS,
+            event: BALANCE_UPDATED_EVENT,
+            fromBlock: from,
+            toBlock: to,
+          }),
+      );
       return logs.length;
     },
     enabled: mounted && isConfigured && !!publicClient,

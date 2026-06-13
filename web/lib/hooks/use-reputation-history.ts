@@ -10,6 +10,7 @@ import {
   isReputationOracleConfigured,
 } from "@/lib/contracts";
 import { ReputationOracleABI } from "@vault8004/abi";
+import { collectLogsInRanges } from "@/lib/get-logs-chunked";
 
 const REPUTATION_UPDATED_EVENT = (ReputationOracleABI as readonly AbiEvent[]).find(
   (item) => item.type === "event" && item.name === "ReputationUpdated",
@@ -75,12 +76,18 @@ export function useReputationHistory(): ReputationHistoryResult {
     queryKey: ["reputation-history", REPUTATION_ORACLE_ADDRESS],
     queryFn: async (): Promise<ReputationHistoryPoint[]> => {
       if (!publicClient || !isReputationOracleConfigured) return [];
-      const logs = await publicClient.getLogs({
-        address: REPUTATION_ORACLE_ADDRESS,
-        event: REPUTATION_UPDATED_EVENT,
-        fromBlock: DECISION_LOG_DEPLOY_BLOCK,
-        toBlock: "latest",
-      });
+      const latest = await publicClient.getBlockNumber();
+      const logs = await collectLogsInRanges(
+        DECISION_LOG_DEPLOY_BLOCK,
+        latest,
+        (from, to) =>
+          publicClient.getLogs({
+            address: REPUTATION_ORACLE_ADDRESS,
+            event: REPUTATION_UPDATED_EVENT,
+            fromBlock: from,
+            toBlock: to,
+          }),
+      );
       return (logs as unknown as RawLog[])
         .map(normalize)
         .filter((p): p is ReputationHistoryPoint => p !== null)
