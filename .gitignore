@@ -3,6 +3,7 @@ node_modules
 .env.local
 *.env
 *.pem
+CLAUDE.md
 contracts/lib/
 contracts/out/
 contracts/cache/
