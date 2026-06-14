@@ -48,6 +48,10 @@ from agent.data.allora_client import (
     AlloraClient,
     AlloraInference,
 )
+from agent.reason.fees import (
+    FUNDING_CARRY_FRICTION_ANNUAL as _FUNDING_CARRY_FRICTION_ANNUAL,
+)
+from agent.reason.quality import compute_stability, stability_multiplier
 from agent.reason.venues import CARRY_CATEGORY, LM_BASE_LEG_FRACTION, STABLES
 from agent.sandbox.apr_history_cache import (
     cache_key,
@@ -131,11 +135,13 @@ MIN_CARRY_DEPTH_USD = Decimal("50000")
 # this fraction (instrument so chunky we'd violate the venue cap just
 # clearing min).
 MAX_CARRY_NOTIONAL_FRACTION = Decimal("0.05")
-# Annualized friction estimate for carry round-trip: swap entry+exit
-# (taker ~10bps × 2) + perp open+close (~5bps × 2) + 1-2 entries per
-# month average ≈ 1.8% drag. Conservative placeholder; recalibrate in
-# `.6` smoke from realized P&L vs predicted carry.
-FUNDING_CARRY_FRICTION_ANNUAL = Decimal("0.018")
+# Annualized round-trip friction for carry/hedge legs. Re-homed to the shared
+# `agent.reason.fees` module so the agent's net-yield math and the web
+# Earn-Explorer's net-of-fees profit derive from the SAME Bybit rates (spot
+# 0.1% + perp taker 0.055%). Value unchanged (0.018) — re-exported here so
+# existing `from agent.sandbox.snapshot import FUNDING_CARRY_FRICTION_ANNUAL`
+# call sites (validator, tests) keep working.
+FUNDING_CARRY_FRICTION_ANNUAL = _FUNDING_CARRY_FRICTION_ANNUAL
 
 # Reallocation horizon used to amortize zero-yield dead-time (subscribe
 # warmup + post-redeem processing) into `effective_apr_net_holding`. The
@@ -261,6 +267,15 @@ class ProductSummary(BaseModel):
     # (hold) from one sliding down (exit) instead of reacting to a single point.
     # None ⇒ no apr-history this cycle (ranker fell back to measured/estimate).
     apr_history_points: list[Decimal] | None = None
+    # Precomputed coin-stability, 0..100 (shared `agent.reason.quality`): blends
+    # APR steadiness (flatness of `apr_history_points`) with price calm (low
+    # |price_change|). Computed in two stages — APR-only at summary build (so the
+    # top-K rank tilts toward steady yield), then re-scored with price calm after
+    # the perp fan-out surfaces `price_change_*`. Drives a MODERATE stability tilt
+    # in `_rank` (does NOT mutate effective_apr) and is surfaced to the LLM so it
+    # prefers steady picks over raw top-APR. None ⇒ no stability signal (e.g.
+    # advance-Earn with no apr-history and no perp) → neutral in ranking.
+    stability_score: float | None = None
     notes: list[str] = Field(default_factory=list)
 
 
@@ -691,6 +706,19 @@ def _flex_or_onchain_summary(
                 except (InvalidOperation, TypeError):
                     pass
 
+    # Stage-1 stability: APR-steadiness only (price_change is surfaced later by
+    # the perp fan-out). This tilts the FIRST `_rank` — where the top-K is cut —
+    # toward steady-yield products so they reach the LLM; `_apply_net_hedge_apr`
+    # re-scores with price calm afterward.
+    stability_score = compute_stability(
+        coin=p.coin,
+        apr_history_pts=(
+            [float(x) for x in apr_history_points] if apr_history_points else None
+        ),
+        price_change_7d_pct=None,
+        price_change_30d_pct=None,
+    )["stability_score"]
+
     return ProductSummary(
         category=category,
         product_id=p.productId,
@@ -705,6 +733,7 @@ def _flex_or_onchain_summary(
         min_subscribe_usd=min_stake,
         stake_precision=stake_precision,
         apr_history_points=apr_history_points,
+        stability_score=stability_score,
         notes=notes,
     )
 
@@ -1376,6 +1405,20 @@ def _rank_key(s: ProductSummary) -> Decimal:
     return s.effective_apr
 
 
+def _rank_value(s: ProductSummary) -> float:
+    """Stability-tilted ranking value: the APR rank key discounted by the coin's
+    stability (moderate — at most ~40% off via `stability_multiplier`, floor 0.6;
+    None stability → no discount). A steadier product can outrank a slightly
+    higher-APR volatile one, while a large APR gap still wins. Only POSITIVE rank
+    values are discounted — a negative net (already a reject/probe) is left as-is
+    so the tilt can't promote a loss above a smaller loss. `effective_apr` itself
+    is never mutated; this only reorders/selects."""
+    rk = float(_rank_key(s))
+    if rk <= 0:
+        return rk
+    return rk * stability_multiplier(s.stability_score)
+
+
 def _lm_is_unleveraged(s: ProductSummary) -> bool:
     """True when an LM row is UNLEVERAGED (`bybit-sandbox.66`). Parses the
     `max_leverage=N` note with the SAME int-parse as the validator's
@@ -1405,15 +1448,18 @@ def _rank(
     stables and LM `max_leverage=1` pairs always appear so the LLM has
     a hedge-free / unleveraged pick available even when alt-coin APRs
     dominate the top of the list.
+
+    Sort key is `_rank_value` — APR with a MODERATE stability tilt (see its
+    docstring), so steady products both survive the top-K cut and rank higher.
     """
-    by_apr = sorted(products, key=_rank_key, reverse=True)
+    by_apr = sorted(products, key=_rank_value, reverse=True)
     if must_include is None:
         return by_apr[:top_k]
     must = [p for p in by_apr if must_include(p)]
     must_ids = {p.product_id for p in must}
     rest = [p for p in by_apr if p.product_id not in must_ids][:top_k]
     merged = must + rest
-    return sorted(merged, key=_rank_key, reverse=True)
+    return sorted(merged, key=_rank_value, reverse=True)
 
 
 async def _measure_realized_apr(
@@ -1736,6 +1782,26 @@ def _surface_price_change(row: ProductSummary, info: "PerpInfo") -> None:
     row.price_change_1d_pct = info.price_change_1d_pct
     row.price_change_7d_pct = info.price_change_7d_pct
     row.price_change_30d_pct = info.price_change_30d_pct
+    # Stage-2 stability: now that price-change is on the row, re-score with price
+    # calm folded in (stage-1 was APR-steadiness only). Drives the final re-rank.
+    row.stability_score = compute_stability(
+        coin=row.coin,
+        apr_history_pts=(
+            [float(x) for x in row.apr_history_points]
+            if row.apr_history_points
+            else None
+        ),
+        price_change_7d_pct=(
+            float(row.price_change_7d_pct)
+            if row.price_change_7d_pct is not None
+            else None
+        ),
+        price_change_30d_pct=(
+            float(row.price_change_30d_pct)
+            if row.price_change_30d_pct is not None
+            else None
+        ),
+    )["stability_score"]
 
 
 def _apply_net_hedge_apr(

@@ -18,7 +18,6 @@ from __future__ import annotations
 import logging
 import math
 import os
-import statistics
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -28,7 +27,8 @@ import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from agent.reason.venues import STABLES
+from agent.reason.fees import round_trip_fee_fraction
+from agent.reason.quality import compute_stability, is_stable
 from agent.sandbox.store import (
     funding_7d_averages,
     funding_history,
@@ -51,8 +51,10 @@ _DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
 
 # Earn-Explorer coin-quality scoring knobs (heuristic — tests assert bands,
 # not exact values, so these stay tunable). See `_coin_quality`.
+# Stability (APR steadiness + price calm) is computed by the shared
+# `agent.reason.quality.compute_stability` so the agent ranker and this API
+# can't drift; only the yield/source-confidence knobs live here.
 _YIELD_KNEE = 20.0  # net-APR % where tanh credit hits ~0.76 (saturates mirage)
-_VOL_FULL = 25.0    # weekly price move % that scores 0 price-stability
 _MIRAGE_VOL = 40.0  # weekly move % above which quality is halved
 # Confidence in the APR number by its source — discounts noisy/estimated rates.
 _SOURCE_CONF = {
@@ -66,13 +68,6 @@ _SOURCE_CONF = {
     "momentum": 0.3,
     "missing": 0.0,
 }
-
-
-def _is_stable(coin: str) -> bool:
-    """A coin is stable when it (or BOTH legs of an LM `BASE/QUOTE` pair) is in
-    the canonical stablecoin set. Drives the price-stability override."""
-    legs = [leg.strip().upper() for leg in coin.split("/") if leg.strip()]
-    return bool(legs) and all(leg in STABLES for leg in legs)
 
 
 def _coin_quality(
@@ -95,7 +90,7 @@ def _coin_quality(
     derived `EarnProductRow` field. See plan: stability blends APR steadiness
     + price calm; quality blends saturating net yield + stability + source
     confidence, with mirage penalties. All scores clamp to sane ranges."""
-    stable = _is_stable(coin)
+    stable = is_stable(coin)
 
     # avg APR over the week (gross), from the daily series when present.
     if apr_history_pts:
@@ -113,46 +108,17 @@ def _coin_quality(
     )
     net_apr_pct = net * 100.0 if net is not None else None
 
-    # APR steadiness — bounded transform of the coefficient of variation.
-    apr_stability: float | None
-    if apr_history_pts and len(apr_history_pts) >= 2:
-        mu = statistics.fmean(apr_history_pts)
-        sd = statistics.pstdev(apr_history_pts)
-        if abs(mu) < 1e-9 and sd < 1e-9:
-            cv = 0.0  # all-zero APR → perfectly steady
-        elif abs(mu) < 1e-9:
-            cv = 10.0  # zero-mean but moving → max dispersion
-        else:
-            cv = sd / abs(mu)
-        apr_stability = 1.0 / (1.0 + 4.0 * cv)
-    else:
-        apr_stability = None
-
-    # Price volatility / calm — 7d move (or 30d ÷4 as a weekly-equivalent).
-    if price_change_7d_pct is not None:
-        price_volatility_pct: float | None = abs(price_change_7d_pct)
-    elif price_change_30d_pct is not None:
-        price_volatility_pct = abs(price_change_30d_pct) / 4.0
-    else:
-        price_volatility_pct = None
-    if stable:
-        price_stability: float | None = 1.0
-    elif price_volatility_pct is None:
-        price_stability = None
-    else:
-        price_stability = max(0.0, 1.0 - price_volatility_pct / _VOL_FULL)
-
-    # Combined stability (price weighted higher — a calm APR on a dying coin
-    # is a trap). Degrade gracefully when one signal is missing.
-    if apr_stability is not None and price_stability is not None:
-        s = 0.4 * apr_stability + 0.6 * price_stability
-    elif apr_stability is not None:
-        s = apr_stability
-    elif price_stability is not None:
-        s = price_stability
-    else:
-        s = None
-    stability_score = s * 100.0 if s is not None else None
+    # Stability (APR steadiness + price calm) — shared with the agent ranker.
+    stab = compute_stability(
+        coin=coin,
+        apr_history_pts=apr_history_pts,
+        price_change_7d_pct=price_change_7d_pct,
+        price_change_30d_pct=price_change_30d_pct,
+    )
+    apr_stability = stab["apr_stability"]
+    price_volatility_pct = stab["price_volatility_pct"]
+    price_stability = stab["price_stability"]
+    stability_score = stab["stability_score"]
 
     # Weekly funding (annualized): accurate 21-period avg → cross-cycle avg →
     # current. Display-only; funding is already inside net_apr for non-stables.
@@ -204,7 +170,9 @@ def _profit_horizon(
     """Return on notional over `days`, realized from the daily APR history
     where it reaches and projected (flagged) beyond it. Earn uses the GROSS
     daily APR series (so earn + funding doesn't double-count the hedge);
-    funding accrues the best-available average rate over the window."""
+    funding accrues the best-available average rate over the window. The
+    round-trip Bybit fee (enter+exit, once per horizon) is subtracted so
+    `total_pct` is the net profit of opening now and exiting after `days`."""
     note: str | None = None
     if apr_history_pts:
         n = len(apr_history_pts)
@@ -233,10 +201,15 @@ def _profit_horizon(
         funding_pct = None
         note = (note + "; " if note else "") + "funding history unavailable"
 
-    total_pct = earn_pct + (funding_pct or 0.0)
+    # Round-trip Bybit fee (enter+exit once over the horizon). Subtracted so
+    # short holds correctly show as net-negative when the fee outweighs the
+    # accrued yield — mirrors the agent's anti-churn economics.
+    fee_pct = round_trip_fee_fraction(is_stable=is_stable) * 100.0
+    total_pct = earn_pct + (funding_pct or 0.0) - fee_pct
     return ProfitHorizon(
         earn_pct=earn_pct,
         funding_pct=funding_pct,
+        fee_pct=fee_pct,
         total_pct=total_pct,
         basis=basis,
         note=note,
@@ -348,12 +321,14 @@ class Portfolio(BaseModel):
 
 class ProfitHorizon(BaseModel):
     """Realized/projected return on notional over a horizon, split into the
-    Earn leg + the hedge funding leg. `basis`: "realized" (entirely from
-    history), "projected" (some/all extrapolated — see `note`), or
-    "unavailable" (no data). `total_pct` is earn + funding."""
+    Earn leg, the hedge funding leg, and the round-trip trading FEE paid to
+    enter+exit once. `basis`: "realized" (entirely from history), "projected"
+    (some/all extrapolated — see `note`), or "unavailable" (no data).
+    `total_pct` is NET: earn + funding − fee."""
 
     earn_pct: float | None = None
     funding_pct: float | None = None
+    fee_pct: float | None = None  # round-trip Bybit fee (enter+exit), subtracted
     total_pct: float | None = None
     basis: str = "unavailable"
     note: str | None = None

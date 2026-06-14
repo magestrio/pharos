@@ -8,7 +8,27 @@ from __future__ import annotations
 
 import pytest
 
-from agent.api.server import _coin_profit, _coin_quality, _is_stable
+from agent.api.server import _coin_profit, _coin_quality
+from agent.reason.fees import (
+    FUNDING_CARRY_FRICTION_ANNUAL,
+    HEDGED_ROUND_TRIP_FEE,
+    PERP_TAKER_FEE_RATE,
+    SPOT_FEE_RATE,
+    round_trip_fee_fraction,
+)
+from agent.reason.quality import compute_stability, is_stable, stability_multiplier
+
+
+def test_bybit_fee_constants_and_round_trip() -> None:
+    # Real Bybit VIP-0 rates.
+    assert float(SPOT_FEE_RATE) == 0.001
+    assert float(PERP_TAKER_FEE_RATE) == 0.00055
+    # Hedged round trip = 2 spot + 2 perp taker = 0.31%.
+    assert float(HEDGED_ROUND_TRIP_FEE) == pytest.approx(0.0031)
+    assert round_trip_fee_fraction(is_stable=False) == pytest.approx(0.0031)
+    assert round_trip_fee_fraction(is_stable=True) == 0.0
+    # Agent net-hedge friction unchanged (no live behavior shift on re-home).
+    assert str(FUNDING_CARRY_FRICTION_ANNUAL) == "0.018"
 
 
 def _q(**over):
@@ -31,11 +51,41 @@ def _q(**over):
 
 
 def test_is_stable_single_and_lm_legs() -> None:
-    assert _is_stable("USDC")
-    assert _is_stable("USDC/USDT")  # both legs stable
-    assert not _is_stable("ETH")
-    assert not _is_stable("ETH/USDT")  # one leg non-stable
-    assert not _is_stable("")
+    assert is_stable("USDC")
+    assert is_stable("USDC/USDT")  # both legs stable
+    assert not is_stable("ETH")
+    assert not is_stable("ETH/USDT")  # one leg non-stable
+    assert not is_stable("")
+
+
+def test_stability_multiplier_bands() -> None:
+    # None → no discount (don't demote products lacking a signal).
+    assert stability_multiplier(None) == 1.0
+    # Max stable → 1.0; min → floor; midpoint → halfway.
+    assert stability_multiplier(100.0) == pytest.approx(1.0)
+    assert stability_multiplier(0.0) == pytest.approx(0.6)
+    assert stability_multiplier(50.0) == pytest.approx(0.8)
+    # Clamped to [floor, 1.0] for out-of-range input.
+    assert stability_multiplier(150.0) == pytest.approx(1.0)
+    assert stability_multiplier(-10.0) == pytest.approx(0.6)
+
+
+def test_compute_stability_apr_only_when_no_price() -> None:
+    # Non-stable with steady APR but no price data → stability = APR-steadiness.
+    s = compute_stability(
+        coin="ETH",
+        apr_history_pts=[0.05, 0.05, 0.05],
+        price_change_7d_pct=None,
+        price_change_30d_pct=None,
+    )
+    assert s["price_stability"] is None
+    assert s["stability_score"] == pytest.approx((s["apr_stability"] or 0) * 100.0)
+    # Stablecoin → price calm forced 1.0 even without price data.
+    st = compute_stability(
+        coin="USDC", apr_history_pts=None,
+        price_change_7d_pct=None, price_change_30d_pct=None,
+    )
+    assert st["price_stability"] == 1.0 and st["stability_score"] == 100.0
 
 
 def test_steady_stablecoin_high_stability_mid_quality() -> None:
@@ -199,9 +249,13 @@ def test_profit_1d_7d_realized_30d_projected() -> None:
     assert p["profit_1d"].basis == "realized"
     assert p["profit_1d"].earn_pct == pytest.approx(0.05 / 365 * 100)
     assert p["profit_1d"].funding_pct == pytest.approx(7.3 / 365)
+    # total is NET of the round-trip fee (0.31% non-stable): earn+funding−fee.
+    assert p["profit_1d"].fee_pct == pytest.approx(0.31)
     assert p["profit_1d"].total_pct == pytest.approx(
-        p["profit_1d"].earn_pct + p["profit_1d"].funding_pct
+        p["profit_1d"].earn_pct + p["profit_1d"].funding_pct - p["profit_1d"].fee_pct
     )
+    # 1d hold loses money — the fee dwarfs a single day's yield (anti-churn).
+    assert p["profit_1d"].total_pct < 0
     # 7d realized over the full window.
     assert p["profit_7d"].basis == "realized"
     assert p["profit_7d"].earn_pct == pytest.approx(0.05 * 7 / 365 * 100)
@@ -245,6 +299,22 @@ def test_profit_no_data_unavailable() -> None:
     )
     assert p["profit_1d"].basis == "unavailable"
     assert p["profit_1d"].total_pct is None
+
+
+def test_profit_fee_only_charged_for_nonstable() -> None:
+    # Non-stable pays the 0.31% hedged round trip; stable Earn pays nothing.
+    ns = _coin_profit(
+        apr_history_pts=[0.05] * 7, effective_apr=0.05, effective_apr_gross=0.05,
+        is_stable=False, funding_7d_annual_pct=0.0,
+    )
+    st = _coin_profit(
+        apr_history_pts=[0.05] * 7, effective_apr=0.05, effective_apr_gross=0.05,
+        is_stable=True, funding_7d_annual_pct=None,
+    )
+    assert ns["profit_7d"].fee_pct == pytest.approx(0.31)
+    assert st["profit_7d"].fee_pct == pytest.approx(0.0)
+    # Same gross earn, but the non-stable nets less by exactly the fee.
+    assert st["profit_7d"].total_pct - ns["profit_7d"].total_pct == pytest.approx(0.31)
 
 
 def test_profit_negative_funding_drags_total() -> None:

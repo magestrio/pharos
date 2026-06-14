@@ -110,6 +110,7 @@ export type EarnProductRow = {
 export type ProfitHorizon = {
   earn_pct: number | null;
   funding_pct: number | null;
+  fee_pct: number | null; // round-trip Bybit fee, already subtracted from total
   total_pct: number | null;
   basis: "realized" | "projected" | "unavailable";
   note: string | null;

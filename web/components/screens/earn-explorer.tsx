@@ -73,7 +73,7 @@ export function EarnExplorer() {
       <SectionHead
         eyebrow="Bybit Earn"
         title="Earn Explorer"
-        subtitle="Every Bybit Earn coin scored for real earnability. Profit = realized return per $100 (APR + funding) over the chosen horizon — ~ marks projected when history is short. Quality blends net APR, stability, and source confidence. Expand a row for the full breakdown."
+        subtitle="Every Bybit Earn coin scored for real earnability. Profit = net return per $100 (APR + funding − Bybit round-trip fee) over the chosen horizon — short holds can go negative when the fee outweighs the yield; ~ marks projected when history is short. Quality blends net APR, stability, and source confidence. Expand a row for the full breakdown."
         right={
           data?.captured_at ? (
             <div className="flex items-center gap-2 font-mono text-[11px] text-dim-400">
@@ -410,7 +410,7 @@ function ProfitPanel({ row }: { row: EarnProductRow }) {
   return (
     <div className="space-y-2">
       <Eyebrow tone="accent">
-        Profit per $100 — realized from history (earn + funding)
+        Profit per $100 — net of fees (earn + funding − Bybit round-trip)
       </Eyebrow>
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         {PROFIT_HORIZONS.map(({ key, label }) => (
@@ -458,6 +458,12 @@ function ProfitCard({ label, h }: { label: string; h: ProfitHorizon | null }) {
           earn {h.earn_pct === null ? "—" : h.earn_pct.toFixed(3) + "%"}
           {" · "}
           funding {h.funding_pct === null ? "n/a" : h.funding_pct.toFixed(3) + "%"}
+          {h.fee_pct !== null && h.fee_pct > 0 && (
+            <>
+              {" · "}
+              <span className="text-danger">−fee {h.fee_pct.toFixed(2)}%</span>
+            </>
+          )}
         </div>
       )}
       {h?.note && <div className="text-[9.5px] font-mono text-dim-600 leading-snug">{h.note}</div>}

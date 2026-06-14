@@ -662,6 +662,41 @@ def test_rank_caps_at_top_k():
     assert [p.product_id for p in ranked] == ["0.07", "0.06", "0.05"]
 
 
+def _stab_row(pid: str, apr: str, coin: str, stability: float | None) -> ProductSummary:
+    return ProductSummary(
+        category="FlexibleSaving", product_id=pid, coin=coin,
+        effective_apr=Decimal(apr), apr_source="apr_history",
+        stability_score=stability,
+    )
+
+
+def test_rank_stability_tilt_steady_beats_jumpy_on_close_apr():
+    """Moderate tilt: a steadier product (high stability_score) outranks a
+    slightly higher-APR volatile one when their APRs are close."""
+    steady = _stab_row("steady", "0.10", "ETH", 90.0)   # 10% × 0.96 = 0.096
+    jumpy = _stab_row("jumpy", "0.11", "SOL", 20.0)     # 11% × 0.68 = 0.0748
+    ranked = _rank([jumpy, steady], top_k=10)
+    assert [p.product_id for p in ranked] == ["steady", "jumpy"]
+
+
+def test_rank_stability_tilt_does_not_override_large_apr_gap():
+    """Stability is a tilt, not a veto: a much higher APR still wins despite
+    a low stability_score."""
+    steady = _stab_row("steady", "0.10", "ETH", 95.0)   # 10% × ~0.98 = 0.098
+    highvol = _stab_row("highvol", "0.30", "SOL", 20.0)  # 30% × 0.68 = 0.204
+    ranked = _rank([steady, highvol], top_k=10)
+    assert ranked[0].product_id == "highvol"
+
+
+def test_rank_none_stability_is_neutral():
+    """stability_score=None → multiplier 1.0 → ordering identical to pure APR
+    (no blind demotion of products without a stability signal)."""
+    a = _stab_row("a", "0.05", "ETH", None)
+    b = _stab_row("b", "0.06", "SOL", None)
+    ranked = _rank([a, b], top_k=10)
+    assert [p.product_id for p in ranked] == ["b", "a"]
+
+
 def test_rank_pins_held_position_below_top_k():
     """Part 1: a held non-stable product that ranks below top_k must still
     survive via the `pin` predicate — otherwise the validator force-redeems it."""
@@ -2076,3 +2111,23 @@ async def test_collect_snapshot_earn_funding_serializes_to_json():
     assert "BTC" in dumped["earn_funding"]
     assert dumped["earn_funding"]["BTC"]["symbol"] == "BTCUSDT"
     assert isinstance(dumped["earn_funding"]["BTC"]["funding_rate"], str)
+
+
+# ─── stability_score on snapshot products (2026-06-14) ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_collect_snapshot_attaches_stability_score():
+    """Stable Flex/OnChain products get a stability_score (stables are price-calm
+    by definition → 100 when no apr-history). Confirms the agent ranker's score
+    is surfaced on the snapshot the LLM reads."""
+    client = _mock_client_full()
+    with patch("agent.sandbox.snapshot._fetch_usdc_peg", _fake_peg_ok):
+        snap = await collect_snapshot(client)
+    flex = {p.product_id: p for p in snap.products["FlexibleSaving"]}
+    # USDC / USD1 are stables → price-calm 1.0, no apr-history → score 100.
+    assert all(p.coin in ("USDC", "USD1") for p in flex.values())
+    assert all(p.stability_score == 100.0 for p in flex.values())
+    # Round-trips through JSON (LLM payload + store).
+    dumped = snap.model_dump(mode="json")
+    assert dumped["products"]["FlexibleSaving"][0]["stability_score"] == 100.0
