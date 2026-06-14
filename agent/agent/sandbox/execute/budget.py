@@ -20,7 +20,6 @@ from agent.sandbox.execute.common import (
     _UNIFIED_SPEND_RESERVE_FACTOR,
     _UNIFIED_SPEND_RESERVE_FLOOR,
     MIN_ACTION_USDC,
-    MIN_SWAP_USDC,
     _coin_mark,
     _redeem_settles_in_cycle,
 )
@@ -446,10 +445,18 @@ def _unfunded_nonstable_subscribe_coins(
           + in-cycle (fast-settling) REDEEM_EARN credit
 
     Mirrors `_redeem_settles_in_cycle`: slow OnChain redeems don't credit
-    this cycle. A coin is unfunded when `required − coverage ≥ MIN_SWAP_USDC`
-    (the same gap the swap planner needs before it would emit a Buy, so a
-    shortfall too small to swap is NOT flagged — avoids over-skipping a pick
-    that the existing native balance already covers) OR the mark is missing.
+    this cycle. A coin is unfunded when `required − coverage > MIN_ACTION_USDC`
+    (any real shortfall beyond mark-price quantization dust) OR the mark is
+    missing.
+
+    The threshold is a small dust floor, NOT `MIN_SWAP_USDC`. A sub-`MIN_SWAP`
+    gap is not a sign the native balance covers it: a small TOP-UP subscribe
+    (e.g. add $1.24 to a $36 MOVE position) has a tiny `need`, but if the coin
+    is fully staked the free-wallet coverage is ~0, the buy-swap is skipped as
+    too-small, and the subscribe 180016s on the full native qty. Whenever
+    coverage genuinely covers the requirement, `coverage ≥ need` and the gap is
+    ≤ 0 regardless — the only positive gap below the dust floor is the
+    ROUND_DOWN quantization on `amount_native`, which the subscribe survives.
 
     Returns the set of non-stable coins to drop. Pure: caller cascades the
     subscribe + paired perp.
@@ -481,6 +488,6 @@ def _unfunded_nonstable_subscribe_coins(
             + _buy_usd_for_coin(earn_swaps, coin)
             + redeem_credit.get(coin, Decimal(0))
         )
-        if need - coverage >= MIN_SWAP_USDC:
+        if need - coverage > MIN_ACTION_USDC:
             unfunded.add(coin)
     return unfunded

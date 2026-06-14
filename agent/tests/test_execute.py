@@ -4670,14 +4670,50 @@ def test_unfunded_nonstable_subscribe_funded_by_buy() -> None:
 
 
 def test_unfunded_nonstable_subscribe_funded_by_native_no_overskip() -> None:
-    """Wallet already holds the coin; shortfall < MIN_SWAP so no Buy was
-    emitted — must NOT be flagged (the native balance covers it)."""
+    """Wallet free balance fully covers the subscribe → NOT flagged."""
     snap = _snapshot(
         total_equity_usd="100",
         perp_market={"TON": _perp("TON", mark="2.0")},
     )
-    # Subscribe $50; native 24 TON × $2 = $48; shortfall $2 < MIN_SWAP $5.
-    snap.wallet.unified_coin_balances = {"TON": Decimal("24")}
+    # Subscribe $50; native 25 TON × $2 = $50 ≥ need $50 → coverage covers it.
+    snap.wallet.unified_coin_balances = {"TON": Decimal("25")}
+    out = _unfunded_nonstable_subscribe_coins(
+        snap,
+        subscribes=[_subscribe_action("TON", "50", native="25")],
+        earn_swaps=[],
+        redeems=[],
+    )
+    assert out == set()
+
+
+def test_unfunded_nonstable_subscribe_small_topup_no_free_balance() -> None:
+    """Live MOVE 180016 regression: a small TOP-UP (sub-MIN_SWAP `need`) into a
+    coin that is fully staked has ~0 free coverage and no Buy is emitted (gap
+    too small to swap). The full native qty would 180016 — must be flagged."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"TON": _perp("TON", mark="2.0")},
+    )
+    # Add $1.24 to an existing position; wallet holds no free TON.
+    snap.wallet.unified_coin_balances = {"TON": Decimal("0")}
+    out = _unfunded_nonstable_subscribe_coins(
+        snap,
+        subscribes=[_subscribe_action("TON", "1.24", native="0.62")],
+        earn_swaps=[],
+        redeems=[],
+    )
+    assert out == {"TON"}
+
+
+def test_unfunded_nonstable_subscribe_quantization_dust_no_overskip() -> None:
+    """A sub-dust positive gap (ROUND_DOWN quantization on `amount_native`,
+    here a $0.10 shortfall) is survivable — must NOT be flagged."""
+    snap = _snapshot(
+        total_equity_usd="100",
+        perp_market={"TON": _perp("TON", mark="2.0")},
+    )
+    # Subscribe $50; native 24.95 TON × $2 = $49.90; gap $0.10 < MIN_ACTION $0.50.
+    snap.wallet.unified_coin_balances = {"TON": Decimal("24.95")}
     out = _unfunded_nonstable_subscribe_coins(
         snap,
         subscribes=[_subscribe_action("TON", "50", native="25")],
@@ -4796,9 +4832,9 @@ def test_diff_nonstable_funded_by_native_keeps_both() -> None:
         perp_market={"TON": _perp("TON", mark="2.0")},
         onchain_products=[_TON_PRODUCT],
     )
-    # $50 TON pick; native 24 TON × $2 = $48 → shortfall $2 < MIN_SWAP $5,
-    # so `_swap_actions_for_earn_picks` emits no Buy.
-    snap.wallet.unified_coin_balances = {"TON": Decimal("24")}
+    # $50 TON pick; native 25 TON × $2 = $50 fully covers it → no shortfall,
+    # so `_swap_actions_for_earn_picks` emits no Buy and the pick is funded.
+    snap.wallet.unified_coin_balances = {"TON": Decimal("25")}
     d = _decision_with_hedge(hedge_notional=-50.0)
     actions = diff_to_actions(snap, d, snapshot_ts="20260608T150000Z")
     assert len([a for a in actions if a.kind == ActionKind.SUBSCRIBE_EARN]) == 1

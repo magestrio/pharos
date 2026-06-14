@@ -948,8 +948,9 @@ def diff_to_actions(
 
     # `.3` planner guard: a non-stable subscribe with NO funded spot path
     # (mark missing → no Buy swap emitted; or the emitted Buy + native
-    # balance + in-cycle redeem still fall short by ≥ MIN_SWAP_USDC for a
-    # non-budget reason) would 180016 live and strand its paired perp as a
+    # balance + in-cycle redeem still fall short of `need` — including a small
+    # top-up whose sub-MIN_SWAP gap never triggers a Buy) would 180016 live
+    # and strand its paired perp as a
     # naked short. Cascade both to SKIP. Shares the per-coin funded-coverage
     # notion with the `.2` pre-flight (`_buy_usd_for_coin` / `_coin_mark`).
     # The runtime `subscribe_failed_coins` guard (`execute_actions`) stays as
