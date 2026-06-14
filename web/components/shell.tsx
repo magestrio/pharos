@@ -10,6 +10,7 @@ import { BRAND } from "@/lib/brand";
 import { useIsMounted } from "@/lib/hooks/use-is-mounted";
 import { LiveTicker } from "@/components/live-ticker";
 import { DecisionLog } from "@/components/screens/decision-log";
+import { EarnExplorer } from "@/components/screens/earn-explorer";
 import { VaultCard } from "@/components/screens/vault-card";
 import { StoreProvider } from "@/lib/agent-store-context";
 import type { CycleSummary, Portfolio } from "@/lib/agent-api";
@@ -60,6 +61,7 @@ const FOOTER_CONTRACTS: ContractEntry[] = [
 const TABS = [
   { id: "vault", label: "Agent Dashboard", short: "Dashboard" },
   { id: "decisions", label: "Decision Log", short: "Decisions" },
+  { id: "earn", label: "Earn Explorer", short: "Earn" },
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
@@ -184,6 +186,7 @@ function ShellBody({
       <main className="relative flex-1 max-w-[1440px] mx-auto w-full px-4 sm:px-6 lg:px-8 py-8 sm:py-10">
         {tab === "vault" && <VaultCard />}
         {tab === "decisions" && <DecisionLog />}
+        {tab === "earn" && <EarnExplorer />}
       </main>
 
       <Footer />

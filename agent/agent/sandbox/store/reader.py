@@ -134,6 +134,53 @@ async def list_events(
     return [dict(r) for r in rows]
 
 
+async def get_latest_snapshot(
+    pool: asyncpg.Pool,
+) -> dict[str, Any] | None:
+    """Most-recent snapshot payload (full JSONB → dict). Powers the
+    Earn-Explorer `/earn/products` endpoint, which reads the product
+    universe + `earn_funding` from the latest snapshot. None when no
+    snapshot recorded yet."""
+    async with pool.acquire() as conn:
+        payload = await conn.fetchval(
+            "SELECT payload FROM snapshots ORDER BY cycle_ts DESC LIMIT 1"
+        )
+    return payload if isinstance(payload, dict) else None
+
+
+async def funding_history(
+    pool: asyncpg.Pool,
+    coin: str,
+    *,
+    limit: int = 60,
+) -> list[dict[str, Any]]:
+    """Cross-cycle funding-rate series for one Earn coin, oldest→newest.
+
+    Reads `earn_funding.<COIN>.funding_rate` from each snapshot, falling
+    back to the hedge-subset `perp_market.<COIN>.funding_rate_8h` for
+    cycles recorded before `earn_funding` existed. Depth is bounded by how
+    many cycles carry the data (forward-only — see plan). Returns rows with
+    `cycle_ts`, `funding_rate` (text|None), `funding_interval_hours`
+    (text|None)."""
+    key = coin.upper()
+    sql = (
+        "SELECT cycle_ts, "
+        "  COALESCE(payload->'earn_funding'->$1->>'funding_rate', "
+        "           payload->'perp_market'->$1->>'funding_rate_8h') "
+        "    AS funding_rate, "
+        "  COALESCE(payload->'earn_funding'->$1->>'funding_interval_hours', "
+        "           payload->'perp_market'->$1->>'funding_interval_hours') "
+        "    AS funding_interval_hours "
+        "FROM snapshots "
+        "WHERE (payload->'earn_funding' ? $1) OR (payload->'perp_market' ? $1) "
+        "ORDER BY cycle_ts DESC LIMIT $2"
+    )
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, key, limit)
+    # Query is newest-first for the LIMIT; the chart wants oldest→newest.
+    return [dict(r) for r in reversed(rows)]
+
+
 async def get_current_portfolio(
     pool: asyncpg.Pool,
 ) -> dict[str, Any] | None:

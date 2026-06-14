@@ -19,6 +19,17 @@ export type BybitProduct = {
   base_apr_string: string | null;
   redeem_lockup_minutes: number | null;
   notes: string[];
+  // Bybit's daily APR series (fractional strings, oldest→newest), present
+  // only for FlexibleSaving + OnChain products.
+  apr_history_points?: string[] | null;
+};
+
+export type EarnFundingEntry = {
+  symbol: string;
+  funding_rate: string | null;
+  funding_interval_hours: string | null;
+  mark_price: string | null;
+  source?: string;
 };
 
 export type EarnPosition = {
@@ -66,6 +77,7 @@ export type SnapshotJson = {
       orderbook_depth_50bps_usd: string;
     }
   >;
+  earn_funding?: Record<string, EarnFundingEntry>;
   usdc_peg: {
     price_usd: string;
     deviation_bps: string;

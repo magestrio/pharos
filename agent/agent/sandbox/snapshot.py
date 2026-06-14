@@ -455,6 +455,31 @@ class PerpInfo(BaseModel):
     price_change_30d_pct: Decimal | None = None
 
 
+class EarnFunding(BaseModel):
+    """Lightweight current-funding context for an Earn coin's USDT perp.
+
+    Unlike `PerpInfo` (a deep per-coin fan-out limited to the ~12-16 hedge
+    candidates), this is harvested for EVERY distinct non-stable Earn coin
+    straight from the already-fetched bulk `all_linear_tickers` — no extra
+    Bybit calls. It exists purely to power the web "Earn Explorer" funding
+    column; the agent's hedging logic still reads `perp_market`.
+
+    `funding_interval_hours` is absent from the bulk tickers feed, so it is
+    `None` unless the coin is also in `perp_market` (then we prefer that
+    exact interval). Readers annualizing a `None` interval default to 8h.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    symbol: str  # e.g. "TONUSDT"
+    funding_rate: Decimal | None = None  # current signed per-period rate
+    funding_interval_hours: Decimal | None = None
+    mark_price: Decimal | None = None
+    # "perp_market" when copied from the deep fan-out, "tickers" when
+    # harvested from the bulk linear-tickers feed.
+    source: str = "tickers"
+
+
 class Snapshot(BaseModel):
     model_config = ConfigDict(extra="ignore")
     schema_version: int = SCHEMA_VERSION
@@ -475,6 +500,12 @@ class Snapshot(BaseModel):
     # Populated for non-stable coins surfaced in OnChain top-K so the
     # hedging-feasibility rules in the prompt have something to score.
     perp_market: dict[str, PerpInfo] = Field(default_factory=dict)
+    # Current funding rate for EVERY distinct non-stable Earn coin that has
+    # a `{coin}USDT` linear perp, keyed by UPPERCASE coin. Harvested from the
+    # bulk linear-tickers feed (no extra API calls); a richer subset overlaps
+    # `perp_market`. Powers the web Earn-Explorer funding column. Stablecoins
+    # (no perp) are legitimately absent. Added 2026-06-14.
+    earn_funding: dict[str, EarnFunding] = Field(default_factory=dict)
     # Raw `/v5/earn/advance/product-extra-info` quote payloads, keyed by
     # `"<Category>/<ProductId>"` (pydantic dislikes tuple keys). Carries
     # the actionable offer details (selectPrice, expiredAt, instUid,
@@ -3115,6 +3146,50 @@ async def collect_snapshot(
             file=__import__('sys').stderr,
         )
 
+    # Current funding rate for every distinct non-stable Earn coin (web
+    # Earn-Explorer column). Harvest from the bulk `all_linear_tickers`
+    # already in memory — zero extra Bybit calls. Prefer the deep
+    # `perp_market` entry when the coin was in the hedge fan-out (it carries
+    # the exact funding interval + 7d-avg); otherwise fall back to the raw
+    # single-period ticker rate. LM coins are "BASE/QUOTE" — both legs count.
+    linear_funding: dict[str, Decimal] = {}
+    for t in all_linear_tickers:
+        if not t.symbol.endswith("USDT") or not t.fundingRate:
+            continue
+        try:
+            linear_funding[t.symbol.removesuffix("USDT").upper()] = Decimal(t.fundingRate)
+        except (InvalidOperation, TypeError):
+            continue
+    earn_coins: set[str] = set()
+    for items in products.values():
+        for item in items:
+            for leg in str(item.coin).upper().split("/"):
+                leg = leg.strip()
+                if leg and leg not in STABLES:
+                    earn_coins.add(leg)
+    earn_funding: dict[str, EarnFunding] = {}
+    for coin in earn_coins:
+        pm = perp_market.get(coin)
+        if pm is not None:
+            earn_funding[coin] = EarnFunding(
+                symbol=pm.symbol,
+                funding_rate=pm.funding_rate_8h,
+                funding_interval_hours=pm.funding_interval_hours,
+                mark_price=pm.mark_price,
+                source="perp_market",
+            )
+            continue
+        rate = linear_funding.get(coin)
+        mark = linear_mark.get(coin)
+        if rate is None and mark is None:
+            continue
+        earn_funding[coin] = EarnFunding(
+            symbol=f"{coin}USDT",
+            funding_rate=rate,
+            mark_price=mark,
+            source="tickers",
+        )
+
     # Convert raw position objects (pydantic models or dicts) to dicts
     # for JSON serialization without leaking pydantic types into Snapshot.
     earn_positions_dump = [
@@ -3139,6 +3214,7 @@ async def collect_snapshot(
         products=products,
         market=market,
         perp_market=perp_market,
+        earn_funding=earn_funding,
         perp_positions=perp_positions,
         advance_earn_quotes=advance_earn_quotes,
         advance_earn_positions=advance_earn_positions,

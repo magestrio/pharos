@@ -2012,3 +2012,67 @@ def test_all_coins_in_fund_extracts_funding_account_only() -> None:
     fund = _all_coins_in_fund(accounts)
     assert fund == {"TIA": Decimal("17.083644"), "USDT": Decimal("5.38")}
     assert "ETH" not in fund  # UNIFIED coin not picked up
+
+
+# ─── earn_funding harvest (Earn-Explorer feed, 2026-06-14) ───────────────────
+
+
+def _mock_client_earn_funding() -> AsyncMock:
+    """`_mock_client_full` + a populated bulk linear-tickers feed so the
+    `earn_funding` harvest has something to pull. The full mock's
+    `get_tickers` requires a `symbol`; the bulk call passes none, so we
+    override to serve both the category-only bulk list and per-symbol calls."""
+    client = _mock_client_full()
+    bulk = [
+        LinearTicker(
+            symbol="BTCUSDT", lastPrice="68000", markPrice="68000",
+            fundingRate="0.0001", price24hPcnt="0.01",
+        ),
+        LinearTicker(
+            symbol="ETHUSDT", lastPrice="3500", markPrice="3500",
+            fundingRate="0.00005", price24hPcnt="-0.01",
+        ),
+    ]
+
+    def _tickers(category, symbol=None):
+        if symbol is None:
+            return bulk
+        hit = [x for x in bulk if x.symbol == symbol]
+        return hit or [LinearTicker(symbol=symbol, lastPrice="1", fundingRate="0")]
+
+    client.get_tickers.side_effect = _tickers
+    return client
+
+
+@pytest.mark.asyncio
+async def test_collect_snapshot_harvests_earn_funding_for_nonstable_coins():
+    """BTC is the LM base coin (non-stable) and has a linear perp, so it
+    lands in `earn_funding` with its current funding rate. Stablecoin Earn
+    products (USDC, USD1) never get an entry, and ETH — which has a perp but
+    is NOT an Earn product coin here — is excluded too (earn coins only)."""
+    client = _mock_client_earn_funding()
+    with patch("agent.sandbox.snapshot._fetch_usdc_peg", _fake_peg_ok):
+        snap = await collect_snapshot(client)
+
+    assert "BTC" in snap.earn_funding
+    bt = snap.earn_funding["BTC"]
+    assert bt.symbol == "BTCUSDT"
+    assert bt.funding_rate == Decimal("0.0001")
+    # Stablecoin Earn products have no perp → no funding entry.
+    assert "USDC" not in snap.earn_funding
+    assert "USD1" not in snap.earn_funding
+    # ETH has a perp but is not an Earn product coin → not harvested.
+    assert "ETH" not in snap.earn_funding
+
+
+@pytest.mark.asyncio
+async def test_collect_snapshot_earn_funding_serializes_to_json():
+    """`earn_funding` round-trips through model_dump(mode="json") so the
+    store/JSONB write path and the web reader see plain strings."""
+    client = _mock_client_earn_funding()
+    with patch("agent.sandbox.snapshot._fetch_usdc_peg", _fake_peg_ok):
+        snap = await collect_snapshot(client)
+    dumped = snap.model_dump(mode="json")
+    assert "BTC" in dumped["earn_funding"]
+    assert dumped["earn_funding"]["BTC"]["symbol"] == "BTCUSDT"
+    assert isinstance(dumped["earn_funding"]["BTC"]["funding_rate"], str)

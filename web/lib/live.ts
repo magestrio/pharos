@@ -81,6 +81,34 @@ export type LivePortfolio = {
   }>;
 };
 
+export type EarnProductRow = {
+  category: string;
+  product_id: string;
+  coin: string;
+  effective_apr_pct: number;
+  apr_source: string;
+  apr_history_pct: number[] | null;
+  funding_rate: number | null;
+  funding_annual_pct: number | null;
+  mark_price: number | null;
+};
+
+export type EarnProducts = {
+  captured_at: string | null;
+  products: EarnProductRow[];
+};
+
+export type FundingHistoryPoint = {
+  ts: string;
+  funding_rate: number | null;
+  funding_annual_pct: number | null;
+};
+
+export type FundingHistory = {
+  coin: string;
+  points: FundingHistoryPoint[];
+};
+
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`${url} → ${res.status}`);
@@ -115,6 +143,34 @@ export function useBybitEarn(params?: { category?: string; coin?: string; limit?
   return useQuery({
     queryKey: ["bybit-earn", params ?? {}],
     queryFn: () => getJson<LiveBybitEarn>(url),
+    refetchInterval: POLL_INTERVAL_MS,
+    staleTime: POLL_INTERVAL_MS / 2,
+  });
+}
+
+export function useEarnExplorer(params?: { category?: string; coin?: string; limit?: number }) {
+  const search = new URLSearchParams();
+  if (params?.category) search.set("category", params.category);
+  if (params?.coin) search.set("coin", params.coin);
+  if (params?.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  const url = qs ? `/api/earn-products?${qs}` : "/api/earn-products";
+  return useQuery({
+    queryKey: ["earn-products", params ?? {}],
+    queryFn: () => getJson<EarnProducts>(url),
+    refetchInterval: POLL_INTERVAL_MS,
+    staleTime: POLL_INTERVAL_MS / 2,
+  });
+}
+
+export function useFundingHistory(coin: string | null, limit = 60) {
+  return useQuery({
+    queryKey: ["funding-history", coin, limit],
+    queryFn: () =>
+      getJson<FundingHistory>(
+        `/api/earn-funding-history?coin=${encodeURIComponent(coin ?? "")}&limit=${limit}`,
+      ),
+    enabled: !!coin,
     refetchInterval: POLL_INTERVAL_MS,
     staleTime: POLL_INTERVAL_MS / 2,
   });

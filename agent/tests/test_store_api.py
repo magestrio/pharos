@@ -71,6 +71,60 @@ def _snapshot() -> dict:
     }
 
 
+def _earn_snapshot(
+    ts: str = "2026-05-29T16:02:11+00:00",
+    *,
+    btc_funding: str = "0.0001",
+) -> dict:
+    """Snapshot with a product universe + earn_funding for the
+    Earn-Explorer endpoints."""
+    return {
+        "captured_at": ts,
+        "wallet": {"total_equity_usd": "200"},
+        "earn_positions": [],
+        "lm_positions": [],
+        "alpha_positions": [],
+        "perp_positions": [],
+        "products": {
+            "FlexibleSaving": [
+                {
+                    "category": "FlexibleSaving",
+                    "product_id": "F1",
+                    "coin": "BTC",
+                    "effective_apr": "0.05",
+                    "apr_source": "apr_history",
+                    "apr_history_points": ["0.04", "0.05", "0.06"],
+                },
+                {
+                    "category": "FlexibleSaving",
+                    "product_id": "F2",
+                    "coin": "USDC",
+                    "effective_apr": "0.03",
+                    "apr_source": "estimate_apr",
+                },
+            ],
+            "LiquidityMining": [
+                {
+                    "category": "LiquidityMining",
+                    "product_id": "L1",
+                    "coin": "BTC/USDT",
+                    "effective_apr": "0.12",
+                    "apr_source": "apy_e8",
+                },
+            ],
+        },
+        "earn_funding": {
+            "BTC": {
+                "symbol": "BTCUSDT",
+                "funding_rate": btc_funding,
+                "funding_interval_hours": "8",
+                "mark_price": "68000",
+                "source": "tickers",
+            },
+        },
+    }
+
+
 def _decision() -> dict:
     return {
         "thesis": "test",
@@ -291,6 +345,86 @@ async def test_healthz_reports_missing_pool_when_no_db(
     finally:
         if saved is not None:
             os.environ["DATABASE_URL"] = saved
+
+
+@pytest.mark.asyncio
+async def test_earn_products_endpoint_shapes_apr_and_funding(
+    api_client: httpx.AsyncClient,
+) -> None:
+    pool = api_client._test_pool  # type: ignore[attr-defined]
+    await record_cycle(
+        pool,
+        outcome=_outcome("20260529T160211Z"),
+        raw_snapshot=_earn_snapshot(),
+        raw_decision=_decision(),
+    )
+    resp = await api_client.get("/earn/products")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["captured_at"].startswith("2026-05-29T16:02:11")
+    by_id = {p["product_id"]: p for p in body["products"]}
+    # APR fractional → pct; Bybit daily history carried through.
+    assert by_id["F1"]["effective_apr_pct"] == pytest.approx(5.0)
+    assert by_id["F1"]["apr_history_pct"] == pytest.approx([4.0, 5.0, 6.0])
+    # BTC funding annualized: 0.0001 × (8760/8) × 100 = 10.95%.
+    assert by_id["F1"]["funding_annual_pct"] == pytest.approx(10.95)
+    # LM "BTC/USDT" matches BTC funding on the base leg.
+    assert by_id["L1"]["funding_annual_pct"] == pytest.approx(10.95)
+    # Stablecoin product: no funding, no history.
+    assert by_id["F2"]["funding_rate"] is None
+    assert by_id["F2"]["apr_history_pct"] is None
+    # Sorted by APR desc (LM 12% > flex 5% > stable 3%).
+    assert [p["product_id"] for p in body["products"]] == ["L1", "F1", "F2"]
+
+
+@pytest.mark.asyncio
+async def test_earn_products_404_without_snapshot(
+    api_client: httpx.AsyncClient,
+) -> None:
+    resp = await api_client.get("/earn/products")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_earn_funding_history_returns_cross_cycle_series(
+    api_client: httpx.AsyncClient,
+) -> None:
+    pool = api_client._test_pool  # type: ignore[attr-defined]
+    await record_cycle(
+        pool,
+        outcome=_outcome("20260529T160000Z"),
+        raw_snapshot=_earn_snapshot("2026-05-29T16:00:00+00:00", btc_funding="0.0001"),
+        raw_decision=_decision(),
+    )
+    await record_cycle(
+        pool,
+        outcome=_outcome("20260529T170000Z"),
+        raw_snapshot=_earn_snapshot("2026-05-29T17:00:00+00:00", btc_funding="0.0002"),
+        raw_decision=_decision(),
+    )
+    resp = await api_client.get("/earn/funding-history", params={"coin": "btc"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["coin"] == "BTC"
+    # Oldest → newest, both cycles present.
+    assert [p["funding_rate"] for p in body["points"]] == pytest.approx([0.0001, 0.0002])
+    assert body["points"][0]["funding_annual_pct"] == pytest.approx(10.95)
+
+
+@pytest.mark.asyncio
+async def test_earn_funding_history_empty_for_unknown_coin(
+    api_client: httpx.AsyncClient,
+) -> None:
+    pool = api_client._test_pool  # type: ignore[attr-defined]
+    await record_cycle(
+        pool,
+        outcome=_outcome("20260529T160000Z"),
+        raw_snapshot=_earn_snapshot(),
+        raw_decision=_decision(),
+    )
+    resp = await api_client.get("/earn/funding-history", params={"coin": "DOGE"})
+    assert resp.status_code == 200
+    assert resp.json() == {"coin": "DOGE", "points": []}
 
 
 assert datetime is not None  # silence ruff on the date helpers above

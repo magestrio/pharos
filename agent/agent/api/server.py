@@ -27,14 +27,43 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from agent.sandbox.store import (
+    funding_history,
     get_current_portfolio,
     get_cycle,
+    get_latest_snapshot,
     list_cycles,
     list_events,
     open_pool,
 )
 
 log = logging.getLogger(__name__)
+
+# Hours in a (non-leap) year, for annualizing a per-period funding rate.
+# Annual = rate × (HOURS_PER_YEAR / funding_interval_hours). Matches the
+# agent's `_annual_funding` (snapshot.py) — never a hardcoded × 3 × 365,
+# which under-states 4h/1h perps.
+_HOURS_PER_YEAR = 24 * 365
+_DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _annual_funding_pct(
+    rate: float | None, interval_hours: float | None
+) -> float | None:
+    if rate is None:
+        return None
+    interval = interval_hours or _DEFAULT_FUNDING_INTERVAL_HOURS
+    if interval <= 0:
+        interval = _DEFAULT_FUNDING_INTERVAL_HOURS
+    return rate * (_HOURS_PER_YEAR / interval) * 100.0
 
 
 # ───────────────────────── response models ───────────────────────────
@@ -94,6 +123,36 @@ class Portfolio(BaseModel):
     wake_reason: str
     positions: list[PositionRow] = Field(default_factory=list)
     wallet: dict[str, Any] | None = None
+
+
+class EarnProductRow(BaseModel):
+    category: str
+    product_id: str
+    coin: str
+    effective_apr_pct: float
+    apr_source: str
+    # Bybit's own daily APR series (oldest→newest, pct), present only for
+    # FlexibleSaving + OnChain. None for categories without a history feed.
+    apr_history_pct: list[float] | None = None
+    funding_rate: float | None = None  # current signed per-period rate
+    funding_annual_pct: float | None = None
+    mark_price: float | None = None
+
+
+class EarnProducts(BaseModel):
+    captured_at: str | None = None
+    products: list[EarnProductRow] = Field(default_factory=list)
+
+
+class FundingHistoryPoint(BaseModel):
+    ts: datetime
+    funding_rate: float | None = None
+    funding_annual_pct: float | None = None
+
+
+class FundingHistory(BaseModel):
+    coin: str
+    points: list[FundingHistoryPoint] = Field(default_factory=list)
 
 
 # ───────────────────────── app + lifespan ────────────────────────────
@@ -186,7 +245,97 @@ def build_app(pool: asyncpg.Pool | None = None) -> FastAPI:
             )
         return row
 
+    @app.get("/earn/products", response_model=EarnProducts)
+    async def earn_products_endpoint(
+        pool: Annotated[asyncpg.Pool, Depends(_get_pool)],
+        category: str | None = None,
+        coin: str | None = None,
+        limit: Annotated[int, Query(ge=1, le=500)] = 200,
+    ) -> EarnProducts:
+        snap = await get_latest_snapshot(pool)
+        if snap is None:
+            raise HTTPException(
+                status_code=404, detail="no snapshot recorded yet"
+            )
+        rows = _build_earn_rows(snap, category=category, coin=coin)
+        rows.sort(key=lambda r: r.effective_apr_pct, reverse=True)
+        return EarnProducts(captured_at=snap.get("captured_at"), products=rows[:limit])
+
+    @app.get("/earn/funding-history", response_model=FundingHistory)
+    async def earn_funding_history_endpoint(
+        pool: Annotated[asyncpg.Pool, Depends(_get_pool)],
+        coin: str,
+        limit: Annotated[int, Query(ge=1, le=500)] = 60,
+    ) -> FundingHistory:
+        rows = await funding_history(pool, coin, limit=limit)
+        points = []
+        for r in rows:
+            rate = _to_float(r.get("funding_rate"))
+            interval = _to_float(r.get("funding_interval_hours"))
+            points.append(
+                FundingHistoryPoint(
+                    ts=r["cycle_ts"],
+                    funding_rate=rate,
+                    funding_annual_pct=_annual_funding_pct(rate, interval),
+                )
+            )
+        return FundingHistory(coin=coin.upper(), points=points)
+
     return app
+
+
+def _build_earn_rows(
+    snap: dict[str, Any],
+    *,
+    category: str | None,
+    coin: str | None,
+) -> list[EarnProductRow]:
+    """Flatten the snapshot's product universe into Earn-Explorer rows,
+    joining each product to its coin's current funding from `earn_funding`
+    (LM `BASE/QUOTE` matches on either leg). Pure function over the snapshot
+    dict — no DB access."""
+    products: dict[str, Any] = snap.get("products") or {}
+    funding: dict[str, Any] = snap.get("earn_funding") or {}
+    coin_filter = coin.upper() if coin else None
+    rows: list[EarnProductRow] = []
+    for cat, items in products.items():
+        if category and cat != category:
+            continue
+        if not isinstance(items, list):
+            continue
+        for p in items:
+            pcoin = str(p.get("coin", ""))
+            if coin_filter and coin_filter not in pcoin.upper():
+                continue
+            fund = None
+            for leg in [pcoin.upper(), *pcoin.upper().split("/")]:
+                fund = funding.get(leg.strip())
+                if fund is not None:
+                    break
+            rate = _to_float(fund.get("funding_rate")) if fund else None
+            interval = (
+                _to_float(fund.get("funding_interval_hours")) if fund else None
+            )
+            apr_points = p.get("apr_history_points")
+            rows.append(
+                EarnProductRow(
+                    category=cat,
+                    product_id=str(p.get("product_id", "")),
+                    coin=pcoin,
+                    effective_apr_pct=(_to_float(p.get("effective_apr")) or 0.0)
+                    * 100.0,
+                    apr_source=str(p.get("apr_source", "")),
+                    apr_history_pct=(
+                        [(_to_float(x) or 0.0) * 100.0 for x in apr_points]
+                        if isinstance(apr_points, list) and apr_points
+                        else None
+                    ),
+                    funding_rate=rate,
+                    funding_annual_pct=_annual_funding_pct(rate, interval),
+                    mark_price=_to_float(fund.get("mark_price")) if fund else None,
+                )
+            )
+    return rows
 
 
 def _get_pool(request: Request) -> asyncpg.Pool:
