@@ -49,6 +49,7 @@ services:
     command: >
       python -m agent.sandbox.loop
       --interval 14400
+      --no-startup-cycle
       --live --yes
       --enable-store
       --enable-watcher

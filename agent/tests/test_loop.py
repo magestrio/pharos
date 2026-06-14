@@ -21,7 +21,12 @@ from agent.bybit_oracle.bybit_client import EarnOrderResult
 from agent.reason.schema import Decision, Pick, VenueAllocation
 from agent.sandbox.carry_state import CarryPositionRecord, CarryState
 from agent.sandbox.decide import DecisionUsage
-from agent.sandbox.loop import run_loop, run_one_cycle
+from agent.sandbox.loop import (
+    _last_cycle_time,
+    _seconds_until_due,
+    run_loop,
+    run_one_cycle,
+)
 
 
 def _stub_usage() -> DecisionUsage:
@@ -167,6 +172,53 @@ def _snapshot_with_ton(
                                  fetched_at=datetime.now(UTC)),
         errors=[],
     )
+
+
+# ─── startup scheduling (--no-startup-cycle) ─────────────────────────────────
+
+
+def test_seconds_until_due_no_history_runs_now(tmp_path: Path) -> None:
+    """No cycle log → 0 (first-ever boot runs immediately)."""
+    assert _seconds_until_due(tmp_path / "cycle_log.jsonl", 14400) == 0.0
+
+
+def test_seconds_until_due_recent_cycle_waits(tmp_path: Path) -> None:
+    """A cycle 1h ago with a 4h interval → ~3h remaining."""
+    from datetime import timedelta
+
+    log = tmp_path / "cycle_log.jsonl"
+    recent = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    log.write_text(json.dumps({"started_at": recent, "finished_at": recent}) + "\n")
+    due = _seconds_until_due(log, 14400)
+    assert 10000 < due <= 10800
+
+
+def test_seconds_until_due_overdue_runs_now(tmp_path: Path) -> None:
+    """A cycle older than the interval → 0 (catch up immediately)."""
+    from datetime import timedelta
+
+    log = tmp_path / "cycle_log.jsonl"
+    old = (datetime.now(UTC) - timedelta(hours=5)).isoformat()
+    log.write_text(json.dumps({"started_at": old, "finished_at": old}) + "\n")
+    assert _seconds_until_due(log, 14400) == 0.0
+
+
+def test_last_cycle_time_uses_last_line_and_skips_malformed(tmp_path: Path) -> None:
+    """Reads the most recent line; bad JSON is skipped; finished_at preferred."""
+    log = tmp_path / "cycle_log.jsonl"
+    older = "2026-06-14T10:00:00+00:00"
+    newer = "2026-06-14T16:00:00+00:00"
+    log.write_text(
+        json.dumps({"started_at": older, "finished_at": older}) + "\n"
+        + "not json\n"
+        + json.dumps({"started_at": "2026-06-14T15:59:00+00:00", "finished_at": newer})
+        + "\n"
+    )
+    assert _last_cycle_time(log) == datetime.fromisoformat(newer)
+
+
+def test_last_cycle_time_none_when_missing(tmp_path: Path) -> None:
+    assert _last_cycle_time(tmp_path / "nope.jsonl") is None
 
 
 def test_clamp_drops_overbudget_new_nonstable_to_cash() -> None:

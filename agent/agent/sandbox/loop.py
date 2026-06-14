@@ -2447,6 +2447,7 @@ async def run_loop(
     yes: bool,
     min_confidence: float,
     once: bool = False,
+    run_on_start: bool = True,
     cycle_log_path: Path = CYCLE_LOG,
     stop_event: asyncio.Event | None = None,
     mantle_rpc_url: str | None = None,
@@ -2576,6 +2577,26 @@ async def run_loop(
                 watcher_interval_seconds, watcher_baseline_path,
             )
 
+        # `--no-startup-cycle`: on a restart (e.g. a redeploy) don't fire an
+        # off-schedule heartbeat. Resume the existing cadence — wait until
+        # `last_cycle + interval` is due before the first heartbeat. The
+        # watcher still wakes us for P0 events during the wait; a first-ever
+        # boot or an overdue schedule runs immediately (`_seconds_until_due`
+        # returns 0). `--once` always runs now (manual smoke/invocation).
+        if not once and not run_on_start and not stop_event.is_set():
+            due_in = _seconds_until_due(cycle_log_path, interval_seconds)
+            if due_in > 0 and not pending_events:
+                log.info(
+                    "no-startup-cycle: last cycle recent — waiting %.0fs "
+                    "until the schedule is due (watcher events still wake)",
+                    due_in,
+                )
+                await _sleep_until_next_cycle(
+                    interval_seconds=due_in,
+                    stop_event=stop_event,
+                    wake_event=wake_event,
+                )
+
         try:
             while not stop_event.is_set():
                 # Drain any events the watcher queued while we slept,
@@ -2649,6 +2670,53 @@ async def run_loop(
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await watcher_task
             await store_stack.aclose()
+
+
+def _last_cycle_time(cycle_log_path: Path) -> datetime | None:
+    """Timestamp of the most recent recorded cycle — prefer `finished_at`,
+    fall back to `started_at`. None when the log is missing / empty /
+    unparseable. The cycle log lives on a persistent volume, so this
+    survives container restarts and lets `--no-startup-cycle` resume the
+    existing cadence across a redeploy."""
+    if not cycle_log_path.is_file():
+        return None
+    last_ts: str | None = None
+    for raw in cycle_log_path.read_text().splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            outcome = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        ts = outcome.get("finished_at") or outcome.get("started_at")
+        if ts:
+            last_ts = ts
+    if not last_ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(last_ts)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+def _seconds_until_due(
+    cycle_log_path: Path,
+    interval_seconds: float,
+    *,
+    now: datetime | None = None,
+) -> float:
+    """Seconds remaining until the heartbeat schedule is next due, based on
+    the last recorded cycle (`last + interval`). 0.0 when there is no
+    history (first-ever boot → run now) or the schedule is already overdue
+    (catch up immediately)."""
+    last = _last_cycle_time(cycle_log_path)
+    if last is None:
+        return 0.0
+    now = now or datetime.now(UTC)
+    elapsed = (now - last).total_seconds()
+    return max(0.0, interval_seconds - elapsed)
 
 
 async def _sleep_until_next_cycle(
@@ -2852,6 +2920,20 @@ def _main() -> None:
         help="dotenv to load (e.g. .env at repo root).",
     )
     parser.add_argument(
+        "--no-startup-cycle",
+        dest="run_on_start",
+        action="store_false",
+        default=True,
+        help=(
+            "On startup, don't fire an immediate heartbeat cycle — resume "
+            "the existing cadence instead (wait until last_cycle + "
+            "--interval is due). Use in the long-running service so a "
+            "redeploy/restart doesn't run an off-schedule cycle. The "
+            "watcher still wakes on P0 events; an overdue or first-ever "
+            "schedule runs immediately. Ignored with --once."
+        ),
+    )
+    parser.add_argument(
         "--enable-watcher",
         action="store_true",
         help=(
@@ -2910,6 +2992,7 @@ def _main() -> None:
             yes=args.yes,
             min_confidence=args.min_confidence,
             once=args.once,
+            run_on_start=args.run_on_start,
             mantle_rpc_url=mantle_rpc_url,
             mantle_vault_address=mantle_vault_address,
             oracle_cfg=oracle_cfg,
