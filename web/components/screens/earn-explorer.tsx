@@ -138,12 +138,12 @@ export function EarnExplorer() {
         <Card className="p-0 overflow-hidden">
           <div className="grid grid-cols-12 text-[10px] uppercase tracking-[0.16em] font-mono text-dim-500 bg-ink-850 px-4 py-2.5">
             <div className="col-span-2">Quality</div>
-            <div className="col-span-3">Coin</div>
+            <div className="col-span-2">Coin</div>
             <div className="col-span-2 text-right">Net APR</div>
             <div className="col-span-2 text-right text-accent">
               Profit {PROFIT_OPTS.find((o) => o.key === profitKey)?.short}
             </div>
-            <div className="col-span-1 text-right">Fund 7d</div>
+            <div className="col-span-2 text-right">Fee break-even</div>
             <div className="col-span-2">Stability</div>
           </div>
 
@@ -235,11 +235,6 @@ function Bar({ value, color = ACCENT }: { value: number | null | undefined; colo
   );
 }
 
-function fundingColor(annual: number | null | undefined): string {
-  if (annual === null || annual === undefined) return "#7A8499";
-  return annual >= 0 ? POS : DANGER;
-}
-
 function EarnRow({
   row,
   profitKey,
@@ -251,7 +246,6 @@ function EarnRow({
   expanded: boolean;
   onToggle: () => void;
 }) {
-  const funding7d = row.funding_7d_annual_pct;
   const profit = row[profitKey] ?? null;
   return (
     <div className="border-t border-ink-600/30">
@@ -262,7 +256,7 @@ function EarnRow({
         <div className="col-span-2">
           <QualityBadge score={row.quality_score} />
         </div>
-        <div className="col-span-3 min-w-0 pr-2">
+        <div className="col-span-2 min-w-0 pr-2">
           <div className="flex items-center gap-1.5 min-w-0">
             <span className="text-white truncate">{row.coin}</span>
             {row.is_stable && (
@@ -279,11 +273,7 @@ function EarnRow({
             : fmtPct(row.net_apr_pct, { decimals: 2, sign: false })}
         </div>
         <ProfitCell profit={profit} />
-        <div className="col-span-1 text-right tabular text-[11px]" style={{ color: fundingColor(funding7d) }}>
-          {funding7d === null || funding7d === undefined
-            ? <span className="text-dim-600">n/a</span>
-            : fmtPct(funding7d, { decimals: 0, sign: true })}
-        </div>
+        <BreakEvenCell profit={profit} />
         <div className="col-span-2 pl-3">
           <Bar value={row.stability_score} color={ACCENT} />
         </div>
@@ -319,6 +309,32 @@ function ProfitCell({ profit }: { profit: ProfitHorizon | null }) {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+// Hours-to-recoup the round-trip fee at the current yield. Stable (no fee) →
+// "no fee"; a losing position (yield ≤ 0) → "never".
+function BreakEvenCell({ profit }: { profit: ProfitHorizon | null }) {
+  if (!profit || profit.total_pct === null) {
+    return <div className="col-span-2 text-right text-dim-600 text-[11px]">—</div>;
+  }
+  if (profit.fee_pct !== null && profit.fee_pct <= 0) {
+    return <div className="col-span-2 text-right text-pos text-[11px]">no fee</div>;
+  }
+  if (profit.break_even_days === null) {
+    return <div className="col-span-2 text-right text-danger text-[11px]">never</div>;
+  }
+  const hours = profit.break_even_days * 24;
+  const text = hours < 48 ? `${Math.round(hours)}h` : `${profit.break_even_days.toFixed(1)}d`;
+  const color = profit.break_even_days > 30 ? WARN : "#9aa3b2";
+  return (
+    <div
+      className="col-span-2 text-right tabular text-[12px]"
+      style={{ color }}
+      title={`${Math.round(hours)}h to recoup the ${profit.fee_pct?.toFixed(2)}% round-trip fee`}
+    >
+      {text}
     </div>
   );
 }
