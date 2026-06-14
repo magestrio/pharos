@@ -26,6 +26,28 @@ export type EarnProductRow = {
   funding_rate: number | null;
   funding_annual_pct: number | null;
   mark_price: number | null;
+  // Coin-quality metrics. The FastAPI path computes these; the file-fallback
+  // below leaves them null (no DB / cross-cycle data, scoring not duplicated).
+  is_stable: boolean;
+  avg_apr_7d_pct: number | null;
+  net_apr_pct: number | null;
+  apr_stability: number | null;
+  price_volatility_pct: number | null;
+  price_stability: number | null;
+  stability_score: number | null;
+  funding_7d_annual_pct: number | null;
+  quality_score: number | null;
+  profit_1d: ProfitHorizon | null;
+  profit_7d: ProfitHorizon | null;
+  profit_30d: ProfitHorizon | null;
+};
+
+type ProfitHorizon = {
+  earn_pct: number | null;
+  funding_pct: number | null;
+  total_pct: number | null;
+  basis: string;
+  note: string | null;
 };
 
 export type EarnProductsResponse = {
@@ -117,6 +139,19 @@ function buildRows(
         funding_rate: rate,
         funding_annual_pct: annualFundingPct(rate, interval),
         mark_price: fund ? num(fund.mark_price) : null,
+        // Quality metrics need the FastAPI/DB path; null in the dev fallback.
+        is_stable: false,
+        avg_apr_7d_pct: null,
+        net_apr_pct: null,
+        apr_stability: null,
+        price_volatility_pct: null,
+        price_stability: null,
+        stability_score: null,
+        funding_7d_annual_pct: null,
+        quality_score: null,
+        profit_1d: null,
+        profit_7d: null,
+        profit_30d: null,
       });
     }
   }

@@ -16,7 +16,9 @@ CLI:
 from __future__ import annotations
 
 import logging
+import math
 import os
+import statistics
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -26,7 +28,9 @@ import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from agent.reason.venues import STABLES
 from agent.sandbox.store import (
+    funding_7d_averages,
     funding_history,
     get_current_portfolio,
     get_cycle,
@@ -44,6 +48,223 @@ log = logging.getLogger(__name__)
 # which under-states 4h/1h perps.
 _HOURS_PER_YEAR = 24 * 365
 _DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
+
+# Earn-Explorer coin-quality scoring knobs (heuristic — tests assert bands,
+# not exact values, so these stay tunable). See `_coin_quality`.
+_YIELD_KNEE = 20.0  # net-APR % where tanh credit hits ~0.76 (saturates mirage)
+_VOL_FULL = 25.0    # weekly price move % that scores 0 price-stability
+_MIRAGE_VOL = 40.0  # weekly move % above which quality is halved
+# Confidence in the APR number by its source — discounts noisy/estimated rates.
+_SOURCE_CONF = {
+    "apr_history": 1.0,
+    "measured_yield": 1.0,
+    "aave_pool": 0.9,
+    "estimate_apr": 0.7,
+    "apy_e8": 0.7,
+    "quote_dual_offer": 0.6,
+    "quote_discount": 0.6,
+    "momentum": 0.3,
+    "missing": 0.0,
+}
+
+
+def _is_stable(coin: str) -> bool:
+    """A coin is stable when it (or BOTH legs of an LM `BASE/QUOTE` pair) is in
+    the canonical stablecoin set. Drives the price-stability override."""
+    legs = [leg.strip().upper() for leg in coin.split("/") if leg.strip()]
+    return bool(legs) and all(leg in STABLES for leg in legs)
+
+
+def _coin_quality(
+    *,
+    coin: str,
+    apr_source: str,
+    effective_apr: float | None,
+    effective_apr_gross: float | None,
+    effective_apr_net_hedge: float | None,
+    apr_history_pts: list[float] | None,
+    price_change_7d_pct: float | None,
+    price_change_30d_pct: float | None,
+    funding_rate: float | None,
+    funding_interval_hours: float | None,
+    funding_rate_7d_avg: float | None,
+    funding_7d_avg_cross: float | None,
+) -> dict[str, Any]:
+    """The Earn-Explorer coin-quality model — single source of truth. Pure
+    (primitives in, dict out) so it's trivially unit-testable. Returns every
+    derived `EarnProductRow` field. See plan: stability blends APR steadiness
+    + price calm; quality blends saturating net yield + stability + source
+    confidence, with mirage penalties. All scores clamp to sane ranges."""
+    stable = _is_stable(coin)
+
+    # avg APR over the week (gross), from the daily series when present.
+    if apr_history_pts:
+        avg_apr_7d_pct = (sum(apr_history_pts) / len(apr_history_pts)) * 100.0
+    else:
+        base = effective_apr_gross if effective_apr_gross is not None else effective_apr
+        avg_apr_7d_pct = base * 100.0 if base is not None else None
+
+    # Realizable yield — net of hedge for non-stables (already baked into
+    # effective_apr by the agent), gross for stables. Never read gross here.
+    net = (
+        effective_apr_net_hedge
+        if effective_apr_net_hedge is not None
+        else effective_apr
+    )
+    net_apr_pct = net * 100.0 if net is not None else None
+
+    # APR steadiness — bounded transform of the coefficient of variation.
+    apr_stability: float | None
+    if apr_history_pts and len(apr_history_pts) >= 2:
+        mu = statistics.fmean(apr_history_pts)
+        sd = statistics.pstdev(apr_history_pts)
+        if abs(mu) < 1e-9 and sd < 1e-9:
+            cv = 0.0  # all-zero APR → perfectly steady
+        elif abs(mu) < 1e-9:
+            cv = 10.0  # zero-mean but moving → max dispersion
+        else:
+            cv = sd / abs(mu)
+        apr_stability = 1.0 / (1.0 + 4.0 * cv)
+    else:
+        apr_stability = None
+
+    # Price volatility / calm — 7d move (or 30d ÷4 as a weekly-equivalent).
+    if price_change_7d_pct is not None:
+        price_volatility_pct: float | None = abs(price_change_7d_pct)
+    elif price_change_30d_pct is not None:
+        price_volatility_pct = abs(price_change_30d_pct) / 4.0
+    else:
+        price_volatility_pct = None
+    if stable:
+        price_stability: float | None = 1.0
+    elif price_volatility_pct is None:
+        price_stability = None
+    else:
+        price_stability = max(0.0, 1.0 - price_volatility_pct / _VOL_FULL)
+
+    # Combined stability (price weighted higher — a calm APR on a dying coin
+    # is a trap). Degrade gracefully when one signal is missing.
+    if apr_stability is not None and price_stability is not None:
+        s = 0.4 * apr_stability + 0.6 * price_stability
+    elif apr_stability is not None:
+        s = apr_stability
+    elif price_stability is not None:
+        s = price_stability
+    else:
+        s = None
+    stability_score = s * 100.0 if s is not None else None
+
+    # Weekly funding (annualized): accurate 21-period avg → cross-cycle avg →
+    # current. Display-only; funding is already inside net_apr for non-stables.
+    if funding_rate_7d_avg is not None:
+        funding_7d_annual_pct = _annual_funding_pct(
+            funding_rate_7d_avg, funding_interval_hours
+        )
+    elif funding_7d_avg_cross is not None:
+        funding_7d_annual_pct = _annual_funding_pct(
+            funding_7d_avg_cross, funding_interval_hours
+        )
+    else:
+        funding_7d_annual_pct = _annual_funding_pct(
+            funding_rate, funding_interval_hours
+        )
+
+    # Composite quality: saturating yield + stability + source confidence.
+    yield_score = math.tanh(max(net_apr_pct or 0.0, 0.0) / _YIELD_KNEE)
+    stab_unit = (stability_score / 100.0) if stability_score is not None else 0.5
+    conf = _SOURCE_CONF.get(apr_source, 0.5)
+    quality = 100.0 * (0.45 * yield_score + 0.40 * stab_unit + 0.15 * conf)
+    if net_apr_pct is not None and net_apr_pct < 0:
+        quality *= 0.3
+    if price_volatility_pct is not None and price_volatility_pct >= _MIRAGE_VOL:
+        quality *= 0.5
+    quality_score = max(0.0, min(100.0, quality))
+
+    return {
+        "is_stable": stable,
+        "avg_apr_7d_pct": avg_apr_7d_pct,
+        "net_apr_pct": net_apr_pct,
+        "apr_stability": apr_stability,
+        "price_volatility_pct": price_volatility_pct,
+        "price_stability": price_stability,
+        "stability_score": stability_score,
+        "funding_7d_annual_pct": funding_7d_annual_pct,
+        "quality_score": quality_score,
+    }
+
+
+def _profit_horizon(
+    days: int,
+    *,
+    apr_history_pts: list[float] | None,
+    base_apr_frac: float | None,
+    funding_annual_pct: float | None,
+    is_stable: bool,
+) -> ProfitHorizon:
+    """Return on notional over `days`, realized from the daily APR history
+    where it reaches and projected (flagged) beyond it. Earn uses the GROSS
+    daily APR series (so earn + funding doesn't double-count the hedge);
+    funding accrues the best-available average rate over the window."""
+    note: str | None = None
+    if apr_history_pts:
+        n = len(apr_history_pts)
+        window = min(days, n)
+        # Daily return ≈ APR/365; sum the realized days in the window.
+        earn_pct = sum(apr_history_pts[-window:]) / 365.0 * 100.0
+        if window < days:
+            avg = sum(apr_history_pts) / n
+            earn_pct += avg * (days - window) / 365.0 * 100.0
+            basis = "projected"
+            note = f"{window}/{days}d from APR history, rest projected"
+        else:
+            basis = "realized"
+    elif base_apr_frac is not None:
+        earn_pct = base_apr_frac * 100.0 * days / 365.0
+        basis = "projected"
+        note = "projected from current APR (no daily history)"
+    else:
+        return ProfitHorizon(basis="unavailable", note="no APR data")
+
+    if is_stable:
+        funding_pct: float | None = 0.0
+    elif funding_annual_pct is not None:
+        funding_pct = funding_annual_pct * days / 365.0
+    else:
+        funding_pct = None
+        note = (note + "; " if note else "") + "funding history unavailable"
+
+    total_pct = earn_pct + (funding_pct or 0.0)
+    return ProfitHorizon(
+        earn_pct=earn_pct,
+        funding_pct=funding_pct,
+        total_pct=total_pct,
+        basis=basis,
+        note=note,
+    )
+
+
+def _coin_profit(
+    *,
+    apr_history_pts: list[float] | None,
+    effective_apr: float | None,
+    effective_apr_gross: float | None,
+    is_stable: bool,
+    funding_7d_annual_pct: float | None,
+) -> dict[str, ProfitHorizon]:
+    """Realized/projected profit over 1d / 7d / 30d. 1d & 7d are realized from
+    Bybit's 7 daily APR points; 30d is projected (only 7d of history exists) —
+    always flagged via `basis`/`note`."""
+    base = effective_apr_gross if effective_apr_gross is not None else effective_apr
+    return {
+        f"profit_{label}": _profit_horizon(
+            days,
+            apr_history_pts=apr_history_pts,
+            base_apr_frac=base,
+            funding_annual_pct=funding_7d_annual_pct,
+            is_stable=is_stable,
+        )
+        for label, days in (("1d", 1), ("7d", 7), ("30d", 30))
+    }
 
 
 def _to_float(value: Any) -> float | None:
@@ -125,6 +346,19 @@ class Portfolio(BaseModel):
     wallet: dict[str, Any] | None = None
 
 
+class ProfitHorizon(BaseModel):
+    """Realized/projected return on notional over a horizon, split into the
+    Earn leg + the hedge funding leg. `basis`: "realized" (entirely from
+    history), "projected" (some/all extrapolated — see `note`), or
+    "unavailable" (no data). `total_pct` is earn + funding."""
+
+    earn_pct: float | None = None
+    funding_pct: float | None = None
+    total_pct: float | None = None
+    basis: str = "unavailable"
+    note: str | None = None
+
+
 class EarnProductRow(BaseModel):
     category: str
     product_id: str
@@ -137,6 +371,20 @@ class EarnProductRow(BaseModel):
     funding_rate: float | None = None  # current signed per-period rate
     funding_annual_pct: float | None = None
     mark_price: float | None = None
+    # Coin-quality derived metrics (see `_coin_quality`).
+    is_stable: bool = False
+    avg_apr_7d_pct: float | None = None      # gross weekly mean APR
+    net_apr_pct: float | None = None         # realizable (net of hedge)
+    apr_stability: float | None = None       # 0..1 (APR steadiness)
+    price_volatility_pct: float | None = None  # |7d move|
+    price_stability: float | None = None     # 0..1
+    stability_score: float | None = None     # 0..100 (combined)
+    funding_7d_annual_pct: float | None = None
+    quality_score: float | None = None       # 0..100 (composite rank key)
+    # Realized/projected profit on notional (earn + funding) by horizon.
+    profit_1d: ProfitHorizon | None = None
+    profit_7d: ProfitHorizon | None = None
+    profit_30d: ProfitHorizon | None = None
 
 
 class EarnProducts(BaseModel):
@@ -257,8 +505,14 @@ def build_app(pool: asyncpg.Pool | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=404, detail="no snapshot recorded yet"
             )
-        rows = _build_earn_rows(snap, category=category, coin=coin)
-        rows.sort(key=lambda r: r.effective_apr_pct, reverse=True)
+        funding_7d = await funding_7d_averages(pool)
+        rows = _build_earn_rows(
+            snap, category=category, coin=coin, funding_7d=funding_7d
+        )
+        # Rank by quality (best earnable coins first); None scores last.
+        rows.sort(
+            key=lambda r: (r.quality_score is None, -(r.quality_score or 0.0))
+        )
         return EarnProducts(captured_at=snap.get("captured_at"), products=rows[:limit])
 
     @app.get("/earn/funding-history", response_model=FundingHistory)
@@ -289,13 +543,18 @@ def _build_earn_rows(
     *,
     category: str | None,
     coin: str | None,
+    funding_7d: dict[str, float] | None = None,
 ) -> list[EarnProductRow]:
     """Flatten the snapshot's product universe into Earn-Explorer rows,
     joining each product to its coin's current funding from `earn_funding`
-    (LM `BASE/QUOTE` matches on either leg). Pure function over the snapshot
-    dict — no DB access."""
+    (LM `BASE/QUOTE` matches on either leg) and computing the coin-quality
+    metrics via `_coin_quality`. `funding_7d` is the cross-cycle per-coin
+    funding average (from `funding_7d_averages`); empty/None when unavailable.
+    Pure function over the snapshot dict — no DB access."""
     products: dict[str, Any] = snap.get("products") or {}
     funding: dict[str, Any] = snap.get("earn_funding") or {}
+    perp_market: dict[str, Any] = snap.get("perp_market") or {}
+    funding_7d = funding_7d or {}
     coin_filter = coin.upper() if coin else None
     rows: list[EarnProductRow] = []
     for cat, items in products.items():
@@ -307,16 +566,54 @@ def _build_earn_rows(
             pcoin = str(p.get("coin", ""))
             if coin_filter and coin_filter not in pcoin.upper():
                 continue
-            fund = None
-            for leg in [pcoin.upper(), *pcoin.upper().split("/")]:
-                fund = funding.get(leg.strip())
-                if fund is not None:
-                    break
+            legs = [pcoin.upper(), *(leg.strip() for leg in pcoin.upper().split("/"))]
+            fund = next((funding.get(leg) for leg in legs if funding.get(leg)), None)
+            perp = next(
+                (perp_market.get(leg) for leg in legs if perp_market.get(leg)), None
+            )
+            cross = next(
+                (funding_7d.get(leg) for leg in legs if leg in funding_7d), None
+            )
             rate = _to_float(fund.get("funding_rate")) if fund else None
             interval = (
                 _to_float(fund.get("funding_interval_hours")) if fund else None
             )
             apr_points = p.get("apr_history_points")
+            apr_history_pct = (
+                [(_to_float(x) or 0.0) * 100.0 for x in apr_points]
+                if isinstance(apr_points, list) and apr_points
+                else None
+            )
+            apr_pts_frac = (
+                [_to_float(x) for x in apr_points]
+                if isinstance(apr_points, list) and apr_points
+                else None
+            )
+            quality = _coin_quality(
+                coin=pcoin,
+                apr_source=str(p.get("apr_source", "")),
+                effective_apr=_to_float(p.get("effective_apr")),
+                effective_apr_gross=_to_float(p.get("effective_apr_gross")),
+                effective_apr_net_hedge=_to_float(p.get("effective_apr_net_hedge")),
+                apr_history_pts=[x for x in (apr_pts_frac or []) if x is not None]
+                or None,
+                price_change_7d_pct=_to_float(p.get("price_change_7d_pct")),
+                price_change_30d_pct=_to_float(p.get("price_change_30d_pct")),
+                funding_rate=rate,
+                funding_interval_hours=interval,
+                funding_rate_7d_avg=(
+                    _to_float(perp.get("funding_rate_7d_avg")) if perp else None
+                ),
+                funding_7d_avg_cross=cross,
+            )
+            profit = _coin_profit(
+                apr_history_pts=[x for x in (apr_pts_frac or []) if x is not None]
+                or None,
+                effective_apr=_to_float(p.get("effective_apr")),
+                effective_apr_gross=_to_float(p.get("effective_apr_gross")),
+                is_stable=bool(quality["is_stable"]),
+                funding_7d_annual_pct=quality["funding_7d_annual_pct"],
+            )
             rows.append(
                 EarnProductRow(
                     category=cat,
@@ -325,14 +622,12 @@ def _build_earn_rows(
                     effective_apr_pct=(_to_float(p.get("effective_apr")) or 0.0)
                     * 100.0,
                     apr_source=str(p.get("apr_source", "")),
-                    apr_history_pct=(
-                        [(_to_float(x) or 0.0) * 100.0 for x in apr_points]
-                        if isinstance(apr_points, list) and apr_points
-                        else None
-                    ),
+                    apr_history_pct=apr_history_pct,
                     funding_rate=rate,
                     funding_annual_pct=_annual_funding_pct(rate, interval),
                     mark_price=_to_float(fund.get("mark_price")) if fund else None,
+                    **quality,
+                    **profit,
                 )
             )
     return rows

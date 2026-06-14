@@ -92,8 +92,12 @@ def _earn_snapshot(
                     "product_id": "F1",
                     "coin": "BTC",
                     "effective_apr": "0.05",
+                    "effective_apr_gross": "0.05",
+                    "effective_apr_net_hedge": "0.05",
                     "apr_source": "apr_history",
                     "apr_history_points": ["0.04", "0.05", "0.06"],
+                    "price_change_7d_pct": "3.0",
+                    "price_change_30d_pct": "8.0",
                 },
                 {
                     "category": "FlexibleSaving",
@@ -120,6 +124,15 @@ def _earn_snapshot(
                 "funding_interval_hours": "8",
                 "mark_price": "68000",
                 "source": "tickers",
+            },
+        },
+        "perp_market": {
+            "BTC": {
+                "symbol": "BTCUSDT",
+                "funding_rate_8h": btc_funding,
+                "funding_rate_7d_avg": "0.00008",
+                "funding_interval_hours": "8",
+                "mark_price": "68000",
             },
         },
     }
@@ -373,8 +386,73 @@ async def test_earn_products_endpoint_shapes_apr_and_funding(
     # Stablecoin product: no funding, no history.
     assert by_id["F2"]["funding_rate"] is None
     assert by_id["F2"]["apr_history_pct"] is None
-    # Sorted by APR desc (LM 12% > flex 5% > stable 3%).
-    assert [p["product_id"] for p in body["products"]] == ["L1", "F1", "F2"]
+    # Sorted by quality_score desc (None last), monotonic non-increasing.
+    scores = [p["quality_score"] for p in body["products"]]
+    present = [s for s in scores if s is not None]
+    assert present == sorted(present, reverse=True)
+
+
+@pytest.mark.asyncio
+async def test_earn_products_quality_fields(
+    api_client: httpx.AsyncClient,
+) -> None:
+    pool = api_client._test_pool  # type: ignore[attr-defined]
+    await record_cycle(
+        pool,
+        outcome=_outcome("20260529T160211Z"),
+        raw_snapshot=_earn_snapshot(),
+        raw_decision=_decision(),
+    )
+    resp = await api_client.get("/earn/products")
+    assert resp.status_code == 200
+    by_id = {p["product_id"]: p for p in resp.json()["products"]}
+    f1, f2 = by_id["F1"], by_id["F2"]
+    # Every row carries a bounded quality score.
+    for p in by_id.values():
+        assert 0.0 <= p["quality_score"] <= 100.0
+    # F1 (BTC, apr_history) — net APR + APR stability + weekly funding present.
+    assert f1["net_apr_pct"] == pytest.approx(5.0)
+    assert f1["avg_apr_7d_pct"] == pytest.approx(5.0)
+    assert f1["apr_stability"] is not None
+    assert f1["is_stable"] is False
+    # funding_7d uses the accurate perp 21-period avg: 0.00008 × 8760/8 × 100.
+    assert f1["funding_7d_annual_pct"] == pytest.approx(0.00008 * (8760 / 8) * 100)
+    # F2 (USDC) flagged stable, high stability.
+    assert f2["is_stable"] is True
+    assert f2["stability_score"] is not None and f2["stability_score"] >= 90.0
+    # Profit horizons: F1 has 3 daily APR points → 1d realized, 7d/30d
+    # projected (window shorter than horizon), each flagged via basis.
+    assert f1["profit_1d"]["basis"] == "realized"
+    assert f1["profit_7d"]["basis"] == "projected"
+    assert f1["profit_30d"]["basis"] == "projected"
+    assert f1["profit_1d"]["total_pct"] is not None
+
+
+@pytest.mark.asyncio
+async def test_funding_7d_averages_reader(
+    api_client: httpx.AsyncClient,
+) -> None:
+    from agent.sandbox.store import funding_7d_averages
+
+    pool = api_client._test_pool  # type: ignore[attr-defined]
+    await record_cycle(
+        pool,
+        outcome=_outcome("20260529T160000Z"),
+        raw_snapshot=_earn_snapshot("2026-05-29T16:00:00+00:00", btc_funding="0.0001"),
+        raw_decision=_decision(),
+    )
+    await record_cycle(
+        pool,
+        outcome=_outcome("20260529T170000Z"),
+        raw_snapshot=_earn_snapshot("2026-05-29T17:00:00+00:00", btc_funding="0.0003"),
+        raw_decision=_decision(),
+    )
+    # Wide window so the fixed-date fixtures fall inside it regardless of the
+    # test host's wall clock (the prod endpoint uses the default 7 days).
+    avgs = await funding_7d_averages(pool, days=100_000)
+    # Only earn_funding coins; BTC averaged across the two cycles.
+    assert set(avgs) == {"BTC"}
+    assert avgs["BTC"] == pytest.approx(0.0002)
 
 
 @pytest.mark.asyncio

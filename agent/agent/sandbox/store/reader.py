@@ -181,6 +181,38 @@ async def funding_history(
     return [dict(r) for r in reversed(rows)]
 
 
+async def funding_7d_averages(
+    pool: asyncpg.Pool, *, days: int = 7
+) -> dict[str, float]:
+    """Per-coin average earn `funding_rate` over the trailing `days` (default
+    7), across all snapshots. Powers the Earn-Explorer `funding_7d_annual_pct`
+    fallback when `perp_market.funding_rate_7d_avg` is absent (it covers only
+    the ~12-16 hedge coins). Forward-only — shallow until a week of cycles
+    accrues. No API calls — one aggregate query over `snapshots`.
+
+    `jsonb_each` is wrapped in COALESCE so snapshots predating `earn_funding`
+    (NULL key) contribute zero rows instead of erroring; the regex guard +
+    `::numeric` cast skip any malformed/empty funding string."""
+    sql = """
+        SELECT f.key AS coin,
+               avg((f.value->>'funding_rate')::numeric) AS avg_rate
+        FROM snapshots s
+        CROSS JOIN LATERAL jsonb_each(
+            COALESCE(s.payload->'earn_funding', '{}'::jsonb)
+        ) AS f
+        WHERE s.cycle_ts >= now() - make_interval(days => $1)
+          AND (f.value->>'funding_rate') ~ '^-?[0-9.]+$'
+        GROUP BY f.key
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, days)
+    return {
+        r["coin"].upper(): float(r["avg_rate"])
+        for r in rows
+        if r["avg_rate"] is not None
+    }
+
+
 async def get_current_portfolio(
     pool: asyncpg.Pool,
 ) -> dict[str, Any] | None:

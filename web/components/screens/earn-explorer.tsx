@@ -17,19 +17,21 @@ import {
   useEarnExplorer,
   useFundingHistory,
   type EarnProductRow,
+  type ProfitHorizon,
 } from "@/lib/live";
 
 const ACCENT = "#F6A94B";
 const POS = "#4ADE80";
 const DANGER = "#FB7185";
+const WARN = "#FBBF6B";
 
-type SortKey = "apr" | "funding";
+type SortKey = "quality" | "net" | "apr";
 
 export function EarnExplorer() {
   const { data, isLoading, isError, error } = useEarnExplorer({ limit: 500 });
   const [category, setCategory] = useState<string>("");
   const [coin, setCoin] = useState<string>("");
-  const [sortKey, setSortKey] = useState<SortKey>("apr");
+  const [sortKey, setSortKey] = useState<SortKey>("quality");
   const [expanded, setExpanded] = useState<string | null>(null);
 
   const rows = data?.products ?? [];
@@ -46,11 +48,13 @@ export function EarnExplorer() {
         (!category || r.category === category) &&
         (!coinUp || r.coin.toUpperCase().includes(coinUp)),
     );
-    out.sort((a, b) =>
-      sortKey === "apr"
-        ? b.effective_apr_pct - a.effective_apr_pct
-        : (b.funding_annual_pct ?? -Infinity) - (a.funding_annual_pct ?? -Infinity),
-    );
+    const keyOf = (r: EarnProductRow) =>
+      sortKey === "quality"
+        ? r.quality_score ?? -1
+        : sortKey === "net"
+          ? r.net_apr_pct ?? -Infinity
+          : r.effective_apr_pct;
+    out.sort((a, b) => keyOf(b) - keyOf(a));
     return out;
   }, [rows, category, coin, sortKey]);
 
@@ -59,7 +63,7 @@ export function EarnExplorer() {
       <SectionHead
         eyebrow="Bybit Earn"
         title="Earn Explorer"
-        subtitle="Every Bybit Earn product the agent sees each cycle — current APR, Bybit's daily APR history, and the perp funding rate for each coin."
+        subtitle="Every Bybit Earn coin scored for real earnability — quality blends realizable net APR (after hedge funding), coin stability (steady APR + low price volatility), and source confidence. Expand a row for the full breakdown."
         right={
           data?.captured_at ? (
             <div className="flex items-center gap-2 font-mono text-[11px] text-dim-400">
@@ -91,11 +95,14 @@ export function EarnExplorer() {
         />
         <div className="flex items-center gap-1 ml-auto font-mono text-[11px] text-dim-500">
           <span>Sort:</span>
+          <SortButton active={sortKey === "quality"} onClick={() => setSortKey("quality")}>
+            Quality
+          </SortButton>
+          <SortButton active={sortKey === "net"} onClick={() => setSortKey("net")}>
+            Net APR
+          </SortButton>
           <SortButton active={sortKey === "apr"} onClick={() => setSortKey("apr")}>
             APR
-          </SortButton>
-          <SortButton active={sortKey === "funding"} onClick={() => setSortKey("funding")}>
-            Funding
           </SortButton>
         </div>
       </div>
@@ -105,11 +112,12 @@ export function EarnExplorer() {
       ) : (
         <Card className="p-0 overflow-hidden">
           <div className="grid grid-cols-12 text-[10px] uppercase tracking-[0.16em] font-mono text-dim-500 bg-ink-850 px-4 py-2.5">
+            <div className="col-span-2">Quality</div>
             <div className="col-span-2">Coin</div>
-            <div className="col-span-3">Category</div>
-            <div className="col-span-2 text-right">APR</div>
-            <div className="col-span-2">APR trend</div>
-            <div className="col-span-3 text-right">Funding / yr</div>
+            <div className="col-span-2">Category</div>
+            <div className="col-span-2 text-right">Net APR</div>
+            <div className="col-span-2">Stability</div>
+            <div className="col-span-2 text-right">Funding 7d</div>
           </div>
 
           {isLoading ? (
@@ -164,11 +172,44 @@ function SortButton({
   );
 }
 
-function fundingTone(annual: number | null): { color: string; tagTone: "pos" | "red" | "neutral" } {
-  if (annual === null) return { color: "#7A8499", tagTone: "neutral" };
-  return annual >= 0
-    ? { color: POS, tagTone: "pos" }
-    : { color: DANGER, tagTone: "red" };
+function qualityColor(score: number | null | undefined): string {
+  if (score === null || score === undefined) return "#7A8499";
+  if (score >= 70) return POS;
+  if (score >= 40) return WARN;
+  return DANGER;
+}
+
+function QualityBadge({ score }: { score: number | null | undefined }) {
+  const color = qualityColor(score);
+  return (
+    <span
+      className="inline-flex items-center justify-center min-w-[2.6rem] px-2 py-0.5 rounded-sm text-[12px] tabular font-semibold border"
+      style={{ color, borderColor: `${color}55`, backgroundColor: `${color}14` }}
+    >
+      {score === null || score === undefined ? "—" : Math.round(score)}
+    </span>
+  );
+}
+
+function Bar({ value, color = ACCENT }: { value: number | null | undefined; color?: string }) {
+  // value in 0..100
+  if (value === null || value === undefined) {
+    return <span className="text-dim-600 text-[10px]">—</span>;
+  }
+  const pct = Math.max(0, Math.min(100, value));
+  return (
+    <div className="flex items-center gap-2 w-full">
+      <div className="flex-1 h-1.5 rounded-full bg-ink-700/70 overflow-hidden">
+        <div className="h-full rounded-full" style={{ width: `${pct}%`, backgroundColor: color }} />
+      </div>
+      <span className="tabular text-[11px] text-dim-300 w-7 text-right">{Math.round(pct)}</span>
+    </div>
+  );
+}
+
+function fundingColor(annual: number | null | undefined): string {
+  if (annual === null || annual === undefined) return "#7A8499";
+  return annual >= 0 ? POS : DANGER;
 }
 
 function EarnRow({
@@ -180,29 +221,37 @@ function EarnRow({
   expanded: boolean;
   onToggle: () => void;
 }) {
-  const ft = fundingTone(row.funding_annual_pct);
+  const funding7d = row.funding_7d_annual_pct;
   return (
     <div className="border-t border-ink-600/30">
       <button
         onClick={onToggle}
         className="w-full grid grid-cols-12 items-center px-4 py-2.5 text-[12px] font-mono text-left hover:bg-ink-850/50 transition-colors"
       >
-        <div className="col-span-2 text-white truncate pr-2">{row.coin}</div>
-        <div className="col-span-3 text-dim-300 truncate pr-2">{row.category}</div>
-        <div className="col-span-2 text-right tabular text-accent">
-          {fmtPct(row.effective_apr_pct, { decimals: 2, sign: false })}
+        <div className="col-span-2">
+          <QualityBadge score={row.quality_score} />
         </div>
-        <div className="col-span-2 flex items-center">
-          {row.apr_history_pct && row.apr_history_pct.length > 1 ? (
-            <Sparkline series={row.apr_history_pct} width={90} height={22} />
-          ) : (
-            <span className="text-dim-600 text-[10px]">—</span>
+        <div className="col-span-2 flex items-center gap-1.5 min-w-0">
+          <span className="text-white truncate">{row.coin}</span>
+          {row.is_stable && (
+            <span className="text-[8.5px] uppercase tracking-[0.08em] text-pos border border-pos/30 bg-pos/10 rounded-sm px-1 py-px shrink-0">
+              stable
+            </span>
           )}
         </div>
-        <div className="col-span-3 text-right tabular" style={{ color: ft.color }}>
-          {row.funding_annual_pct === null
+        <div className="col-span-2 text-dim-300 truncate pr-2 text-[11px]">{row.category}</div>
+        <div className="col-span-2 text-right tabular text-accent">
+          {row.net_apr_pct === null || row.net_apr_pct === undefined
+            ? fmtPct(row.effective_apr_pct, { decimals: 2, sign: false })
+            : fmtPct(row.net_apr_pct, { decimals: 2, sign: false })}
+        </div>
+        <div className="col-span-2 pr-3">
+          <Bar value={row.stability_score} color={ACCENT} />
+        </div>
+        <div className="col-span-2 text-right tabular" style={{ color: fundingColor(funding7d) }}>
+          {funding7d === null || funding7d === undefined
             ? <span className="text-dim-600">n/a</span>
-            : fmtPct(row.funding_annual_pct, { decimals: 1, sign: true })}
+            : fmtPct(funding7d, { decimals: 1, sign: true })}
         </div>
       </button>
       {expanded && <EarnRowDetail row={row} />}
@@ -225,7 +274,10 @@ function EarnRowDetail({ row }: { row: EarnProductRow }) {
     : 0;
 
   return (
-    <div className="px-4 pb-5 pt-2 bg-ink-950/40 grid grid-cols-1 lg:grid-cols-2 gap-6">
+    <div className="px-4 pb-5 pt-3 bg-ink-950/40 space-y-5">
+      <ProfitPanel row={row} />
+      <QualityBreakdown row={row} />
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
       <div className="space-y-2">
         <Eyebrow tone="accent">APR history (Bybit daily)</Eyebrow>
         {aprSeries.length > 1 ? (
@@ -273,8 +325,206 @@ function EarnRowDetail({ row }: { row: EarnProductRow }) {
             : fmtPct(row.funding_annual_pct, { decimals: 2, sign: true }) + " / yr"}
         </div>
       </div>
+      </div>
     </div>
   );
+}
+
+const PROFIT_HORIZONS: Array<{ key: "profit_1d" | "profit_7d" | "profit_30d"; label: string }> = [
+  { key: "profit_1d", label: "1 day" },
+  { key: "profit_7d", label: "7 days" },
+  { key: "profit_30d", label: "30 days" },
+];
+
+function basisBadge(basis: string | undefined): { text: string; color: string } {
+  if (basis === "realized") return { text: "realized", color: POS };
+  if (basis === "projected") return { text: "projected", color: WARN };
+  return { text: "no history", color: "#7A8499" };
+}
+
+function ProfitPanel({ row }: { row: EarnProductRow }) {
+  return (
+    <div className="space-y-2">
+      <Eyebrow tone="accent">
+        Profit per $100 — realized from history (earn + funding)
+      </Eyebrow>
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        {PROFIT_HORIZONS.map(({ key, label }) => (
+          <ProfitCard key={key} label={label} h={row[key] ?? null} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ProfitCard({ label, h }: { label: string; h: ProfitHorizon | null }) {
+  const badge = basisBadge(h?.basis);
+  const total = h?.total_pct ?? null;
+  const usd = total === null ? null : (total / 100) * 100; // per $100 notional
+  return (
+    <div className="border border-ink-600/40 rounded-sm p-3 space-y-1.5">
+      <div className="flex items-center justify-between">
+        <span className="font-mono text-[10.5px] uppercase tracking-[0.14em] text-dim-400">
+          {label}
+        </span>
+        <span
+          className="text-[8.5px] uppercase tracking-[0.08em] rounded-sm px-1 py-px border"
+          style={{ color: badge.color, borderColor: `${badge.color}55`, backgroundColor: `${badge.color}14` }}
+        >
+          {badge.text}
+        </span>
+      </div>
+      {total === null ? (
+        <div className="text-[15px] text-dim-500 font-mono">—</div>
+      ) : (
+        <div className="flex items-baseline gap-2">
+          <span
+            className="text-[20px] font-serif leading-none tabular"
+            style={{ color: total >= 0 ? POS : DANGER }}
+          >
+            {fmtPct(total, { decimals: total < 1 ? 3 : 2, sign: true })}
+          </span>
+          <span className="text-[10.5px] text-dim-500 font-mono tabular">
+            ${usd!.toFixed(usd! < 1 ? 3 : 2)}
+          </span>
+        </div>
+      )}
+      {h && (h.earn_pct !== null || h.funding_pct !== null) && (
+        <div className="font-mono text-[10px] text-dim-500 tabular">
+          earn {h.earn_pct === null ? "—" : h.earn_pct.toFixed(3) + "%"}
+          {" · "}
+          funding {h.funding_pct === null ? "n/a" : h.funding_pct.toFixed(3) + "%"}
+        </div>
+      )}
+      {h?.note && <div className="text-[9.5px] font-mono text-dim-600 leading-snug">{h.note}</div>}
+    </div>
+  );
+}
+
+function QualityBreakdown({ row }: { row: EarnProductRow }) {
+  const grossApr = row.avg_apr_7d_pct;
+  const netApr = row.net_apr_pct;
+  const hedgeCost =
+    grossApr !== null && grossApr !== undefined && netApr !== null && netApr !== undefined
+      ? grossApr - netApr
+      : null;
+  const penalties: string[] = [];
+  if (netApr !== null && netApr !== undefined && netApr < 0) penalties.push("net APR negative");
+  if (
+    row.price_volatility_pct !== null &&
+    row.price_volatility_pct !== undefined &&
+    row.price_volatility_pct >= 40
+  )
+    penalties.push("high volatility");
+
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      {/* Yield */}
+      <div className="space-y-2 border border-ink-600/40 rounded-sm p-3">
+        <Eyebrow tone="accent">Realizable yield</Eyebrow>
+        <Metric label="Avg APR 7d (gross)" value={pct(grossApr)} />
+        <Metric label="Net APR (after hedge)" value={pct(netApr)} strong />
+        {hedgeCost !== null && (
+          <Metric
+            label="Hedge cost"
+            value={fmtPct(hedgeCost, { decimals: 2, sign: true })}
+            tone={hedgeCost > 0 ? "neg" : "pos"}
+          />
+        )}
+        <div className="font-mono text-[10px] text-dim-500 pt-1">source: {row.apr_source}</div>
+      </div>
+
+      {/* Stability */}
+      <div className="space-y-2 border border-ink-600/40 rounded-sm p-3">
+        <Eyebrow tone="accent">Stability {row.is_stable ? "(stablecoin)" : ""}</Eyebrow>
+        <LabeledBar label="APR steadiness · 40%" value={unit(row.apr_stability)} />
+        <LabeledBar label="Price calm · 60%" value={unit(row.price_stability)} />
+        <div className="pt-1">
+          <LabeledBar label="Combined" value={row.stability_score} color={POS} />
+        </div>
+        {row.price_volatility_pct !== null && row.price_volatility_pct !== undefined && (
+          <div className="font-mono text-[10px] text-dim-500">
+            7d price move: ±{row.price_volatility_pct.toFixed(1)}%
+          </div>
+        )}
+      </div>
+
+      {/* Quality */}
+      <div className="space-y-2 border border-ink-600/40 rounded-sm p-3">
+        <Eyebrow tone="accent">Quality score</Eyebrow>
+        <div className="flex items-baseline gap-2">
+          <span
+            className="text-[28px] font-serif leading-none"
+            style={{ color: qualityColor(row.quality_score) }}
+          >
+            {row.quality_score === null || row.quality_score === undefined
+              ? "—"
+              : Math.round(row.quality_score)}
+          </span>
+          <span className="text-[11px] text-dim-500 font-mono">/ 100</span>
+        </div>
+        <div className="font-mono text-[10px] text-dim-400 leading-relaxed">
+          0.45·yield + 0.40·stability + 0.15·source confidence
+        </div>
+        {penalties.length > 0 && (
+          <div className="text-[10px] font-mono text-danger">
+            penalty: {penalties.join(", ")}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Metric({
+  label,
+  value,
+  strong,
+  tone,
+}: {
+  label: string;
+  value: string;
+  strong?: boolean;
+  tone?: "pos" | "neg";
+}) {
+  const color = tone === "pos" ? POS : tone === "neg" ? DANGER : undefined;
+  return (
+    <div className="flex items-center justify-between gap-2 text-[11px] font-mono">
+      <span className="text-dim-400">{label}</span>
+      <span
+        className={`tabular ${strong ? "text-white font-semibold" : "text-dim-200"}`}
+        style={color ? { color } : undefined}
+      >
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function LabeledBar({
+  label,
+  value,
+  color = ACCENT,
+}: {
+  label: string;
+  value: number | null | undefined;
+  color?: string;
+}) {
+  return (
+    <div className="space-y-1">
+      <div className="text-[10px] font-mono text-dim-400">{label}</div>
+      <Bar value={value} color={color} />
+    </div>
+  );
+}
+
+// 0..1 → 0..100 for bar display.
+function unit(v: number | null | undefined): number | null {
+  return v === null || v === undefined ? null : v * 100;
+}
+
+function pct(v: number | null | undefined): string {
+  return v === null || v === undefined ? "—" : fmtPct(v, { decimals: 2, sign: false });
 }
 
 function EmptyChart({ note }: { note: string }) {

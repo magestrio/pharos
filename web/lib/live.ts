@@ -91,6 +91,28 @@ export type EarnProductRow = {
   funding_rate: number | null;
   funding_annual_pct: number | null;
   mark_price: number | null;
+  // Coin-quality metrics (computed server-side; null in the dev file-fallback).
+  is_stable?: boolean;
+  avg_apr_7d_pct?: number | null;
+  net_apr_pct?: number | null;
+  apr_stability?: number | null; // 0..1
+  price_volatility_pct?: number | null;
+  price_stability?: number | null; // 0..1
+  stability_score?: number | null; // 0..100
+  funding_7d_annual_pct?: number | null;
+  quality_score?: number | null; // 0..100
+  // Realized/projected profit on notional by horizon.
+  profit_1d?: ProfitHorizon | null;
+  profit_7d?: ProfitHorizon | null;
+  profit_30d?: ProfitHorizon | null;
+};
+
+export type ProfitHorizon = {
+  earn_pct: number | null;
+  funding_pct: number | null;
+  total_pct: number | null;
+  basis: "realized" | "projected" | "unavailable";
+  note: string | null;
 };
 
 export type EarnProducts = {
