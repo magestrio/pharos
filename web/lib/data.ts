@@ -85,6 +85,5 @@ export const RISK_FLAGS: RiskFlag[] = [
   { key: "attestor_lag_warning", label: "Attestor lag warning", thresh: "> 30 min", tone: "warn" },
   { key: "attestor_lag_critical", label: "Attestor lag critical", thresh: "> 60 min · forced exit", tone: "red" },
   { key: "funding_rate_negative_triggered", label: "Funding flipped negative", thresh: "basis trade auto-close", tone: "warn" },
-  { key: "aave_utilization_high", label: "Aave utilization high", thresh: "> 90%", tone: "warn" },
   { key: "perp_orderbook_thin", label: "Perp orderbook thin", thresh: "depth < 10× position", tone: "warn" },
 ];

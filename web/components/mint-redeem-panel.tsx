@@ -98,7 +98,7 @@ function FlowExplainer({ mode }: { mode: Mode }) {
           receive <span className="text-neon">vUSDC</span> at the current exchange rate.
         </p>
         <p>
-          As the agent allocates the underlying USDC across Aave + Bybit Earn, the exchange rate
+          As the agent allocates the underlying USDC across Bybit Earn, the exchange rate
           grows. Your vUSDC redeems for more USDC than it costs today - yield realised, never
           marked-to-market.
         </p>

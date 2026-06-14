@@ -107,7 +107,6 @@ function HeroBlock({ stats }: { stats: VaultStats }) {
           </h1>
           <p className="text-[16px] sm:text-[17px] text-dim-300 max-w-[58ch] leading-[1.55]">
             Mint USDC, receive vUSDC. The exchange rate grows as our agent allocates across{" "}
-            <span className="font-serif italic text-white">Aave V3</span> and{" "}
             <span className="font-serif italic text-white">Bybit Earn</span> (200+ products) with
             delta-neutral hedging on volatile positions. Every decision logged on-chain. Reputation
             verifiable through ERC-8004.
@@ -989,8 +988,6 @@ const ALLOC_VENUE_META: Record<
   string,
   { label: string; sub: string; color: string }
 > = {
-  aave_v3_usdc: { label: "Aave V3 USDC", sub: "lending · on-chain", color: "#F6A94B" },
-  aave_v3_weth: { label: "Aave V3 WETH", sub: "lending · on-chain", color: "#FFC97A" },
   bybit_flex: { label: "Bybit Flexible Earn", sub: "stable yield", color: "#F6A94B" },
   bybit_onchain: { label: "Bybit OnChain Earn", sub: "staked / hedged", color: "#D9A005" },
   bybit_lm: { label: "Bybit Liquidity Mining", sub: "CPMM LP", color: "#FFC97A" },
@@ -1021,8 +1018,6 @@ const VENUE_KIND_LABELS: Record<string, string> = {
   bybit_dual_asset: "DualAsset",
   bybit_hold_to_earn: "Hold-to-Earn",
   bybit_alpha: "Alpha Farm",
-  aave_v3_usdc: "Aave Supply",
-  aave_v3_weth: "Aave Supply",
 };
 
 type HedgedTrade = {

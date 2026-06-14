@@ -29,22 +29,12 @@ export interface AllocationStats {
 
 // Venue metadata - one row per real venue. Bybit Attestor used to be a
 // single bucket; now every sub-venue (Flex, LM, OnChain, DiscountBuy,
-// DualAsset, Hold-to-Earn, perp) renders independently. Cash + Aave
-// legs included so the donut can hold them when there's signal.
+// DualAsset, Hold-to-Earn, perp) renders independently. Cash leg
+// included so the donut can hold it when there's signal.
 const VENUE_META: Record<
   string,
   { label: string; sub: string; color: string }
 > = {
-  aave_v3_usdc: {
-    label: "Aave V3 USDC",
-    sub: "lending · on-chain",
-    color: "#F6A94B",
-  },
-  aave_v3_weth: {
-    label: "Aave V3 WETH",
-    sub: "lending · on-chain",
-    color: "#FFC97A",
-  },
   bybit_flex: {
     label: "Bybit Flexible Earn",
     sub: "off-chain · 200+ stable products",
@@ -195,8 +185,8 @@ function buildFromDecision(
  * Build allocation rows from the latest snapshot's positions. Each
  * unique `venue` becomes one row; cash is whatever total equity
  * isn't explained by positions. Zero/negligible rows are dropped so
- * the donut isn't cluttered with "Aave 0%" when the agent isn't
- * actually on Aave this cycle.
+ * the donut isn't cluttered with venues the agent isn't actually
+ * holding this cycle.
  */
 function buildFromPositions(
   positions: PositionRow[],

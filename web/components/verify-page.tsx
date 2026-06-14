@@ -3,8 +3,6 @@
 import Link from "next/link";
 
 import {
-  AAVE_USDC_ADAPTER_ADDRESS,
-  AAVE_WETH_ADAPTER_ADDRESS,
   BYBIT_ATTESTOR_ADDRESS,
   CAPITAL_MANAGER_ADDRESS,
   DECISION_LOG_ADDRESS,
@@ -60,18 +58,6 @@ function rows(): ContractRow[] {
       address: REPUTATION_ORACLE_ADDRESS,
       status: live(REPUTATION_ORACLE_ADDRESS),
       note: "Writes annualized APR (bps) to the ERC-8004 Reputation Registry. 1h throttle.",
-    },
-    {
-      label: "AaveV3UsdcAdapter",
-      address: AAVE_USDC_ADAPTER_ADDRESS,
-      status: live(AAVE_USDC_ADAPTER_ADDRESS),
-      note: "Supplies USDC to Aave V3 on Mantle. valueInUsdc() = aUSDC balance.",
-    },
-    {
-      label: "AaveV3WethAdapter",
-      address: AAVE_WETH_ADAPTER_ADDRESS,
-      status: live(AAVE_WETH_ADAPTER_ADDRESS),
-      note: "Supplies WETH to Aave V3. valueInUsdc() converts via the Aave oracle.",
     },
     {
       label: "BybitAttestor",

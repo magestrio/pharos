@@ -21,7 +21,6 @@ function humanize(s: string): string {
 // Branded venue casing (LM, OnChain) - explicit, not derivable from humanize.
 const VENUE_LABELS: Record<string, string> = {
   cash_usdc: "Cash USDC",
-  aave_v3_usdc: "Aave V3 USDC",
   bybit_flex: "Bybit Flex",
   bybit_onchain: "Bybit OnChain",
   bybit_lm: "Bybit LM",
