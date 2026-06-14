@@ -143,8 +143,8 @@ export function EarnExplorer() {
             <div className="col-span-2 text-right text-accent">
               Profit {PROFIT_OPTS.find((o) => o.key === profitKey)?.short}
             </div>
-            <div className="col-span-2 text-right">Fee break-even</div>
-            <div className="col-span-2">Stability</div>
+            <div className="col-span-2 text-right pr-5">Fee break-even</div>
+            <div className="col-span-2 pl-2">Stability</div>
           </div>
 
           {isLoading ? (
@@ -317,20 +317,20 @@ function ProfitCell({ profit }: { profit: ProfitHorizon | null }) {
 // "no fee"; a losing position (yield ≤ 0) → "never".
 function BreakEvenCell({ profit }: { profit: ProfitHorizon | null }) {
   if (!profit || profit.total_pct === null) {
-    return <div className="col-span-2 text-right text-dim-600 text-[11px]">—</div>;
+    return <div className="col-span-2 text-right pr-5 text-dim-600 text-[11px]">—</div>;
   }
   if (profit.fee_pct !== null && profit.fee_pct <= 0) {
-    return <div className="col-span-2 text-right text-pos text-[11px]">no fee</div>;
+    return <div className="col-span-2 text-right pr-5 text-pos text-[11px]">no fee</div>;
   }
   if (profit.break_even_days === null) {
-    return <div className="col-span-2 text-right text-danger text-[11px]">never</div>;
+    return <div className="col-span-2 text-right pr-5 text-danger text-[11px]">never</div>;
   }
   const hours = profit.break_even_days * 24;
   const text = hours < 48 ? `${Math.round(hours)}h` : `${profit.break_even_days.toFixed(1)}d`;
   const color = profit.break_even_days > 30 ? WARN : "#9aa3b2";
   return (
     <div
-      className="col-span-2 text-right tabular text-[12px]"
+      className="col-span-2 text-right pr-5 tabular text-[12px]"
       style={{ color }}
       title={`${Math.round(hours)}h to recoup the ${profit.fee_pct?.toFixed(2)}% round-trip fee`}
     >
