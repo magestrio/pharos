@@ -25,13 +25,21 @@ const POS = "#4ADE80";
 const DANGER = "#FB7185";
 const WARN = "#FBBF6B";
 
-type SortKey = "quality" | "net" | "apr";
+type SortKey = "quality" | "net" | "apr" | "profit";
+type ProfitKey = "profit_1d" | "profit_7d" | "profit_30d";
+
+const PROFIT_OPTS: Array<{ key: ProfitKey; short: string; label: string }> = [
+  { key: "profit_1d", short: "Day", label: "1d" },
+  { key: "profit_7d", short: "Week", label: "7d" },
+  { key: "profit_30d", short: "Month", label: "30d" },
+];
 
 export function EarnExplorer() {
   const { data, isLoading, isError, error } = useEarnExplorer({ limit: 500 });
   const [category, setCategory] = useState<string>("");
   const [coin, setCoin] = useState<string>("");
   const [sortKey, setSortKey] = useState<SortKey>("quality");
+  const [profitKey, setProfitKey] = useState<ProfitKey>("profit_7d");
   const [expanded, setExpanded] = useState<string | null>(null);
 
   const rows = data?.products ?? [];
@@ -53,17 +61,19 @@ export function EarnExplorer() {
         ? r.quality_score ?? -1
         : sortKey === "net"
           ? r.net_apr_pct ?? -Infinity
-          : r.effective_apr_pct;
+          : sortKey === "profit"
+            ? r[profitKey]?.total_pct ?? -Infinity
+            : r.effective_apr_pct;
     out.sort((a, b) => keyOf(b) - keyOf(a));
     return out;
-  }, [rows, category, coin, sortKey]);
+  }, [rows, category, coin, sortKey, profitKey]);
 
   return (
     <section className="space-y-6">
       <SectionHead
         eyebrow="Bybit Earn"
         title="Earn Explorer"
-        subtitle="Every Bybit Earn coin scored for real earnability — quality blends realizable net APR (after hedge funding), coin stability (steady APR + low price volatility), and source confidence. Expand a row for the full breakdown."
+        subtitle="Every Bybit Earn coin scored for real earnability. Profit = realized return per $100 (APR + funding) over the chosen horizon — ~ marks projected when history is short. Quality blends net APR, stability, and source confidence. Expand a row for the full breakdown."
         right={
           data?.captured_at ? (
             <div className="flex items-center gap-2 font-mono text-[11px] text-dim-400">
@@ -93,10 +103,25 @@ export function EarnExplorer() {
           placeholder="Filter coin (e.g. BTC)"
           className="bg-ink-850 border border-ink-600/70 rounded-sm px-3 py-1.5 text-[12px] font-mono text-dim-200 placeholder:text-dim-600 w-44"
         />
+        <div className="flex items-center gap-1 font-mono text-[11px] text-dim-500">
+          <span>Profit:</span>
+          {PROFIT_OPTS.map((o) => (
+            <SortButton
+              key={o.key}
+              active={profitKey === o.key}
+              onClick={() => setProfitKey(o.key)}
+            >
+              {o.short}
+            </SortButton>
+          ))}
+        </div>
         <div className="flex items-center gap-1 ml-auto font-mono text-[11px] text-dim-500">
           <span>Sort:</span>
           <SortButton active={sortKey === "quality"} onClick={() => setSortKey("quality")}>
             Quality
+          </SortButton>
+          <SortButton active={sortKey === "profit"} onClick={() => setSortKey("profit")}>
+            Profit
           </SortButton>
           <SortButton active={sortKey === "net"} onClick={() => setSortKey("net")}>
             Net APR
@@ -113,11 +138,13 @@ export function EarnExplorer() {
         <Card className="p-0 overflow-hidden">
           <div className="grid grid-cols-12 text-[10px] uppercase tracking-[0.16em] font-mono text-dim-500 bg-ink-850 px-4 py-2.5">
             <div className="col-span-2">Quality</div>
-            <div className="col-span-2">Coin</div>
-            <div className="col-span-2">Category</div>
+            <div className="col-span-3">Coin</div>
             <div className="col-span-2 text-right">Net APR</div>
+            <div className="col-span-2 text-right text-accent">
+              Profit {PROFIT_OPTS.find((o) => o.key === profitKey)?.short}
+            </div>
+            <div className="col-span-1 text-right">Fund 7d</div>
             <div className="col-span-2">Stability</div>
-            <div className="col-span-2 text-right">Funding 7d</div>
           </div>
 
           {isLoading ? (
@@ -137,6 +164,7 @@ export function EarnExplorer() {
                 <EarnRow
                   key={key}
                   row={r}
+                  profitKey={profitKey}
                   expanded={expanded === key}
                   onToggle={() => setExpanded(expanded === key ? null : key)}
                 />
@@ -214,14 +242,17 @@ function fundingColor(annual: number | null | undefined): string {
 
 function EarnRow({
   row,
+  profitKey,
   expanded,
   onToggle,
 }: {
   row: EarnProductRow;
+  profitKey: ProfitKey;
   expanded: boolean;
   onToggle: () => void;
 }) {
   const funding7d = row.funding_7d_annual_pct;
+  const profit = row[profitKey] ?? null;
   return (
     <div className="border-t border-ink-600/30">
       <button
@@ -231,30 +262,63 @@ function EarnRow({
         <div className="col-span-2">
           <QualityBadge score={row.quality_score} />
         </div>
-        <div className="col-span-2 flex items-center gap-1.5 min-w-0">
-          <span className="text-white truncate">{row.coin}</span>
-          {row.is_stable && (
-            <span className="text-[8.5px] uppercase tracking-[0.08em] text-pos border border-pos/30 bg-pos/10 rounded-sm px-1 py-px shrink-0">
-              stable
-            </span>
-          )}
+        <div className="col-span-3 min-w-0 pr-2">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <span className="text-white truncate">{row.coin}</span>
+            {row.is_stable && (
+              <span className="text-[8.5px] uppercase tracking-[0.08em] text-pos border border-pos/30 bg-pos/10 rounded-sm px-1 py-px shrink-0">
+                stable
+              </span>
+            )}
+          </div>
+          <div className="text-dim-500 truncate text-[10px]">{row.category}</div>
         </div>
-        <div className="col-span-2 text-dim-300 truncate pr-2 text-[11px]">{row.category}</div>
         <div className="col-span-2 text-right tabular text-accent">
           {row.net_apr_pct === null || row.net_apr_pct === undefined
             ? fmtPct(row.effective_apr_pct, { decimals: 2, sign: false })
             : fmtPct(row.net_apr_pct, { decimals: 2, sign: false })}
         </div>
-        <div className="col-span-2 pr-3">
-          <Bar value={row.stability_score} color={ACCENT} />
-        </div>
-        <div className="col-span-2 text-right tabular" style={{ color: fundingColor(funding7d) }}>
+        <ProfitCell profit={profit} />
+        <div className="col-span-1 text-right tabular text-[11px]" style={{ color: fundingColor(funding7d) }}>
           {funding7d === null || funding7d === undefined
             ? <span className="text-dim-600">n/a</span>
-            : fmtPct(funding7d, { decimals: 1, sign: true })}
+            : fmtPct(funding7d, { decimals: 0, sign: true })}
+        </div>
+        <div className="col-span-2 pl-3">
+          <Bar value={row.stability_score} color={ACCENT} />
         </div>
       </button>
       {expanded && <EarnRowDetail row={row} />}
+    </div>
+  );
+}
+
+function ProfitCell({ profit }: { profit: ProfitHorizon | null }) {
+  const total = profit?.total_pct ?? null;
+  const realized = profit?.basis === "realized";
+  return (
+    <div className="col-span-2 text-right">
+      {total === null ? (
+        <span className="text-dim-600 text-[11px]">no history</span>
+      ) : (
+        <div className="flex items-center justify-end gap-1.5">
+          <span
+            className="tabular font-semibold"
+            style={{ color: total >= 0 ? POS : DANGER }}
+            title={profit?.note ?? undefined}
+          >
+            {fmtPct(total, { decimals: total !== 0 && Math.abs(total) < 1 ? 3 : 2, sign: true })}
+          </span>
+          {!realized && (
+            <span
+              className="text-[8px] uppercase tracking-[0.06em] text-warn shrink-0"
+              title={profit?.note ?? "projected"}
+            >
+              ~
+            </span>
+          )}
+        </div>
+      )}
     </div>
   );
 }
