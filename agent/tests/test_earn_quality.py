@@ -249,13 +249,13 @@ def test_profit_1d_7d_realized_30d_projected() -> None:
     assert p["profit_1d"].basis == "realized"
     assert p["profit_1d"].earn_pct == pytest.approx(0.05 / 365 * 100)
     assert p["profit_1d"].funding_pct == pytest.approx(7.3 / 365)
-    # total is NET of the round-trip fee (0.31% non-stable): earn+funding−fee.
+    # total is GROSS yield (earn + funding); fee is reported via break-even.
     assert p["profit_1d"].fee_pct == pytest.approx(0.31)
     assert p["profit_1d"].total_pct == pytest.approx(
-        p["profit_1d"].earn_pct + p["profit_1d"].funding_pct - p["profit_1d"].fee_pct
+        p["profit_1d"].earn_pct + p["profit_1d"].funding_pct
     )
-    # 1d hold loses money — the fee dwarfs a single day's yield (anti-churn).
-    assert p["profit_1d"].total_pct < 0
+    # Positive-yield non-stable → finite break-even (days to recoup the fee).
+    assert p["profit_1d"].break_even_days is not None and p["profit_1d"].break_even_days > 0
     # 7d realized over the full window.
     assert p["profit_7d"].basis == "realized"
     assert p["profit_7d"].earn_pct == pytest.approx(0.05 * 7 / 365 * 100)
@@ -313,8 +313,10 @@ def test_profit_fee_only_charged_for_nonstable() -> None:
     )
     assert ns["profit_7d"].fee_pct == pytest.approx(0.31)
     assert st["profit_7d"].fee_pct == pytest.approx(0.0)
-    # Same gross earn, but the non-stable nets less by exactly the fee.
-    assert st["profit_7d"].total_pct - ns["profit_7d"].total_pct == pytest.approx(0.31)
+    # Same gross yield (fee is NOT in total); the fee shows up as break-even.
+    assert ns["profit_7d"].total_pct == pytest.approx(st["profit_7d"].total_pct)
+    assert st["profit_7d"].break_even_days == 0.0  # no fee → instantly profitable
+    assert ns["profit_7d"].break_even_days > 0.0  # must hold to clear the fee
 
 
 def test_profit_negative_funding_drags_total() -> None:

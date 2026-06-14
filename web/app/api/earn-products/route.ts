@@ -46,6 +46,7 @@ type ProfitHorizon = {
   earn_pct: number | null;
   funding_pct: number | null;
   fee_pct: number | null;
+  break_even_days: number | null;
   total_pct: number | null;
   basis: string;
   note: string | null;

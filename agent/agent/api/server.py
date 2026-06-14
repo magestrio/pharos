@@ -170,9 +170,13 @@ def _profit_horizon(
     """Return on notional over `days`, realized from the daily APR history
     where it reaches and projected (flagged) beyond it. Earn uses the GROSS
     daily APR series (so earn + funding doesn't double-count the hedge);
-    funding accrues the best-available average rate over the window. The
-    round-trip Bybit fee (enter+exit, once per horizon) is subtracted so
-    `total_pct` is the net profit of opening now and exiting after `days`."""
+    funding accrues the best-available average rate over the window.
+
+    `total_pct` is the GROSS yield (earn + funding) — what you make holding it.
+    The round-trip Bybit fee is a one-time entry+exit cost, reported separately
+    via `fee_pct` + `break_even_days` (hold past break-even to net positive)
+    rather than buried in every horizon (which made tiny daily yields all read
+    negative)."""
     note: str | None = None
     if apr_history_pts:
         n = len(apr_history_pts)
@@ -201,15 +205,25 @@ def _profit_horizon(
         funding_pct = None
         note = (note + "; " if note else "") + "funding history unavailable"
 
-    # Round-trip Bybit fee (enter+exit once over the horizon). Subtracted so
-    # short holds correctly show as net-negative when the fee outweighs the
-    # accrued yield — mirrors the agent's anti-churn economics.
+    # Gross yield over the horizon (what you make holding the position).
+    total_pct = earn_pct + (funding_pct or 0.0)
+
+    # Round-trip Bybit fee is a one-time entry+exit cost — report it via the
+    # break-even hold rather than netting it into a tiny daily yield.
     fee_pct = round_trip_fee_fraction(is_stable=is_stable) * 100.0
-    total_pct = earn_pct + (funding_pct or 0.0) - fee_pct
+    per_day_yield = total_pct / days
+    if fee_pct <= 0.0:
+        break_even_days: float | None = 0.0
+    elif per_day_yield > 1e-9:
+        break_even_days = fee_pct / per_day_yield
+    else:
+        break_even_days = None  # yield ≤ 0 → fee never recouped (a real loss)
+
     return ProfitHorizon(
         earn_pct=earn_pct,
         funding_pct=funding_pct,
         fee_pct=fee_pct,
+        break_even_days=break_even_days,
         total_pct=total_pct,
         basis=basis,
         note=note,
@@ -328,8 +342,14 @@ class ProfitHorizon(BaseModel):
 
     earn_pct: float | None = None
     funding_pct: float | None = None
-    fee_pct: float | None = None  # round-trip Bybit fee (enter+exit), subtracted
-    total_pct: float | None = None
+    # Round-trip Bybit fee (enter+exit). A ONE-TIME cost, NOT subtracted from
+    # total_pct (the fee amortizes over the hold) — surfaced via break_even_days.
+    fee_pct: float | None = None
+    # Days to hold at this yield rate before the gross return covers the
+    # round-trip fee. 0 for stables (no fee); None when the yield is ≤ 0 (the
+    # position loses money regardless of fee, e.g. deeply negative funding).
+    break_even_days: float | None = None
+    total_pct: float | None = None  # GROSS yield over the horizon (earn + funding)
     basis: str = "unavailable"
     note: str | None = None
 

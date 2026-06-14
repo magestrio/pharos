@@ -110,8 +110,9 @@ export type EarnProductRow = {
 export type ProfitHorizon = {
   earn_pct: number | null;
   funding_pct: number | null;
-  fee_pct: number | null; // round-trip Bybit fee, already subtracted from total
-  total_pct: number | null;
+  fee_pct: number | null; // one-time round-trip Bybit fee (NOT in total)
+  break_even_days: number | null; // days to hold before yield covers the fee
+  total_pct: number | null; // GROSS yield over the horizon (earn + funding)
   basis: "realized" | "projected" | "unavailable";
   note: string | null;
 };
