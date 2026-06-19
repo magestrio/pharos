@@ -32,7 +32,7 @@ STABLES: frozenset[str] = frozenset(
 # model knows its own heartbeat) AND consumed by the loop as the default
 # `--interval`; sharing one constant keeps the two from contradicting each
 # other (ah.17 / prompt-2 — the prompt used to say both "4h" and "30 min").
-DEFAULT_CYCLE_INTERVAL_SECONDS: int = 4 * 60 * 60  # 4h
+DEFAULT_CYCLE_INTERVAL_SECONDS: int = 8 * 60 * 60  # 8h
 
 VenueId = Literal[
     "cash_usdc",

@@ -48,7 +48,7 @@ services:
       BYBIT_PRIVATE_KEY_PATH: /run/secrets/bybit-rsa.pem
     command: >
       python -m agent.sandbox.loop
-      --interval 14400
+      --interval 28800
       --no-startup-cycle
       --live --yes
       --enable-store

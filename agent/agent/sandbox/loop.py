@@ -187,14 +187,15 @@ from agent.validate.rules import (
 # `event-driven-rebalance.6` because the watcher (`event-driven-rebalance.2/.3`)
 # now covers fast-moving signals via `wake_event` — including
 # `lm_liquidation_distance ≤ 10%` (P0) which is the original reason the
-# heartbeat was tightened. Pair this default with `--enable-watcher`;
-# running without the watcher means a fast LM liquidation can land in
-# the gap between two heartbeats. Cost economics: 4h × 6 cycles/day ×
-# $0.14 ≈ $0.84/day baseline API (vs $6.72/day at 30min), reactive
-# cycles add on top.
+# heartbeat was tightened. Widened to 8h on 2026-06-19 to halve baseline
+# API cost — the watcher still covers fast-moving signals between beats.
+# Pair this default with `--enable-watcher`; running without the watcher
+# means a fast LM liquidation can land in the gap between two heartbeats.
+# Cost economics: 8h × 3 cycles/day × ~$0.14 ≈ $0.42/day baseline API,
+# reactive cycles add on top.
 # Re-export the shared cadence (ah.17) under the loop's local name so the
 # argparse default + the system prompt's "heartbeat" narrative stay in sync.
-DEFAULT_INTERVAL_SECONDS = DEFAULT_CYCLE_INTERVAL_SECONDS  # 4h
+DEFAULT_INTERVAL_SECONDS = DEFAULT_CYCLE_INTERVAL_SECONDS  # 8h
 # Lives under state/ (a persisted Docker volume) — NOT the package root, which
 # is ephemeral container FS wiped on every `compose up --build`. The crash-
 # recovery gate cross-references this ledger against the persisted executions/

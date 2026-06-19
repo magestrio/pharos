@@ -260,19 +260,10 @@ def test_pricing_table_covers_models_referenced_by_decide() -> None:
 # ─── .40 prompt-cache 1h TTL ──────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_decide_sets_1h_cache_ttl_on_system_block() -> None:
-    """`.40`: explicit 1h TTL on the system-block cache_control extends
-    cache lifetime from 5min default to 60min, so event-driven cycles
-    firing within an hour amortize the 2× write rate against
-    cache-reads at 10% of input. Regression guard so a future refactor
-    doesn't silently drop the TTL.
-    """
-    from unittest.mock import AsyncMock
-
-    from agent.sandbox.decide import CACHE_TTL, TOOL_NAME, decide
-
-    captured_kwargs: dict = {}
+def _stub_create_capturing(captured_kwargs: dict):
+    """Build a fake `messages.create` that records its kwargs and returns
+    a minimal valid `submit_decision` tool call."""
+    from agent.sandbox.decide import TOOL_NAME
 
     async def _fake_create(**kwargs):
         captured_kwargs.update(kwargs)
@@ -303,17 +294,56 @@ async def test_decide_sets_1h_cache_ttl_on_system_block() -> None:
             ),
         )
 
+    return _fake_create
+
+
+@pytest.mark.asyncio
+async def test_decide_sets_1h_cache_ttl_on_event_driven_cycle() -> None:
+    """`.40`: event-driven cycles cache the system block at the 1h TTL so
+    a burst firing within the hour amortizes the 2× write against
+    cache-reads at 10% of input. Gated on `wake_events` (2026-06-19).
+    """
+    from unittest.mock import AsyncMock
+
+    from agent.sandbox.decide import CACHE_TTL, decide
+
+    captured_kwargs: dict = {}
     fake_client = AsyncMock()
-    fake_client.messages.create = _fake_create
+    fake_client.messages.create = _stub_create_capturing(captured_kwargs)
 
     snapshot = {"captured_at": "2026-06-04T00:00:00Z"}
-    decision, usage = await decide(snapshot, client=fake_client)
+    await decide(
+        snapshot,
+        client=fake_client,
+        wake_events=[{"severity": "P0", "kind": "peg_drift", "message": "x"}],
+    )
 
     system_blocks = captured_kwargs.get("system") or []
     assert system_blocks, "decide() must pass a system block to Anthropic"
     cache_control = system_blocks[0].get("cache_control") or {}
     assert cache_control.get("type") == "ephemeral"
     assert cache_control.get("ttl") == CACHE_TTL == "1h"
+
+
+@pytest.mark.asyncio
+async def test_decide_skips_cache_on_heartbeat_cycle() -> None:
+    """Heartbeat cycles (no `wake_events`) are 8h apart — they never read
+    the cache back, so writing it would just double the system-block
+    input cost. Guard that no cache_control is sent (2026-06-19)."""
+    from unittest.mock import AsyncMock
+
+    from agent.sandbox.decide import decide
+
+    captured_kwargs: dict = {}
+    fake_client = AsyncMock()
+    fake_client.messages.create = _stub_create_capturing(captured_kwargs)
+
+    snapshot = {"captured_at": "2026-06-04T00:00:00Z"}
+    await decide(snapshot, client=fake_client)
+
+    system_blocks = captured_kwargs.get("system") or []
+    assert system_blocks, "decide() must pass a system block to Anthropic"
+    assert "cache_control" not in system_blocks[0]
 
 
 # ─── .4 memory layer (multi-cycle prior decisions) ────────────────────────
@@ -535,6 +565,52 @@ def test_summarize_prior_decision_truncates_long_thesis() -> None:
     # Must contain the truncation marker and not the full original.
     assert "…" in out
     assert "x" * 500 not in out
+
+
+def test_trim_snapshot_drops_missing_apr_products() -> None:
+    """`apr_source == "missing"` products are un-pickable (validator
+    rejects any non-zero weight), so they're stripped from the LLM
+    payload to save input tokens. Pickable rows and category keys
+    survive; the on-disk snapshot is untouched (function returns a copy).
+    """
+    from agent.sandbox.decide import _trim_snapshot_for_llm
+
+    snapshot = {
+        "captured_at": "2026-06-05T00:00:00Z",
+        "products": {
+            "FlexibleSaving": [
+                {"product_id": "1", "apr_source": "list", "effective_apr": "0.05"},
+                {"product_id": "2", "apr_source": "missing", "effective_apr": "0"},
+            ],
+            "DoubleWin": [
+                {"product_id": "9", "apr_source": "missing", "effective_apr": "0"},
+            ],
+        },
+    }
+    trimmed = _trim_snapshot_for_llm(snapshot)
+
+    flex = trimmed["products"]["FlexibleSaving"]
+    assert [p["product_id"] for p in flex] == ["1"]
+    # Entirely-missing category collapses to an empty list but the key
+    # stays so the model still sees the family exists.
+    assert trimmed["products"]["DoubleWin"] == []
+    # Original snapshot must not be mutated.
+    assert len(snapshot["products"]["FlexibleSaving"]) == 2
+
+
+def test_build_user_message_serializes_snapshot_compactly() -> None:
+    """The snapshot JSON must be minified (no indent) — pretty-printing
+    roughly doubles the input token bill on whitespace alone."""
+    from agent.sandbox.decide import _build_user_message
+
+    snapshot = {
+        "captured_at": "2026-06-05T00:00:00Z",
+        "products": {"FlexibleSaving": [{"product_id": "1", "apr_source": "list"}]},
+    }
+    msg = _build_user_message(snapshot)
+    # Compact separators leave no ", " or ": " spacing and no newline-indent.
+    assert '"product_id":"1"' in msg
+    assert '\n    "' not in msg
 
 
 def test_build_user_message_includes_recent_decisions_section() -> None:

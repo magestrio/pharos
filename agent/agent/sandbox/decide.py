@@ -74,13 +74,16 @@ PICK_INVALIDATE_COOLDOWN_MIN = 120
 
 # Prompt-cache TTL on the system block. Anthropic's `ephemeral` cache
 # defaults to 5min; the explicit `"1h"` extends that to 60min at the
-# cost of a higher cache-write rate (2× input vs 1.25× for 5m). For
-# Vault8004 the 4h heartbeat misses cache regardless of TTL, but the
-# event-driven re-decide path (`event-driven-rebalance`) often fires
+# cost of a higher cache-write rate (2× input vs 1.25× for 5m).
+#
+# Caching is gated on `wake_events` (see `decide()`): the 8h heartbeat
+# ALWAYS misses the cache (interval ≫ TTL) yet would still pay the 2×
+# write premium on the ~15K-token system block — pure waste, so heartbeat
+# cycles send NO cache_control and bill that block at the 1× input rate.
+# The event-driven re-decide path (`event-driven-rebalance`) often fires
 # multiple cycles within an hour (peg drift + funding flip in the same
-# window) — those amortize the 2× write against several cache-reads at
-# 10% of input. Net win on event-driven days, neutral on heartbeat-only
-# days. `.40`.
+# window) — there the 2× write amortizes against cache-reads at 10% of
+# input, so those cycles DO cache. `.40`, gating added 2026-06-19.
 CACHE_TTL = "1h"
 
 
@@ -269,17 +272,39 @@ def _trim_snapshot_for_llm(snapshot: dict[str, Any]) -> dict[str, Any]:
     happens only at the LLM serialization boundary. Current trims:
     - `usdc_peg.source` (always "coingecko" — static)
     - `usdc_peg.fetched_at` (redundant — top-level `captured_at` exists)
-    Both are operational metadata; peg-stress logic in the prompt only
-    reads `deviation_bps`. Token saving: ~15 per cycle.
+      Both are operational metadata; peg-stress logic in the prompt only
+      reads `deviation_bps`.
+    - `products.<cat>` rows with `apr_source == "missing"`. These are
+      un-pickable: the validator forces any non-zero weight on a missing
+      pick to reject (`check_no_missing_apr_source`), so the LLM can't
+      allocate to them — listing them just burns input tokens. Whole
+      categories that are entirely missing (DoubleWin, DiscountBuy until
+      their quote endpoints ship) collapse to an empty list; the system
+      prompt still documents the family so the model knows it exists.
+      Biggest single trim (~2-3K tokens/cycle).
 
-    Future trim targets — products top-K downsize, perp_market subset for
-    disabled venues, wallet account raw-array compaction — plug in here.
+    Future trim targets — products top-K downsize, advance_earn_quotes
+    field subset, perp_market subset for disabled venues — plug in here.
     """
     trimmed = {**snapshot}
     peg = trimmed.get("usdc_peg")
     if isinstance(peg, dict):
         trimmed["usdc_peg"] = {
             k: v for k, v in peg.items() if k not in ("source", "fetched_at")
+        }
+    products = trimmed.get("products")
+    if isinstance(products, dict):
+        trimmed["products"] = {
+            cat: (
+                [
+                    p
+                    for p in rows
+                    if not (isinstance(p, dict) and p.get("apr_source") == "missing")
+                ]
+                if isinstance(rows, list)
+                else rows
+            )
+            for cat, rows in products.items()
         }
     return trimmed
 
@@ -311,7 +336,12 @@ def _build_user_message(
     wake_events: list[dict[str, Any]] | None = None,
 ) -> str:
     snapshot = _trim_snapshot_for_llm(snapshot)
-    payload = json.dumps(snapshot, indent=2, sort_keys=True, default=str)
+    # Compact separators (no indent): pretty-printing the snapshot JSON
+    # roughly doubles its token count on whitespace alone, and the model
+    # reads minified JSON just as well. sort_keys stays for determinism.
+    payload = json.dumps(
+        snapshot, sort_keys=True, separators=(",", ":"), default=str
+    )
     parts: list[str] = []
     # Wake reason goes FIRST when present — we want Claude to see why
     # this cycle exists before reading the snapshot, so the re-decide
@@ -676,16 +706,18 @@ async def decide(
     client = client or anthropic.AsyncAnthropic()
     system_prompt = system_prompt or build_system_prompt()
 
+    # Cache only on event-driven cycles, which cluster within the cache
+    # TTL and so actually read back what they write. Heartbeat cycles are
+    # 8h apart — they'd never hit the cache, so writing it just doubles
+    # the system-block input cost (see CACHE_TTL note).
+    system_block: dict[str, Any] = {"type": "text", "text": system_prompt}
+    if wake_events:
+        system_block["cache_control"] = {"type": "ephemeral", "ttl": CACHE_TTL}
+
     response = await client.messages.create(
         model=MODEL,
         max_tokens=MAX_TOKENS,
-        system=[
-            {
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral", "ttl": CACHE_TTL},
-            }
-        ],
+        system=[system_block],
         tools=[_DECISION_TOOL],
         tool_choice={"type": "tool", "name": TOOL_NAME},
         messages=[
